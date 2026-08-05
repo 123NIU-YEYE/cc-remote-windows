@@ -276,7 +276,6 @@ class RollbackCommandJournal:
             if (not stat.S_ISREG(st.st_mode)
                     or st.st_size > len(_LOCK_MAGIC)):
                 raise OSError("rollback lock is not a regular file")
-<<<<<<< HEAD
             fchmod(fd, self.lock_path, 0o600)
             flock(fd, LOCK_EX)
             os.lseek(fd, 0, os.SEEK_SET)

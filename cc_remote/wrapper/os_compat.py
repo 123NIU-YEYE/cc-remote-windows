@@ -88,6 +88,64 @@ def force_rmtree(path: str | PathLike[str]) -> None:
             time.sleep(min(0.05 * (attempt + 1), 0.5))
 
 
+def open_with_share_delete(
+    path: str | PathLike[str], flags: int, mode: int = 0o600,
+) -> int:
+    """Open a file so it can still be unlinked/replaced while this fd is open.
+
+    Plain ``os.open`` on Windows does not grant ``FILE_SHARE_DELETE``, so any
+    unlink or rename of the path from another descriptor (including a second
+    open in this same process) raises ``PermissionError: [WinError 32]``
+    while this fd remains open. Unix descriptors never carry that
+    restriction, so this only changes behavior on Windows; unlike
+    ``os.O_TEMPORARY`` it does not delete the file when the fd closes, so it
+    is safe for paths that may legitimately outlive this open.
+    """
+    if sys.platform != "win32":
+        return os.open(path, flags, mode)
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    create_new = 1
+    open_existing = 3
+    file_attribute_normal = 0x80
+    invalid_handle_value = wintypes.HANDLE(-1).value
+
+    if flags & os.O_RDWR:
+        access, access_flags = generic_read | generic_write, os.O_RDWR
+    elif flags & os.O_WRONLY:
+        access, access_flags = generic_write, os.O_WRONLY
+    else:
+        access, access_flags = generic_read, os.O_RDONLY
+    disposition = (
+        create_new if flags & os.O_CREAT and flags & os.O_EXCL
+        else open_existing
+    )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        os.fspath(path), access,
+        file_share_read | file_share_write | file_share_delete,
+        None, disposition, file_attribute_normal, None,
+    )
+    if handle == invalid_handle_value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return msvcrt.open_osfhandle(handle, access_flags)
+
+
 def pread(fd: int, length: int, offset: int) -> bytes:
     """Positioned read, backed by lseek+read where the platform lacks pread.
 

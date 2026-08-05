@@ -10,10 +10,19 @@ if sys.platform == "win32":
 
     LOCK_EX = 0x1
     LOCK_UN = 0x0
+    LOCK_NB = 0x2
 
     def flock(fd: int, operation: int) -> None:
-        """Lock the first byte without changing the caller's file position."""
-        if operation not in {LOCK_EX, LOCK_UN}:
+        """Lock the first byte without changing the caller's file position.
+
+        ``operation`` may OR in ``LOCK_NB`` to request a single non-blocking
+        attempt, raising ``BlockingIOError`` immediately on contention (the
+        same contract ``fcntl.flock`` gives Unix callers that poll with their
+        own retry loop). Without it, this blocks with internal retries.
+        """
+        non_blocking = bool(operation & LOCK_NB)
+        base_operation = operation & ~LOCK_NB
+        if base_operation not in {LOCK_EX, LOCK_UN}:
             raise ValueError(f"Unsupported lock operation: {operation}")
         # ``os.open`` defaults to text mode on Windows. Journals use raw byte
         # reads/writes, so leave the descriptor in binary mode and avoid CRLF
@@ -22,9 +31,15 @@ if sys.platform == "win32":
         original_offset = os.lseek(fd, 0, os.SEEK_CUR)
         try:
             os.lseek(fd, 0, os.SEEK_SET)
-            if operation == LOCK_UN:
+            if base_operation == LOCK_UN:
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
                 return
+            if non_blocking:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    return
+                except OSError as exc:
+                    raise BlockingIOError(*exc.args) from exc
             for attempt in range(100):
                 try:
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -41,4 +56,5 @@ else:
 
     LOCK_EX = fcntl.LOCK_EX
     LOCK_UN = fcntl.LOCK_UN
+    LOCK_NB = fcntl.LOCK_NB
     flock = fcntl.flock
