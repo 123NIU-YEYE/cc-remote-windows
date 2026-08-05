@@ -999,7 +999,12 @@ def test_preview_lock_refuses_symlink_without_chmodding_target(tmp_path):
     target.write_text("do not touch", encoding="utf-8")
     target.chmod(0o640)
     before = target.stat().st_mode & 0o777
-    (state / ".preview-capabilities.lock").symlink_to(target)
+    try:
+        (state / ".preview-capabilities.lock").symlink_to(target)
+    except OSError as exc:
+        if sys.platform == "win32":
+            pytest.skip(f"Windows symlink privilege is unavailable: {exc}")
+        raise
 
     store = PreviewCapabilityStore(state)
 
@@ -1012,14 +1017,14 @@ def test_preview_lock_wait_is_bounded(tmp_path, monkeypatch):
     clock = iter((0.0, 0.0, 6.0))
 
     def busy_lock(_descriptor, operation):
-        if operation & preview_capabilities.fcntl.LOCK_NB:
+        if operation & preview_capabilities.LOCK_NB:
             raise BlockingIOError
 
     monkeypatch.setattr(
         preview_capabilities.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(
         preview_capabilities.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(preview_capabilities.fcntl, "flock", busy_lock)
+    monkeypatch.setattr(preview_capabilities, "flock", busy_lock)
 
     with pytest.raises(TimeoutError, match="acquisition timed out"):
         with store._exclusive_lock():
@@ -1372,7 +1377,16 @@ def test_external_diff_never_reopens_capability_checked_path(
         nonlocal replaced
         if replaced:
             return
-        os.replace(replacement, outside)
+        try:
+            os.replace(replacement, outside)
+        except OSError:
+            # Windows denies replacing a path while another descriptor holds
+            # it open without share-delete, so the race this test injects
+            # cannot land there at all. That is consistent with (and even
+            # stronger than) the invariant under test: the read snapshot is
+            # never affected by a racing replace.
+            if sys.platform != "win32":
+                raise
         replaced = True
 
     def racing_lstat(path, *args, **kwargs):
