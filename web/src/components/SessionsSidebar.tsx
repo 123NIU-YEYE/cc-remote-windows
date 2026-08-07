@@ -38,7 +38,7 @@ interface Props {
 
 function basename(cwd?: string | null): string {
   if (!cwd) return "其他";
-  const parts = cwd.replace(/\/+$/, "").split("/");
+  const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]/);
   return parts[parts.length - 1] || cwd;
 }
 
