@@ -2,6 +2,23 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.11
+
+Add optional Codex asynchronous tasks and restore Claude side-chat history reliably.
+Wire protocol v74 is unchanged. See the bilingual [release notes](docs/releases/v4.0.11.md).
+
+- Run commands or external agents through the shared official Codex daemon and
+  return results to the originating account/thread without a provider-specific adapter.
+- Show background activity above the composer and label resumed processing; track
+  the exact callback turn before marking delivery successful and retain failed results.
+- Enforce task deadlines at submission, classify native timeouts correctly and
+  avoid replaying commands or callbacks whose outcome is uncertain.
+- Refresh an enabled task MCP after upgrades without restarting its daemon.
+- Display restored Claude BTW history at once, preserve completion markers and
+  keep background continuations in order.
+- Fix macOS Bash 3.2 installation and Supervisor preflight compatibility, and
+  document recommended Release installations with one-command updates.
+
 ## v4.0.10
 
 Add managed Linux migration, Supervisor installation/adoption and verified upgrade
