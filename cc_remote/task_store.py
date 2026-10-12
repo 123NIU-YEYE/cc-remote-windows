@@ -14,7 +14,14 @@ from uuid import UUID, uuid4
 OUTPUT_BYTES = 64 * 1024
 MAX_ACTIVE = 8
 MAX_RECORDS = 200
+DELIVERY_TRACK_SECONDS = 86400
 TERMINAL = {"completed", "failed", "cancelled", "timed_out", "interrupted"}
+# Known legacy callback IDs (NULL deadline) get one reconciliation window;
+# 0 closes it durably. A lost acknowledgment without an ID is never guessed.
+_PENDING_WORK = """(state IN ('queued','running') OR delivery IN ('pending','sending','accepted')
+    OR (delivery IN ('failed','unknown') AND delivery_turn_id IS NOT NULL
+        AND delivery_turn_id != ''
+        AND (delivery_recheck_until IS NULL OR delivery_recheck_until > 0)))"""
 
 
 def thread_id(value):
@@ -86,16 +93,21 @@ class TaskStore:
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 delivery TEXT NOT NULL DEFAULT 'pending', error TEXT, delivery_error TEXT,
                 delivery_turn_id TEXT, delivery_accepted_at REAL,
+                delivery_failure_status TEXT, delivery_failure_seen_at REAL,
+                delivery_recheck_until REAL,
                 next_attempt REAL NOT NULL DEFAULT 0,
                 created REAL NOT NULL, updated REAL NOT NULL,
                 UNIQUE(sid, request_id))""")
             # Additive migration preserves receipts made by older workers. Take
             # the write lock before rechecking: MCP and worker can open together.
+            additions = {"delivery_turn_id": "TEXT", "delivery_accepted_at": "REAL",
+                         "delivery_failure_status": "TEXT", "delivery_failure_seen_at": "REAL",
+                         "delivery_recheck_until": "REAL"}
             columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
-            if not {"delivery_turn_id", "delivery_accepted_at"} <= columns:
+            if not additions.keys() <= columns:
                 db.execute("BEGIN IMMEDIATE")
                 columns = {row[1] for row in db.execute("PRAGMA table_info(tasks)")}
-                for name, kind in (("delivery_turn_id", "TEXT"), ("delivery_accepted_at", "REAL")):
+                for name, kind in additions.items():
                     if name not in columns:
                         db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {kind}")
                 db.commit()
@@ -203,6 +215,7 @@ class TaskStore:
         if not fields or not fields.keys() <= {
             "state", "output", "truncated", "exit_code", "delivery", "error", "delivery_error",
             "next_attempt", "delivery_turn_id", "delivery_accepted_at",
+            "delivery_failure_status", "delivery_failure_seen_at", "delivery_recheck_until",
         }:
             raise ValueError("Invalid task update")
         with self.db() as db:
@@ -248,14 +261,12 @@ class TaskStore:
 
     def recoverable(self):
         with self.db() as db:
-            return [row[0] for row in db.execute("SELECT id FROM tasks WHERE "
-                    "(state IN ('queued','running') OR delivery IN ('pending','sending','accepted')) "
+            return [row[0] for row in db.execute(f"SELECT id FROM tasks WHERE {_PENDING_WORK} "
                     "AND next_attempt<=? ORDER BY created LIMIT ?", (time.time(), MAX_RECORDS))]
 
     def has_pending(self):
         with self.db() as db:
-            return bool(db.execute("SELECT 1 FROM tasks WHERE state IN ('queued','running') "
-                                   "OR delivery IN ('pending','sending','accepted') LIMIT 1").fetchone())
+            return bool(db.execute(f"SELECT 1 FROM tasks WHERE {_PENDING_WORK} LIMIT 1").fetchone())
 
 
 def public_task(task, *, output=False):

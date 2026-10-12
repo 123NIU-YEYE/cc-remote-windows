@@ -128,10 +128,25 @@ The worker checks that exact thread and turn through read-only, paginated
 resume a thread or send another message to check progress. Checks run every 30
 seconds, including after worker recovery, and do not occupy a command slot for
 the model's whole turn. Only that turn's `completed` status records `delivered`.
-A `failed` or `interrupted` turn records notification `failed`, independently of
-the command's own success. Completion means the callback turn ended normally,
-not that the model semantically understood the result. If no outcome can be
-confirmed within 24 hours, the receipt becomes `unknown` and remains retained.
+A first `failed` or `interrupted` snapshot remains `accepted`: history can lag
+the live callback just after acceptance. The same negative status must be read
+again at least 30 seconds later before recording notification `failed`,
+independently of the command's own success. An intervening unavailable or changed
+status resets this confirmation. Failed callbacks continue to be checked within
+the original 24-hour tracking window; that exact turn becoming `inProgress` or
+`completed` corrects the receipt and its panel state. Completion means the
+callback turn ended normally, not that the model semantically understood the
+result. If no outcome can be confirmed within 24 hours, the receipt becomes
+`unknown` and remains retained; a confirmed failure keeps its warning.
+
+Old failed/unconfirmed receipts with a known callback turn ID receive one
+24-hour reconciliation window when the upgraded worker checks them. MCP startup
+detects this work even if no commands remain active. Reconciliation only reads
+the existing daemon; it never resumes a thread, resends a callback or reruns a
+command. The deadline and failure observations survive restart, and one final
+read at the deadline ends tracking without renewing it on the next restart.
+Unavailable history keeps a warning. Lost acknowledgments without a known turn
+ID and explicit rejections are not guessed or retried.
 Neither accepted nor failed/unconfirmed callbacks are automatically resent.
 Older `delivered` records without a turn ID retain their original meaning
 (acceptance only); upgrading does not invent an outcome for them.
@@ -163,9 +178,10 @@ deployment procedure. Private task state is not part of release cleanup.
 `tests/test_async_tasks.py` exercises execution, failures, cancellation, bounded
 output, caller isolation, ambiguous delivery, recovery and MCP calls using a
 local fake app-server and trivial subprocesses. Callback regressions cover
-acceptance followed by provider failure, exact-turn pagination, recovery without
-resubmission, unavailable history, bounded tracking and concurrent old-store
-migration. These tests spend no model tokens.
+acceptance followed by provider failure, transient startup interruption,
+late correction of failed callbacks, exact-turn pagination, recovery without
+resubmission, unavailable history, bounded tracking, legacy reconciliation and
+concurrent old-store migration. These tests spend no model tokens.
 They do not establish real App/CLI rendering or native end-to-end inference;
 those require a separate, explicitly scoped live acceptance run. The caller
 regression covers both `_meta.threadId` from the official 0.159.2 app-server's

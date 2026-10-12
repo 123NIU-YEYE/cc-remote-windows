@@ -19,12 +19,13 @@ import sys
 import time
 
 from cc_remote import task_rpc
-from cc_remote.task_store import OUTPUT_BYTES, TERMINAL, TaskStore, public_task, request_thread
+from cc_remote.task_store import (
+    DELIVERY_TRACK_SECONDS, OUTPUT_BYTES, TERMINAL, TaskStore, public_task, request_thread,
+)
 from cc_remote.wrapper.child_env import sanitized_child_env
 
 POLL_SECONDS = 0.25
 RETRY_SECONDS = 30
-DELIVERY_TRACK_SECONDS = 86400
 
 
 class CancelledBeforeExecution(Exception):
@@ -218,7 +219,9 @@ async def deliver(store, task):
 
 
 async def check_delivery(store, task):
-    if task["delivery"] != "accepted":
+    if (task["delivery"] not in {"accepted", "failed", "unknown"}
+            or not task["delivery_turn_id"]
+            or (task["delivery"] != "accepted" and task["delivery_recheck_until"] == 0)):
         return
     task_id = task["id"]
     status = None
@@ -230,18 +233,53 @@ async def check_delivery(store, task):
                 status = await native.turn_status(task["sid"], task["delivery_turn_id"])
     except Exception:
         pass
+    now = time.time()
+    deadline = task["delivery_recheck_until"]
+    if deadline is None:
+        # NULL is a legacy/untracked receipt, 0 is a finished reconciliation.
+        # Give old failed/unknown callbacks one bounded read-only repair window;
+        # this also catches a failure written by an old worker after migration.
+        start = (task["delivery_accepted_at"] or 0) if task["delivery"] == "accepted" else now
+        deadline = start + DELIVERY_TRACK_SECONDS
+    updates = dict(delivery_failure_status=None, delivery_failure_seen_at=None,
+                   delivery_recheck_until=deadline, next_attempt=min(now + RETRY_SECONDS, deadline))
     if status == "completed":
-        store.update(task_id, delivery="delivered", delivery_error=None)
-    elif status in {"failed", "interrupted"}:
-        store.update(task_id, delivery="failed", delivery_error=(
+        updates.update(delivery="delivered", delivery_error=None, delivery_recheck_until=0,
+                       next_attempt=0)
+    elif status in {"failed", "interrupted"} and (
+        task["delivery"] == "failed" or (
+            task["delivery_failure_status"] == status
+            and task["delivery_failure_seen_at"] is not None
+            and now - task["delivery_failure_seen_at"] >= RETRY_SECONDS
+        )
+    ):
+        # A paginated history read can report an interrupted turn just after
+        # turn/start accepts it. Require separated observations, then continue
+        # reconciling this exact ID: a later live/completed state wins.
+        updates.update(delivery="failed", delivery_error=(
             f"Codex callback turn {status}; result retained in task_result; not resent"))
-    elif time.time() >= (task["delivery_accepted_at"] or 0) + DELIVERY_TRACK_SECONDS:
-        store.update(task_id, delivery="unknown", delivery_error=(
-            "Callback outcome could not be confirmed within 24 hours; result retained; not resent"))
+        if now >= deadline:
+            updates.update(delivery_recheck_until=0, next_attempt=0)
+    elif now >= deadline:
+        retain_failure = task["delivery"] == "failed" and status != "inProgress"
+        updates.update(delivery="failed" if retain_failure else "unknown",
+                       delivery_error=task["delivery_error"] if retain_failure else
+                       "Callback outcome could not be confirmed within 24 hours; result retained; not resent",
+                       delivery_recheck_until=0, next_attempt=0)
+    elif status in {"failed", "interrupted"}:
+        since = (task["delivery_failure_seen_at"]
+                 if task["delivery_failure_status"] == status else None)
+        updates.update(delivery="accepted", delivery_failure_status=status,
+                       delivery_failure_seen_at=now if since is None else since,
+                       delivery_error="Callback accepted; waiting to confirm its outcome; not resent")
+    elif status == "inProgress":
+        updates.update(delivery="accepted", delivery_error=None)
     else:
-        store.update(task_id, next_attempt=time.time() + RETRY_SECONDS,
-                     delivery_error=None if status == "inProgress" else
-                     "Callback accepted; waiting to confirm its outcome; not resent")
+        # An unavailable read neither confirms an earlier candidate failure nor
+        # hides an existing warning. Tracking ends once, even across restarts.
+        updates.update(delivery_error=task["delivery_error"] if task["delivery"] != "accepted" else
+                       "Callback accepted; waiting to confirm its outcome; not resent")
+    store.update(task_id, **updates)
 
 
 async def process_task(store, task_id):
