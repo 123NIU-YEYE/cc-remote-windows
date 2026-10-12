@@ -2,6 +2,19 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.13
+
+Refine Goal dialogs and keep running indicators on the current Codex turn.
+Wire protocol v74 is unchanged. See the bilingual [release notes](docs/releases/v4.0.13.md).
+
+- Use a target icon, smaller objective text and compact metrics in the Goal dialog,
+  preserving Codex budget controls and Claude check details.
+- Keep mobile dialogs positioned correctly outside the transformed chat pane.
+- Bind every automatic Codex turn before its first output so the running spark
+  and process label move to the successor even without an idle gap.
+- Preserve Stop state and reconnect ownership while allowing official user
+  messages to refine the turn binding without duplicate rows.
+
 ## v4.0.12
 
 Correct Codex Goal continuation and background callback state reporting.
