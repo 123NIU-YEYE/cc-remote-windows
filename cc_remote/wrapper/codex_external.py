@@ -88,6 +88,7 @@ class TurnMarkers:
     ordered: tuple[tuple[str, str], ...] = ()
     has_visible_user_message: bool = False
     terminals: tuple[RolloutTerminalMarker, ...] = ()
+    automatic_started: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -945,6 +946,7 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
     finished: set[str] = set()
     ordered: list[tuple[str, str]] = []
     terminals: list[RolloutTerminalMarker] = []
+    automatic_started: set[str] = set()
     has_visible_user_message = False
     for line in lines:
         try:
@@ -966,6 +968,10 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         if kind == "task_started":
             started.add(turn_id)
             ordered.append((kind, turn_id))
+            root_id = payload.get("root_turn_id")
+            if (isinstance(root_id, str) and _SAFE_WIRE_ID.fullmatch(root_id)
+                    and root_id != turn_id):
+                automatic_started.add(turn_id)
         elif kind in _TERMINAL_EVENTS:
             finished.add(turn_id)
             ordered.append((kind, turn_id))
@@ -1009,7 +1015,30 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
     return TurnMarkers(
         frozenset(started), frozenset(finished), carry, tuple(ordered),
         has_visible_user_message, tuple(terminals),
+        frozenset(automatic_started),
     )
+
+
+def codex_active_goal_turn(path: str, *, max_bytes: int) -> str | None:
+    """Return only the latest unfinished, explicitly rooted continuation.
+
+    This is a bounded candidate read, never proof that a writer is alive. The
+    caller must validate the exact id against the owning shared app-server.
+    """
+    with open(path, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        start = max(0, size - max_bytes)
+        stream.seek(start)
+        data = stream.read(max_bytes)
+    if start:
+        _, _, data = data.partition(b"\n")
+    markers = parse_turn_markers(data)
+    if not markers.ordered:
+        return None
+    kind, turn_id = markers.ordered[-1]
+    if kind == "task_started" and turn_id in markers.automatic_started:
+        return turn_id
+    return None
 
 
 _CODEX_REQUEST_MARKER = "## My request for Codex:"
