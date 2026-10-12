@@ -303,6 +303,12 @@ class SessionContext:
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
     codex_spontaneous_task: Optional[asyncio.Task] = None
+    # Native completion can precede the relay-facing consumer's cleanup. Keep
+    # the newest successor pending until that consumer releases its projection.
+    # Only an exact native terminal allows this handoff, never local idle/EOF.
+    codex_spontaneous_completed_id: Optional[str] = None
+    codex_spontaneous_next_id: Optional[str] = None
+    codex_spontaneous_history_gap: bool = False
     # Do not invent an empty native-turn anchor before the app-server reveals
     # whether a spontaneous turn came from a real CLI user item. The official
     # user item id is also History's durable identity; Goal/automatic turns keep

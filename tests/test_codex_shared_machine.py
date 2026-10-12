@@ -3647,3 +3647,106 @@ def test_stdio_work_keeps_legacy_terminal_mutex_and_read_only_state(
         return None
 
     asyncio.run(go())
+
+
+def test_restart_recovers_unleased_goal_continuation_without_resubmitting(
+    tmp_path, monkeypatch,
+):
+    async def go():
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started", "turn_id": "goal-next",
+            "root_turn_id": "human-root",
+        }}) + "\n")
+        monkeypatch.setattr(machine, "_codex_rollout_for_wire", lambda sid: str(rollout))
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine, ctx.space = "codex", "code"
+        sdk = _RecoveredOwnedGoalSdk()
+        sdk.machine, sdk.ctx = machine, ctx
+        probes = []
+
+        async def probe(turn_id):
+            probes.append(turn_id)
+            return SimpleNamespace(turn_id=turn_id)
+
+        sdk.probe_owned_turn = probe
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+        assert machine._codex_turn_leases.get("sid") is None
+        assert await machine._recover_codex_owned_turn(ctx, "sid")
+        assert ctx.state == "running"
+        assert ctx.codex_spontaneous_turn_id == "goal-next"
+        assert machine._codex_turn_leases.get("sid").automatic
+        assert probes == ["goal-next"]
+        assert sdk.queries == []
+        assert sdk.interrupts == 0
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.sleep(0)
+        # A real terminal, not an elapsed timer, releases the recovered turn.
+        sdk.interrupted.set()
+        await asyncio.wait_for(task, 1)
+        assert ctx.state == "idle"
+        assert machine._codex_turn_leases.get("sid") is None
+        assert any(isinstance(event, StateEvent) and event.state == "running"
+                   for event in transport.sent)
+
+    asyncio.run(go())
+
+
+def test_unleased_goal_recovery_requires_live_exact_continuation(tmp_path, monkeypatch):
+    async def go(case):
+        machine, _ = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        payload = {"type": "task_started", "turn_id": "goal-next",
+                   "root_turn_id": "human-root"}
+        if case == "ordinary":
+            payload.pop("root_turn_id")
+        if case == "root-self":
+            payload["root_turn_id"] = "goal-next"
+        rollout.write_text(json.dumps({"type": "event_msg", "payload": payload}) + "\n")
+        if case == "terminal":
+            with rollout.open("ab") as stream:
+                stream.write(_event("task_complete", "goal-next"))
+        monkeypatch.setattr(machine, "_codex_rollout_for_wire", lambda sid: str(rollout))
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine, ctx.space = "codex", "code"
+        sdk = _RecoveredOwnedGoalSdk()
+        sdk.machine, sdk.ctx = machine, ctx
+
+        async def get_goal():
+            return {"status": "paused" if case == "paused" else "active"}
+
+        async def probe(turn_id):
+            if case == "unavailable":
+                raise OSError("daemon unavailable")
+            if case == "not-active":
+                return None
+            if case == "completed-during-probe":
+                with rollout.open("ab") as stream:
+                    stream.write(_event("task_complete", "goal-next"))
+            if case == "rotated":
+                replacement = tmp_path / "replacement"
+                replacement.write_bytes(rollout.read_bytes())
+                os.replace(replacement, rollout)
+            if case == "new-user-query":
+                ctx.state = "running"
+            if case == "evicted":
+                machine.sessions.pop(ctx.key)
+            return SimpleNamespace(turn_id=turn_id)
+
+        sdk.get_goal, sdk.probe_owned_turn = get_goal, probe
+        if case == "private":
+            sdk.using_daemon_proxy = sdk.shared_daemon_affinity = False
+        ctx.sdk = sdk
+        machine.sessions[ctx.key] = ctx
+        assert not await machine._recover_codex_owned_turn(ctx, "sid"), case
+        assert ctx.codex_spontaneous_task is None, case
+        assert machine._codex_turn_leases.get("sid") is None, case
+        assert not sdk.queries and not sdk.interrupts, case
+
+    for case in ("ordinary", "root-self", "terminal", "paused", "not-active",
+                 "unavailable", "completed-during-probe", "rotated", "new-user-query",
+                 "evicted", "private"):
+        asyncio.run(go(case))
