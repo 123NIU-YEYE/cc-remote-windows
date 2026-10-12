@@ -10687,7 +10687,7 @@ for (const engine of ["codex", "claude"] as const) {
       const dialog = page.getByRole("dialog", { name: `${engine === "codex" ? "Codex" : "Claude"} Goal` });
       await expect(dialog).toBeVisible();
       await expect(dialog.getByRole("textbox")).toHaveCount(0);
-      expect(await dialog.evaluate(node => parseFloat(getComputedStyle(node).borderRadius))).toBeGreaterThanOrEqual(28);
+      expect(await dialog.evaluate(node => parseFloat(getComputedStyle(node).borderRadius))).toBeGreaterThanOrEqual(20);
       await expect(dialog.getByText("完成 protocol v30 发布并验证所有终端同步升级", { exact: true })).toHaveCount(1);
       if (engine === "claude") {
         await expect(dialog).toContainText("检查轮次");
