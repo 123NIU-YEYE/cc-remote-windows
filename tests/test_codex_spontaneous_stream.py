@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import cc_remote.wrapper.codex_handle as codex_handle_module
 import pytest
+from cc_remote.codex_daemon_restart import CodexDaemonRestartState
 from cc_remote.protocol import (
     Delta, Error, GoalState, ProcessEvent, SessionListInvalidated, StateEvent,
     Steer, ToolDelta, ToolResult, ToolUse, TurnBinding, TurnDiff, TurnEnd,
@@ -2363,6 +2364,144 @@ def test_goal_successor_burst_is_bounded_and_recovers_history(monkeypatch, cance
             if pending is not None and not pending.done():
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("race_at", ["relay", "anchor", "waiting", "interrupt"])
+def test_account_switch_belongs_to_queued_goal_successor(monkeypatch, race_at):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine, ctx.space = "codex", "code"
+        ctx.codex_checkpoint = False
+        ctx.codex_daemon_epoch = "old-epoch"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(ctx, phase, turn_id))
+        held, release, marker, resumed = (asyncio.Event() for _ in range(4))
+        switch = CodexDaemonRestartState("new-epoch", "ready", 1, 10**12)
+        interrupts, reconnects, goal_resumes = [], [], []
+        original_send = transport.send
+
+        async def frame(method, turn_id, **params):
+            await handle._dispatch(_notification(method, turn_id, **params))
+
+        async def answer(turn_id):
+            await frame("item/completed", turn_id, item={
+                "id": "answer-" + turn_id, "type": "agentMessage",
+                "text": turn_id, "phase": "final_answer",
+            })
+
+        async def send(event):
+            if (ctx.codex_spontaneous_turn_id == "old-goal" and (
+                race_at == "relay" and isinstance(event, Delta)
+                or race_at == "waiting" and isinstance(event, StateEvent)
+                and event.phase == "waiting"
+            )):
+                held.set()
+                await release.wait()
+            await original_send(event)
+
+        async def recover_user(_sid, turn_id, *_args, **_kwargs):
+            if race_at == "anchor" and turn_id == "old-goal":
+                held.set()
+                await release.wait()
+            return None
+
+        async def watch(_ctx, *, starting_epoch):
+            if starting_epoch == switch.epoch:
+                await asyncio.Event().wait()
+            await marker.wait()
+            return switch
+
+        async def restart_state(_ctx, **_kwargs):
+            return switch
+
+        async def request(method, params):
+            assert method == "turn/interrupt"
+            target = params["turnId"]
+            interrupts.append((ctx.codex_spontaneous_turn_id, target))
+            if race_at == "interrupt" and target == "old-goal":
+                held.set()
+                await release.wait()
+            else:
+                await frame("turn/completed", target, turn={
+                    "id": target, "status": "interrupted",
+                })
+            return {}
+
+        async def reconnect(_ctx, **_kwargs):
+            reconnects.append(ctx.codex_spontaneous_anchor_id)
+            ctx.codex_daemon_epoch = switch.epoch
+            return True
+
+        async def goal():
+            return {"status": "active"}
+
+        async def resume_goal(_ctx, _goal):
+            goal_resumes.append(ctx.codex_spontaneous_anchor_id)
+            await frame("turn/started", "replacement-goal", turn={"id": "replacement-goal"})
+            resumed.set()
+            return True
+
+        monkeypatch.setattr(transport, "send", send)
+        monkeypatch.setattr(machine, "_recover_official_codex_user", recover_user)
+        monkeypatch.setattr(machine, "_codex_shared_affinity", lambda _ctx: True)
+        monkeypatch.setattr(machine, "_wait_for_codex_account_switch", watch)
+        monkeypatch.setattr(machine, "_codex_restart_state_for_ctx", restart_state)
+        monkeypatch.setattr(machine, "_read_codex_restart_state_for_ctx", lambda _ctx: switch)
+        monkeypatch.setattr(machine, "_ensure_codex_daemon_generation", reconnect)
+        monkeypatch.setattr(machine, "_resume_codex_goal_after_account_switch", resume_goal)
+        monkeypatch.setattr(machine, "_schedule_history_refresh", lambda *a, **kw: None)
+        monkeypatch.setattr(handle, "_request", request)
+        monkeypatch.setattr(handle, "get_goal", goal)
+
+        await frame("turn/started", "old-goal", turn={"id": "old-goal"})
+        old_task = ctx.codex_spontaneous_task
+        try:
+            if race_at == "relay":
+                await answer("old-goal")
+            else:
+                marker.set()
+            await asyncio.wait_for(held.wait(), 2)
+            if race_at != "relay":
+                await answer("old-goal")
+            await frame("turn/completed", "old-goal", turn={"id": "old-goal", "status": "completed"})
+            await frame("turn/started", "next-goal", turn={"id": "next-goal"})
+            await answer("next-goal")
+            assert ctx.codex_spontaneous_next_id == "next-goal"
+            marker.set()
+            release.set()
+            await asyncio.wait_for(resumed.wait(), 2)
+            await asyncio.wait_for(old_task, 2)
+            expected = [("old-goal", "old-goal")] if race_at == "interrupt" else []
+            assert interrupts == [*expected, ("next-goal", "next-goal")]
+            assert reconnects == ["next-goal"]
+            assert goal_resumes == ["next-goal"]
+            ends = [e for e in transport.sent if isinstance(e, TurnEnd)]
+            assert [(e.turn_id, e.result.subtype) for e in ends] == [("old-goal", "success")]
+            assert ctx.state == "running"
+            assert not any(isinstance(e, StateEvent) and e.state == "idle" for e in transport.sent)
+            replacement = ctx.codex_spontaneous_task
+            await answer("replacement-goal")
+            await frame("turn/completed", "replacement-goal", turn={
+                "id": "replacement-goal", "status": "completed",
+            })
+            await asyncio.wait_for(replacement, 2)
+            assert ctx.state == "idle"
+            assert not any(isinstance(e, Error) for e in transport.sent)
+        finally:
+            release.set()
+            pending = {old_task, ctx.codex_spontaneous_task} - {None}
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
 
     asyncio.run(run())
 

@@ -22450,6 +22450,7 @@ class WrapperMachine:
             else ctx.sdk.receive_spontaneous_response(turn_id),
         ).__aiter__()
         restart_watch_task: Optional[asyncio.Task] = None
+        next_stream_task: Optional[asyncio.Task] = None
         overflowed = False
         terminal_seen = False
         stream_closed = False
@@ -22479,6 +22480,23 @@ class WrapperMachine:
                 await asyncio.gather(
                     restart_watch_task, return_exceptions=True)
             restart_watch_task = None
+
+        async def cancel_stream_read() -> None:
+            nonlocal next_stream_task
+            if next_stream_task is not None:
+                if not next_stream_task.done():
+                    next_stream_task.cancel()
+                await asyncio.gather(next_stream_task, return_exceptions=True)
+                next_stream_task = None
+
+        async def defer_restart_to_successor() -> bool:
+            if ctx.codex_spontaneous_next_id is None:
+                return False
+            # This consumer only owns the completed predecessor's projection.
+            # Leave the persistent epoch marker for the successor's watcher.
+            await cancel_restart_watch()
+            ctx.codex_account_handoff = False
+            return True
 
         async def ensure_automatic_anchor() -> None:
             """Recover a missed CLI user row or anchor true automatic output."""
@@ -22659,24 +22677,24 @@ class WrapperMachine:
 
         async def next_stream_item():
             """Race the live stream against an intentional daemon generation."""
-            next_task = asyncio.create_task(anext(stream))
-            try:
-                if restart_watch_task is None:
-                    return ("message", await next_task)
+            nonlocal next_stream_task
+            if next_stream_task is None:
+                next_stream_task = asyncio.create_task(anext(stream))
+            if restart_watch_task is not None and ctx.codex_spontaneous_next_id is None:
                 done, _pending = await asyncio.wait(
-                    {next_task, restart_watch_task},
+                    {next_stream_task, restart_watch_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                # The hook marker is authoritative even when the old daemon
-                # closes or emits a terminal in the same scheduler tick.
-                if restart_watch_task in done:
-                    return ("codex_account_switch",
-                            restart_watch_task.result())
-                return ("message", next_task.result())
+                # A queued successor owns the native turn now. Drain this
+                # predecessor even if its watcher became ready in the same tick.
+                if restart_watch_task in done and ctx.codex_spontaneous_next_id is None:
+                    # Preserve the read until handoff commits: a successor can
+                    # still arrive while anchor/relay/interrupt I/O is awaited.
+                    return ("codex_account_switch", restart_watch_task.result())
+            try:
+                return ("message", await next_stream_task)
             finally:
-                if not next_task.done():
-                    next_task.cancel()
-                    await asyncio.gather(next_task, return_exceptions=True)
+                next_stream_task = None
 
         async def handoff_account_switch(
             switch_state: CodexDaemonRestartState,
@@ -22685,7 +22703,11 @@ class WrapperMachine:
             nonlocal translator, current_turn_id, stream
             nonlocal overflowed, terminal_seen, stream_closed
 
+            if await defer_restart_to_successor():
+                return "deferred"
             await ensure_automatic_anchor()
+            if await defer_restart_to_successor():
+                return "deferred"
             ctx.codex_account_handoff = True
             await self._emit(ctx, StateEvent(
                 state="running",
@@ -22693,6 +22715,8 @@ class WrapperMachine:
                 detail="Codex 账号已切换，正在把当前任务转移到新账号…",
                 msg_id=logical_msg_id,
             ))
+            if await defer_restart_to_successor():
+                return "deferred"
 
             try:
                 await ctx.sdk.interrupt()
@@ -22703,6 +22727,8 @@ class WrapperMachine:
                     session_id=ctx.session_id,
                     error_type=type(exc).__name__,
                 )
+            if await defer_restart_to_successor():
+                return "deferred"
 
             # Close any partial assistant/tool blocks from the old native turn,
             # but keep the logical browser turn busy: its failure boundary is an
@@ -22725,6 +22751,8 @@ class WrapperMachine:
                 await self._emit(ctx, event)
 
             await cancel_restart_watch()
+            if await defer_restart_to_successor():
+                return "deferred"
 
             # Release the old native id before reconnect. thread/resume or
             # goal/set may synchronously announce a replacement automatic turn;
@@ -22735,6 +22763,7 @@ class WrapperMachine:
                 ctx.codex_spontaneous_turn_id = None
             if ctx.codex_spontaneous_task is current_task:
                 ctx.codex_spontaneous_task = None
+            await cancel_stream_read()
 
             async def interrupted_handoff_result() -> Optional[str]:
                 if (
@@ -23127,6 +23156,7 @@ class WrapperMachine:
                 )
         finally:
             await cancel_restart_watch()
+            await cancel_stream_read()
             ctx.codex_account_handoff = False
             try:
                 # A replacement lifecycle task owns a different id. Its cleanup
