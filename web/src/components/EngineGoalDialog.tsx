@@ -58,21 +58,22 @@ export default function EngineGoalDialog({ engine, goal, loading, disabled, scop
     </GoalMore>
   </>;
   return <GoalSheet engine={engine} scopeRef={scopeRef} onClose={onClose} footer={footer}
-    title={`${codex ? "Codex" : "Claude"} · ${editing ? goal ? "修改目标" : "新目标" : "当前目标"}`}
+    title={editing ? goal ? "修改目标" : "新目标" : "当前目标"}
     status={!editing && goal ? goalStatusName[goal.status] : undefined}>
     {children}
     {loading && !goal ? <p className="goal-hint" role="status">正在读取目标…</p>
       : editing ? <GoalObjective value={objective} onChange={setObjective} disabled={pending}
         hint={codex ? "围绕目标持续执行，直到完成或暂停。" : "写清完成条件，Claude 会持续检查。"} />
       : goal && <>
+        <p className="goal-section-label">目标描述</p>
         <p className="goal-objective">{goal.objective}</p>
         {codex && goal.tokenBudget && <GoalMeter label="Token 预算用量" used={goal.tokensUsed} total={goal.tokenBudget} />}
-        <div className="goal-stats">
-          {!codex && <div><small>检查轮次</small><b>{goal.iterations ?? 0} 次</b></div>}
-          <div><small>运行时间</small><b>{duration(goal.timeUsedSeconds)}</b></div>
-          <div><small>已用 Token</small><b>{goalTokens(goal.tokensUsed)}</b></div>
-          {codex && <div><small>Token 预算</small><b>{goal.tokenBudget ? goalTokens(goal.tokenBudget) : "不限"}</b></div>}
-        </div>
+        <dl className="goal-stats">
+          {!codex && <div><dt>检查轮次</dt><dd>{goal.iterations ?? 0} 次</dd></div>}
+          <div><dt>运行时间</dt><dd>{duration(goal.timeUsedSeconds)}</dd></div>
+          <div><dt>已用 Token</dt><dd>{goalTokens(goal.tokensUsed)}</dd></div>
+          {codex && <div><dt>Token 预算</dt><dd>{goal.tokenBudget ? goalTokens(goal.tokenBudget) : "不限"}</dd></div>}
+        </dl>
         {!codex && <div className="goal-last-check"><small>最近一次检查</small>
           <p>{goal.lastReason || (goal.status === "complete" ? "目标已完成。" : "等待首次检查结果。")}</p>
         </div>}

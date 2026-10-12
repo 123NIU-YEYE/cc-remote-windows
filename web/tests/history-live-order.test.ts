@@ -1369,6 +1369,70 @@ try {
   "idle History repair retains the collapsed process payload");
   const { ChatView } = await reducerHarness.ssrLoadModule(
     "/src/components/ChatView.tsx");
+  // Goal can start its successor milliseconds after a terminal, without an
+  // intervening idle state. Match the wrapper's ordered binding/state/anchor
+  // contract; only the successor may own the running spark and process label.
+  for (const legacyLiveFallbackBlocked of [false, true]) {
+    const sid = "goal-successor-handoff";
+    const oldId = "completed-goal-turn";
+    const nextId = "next-goal-turn";
+    const oldTurn: Turn = {
+      id: oldId, forkPointId: oldId, prompt: "", done: true,
+      blocks: [{ kind: "text", message_id: "old-goal-answer",
+        channel: "final", text: "checkpoint saved", done: true }],
+    };
+    let handoff = {
+      ...initialState, focusedSid: sid,
+      runtimes: { [sid]: {
+        ...createRuntime(), state: "running", legacyLiveFallbackBlocked,
+        turns: [oldTurn], liveOwner: { turnId: oldId, seq: 50 },
+        lastLiveSeq: 50,
+      } },
+    };
+    const apply = (body: Record<string, unknown>) => {
+      handoff = reduce(handoff, { type: "event", event: event({ sid, ...body }) });
+    };
+    apply({ type: "turn_binding", msg_id: nextId, turn_id: nextId, seq: 51 });
+    apply({ type: "state", state: "running", msg_id: nextId, seq: 52 });
+    assert.equal(handoff.runtimes[sid].liveOwner?.turnId, nextId,
+      "the successor owns activity before its first output, without going idle");
+    apply({ type: "user_msg", msg_id: nextId, prompt: "", seq: 53 });
+    apply({ type: "assistant_msg_start", message_id: "next-goal-commentary",
+      channel: "commentary", seq: 54 });
+    apply({ type: "delta", message_id: "next-goal-commentary",
+      channel: "commentary", text: "continue from the checkpoint", seq: 55 });
+    apply({ type: "assistant_msg_end", message_id: "next-goal-commentary", seq: 56 });
+    const runtime = handoff.runtimes[sid];
+    const activeId = exactActiveTurnId(runtime.turns, runtime.liveOwner?.turnId, true);
+    assert.equal(activeId, nextId);
+    assert.equal(runtime.turns.length, 2);
+    assert.equal(runtime.turns[0].done, true);
+    assert.equal(runtime.turns[1].done, false);
+    const renderRow = (turn: Turn) => renderToStaticMarkup(createElement(ChatView, {
+      sid, turns: [turn], engine: "codex", activeTurnId: activeId,
+      onEdit: () => {}, onGetDiff: () => {}, onLoadDetail: () => {},
+    }));
+    const previousMarkup = renderRow(runtime.turns[0]);
+    assert.doesNotMatch(previousMarkup, /class="turn-working"/,
+      "the completed Goal row must release its animated spark");
+    assert.match(previousMarkup, /class="turn-done-mark"/);
+    const successorMarkup = renderRow(runtime.turns[1]);
+    assert.match(successorMarkup, /class="turn-working"/,
+      "the latest automatic Goal row owns the animated spark");
+    assert.match(successorMarkup, /turn-process-label running/,
+      "a completed commentary item is not a completed enclosing Goal turn");
+
+    // A native CLI user item can refine the initial native-turn binding.
+    // It must keep one row rather than duplicating the automatic placeholder.
+    apply({ type: "user_msg", msg_id: "official-user-item", prompt: "continue", seq: 57 });
+    apply({ type: "turn_binding", msg_id: "official-user-item", turn_id: nextId, seq: 58 });
+    const refined = handoff.runtimes[sid];
+    assert.equal(refined.turns.length, 2);
+    assert.equal(refined.turns[1].forkPointId, nextId);
+    assert.equal(refined.turns[1].prompt, "continue");
+    assert.equal(exactActiveTurnId(refined.turns, refined.liveOwner?.turnId, true),
+      refined.turns[1].id);
+  }
   const idleMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: idleSid, turns: [repaired], engine: "codex",
     onEdit: () => {}, onGetDiff: () => {}, onLoadDetail: () => {},
