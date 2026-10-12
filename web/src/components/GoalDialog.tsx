@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
 import { useChatDialogGeometry } from "../chat-dialog-geometry";
-import { EngineIcon, Icon } from "../icons";
+import { Icon } from "../icons";
 import type { Engine } from "../protocol";
 import "./GoalDialog.css";
 import { goalTokens } from "../goal-presentation";
@@ -45,13 +46,20 @@ export function GoalSheet({ engine, title, status, scopeRef, onClose, children, 
   }, [hasGeometry]);
   if (!geometry) return null;
   const name = engine === "codex" ? "Codex" : "Claude";
-  return <>
+  // Geometry uses viewport coordinates. The mobile chat pane is transformed
+  // for the sidebar, so keep the dialog outside its fixed-position container.
+  return createPortal(<>
     <div className="scrim show goal-scrim" onClick={onClose} />
     <section ref={dialogRef} tabIndex={-1} className={`sheet show goal-sheet goal-card goal-card-${engine}`}
-      role="dialog" aria-modal="true" aria-label={`${name} Goal`} style={geometry}>
+      role="dialog" aria-modal="true" aria-label={`${name} Goal`} style={geometry} data-lock-horizontal-swipe>
       <header className="goal-sheet-head">
-        <span className="goal-sheet-icon"><EngineIcon engine={engine} size={23} /></span>
-        <b>{title}</b>
+        <span className="goal-sheet-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width={18} height={18} fill="none" stroke="currentColor"
+            strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M13 5.4a8.5 8.5 0 1 0 5.6 5.6M11.9 9.2a4.5 4.5 0 1 0 2.9 2.9M10.5 13.5 18 6m-7.5 4.5v3h3M18 2v4h4l-4 4h-4V6Z" />
+          </svg>
+        </span>
+        <div className="goal-sheet-title"><b>{title}</b><span>{name}</span></div>
         {status && <span className="goal-card-status"><i />{status}</span>}
         <button type="button" className="goal-icon-button" onClick={onClose} aria-label="关闭">
           <Icon name="close" size={18} />
@@ -60,14 +68,16 @@ export function GoalSheet({ engine, title, status, scopeRef, onClose, children, 
       <div className="goal-sheet-scroll">{children}</div>
       <footer className="goal-sheet-actions">{footer}</footer>
     </section>
-  </>;
+  </>, document.body);
 }
 
 export function GoalObjective({ value, onChange, hint, disabled = false }: {
   value: string; onChange: (value: string) => void; hint: string; disabled?: boolean;
 }) {
+  const id = useId();
   return <div className="goal-editor">
-    <textarea aria-label="目标内容" value={value} disabled={disabled} maxLength={16384}
+    <label className="goal-section-label" htmlFor={id}>目标描述</label>
+    <textarea id={id} aria-label="目标内容" value={value} disabled={disabled} maxLength={16384}
       placeholder="这次，你想完成什么？" rows={4}
       onChange={event => onChange(event.target.value)} />
     <p className="goal-hint">{hint}</p>
