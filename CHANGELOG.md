@@ -2,6 +2,20 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.12
+
+Correct Codex Goal continuation and background callback state reporting.
+Wire protocol v74 is unchanged. See the bilingual [release notes](docs/releases/v4.0.12.md).
+
+- Keep automatic turns running across stream handoffs and recover an active Goal
+  after reconnect by verifying its exact native turn on the shared daemon.
+- Let the current native turn handle account switches, preserving a completed
+  predecessor's result and its successor's separate lifecycle.
+- Confirm callback failures across separated reads and reconcile later completion
+  without resending callbacks or rerunning commands.
+- Repair legacy failed/unconfirmed receipts with known callback IDs within one
+  bounded tracking window; retain unresolved results for inspection.
+
 ## v4.0.11
 
 Add optional Codex asynchronous tasks and restore Claude side-chat history reliably.
