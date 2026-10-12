@@ -30,6 +30,17 @@ def store(tmp_path):
     return TaskStore(home)
 
 
+@pytest.fixture
+def delivery_clock(monkeypatch):
+    clock = SimpleNamespace(now=tasks.time.time())
+    # Patch module references, not the process-wide clock used by asyncio.
+    from cc_remote import task_store
+    fake = SimpleNamespace(time=lambda: clock.now)
+    monkeypatch.setattr(tasks, "time", fake)
+    monkeypatch.setattr(task_store, "time", fake)
+    return clock
+
+
 def start(store, *, sid=None, code="print('done')", request_id=None, **kwargs):
     sid = sid or str(uuid4())
     key = store.create(sid, argv=[sys.executable, "-c", code], cwd=str(store.home),
@@ -390,7 +401,8 @@ def test_completion_ack_loss_is_not_replayed(store, mode, expected):
 @pytest.mark.parametrize("outcome,expected", [
     ("completed", "delivered"), ("failed", "failed"), ("interrupted", "failed"),
 ])
-def test_callback_acceptance_is_not_success_and_outcome_survives_recovery(store, outcome, expected):
+def test_callback_acceptance_is_not_success_and_outcome_survives_recovery(
+        store, delivery_clock, outcome, expected):
     sid, key = start(store)
     store.update(key, state="completed", output=b"result survives provider rejection")
 
@@ -410,6 +422,14 @@ def test_callback_acceptance_is_not_success_and_outcome_survives_recovery(store,
             reopened.recover()
             native.outcomes.status = outcome
             reopened.update(key, next_attempt=0)
+            if outcome != "completed":
+                await tasks.process_task(reopened, key)
+                assert reopened.get(key)["delivery"] == "accepted"
+                # A failure candidate survives restarts, but a second immediate
+                # read cannot confirm it. Final bounded recheck can confirm it.
+                await tasks.check_delivery(reopened, reopened.get(key))
+                assert reopened.get(key)["delivery"] == "accepted"
+                delivery_clock.now += tasks.DELIVERY_TRACK_SECONDS
             await asyncio.wait_for(tasks.run_worker(reopened), 5)
             receipt = public_task(reopened.get(key), output=True)
             assert receipt["state"] == "completed"
@@ -423,7 +443,7 @@ def test_callback_acceptance_is_not_success_and_outcome_survives_recovery(store,
     asyncio.run(run())
 
 
-def test_callback_checks_exact_turn_across_pages_not_latest_success(store):
+def test_callback_checks_exact_turn_across_pages_not_latest_success(store, delivery_clock):
     _, key = start(store)
     store.update(key, state="completed")
 
@@ -435,14 +455,195 @@ def test_callback_checks_exact_turn_across_pages_not_latest_success(store):
                 "older": {"data": [{"id": "native-turn", "status": "failed"}], "nextCursor": None},
             }
             await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "accepted"
+            delivery_clock.now += tasks.RETRY_SECONDS
+            await tasks.process_task(store, key)
             assert store.get(key)["delivery"] == "failed"
-            assert [p["cursor"] for p in native.outcomes.reads] == [None, "older"]
+            assert [p["cursor"] for p in native.outcomes.reads] == [None, "older", None, "older"]
             assert len(native.receipts) == 1
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("initial_status", ["interrupted", "failed"])
+def test_callback_startup_failure_snapshot_is_rechecked_without_resubmission(store, initial_status):
+    from cc_remote.wrapper.codex_tasks import read_task_activity
+    sid, key = start(store)
+    store.update(key, state="completed", exit_code=0, output=b"already executed")
+
+    async def run():
+        async with daemon(store, turn_status=initial_status) as native:
+            await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "accepted"
+            assert read_task_activity(store.home)[sid][0].status == "pending"
+            assert store.has_pending()
+            native.outcomes.status = "completed"
+            await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "delivered"
+            assert read_task_activity(store.home) == {}
+            assert store.get(key)["output"] == b"already executed"
+            assert len(native.receipts) == 1 and not native.commands
+            assert "thread/resume" not in native.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("legacy_delivery", ["failed", "unknown"])
+def test_legacy_callback_failure_is_reconciled_on_worker_start(store, legacy_delivery):
+    sid, key = start(store)
+    store.update(key, state="completed", delivery=legacy_delivery, exit_code=0,
+                 delivery_turn_id="native-turn", delivery_accepted_at=1,
+                 delivery_error="Codex callback turn interrupted", output=b"original result")
+    # Simulate the exact pre-fix database. It must be enrolled once even when
+    # acceptance was over 24 hours ago, without rewriting command/result state.
+    with sqlite3.connect(store.path) as db:
+        columns = {r[1] for r in db.execute("PRAGMA table_info(tasks)")}
+        for name in ("delivery_failure_status", "delivery_failure_seen_at", "delivery_recheck_until"):
+            if name in columns:
+                db.execute(f"ALTER TABLE tasks DROP COLUMN {name}")
+    reopened = TaskStore(store.home)
+    assert reopened.has_pending()
+
+    async def run():
+        async with daemon(reopened, turn_status="completed") as native:
+            await asyncio.wait_for(tasks.run_worker(reopened), 5)
+            task = reopened.get(key, sid)
+            assert task["state"] == "completed" and task["delivery"] == "delivered"
+            assert task["delivery_error"] is None and task["output"] == b"original result"
+            assert not native.receipts and not native.commands
+            assert "thread/resume" not in native.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("recovery", ["completed", "inProgress"])
+def test_confirmed_callback_failure_keeps_tracking_and_can_recover(store, delivery_clock, recovery):
+    sid, key = start(store)
+    store.update(key, state="completed", output=b"retained command result")
+
+    async def run():
+        async with daemon(store, turn_status="interrupted") as native:
+            await tasks.process_task(store, key)
+            original = store.get(key)
+            assert original["delivery"] == "accepted"
+            assert key not in store.recoverable(), "checks are rate limited"
+            # Reopen between observations to test durable confirmation.
+            reopened = TaskStore(store.home)
+            reopened.recover()
+            delivery_clock.now += tasks.RETRY_SECONDS
+            assert key in reopened.recoverable()
+            await tasks.process_task(reopened, key)
+            assert reopened.get(key)["delivery"] == "failed"
+            assert reopened.has_pending(), "failure must not end reconciliation"
+            assert key not in reopened.recoverable()
+            delivery_clock.now += tasks.RETRY_SECONDS
+            native.outcomes.status = recovery
+            await tasks.process_task(reopened, key)
+            if recovery == "inProgress":
+                row = reopened.get(key)
+                assert row["delivery"] == "accepted" and row["delivery_error"] is None
+                assert row["delivery_failure_seen_at"] is None
+                assert row["delivery_recheck_until"] == original["delivery_recheck_until"]
+                # A later independent negative read requires confirmation anew.
+                native.outcomes.status = "failed"
+                delivery_clock.now += tasks.RETRY_SECONDS
+                await tasks.process_task(reopened, key)
+                assert reopened.get(key)["delivery"] == "accepted"
+                native.outcomes.status = "completed"
+                delivery_clock.now += tasks.RETRY_SECONDS
+                await asyncio.wait_for(tasks.run_worker(reopened), 5)
+            row = reopened.get(key, sid)
+            assert row["delivery"] == "delivered" and row["delivery_error"] is None
+            assert row["output"] == b"retained command result" and not reopened.has_pending()
+            assert len(native.receipts) == 1 and not native.commands
+            assert "thread/resume" not in native.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("intermediate", [None, "inProgress", "failed"])
+def test_failure_confirmation_requires_consistent_separated_observations(store, delivery_clock, intermediate):
+    _, key = start(store)
+    store.update(key, state="completed")
+
+    async def run():
+        async with daemon(store, turn_status="interrupted") as native:
+            await tasks.process_task(store, key)
+            native.outcomes.status = intermediate
+            delivery_clock.now += tasks.RETRY_SECONDS
+            await tasks.process_task(store, key)
+            native.outcomes.status = "interrupted"
+            delivery_clock.now += tasks.RETRY_SECONDS
+            await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "accepted"
+            delivery_clock.now += tasks.RETRY_SECONDS - 1
+            await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "accepted"
+            delivery_clock.now += 1
+            await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "failed"
+            assert len(native.receipts) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("initial", ["failed", "unknown"])
+@pytest.mark.parametrize("last_status", ["completed", "interrupted", "inProgress", None])
+def test_legacy_reconciliation_has_one_deadline_and_final_read(
+        store, delivery_clock, initial, last_status):
+    _, key = start(store)
+    store.update(key, state="completed", delivery=initial, delivery_turn_id="native-turn",
+                 delivery_accepted_at=1, delivery_error="old warning", output=b"keep me")
+
+    async def run():
+        async with daemon(store, turn_status="interrupted") as native:
+            assert store.has_pending()
+            await tasks.process_task(store, key)
+            deadline = store.get(key)["delivery_recheck_until"]
+            assert deadline == delivery_clock.now + tasks.DELIVERY_TRACK_SECONDS
+            delivery_clock.now += tasks.RETRY_SECONDS
+            await tasks.process_task(store, key)
+            assert store.get(key)["delivery"] == "failed"
+            assert store.get(key)["delivery_recheck_until"] == deadline
+            delivery_clock.now = deadline - 1
+            await tasks.process_task(store, key)
+            assert store.get(key)["next_attempt"] == deadline
+            native.outcomes.status = last_status
+            delivery_clock.now = deadline
+            await asyncio.wait_for(tasks.run_worker(store), 5)
+            row = store.get(key)
+            expected = ("delivered" if last_status == "completed" else
+                        "unknown" if last_status == "inProgress" else "failed")
+            assert row["delivery"] == expected
+            assert row["delivery_recheck_until"] == 0 and row["output"] == b"keep me"
+            # Finished reconciliation must not be renewed by MCP/worker restart.
+            reads = len(native.outcomes.reads)
+            reopened = TaskStore(store.home)
+            delivery_clock.now += tasks.DELIVERY_TRACK_SECONDS
+            assert not reopened.has_pending()
+            await tasks.run_worker(reopened)
+            await tasks.check_delivery(reopened, reopened.get(key))
+            assert len(native.outcomes.reads) == reads
+            assert not native.receipts and not native.commands
+            assert "thread/resume" not in native.calls
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("delivery,turn_id", [
+    ("unknown", None), ("failed", None), ("unknown", ""),
+    ("rejected", "native-turn"), ("delivered", "native-turn"), ("suppressed", "native-turn"),
+])
+def test_reconciliation_never_guesses_receipt_identity_or_replays_delivery(store, delivery, turn_id):
+    _, key = start(store)
+    store.update(key, state="completed", delivery=delivery, delivery_turn_id=turn_id)
+
+    async def run():
+        async with daemon(store) as native:
+            assert not store.has_pending()
+            await tasks.run_worker(store)
+            await tasks.process_task(store, key)
+            assert native.calls == []
+            assert store.get(key)["delivery"] == delivery
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("missing", ["history", "rpc", "socket", "malformed"])
-def test_unconfirmed_callback_is_retained_with_bounded_tracking(store, missing):
+def test_unconfirmed_callback_is_retained_with_bounded_tracking(store, delivery_clock, missing):
     _, key = start(store)
     store.update(key, state="completed", output=b"keep me")
 
@@ -472,7 +673,7 @@ def test_unconfirmed_callback_is_retained_with_bounded_tracking(store, missing):
     assert store.has_pending()
     asyncio.run(tasks.process_task(store, key))
     assert store.get(key)["delivery"] == "accepted"
-    store.update(key, delivery_accepted_at=tasks.time.time() - tasks.DELIVERY_TRACK_SECONDS - 1)
+    delivery_clock.now += tasks.DELIVERY_TRACK_SECONDS + 1
     asyncio.run(tasks.process_task(store, key))
     assert store.get(key)["delivery"] == "unknown"
     assert store.get(key)["output"] == b"keep me"
@@ -484,14 +685,17 @@ def test_callback_tracking_migrates_old_store_concurrently_without_reinterpretin
     sid, key = start(store)
     store.update(key, state="completed", delivery="delivered", output=b"legacy receipt")
     with sqlite3.connect(store.path) as db:
-        db.execute("ALTER TABLE tasks DROP COLUMN delivery_turn_id")
-        db.execute("ALTER TABLE tasks DROP COLUMN delivery_accepted_at")
+        for name in ("delivery_turn_id", "delivery_accepted_at", "delivery_failure_status",
+                     "delivery_failure_seen_at", "delivery_recheck_until"):
+            db.execute(f"ALTER TABLE tasks DROP COLUMN {name}")
     assert store.activity_snapshot() == [], "read-only wrapper must support the old schema"
     with ThreadPoolExecutor(max_workers=4) as pool:
         rows = list(pool.map(lambda _: TaskStore(store.home).get(key, sid), range(4)))
     for row in rows:
         assert row["delivery"] == "delivered" and row["delivery_turn_id"] is None
         assert row["delivery_accepted_at"] is None and row["output"] == b"legacy receipt"
+        assert row["delivery_failure_status"] is None and row["delivery_failure_seen_at"] is None
+        assert row["delivery_recheck_until"] is None
     assert not store.has_pending()
 
 
