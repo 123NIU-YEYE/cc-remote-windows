@@ -2246,6 +2246,19 @@ def test_goal_successor_waits_for_old_projection_without_becoming_idle(
             new_start = next(i for i, e in enumerate(transport.sent)
                              if isinstance(e, UserMsg) and e.msg_id == "next-goal")
             assert old_end < new_start
+            new_binding = next(i for i, e in enumerate(transport.sent)
+                               if isinstance(e, TurnBinding)
+                               and e.msg_id == e.turn_id == "next-goal")
+            new_state = next(i for i, e in enumerate(transport.sent)
+                             if isinstance(e, StateEvent)
+                             and e.msg_id == "next-goal")
+            assert old_end < new_binding < new_state < new_start
+            assert transport.sent[new_state].state == ctx.state
+            # Reconnect must receive the same exact owner, even though the
+            # session never went idle between the two automatic turns.
+            assert ctx.active_turn_binding is not None
+            assert ctx.active_turn_binding.msg_id == "next-goal"
+            assert ctx.active_turn_binding.turn_id == "next-goal"
             task = ctx.codex_spontaneous_task
             if successor_outcome == "closed":
                 handle._close_spontaneous_stream("next-goal")
@@ -2678,6 +2691,7 @@ def test_machine_uses_live_cli_user_item_as_spontaneous_turn_identity():
         bindings = [event for event in transport.sent
                     if isinstance(event, TurnBinding)]
         assert [(event.msg_id, event.turn_id) for event in bindings] == [
+            (turn_id, turn_id),
             ("cli-user-item", turn_id),
         ]
         assert not any(event.prompt == "" for event in users)
@@ -2754,7 +2768,7 @@ def test_machine_recovers_missed_cli_user_before_first_output(monkeypatch):
             (event.msg_id, event.turn_id)
             for event in transport.sent
             if isinstance(event, TurnBinding)
-        ] == [("persisted-cli-user", turn_id)]
+        ] == [(turn_id, turn_id), ("persisted-cli-user", turn_id)]
         assert recoveries == [(
             ctx.session_id,
             turn_id,

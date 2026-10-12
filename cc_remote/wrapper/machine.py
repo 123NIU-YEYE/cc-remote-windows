@@ -22925,20 +22925,21 @@ class WrapperMachine:
             ctx.active_msg_id = logical_msg_id
             await self._remember_codex_initial_turn_alias(
                 ctx, current_turn_id)
-            if recovered_msg_id is not None:
-                # A replacement wrapper starts a fresh sequence generation.  An
-                # exact logical/native owner must enter that ring before any
-                # recovered tail, otherwise the browser correctly refuses to
-                # route unbound deltas into an old-generation row.
-                await self._emit(ctx, TurnBinding(
-                    msg_id=recovered_msg_id,
-                    turn_id=current_turn_id,
-                ))
-            if announce_running:
+            # Every automatic turn needs its own ordered owner, including a
+            # successor which starts before the previous consumer goes idle.
+            # The binding also seeds reconnects before any user/output anchor
+            # arrives; a recovered official user item can refine it later.
+            await self._emit(ctx, TurnBinding(
+                msg_id=logical_msg_id,
+                turn_id=current_turn_id,
+            ))
+            if announce_running or ctx.state != "idle":
                 await self._emit(ctx, StateEvent(
-                    state="running",
+                    # Preserve a Stop received during predecessor cleanup.
+                    state="running" if announce_running else ctx.state,
                     msg_id=logical_msg_id,
                 ))
+            if announce_running:
                 log.info("state transition", sid=ctx.session_id, state="running")
             # turn/started is delivered only after app-server has already begun
             # executing the automatic continuation. A filesystem pre-image taken
