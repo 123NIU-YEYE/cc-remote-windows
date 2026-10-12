@@ -3922,10 +3922,16 @@ class CodexHandle:
         self._spontaneous_queue_turn_id = None
         self._spontaneous_overflow = False
 
-    async def receive_spontaneous_response(self, turn_id: str):
-        """Yield exactly one spontaneous turn's raw frames and internal signals."""
+    def receive_spontaneous_response(self, turn_id: str):
+        """Bind this turn's queue now, before a successor can replace it."""
         q = self._spontaneous_q
         if q is None or self._spontaneous_queue_turn_id != turn_id:
+            q = None
+        return self._receive_spontaneous_queue(q)
+
+    async def _receive_spontaneous_queue(self, q):
+        """Yield exactly one captured turn, even if its consumer starts late."""
+        if q is None:
             return
         terminal_seen = False
         try:
@@ -5880,8 +5886,9 @@ class CodexHandle:
 
         Arm the bounded stream before the status reads so a terminal notification
         racing either RPC is captured rather than leaving a false running state.
-        Machine has already matched this id against its private lease and an
-        exact source-bound rollout witness; the bounded latest-turn page
+        Machine has matched this id against a private lease or an explicitly
+        rooted Goal continuation, plus an exact source-bound rollout witness;
+        the bounded latest-turn page
         revalidates that the official control turn is still active.
         """
         if not isinstance(turn_id, str) or not turn_id:

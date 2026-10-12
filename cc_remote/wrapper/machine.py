@@ -398,6 +398,7 @@ from cc_remote.wrapper.claude_external import (
     classify_claude_growth,
 )
 from cc_remote.wrapper.codex_external import (
+    codex_active_goal_turn,
     CodexTuiLogTracker, HolderScan, RolloutTerminalMarker,
     codex_app_server_client_socket,
     parse_turn_markers,
@@ -5535,7 +5536,7 @@ class WrapperMachine:
             )
             return False
         if lease is None:
-            return False
+            return await self._recover_unleased_codex_goal(ctx, session_id)
 
         try:
             path = await asyncio.to_thread(
@@ -5892,6 +5893,67 @@ class WrapperMachine:
         except Exception:
             pass
         return False
+
+    async def _recover_unleased_codex_goal(
+        self, ctx: SessionContext, session_id: str,
+    ) -> bool:
+        """Attach a shared Goal continuation whose start preceded this client.
+
+        Old wrappers could lose the successor's lease while draining its
+        predecessor. A Goal flag alone is insufficient: require an explicitly
+        rooted rollout start and the same active turn on the shared daemon.
+        Recovery only subscribes to that existing stream; it submits no input.
+        """
+        sdk = ctx.sdk
+
+        def available() -> bool:
+            return bool(
+                self._is_resident_context(ctx)
+                and ctx.sdk is sdk
+                and self._codex_shared_live(ctx)
+                and ctx.state == "idle"
+                and ctx.turn_task is None
+                and ctx.codex_spontaneous_task is None
+                and not getattr(sdk, "turn_active", False)
+            )
+
+        if not available() or not all(callable(getattr(sdk, name, None)) for name in (
+                "get_goal", "probe_owned_turn", "recover_owned_turn")):
+            return False
+        try:
+            path = await asyncio.to_thread(self._codex_rollout_for_wire, session_id)
+            if not path:
+                return False
+            source = await asyncio.to_thread(HistorySourceFingerprint.capture, path)
+            turn_id = await asyncio.to_thread(
+                codex_active_goal_turn, path, max_bytes=self.CODEX_TAIL_READ_MAX)
+            if not turn_id:
+                return False
+            goal = await sdk.get_goal()
+            if not isinstance(goal, dict) or goal.get("status") != "active":
+                return False
+            if await sdk.probe_owned_turn(turn_id) is None or not available():
+                return False
+            # Rotation, rollback, or a terminal during the native reads invalidates
+            # the candidate. The handle arms before its final ordered native read,
+            # so completion racing the subscription cannot create a stuck turn.
+            current = await asyncio.to_thread(HistorySourceFingerprint.capture, path)
+            if not history_source_extends(source, current):
+                return False
+            latest = await asyncio.to_thread(
+                codex_active_goal_turn, path, max_bytes=self.CODEX_TAIL_READ_MAX)
+            if latest != turn_id or not available():
+                return False
+            recovered = await sdk.recover_owned_turn(turn_id)
+        except Exception as exc:
+            log.warning(
+                "Codex Goal continuation recovery unavailable",
+                session_id=session_id, error_type=type(exc).__name__)
+            return False
+        if recovered:
+            log.info("recovered shared Codex Goal continuation",
+                     session_id=session_id, turn_id=turn_id)
+        return bool(recovered)
 
     async def _adopt_reconciled_codex_turn_start(
         self,
@@ -18325,6 +18387,11 @@ class WrapperMachine:
                 ERR_NOT_STEERABLE,
                 "Codex 正在核对当前回合归属，本次引导未发送；请稍后重试。",
             )
+        if ctx.codex_spontaneous_next_id is not None:
+            return await reject(
+                ERR_NOT_STEERABLE,
+                "Codex 正在切换自动回合，本次引导未发送；请稍后重试。",
+            )
         if ctx.codex_uncertain_steer is not None:
             return await reject(
                 ERR_STEER_UNKNOWN,
@@ -18403,6 +18470,11 @@ class WrapperMachine:
                     return await reject(
                         ERR_NOT_STEERABLE,
                         "Codex 正在核对当前回合归属，本次引导未发送；请稍后重试。",
+                    )
+                if ctx.codex_spontaneous_next_id is not None:
+                    return await reject(
+                        ERR_NOT_STEERABLE,
+                        "Codex 正在切换自动回合，本次引导未发送；请稍后重试。",
                     )
                 sdk_turn_id = getattr(ctx.sdk, "turn_id", None)
                 sdk_turn_active = bool(
@@ -22177,6 +22249,23 @@ class WrapperMachine:
                 return
             if (ctx.codex_spontaneous_turn_id is not None
                     and ctx.codex_spontaneous_turn_id != turn_id):
+                predecessor = (
+                    ctx.codex_spontaneous_next_id
+                    or ctx.codex_spontaneous_turn_id
+                )
+                if ctx.codex_spontaneous_next_id == turn_id:
+                    return
+                if ctx.codex_spontaneous_completed_id == predecessor:
+                    # The native writer has finished; only its local projection
+                    # is still draining. Keep stdout free of relay I/O and let
+                    # that consumer hand off after publishing its real terminal.
+                    if ctx.codex_spontaneous_next_id is not None:
+                        # Bound retention to the draining turn and the newest
+                        # native bridge. Faster completed successors are rebuilt
+                        # from rollout history, never fabricated as interrupted.
+                        ctx.codex_spontaneous_history_gap = True
+                    ctx.codex_spontaneous_next_id = turn_id
+                    return
                 log.warning(
                     "overlapping codex spontaneous turn ignored",
                     active_turn_id=ctx.codex_spontaneous_turn_id,
@@ -22194,6 +22283,8 @@ class WrapperMachine:
                 else None
             )
             ctx.codex_spontaneous_turn_id = turn_id
+            if ctx.codex_spontaneous_completed_id != turn_id:
+                ctx.codex_spontaneous_completed_id = None
             if (
                 not ctx.codex_account_handoff
                 or ctx.codex_spontaneous_anchor_id is None
@@ -22242,6 +22333,7 @@ class WrapperMachine:
                 announce_running=announce_running,
                 recovered_msg_id=recovered_msg_id,
                 goal_prompt=self._take_codex_goal_prompt(ctx, turn_id),
+                raw_stream=ctx.sdk.receive_spontaneous_response(turn_id),
             ))
             ctx.codex_spontaneous_task = task
             ctx.codex_recovered_turn_id = None
@@ -22255,6 +22347,10 @@ class WrapperMachine:
         ):
             ctx.codex_deferred_turn_start_id = None
             return
+        if phase == "completed" and turn_id in {
+            ctx.codex_spontaneous_turn_id, ctx.codex_spontaneous_next_id,
+        }:
+            ctx.codex_spontaneous_completed_id = turn_id
         if phase != "completed" or ctx.codex_spontaneous_turn_id != turn_id:
             return
         # The raw consumer receives the same authoritative turn/completed frame
@@ -22293,6 +22389,21 @@ class WrapperMachine:
         # query() can win the race with rollout creation. Retry before the
         # active lease clears the only exact Remote message id we can prove.
         await self._remember_codex_initial_turn_alias(ctx, turn_id)
+        # Retain the old claim through every cleanup await. A successor received
+        # during cleanup must take the same ordered handoff as one received while
+        # its predecessor's terminal was still waiting to reach the browser.
+        await self._cleanup_codex_steer_attachments(ctx)
+        if ctx.codex_spontaneous_history_gap:
+            ctx.codex_spontaneous_history_gap = False
+            # Skipped automatic turns cannot leave count-based file rollback
+            # aligned to only a subset of the native conversation.
+            await self._retire_codex_checkpoint(
+                ctx, reason="automatic turns outpaced live projection")
+            sid = self._ctx_wire_sid(ctx)
+            if sid:
+                self._schedule_history_refresh(
+                    sid, before=None, limit=self.MIRROR_LIMIT,
+                    cwd=None, detail="summary")
         ctx.codex_spontaneous_turn_id = None
         ctx.codex_spontaneous_anchor_id = None
         self._release_codex_turn(ctx, turn_id)
@@ -22302,9 +22413,14 @@ class WrapperMachine:
                     and ctx.codex_spontaneous_task.done())):
             ctx.codex_spontaneous_task = None
         ctx.active_msg_id = None
+        successor = ctx.codex_spontaneous_next_id
+        ctx.codex_spontaneous_next_id = None
+        if successor is not None and not (current and current.cancelling()):
+            await self._on_codex_turn_lifecycle(ctx, "started", successor)
+            return
+        ctx.codex_spontaneous_completed_id = None
         ctx.interrupt_deadline = None
         ctx.interrupt_event.clear()
-        await self._cleanup_codex_steer_attachments(ctx)
         # If this continuation began while the previous managed consumer was
         # still unwinding, that task performs the final unlock after it releases
         # translator/queue ownership. Unlocking here would admit a second
@@ -22321,6 +22437,7 @@ class WrapperMachine:
         recovered_msg_id: Optional[str] = None,
         pending_switch: Optional[CodexDaemonRestartState] = None,
         goal_prompt: Optional[str] = None,
+        raw_stream=None,
     ) -> bool | None:
         """Translate one goal/automatic turn from the handle's bounded bridge."""
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
@@ -22329,7 +22446,8 @@ class WrapperMachine:
         if recovered_msg_id and ctx.codex_spontaneous_anchor_id is None:
             ctx.codex_spontaneous_anchor_id = recovered_msg_id
         stream = coalesce_codex_live_notifications(
-            ctx.sdk.receive_spontaneous_response(turn_id),
+            raw_stream if raw_stream is not None
+            else ctx.sdk.receive_spontaneous_response(turn_id),
         ).__aiter__()
         restart_watch_task: Optional[asyncio.Task] = None
         overflowed = False
@@ -27552,6 +27670,9 @@ class WrapperMachine:
                 return error
         if ctx.engine == "codex":
             await self._resolve_codex_session_effort(ctx)
+            if not newly_spawned and ctx.state == "idle":
+                async with ctx.query_lock:
+                    await self._recover_codex_owned_turn(ctx, sid)
         self.focused_sid = ctx.key
         # A newly-spawned session isn't tracked by the client yet — send its
         # snapshot + full replay so the client builds a runtime for it (else the
