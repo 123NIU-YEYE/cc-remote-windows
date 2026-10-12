@@ -94,7 +94,11 @@ def test_spontaneous_delivery_publishes_one_native_user_with_no_placeholder(kind
         await asyncio.wait_for(ctx.codex_spontaneous_task, 1)
         users = [e for e in transport.sent if isinstance(e, UserMsg)]
         assert [(u.msg_id, u.prompt, u.source_thread_id) for u in users] == [("incoming", PROMPT, SOURCE)]
-        assert [(e.msg_id, e.turn_id) for e in transport.sent if isinstance(e, TurnBinding)] == [("incoming", "task")]
+        # Claim the native turn before output, then refine its owner using the
+        # official incoming message. Neither binding fabricates a user bubble.
+        assert [(e.msg_id, e.turn_id) for e in transport.sent if isinstance(e, TurnBinding)] == [
+            ("task", "task"), ("incoming", "task"),
+        ]
     asyncio.run(run())
 
 
