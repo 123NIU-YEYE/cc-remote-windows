@@ -1098,6 +1098,14 @@ for (const [engine, delivery] of [
     ]);
     await expect(panel.locator(".attach-image-preview")).toHaveCount(1);
     await expect(panel.locator(".attach-file")).toHaveText("side.txt");
+    // Pending attachments stay above the input border, scoped to this chat
+    // for normal, queued and steered submission alike.
+    await expect(panel.locator(".btw-composer>.btw-pastes .attach-image-preview")).toHaveCount(1);
+    await expect(panel.locator(".btw-composer>.btw-pastes .attach-file")).toHaveText("side.txt");
+    const card = await panel.locator(".btw-input-card").boundingBox();
+    const attachment = await panel.locator(".attach-file").boundingBox();
+    expect(attachment!.y + attachment!.height).toBeLessThan(card!.y);
+    await expect(panel.locator(".btw-input-card .attach")).toHaveCount(0);
     await expect(page.locator(".composer .attach-file, .composer .attach-image-preview")).toHaveCount(0);
     // An attachment-only click sends payload; it must never stop the active turn.
     await panel.getByRole("button", { name: "发送", exact: true }).click();
@@ -3190,6 +3198,199 @@ test("remote Viewer ignores a late catalog from the previous session", async ({ 
   await expect(original).toHaveURL(href);
   await expect(page.locator(".remote-viewer-panel")).toHaveCount(0);
   await original.close();
+});
+
+for (const engine of ["claude", "codex"] as const) {
+  test(`side chat scope center expansion preserves the mounted ${engine} chat and draft`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { visible: true, engine,
+      seedTurns: Array.from({ length: 16 }, (_, i) => ({
+        id: `center-turn-${i}`, prompt: `侧聊问题 ${i + 1}`, done: true,
+        blocks: [{ kind: "text" as const, message_id: `center-answer-${i}`,
+          channel: "final" as const, done: true,
+          text: `第 ${i + 1} 段。${"切换布局时保留当前阅读位置和正在处理的任务。".repeat(10)}` }],
+      })),
+    });
+    await page.goto("/");
+    const panel = page.locator(".btw-panel");
+    const input = panel.getByRole("textbox");
+    await expect(input).toBeEnabled();
+    // BTW restores through live-tail replay, independently of main history.
+    const sid = "btw-layout-child";
+    relay.emit({ type: "replay_start", sid, generation: "layout-generation",
+      from_seq: 0, to_seq: 100, rebuild: true, truncated: false });
+    for (let i = 0; i < 16; i++) {
+      relay.emit({ type: "user_msg", sid, msg_id: `center-user-${i}`, prompt: `侧聊问题 ${i + 1}` });
+      relay.emit({ type: "delta", sid, message_id: `center-answer-${i}`, channel: "final",
+        text: `第 ${i + 1} 段。${"切换布局时保留当前阅读位置和正在处理的任务。".repeat(10)}` });
+      relay.emit({ type: "assistant_msg_end", sid, message_id: `center-answer-${i}`, channel: "final" });
+      relay.emit({ type: "turn_end", sid, turn_id: `center-answer-${i}`, checkpoint_id: `center-user-${i}`,
+        result: { subtype: "success", duration_ms: 1000, is_error: false } });
+    }
+    relay.emit({ type: "replay_end", sid, to_seq: 100, truncated: false });
+    await expect(panel.locator(".thread")).toBeVisible();
+    await input.fill("尚未发送的侧聊草稿");
+    await panel.getByLabel("添加文件", { exact: true }).setInputFiles({
+      name: "side-notes.txt", mimeType: "text/plain", buffer: Buffer.from("only this side chat"),
+    });
+    await expect(panel.locator(".btw-composer>.btw-pastes .attach-file")).toHaveText("side-notes.txt");
+    const originalPanel = await panel.elementHandle();
+    const originalThread = await panel.locator(".thread").elementHandle();
+    const originalInput = await input.elementHandle();
+    const docked = (await panel.boundingBox())!;
+    await panel.getByRole("button", { name: "居中展开侧边对话", exact: true }).click();
+    await expect(panel).toHaveAttribute("aria-modal", "true");
+    await expect(panel.getByRole("button", { name: "调整 BTW 面板宽度" })).toHaveCount(0);
+    const expanded = (await panel.boundingBox())!;
+    expect(expanded.width).toBeGreaterThan(docked.width + 300);
+    expect(Math.abs(expanded.x + expanded.width / 2 - 784)).toBeLessThan(2);
+    expect(Math.abs(expanded.y + expanded.height / 2 - 500)).toBeLessThan(2);
+    await expectRightPanelSpace(page, false);
+    expect(await originalPanel!.evaluate(node => node === document.querySelector(".btw-panel"))).toBe(true);
+    expect(await originalThread!.evaluate(node => node === document.querySelector(".btw-panel .thread"))).toBe(true);
+    expect(await originalInput!.evaluate(node => node === document.querySelector(".btw-panel textarea"))).toBe(true);
+    await expect(input).toHaveValue("尚未发送的侧聊草稿");
+    await expect(panel.locator(".btw-composer>.btw-pastes .attach-file")).toHaveText("side-notes.txt");
+    await expect.poll(() => panel.locator(".thread").evaluate(node =>
+      node.scrollHeight - node.clientHeight - node.scrollTop)).toBeLessThan(3);
+
+    // Nested attachment dialogs own Escape; closing them must not collapse BTW.
+    await panel.getByRole("button", { name: "添加附件", exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "添加附件", exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog", { name: "添加附件", exact: true })).toHaveCount(0);
+    await expect(panel).toHaveClass(/btw-expanded/);
+    await input.focus();
+    await page.keyboard.press("Shift+Tab");
+    expect(await panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`btw-centered-${engine}.png`) });
+    await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+    await page.screenshot({ path: testInfo.outputPath(`btw-centered-${engine}-dark.png`) });
+
+    await page.keyboard.press("Escape");
+    await expect(panel).not.toHaveClass(/btw-expanded/);
+    await expectRightPanelSpace(page, true);
+    await expect(panel.getByRole("button", { name: "调整 BTW 面板宽度" })).toBeVisible();
+    expect((await panel.boundingBox())!.width).toBe(docked.width);
+    const thread = panel.locator(".thread");
+    await thread.dispatchEvent("wheel", { deltaY: -500 });
+    await thread.evaluate(node => { node.scrollTop -= 500; node.dispatchEvent(new Event("scroll")); });
+    // Switch before the wheel idle timer fires: layout must retain this row.
+    const readingTurn = await thread.evaluate(node => {
+      const bounds = node.getBoundingClientRect();
+      // The history virtualizer retains the visible row nearest the top edge.
+      return [...node.querySelectorAll<HTMLElement>("[data-turn-id]")]
+        .filter(row => row.getBoundingClientRect().bottom > bounds.top
+          && row.getBoundingClientRect().top < bounds.bottom)
+        .sort((a, b) => Math.abs(a.getBoundingClientRect().top - bounds.top)
+          - Math.abs(b.getBoundingClientRect().top - bounds.top))[0]?.dataset.turnId;
+    });
+    expect(readingTurn).toBeTruthy();
+    await page.keyboard.press("Control+Shift+e");
+    await expect(panel).toHaveClass(/btw-expanded/);
+    await expect.poll(() => thread.evaluate((node, id) => {
+      const bounds = node.getBoundingClientRect();
+      const row = node.querySelector(`[data-turn-id="${id}"]`)?.getBoundingClientRect();
+      return !!row && row.bottom > bounds.top && row.top < bounds.bottom;
+    }, readingTurn)).toBe(true);
+    await panel.getByRole("button", { name: "收回右侧", exact: true }).click();
+    await expect(panel).not.toHaveClass(/btw-expanded/);
+    await page.keyboard.press("Control+Shift+k");
+    await expect(panel).toHaveCount(0);
+    // The new shortcut opens a retained chat directly in the centered view.
+    await page.keyboard.press("Control+Shift+e");
+    await expect(panel).toHaveClass(/btw-expanded/);
+    await expect(input).toHaveValue("尚未发送的侧聊草稿");
+    await expect(panel.locator(".btw-composer>.btw-pastes .attach-file")).toHaveText("side-notes.txt");
+    await page.keyboard.press("Control+Shift+k");
+    await page.keyboard.press("Control+Shift+k");
+    await expect(panel).not.toHaveClass(/btw-expanded/);
+    expect(relay.commands.filter(command =>
+      ["open_btw", "close_btw", "query", "steer", "interrupt", "set_perm", "set_collaboration_mode"]
+        .includes(String(command.type)))).toEqual([]);
+  });
+}
+
+for (const engine of ["claude", "codex"] as const) {
+  test(`side chat scope centered dismissal restores the previous ${engine} layout`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { visible: false, engine });
+    await page.goto("/");
+    await expect(page.getByText("session layout-p", { exact: true })).toBeVisible();
+    const panel = page.locator(".btw-panel");
+    await expect(panel).toHaveCount(0);
+
+    for (const origin of ["hidden", "docked"] as const) {
+      for (const dismiss of ["shortcut", "outside", "escape"] as const) {
+        await page.keyboard.press("Meta+Shift+e");
+        await expect(panel).toHaveClass(/btw-expanded/);
+        await expectRightPanelSpace(page, false);
+        if (origin === "hidden" && dismiss === "shortcut") {
+          await panel.getByRole("textbox").fill("关闭大窗也要保留的草稿");
+          await panel.getByLabel("添加文件", { exact: true }).setInputFiles({
+            name: "retained.txt", mimeType: "text/plain", buffer: Buffer.from("retained attachment"),
+          });
+        }
+        await expect(panel.getByRole("textbox")).toHaveValue("关闭大窗也要保留的草稿");
+        await expect(panel.locator(".attach-file")).toHaveText("retained.txt");
+        // Clicking inside never dismisses the overlay.
+        await panel.getByRole("textbox").click();
+        await expect(panel).toHaveClass(/btw-expanded/);
+        if (dismiss === "shortcut") await page.keyboard.press("Meta+Shift+e");
+        else if (dismiss === "escape") await page.keyboard.press("Escape");
+        else await page.locator(".btw-expanded-backdrop").click({ position: { x: 4, y: 4 } });
+        if (origin === "hidden") await expect(panel).toHaveCount(0);
+        else {
+          await expect(panel).toBeVisible();
+          await expect(panel).not.toHaveClass(/btw-expanded/);
+        }
+        await expect(page.locator(".btw-expanded-backdrop")).toHaveCount(0);
+        await expectRightPanelSpace(page, origin === "docked");
+      }
+      if (origin === "hidden") {
+        // The explicit header action still docks a directly opened overlay.
+        await page.keyboard.press("Meta+Shift+e");
+        await panel.getByRole("button", { name: "收回右侧", exact: true }).click();
+        await expect(panel).not.toHaveClass(/btw-expanded/);
+        await expectRightPanelSpace(page, true);
+      }
+    }
+    // A later direct open must not inherit the previous docked return target.
+    await page.keyboard.press("Control+Shift+k");
+    await expect(panel).toHaveCount(0);
+    await page.keyboard.press("Meta+Shift+e");
+    await expect(panel).toHaveClass(/btw-expanded/);
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveCount(0);
+    expect(relay.commands.filter(command =>
+      ["open_btw", "close_btw", "query", "steer", "interrupt"].includes(String(command.type)))).toEqual([]);
+  });
+}
+
+test("side chat scope centered attachments fit a narrow viewport", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockRightPanelRelay(page, { visible: true });
+  await page.goto("/");
+  const panel = page.locator(".btw-panel");
+  await panel.getByRole("button", { name: "居中展开侧边对话", exact: true }).click();
+  await panel.getByLabel("添加文件", { exact: true }).setInputFiles([
+    { name: "一份名称很长的侧聊附件-验证窄屏输入区不溢出.txt", mimeType: "text/plain", buffer: Buffer.from("notes") },
+    { name: "side.png", mimeType: "image/png", buffer: staticPng() },
+  ]);
+  await expect(panel.locator(".btw-composer>.btw-pastes .attach-image-preview")).toHaveCount(1);
+  expect(await panel.evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
+  const card = (await panel.locator(".btw-input-card").boundingBox())!;
+  expect(card.x).toBeGreaterThan(0);
+  expect(card.x + card.width).toBeLessThan(390);
+  expect(card.y + card.height).toBeLessThan(844);
+  await panel.getByRole("button", { name: "预览待发送图片 1" }).click();
+  await expect(page.getByRole("dialog", { name: "图片预览", exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "图片预览", exact: true })).toHaveCount(0);
+  await expect(panel).toHaveClass(/btw-expanded/);
+  await panel.getByRole("button", { name: "移除待发送图片 1" }).click();
+  await expect(panel.locator(".attach-image-preview")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("btw-centered-mobile.png") });
 });
 
 test("side chat scope follows its parent through navigation and refresh without creating forks", async ({ page }) => {

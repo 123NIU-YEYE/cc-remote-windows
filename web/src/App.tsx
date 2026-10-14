@@ -31,7 +31,7 @@ import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
-import { ChatView } from "./components/ChatView";
+import { ChatView, type ChatViewHandle } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
 import { SidebarToggle } from "./components/SidebarToggle";
@@ -365,6 +365,11 @@ export default function App() {
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
   // The right slot is shared by artifacts and /btw.
+  const [expandedBtw, setExpandedBtw] = useState<{
+    scope: string;
+    returnToDocked: boolean;
+  } | null>(null);
+  const btwChatViewRef = useRef<ChatViewHandle>(null);
   const [btwPanelScopes, setBtwPanelScopes] = useState(
     () => readBtwPanelScopes(sessionStorage));
   const [rightView, setRightView] = useState<RightPanelView>(
@@ -795,8 +800,10 @@ export default function App() {
     getDiff: (file: string) => void;
     openBtw: () => void;
     collapseBtw: () => void;
+    toggleBtwExpanded: () => void;
   }>({ artifact: null, btwSid: null, rightView: "diff",
-    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {} });
+    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {},
+    toggleBtwExpanded: () => {} });
 
   useEffect(() => {
     const current = reconcileOpenMigrationSession(
@@ -939,6 +946,8 @@ export default function App() {
     : filesShowing ? "files"
     : rightView === "btw" && btwShowing ? "btw"
       : state.artifact ? "diff" : btwShowing ? "btw" : null;
+  const btwExpanded = visibleRightPanel === "btw" && !!btwPanelKey
+    && expandedBtw?.scope === btwPanelKey;
   // Questions, hydration and completion receipts must agree with the rendered
   // slot, including when an agent or artifact covers a retained side chat.
   const visibleBtwSid = visibleRightPanel === "btw" ? activeBtwSid : null;
@@ -4099,9 +4108,9 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || e.repeat) return;
       if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        if (e.defaultPrevented || e.isComposing || e.repeat
-            || e.composedPath().some((target) => target instanceof HTMLElement
+        if (e.composedPath().some((target) => target instanceof HTMLElement
               && (target.matches("input, textarea, select, [role=textbox]")
                 || target.isContentEditable))
             || document.querySelector('[role="dialog"], [aria-modal="true"], dialog[open]')) return;
@@ -4113,8 +4122,12 @@ export default function App() {
         }
         return;
       }
-      if (!(e.metaKey || e.ctrlKey)) return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
       const k = e.key.toLowerCase();
+      // Let a nested picker/confirmation finish before moving its owner panel.
+      if ((k === "e" || k === "k") && e.shiftKey
+          && [...document.querySelectorAll<HTMLElement>('[role="dialog"], dialog[open]')]
+            .some(node => !node.classList.contains("btw-panel") && node.getClientRects().length)) return;
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
@@ -4130,6 +4143,9 @@ export default function App() {
           latest.collapseBtw();
         }
         else latest.openBtw();
+      } else if (k === "e" && e.shiftKey) {
+        e.preventDefault();
+        shortcutRef.current.toggleBtwExpanded();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -4141,6 +4157,7 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
         if ((rt.control && sessionControlLocksInput(rt.control))
@@ -5318,17 +5335,39 @@ export default function App() {
     }
     setBtwOpeningFor(parentSid, true);
   };
-  const openBtw = () => {
+  const openBtw = (expanded = false) => {
     if (!confirmArtifactDiscard()) return;
     if (!btwPanelKey) return;
     closeViewer();
+    if (expanded) {
+      setAgentPanel(null);
+      setFileBrowser(null);
+    }
     setRightView("btw");
+    setExpandedBtw(expanded ? { scope: btwPanelKey, returnToDocked: false } : null);
     setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
     if (!activeBtwGroup && !btwOpening) createBtw();
   };
   const collapseBtw = () => {
+    setExpandedBtw(null);
     if (btwPanelKey) setBtwPanelScopes(
       (current) => setBtwPanelScope(current, btwPanelKey, false));
+  };
+  const dockBtw = () => {
+    btwChatViewRef.current?.prepareLayoutChange();
+    setExpandedBtw(null);
+  };
+  const toggleBtwExpanded = () => {
+    // Shortcut / backdrop / Escape restore the presentation that was visible
+    // before expansion. A directly opened overlay must not leave a side panel.
+    if (btwExpanded) {
+      if (expandedBtw?.returnToDocked) dockBtw();
+      else collapseBtw();
+    } else if (visibleRightPanel !== "btw") openBtw(true);
+    else if (btwPanelKey) {
+      btwChatViewRef.current?.prepareLayoutChange();
+      setExpandedBtw({ scope: btwPanelKey, returnToDocked: true });
+    }
   };
   const selectBtw = (sid: string) => {
     const parentSid = visibleParentSid;
@@ -5444,7 +5483,7 @@ export default function App() {
   };
   shortcutRef.current = {
     artifact: state.artifact, btwSid: activeBtwSid, rightView,
-    getDiff, openBtw, collapseBtw,
+    getDiff, openBtw, collapseBtw, toggleBtwExpanded,
   };
   const logout = async () => {
     try {
@@ -5546,7 +5585,7 @@ export default function App() {
     <ViewerPagesProvider scope={visibleParentSid && authed
       ? { machineId, sid: visibleParentSid, space, engine } : null} onOpen={openViewerPage}>
     <RemoteViewerContext.Provider value={visibleParentSid ? openViewerLink : null}>
-    <SidebarShell controller={sidebar} className={visibleRightPanel !== null ? "panel-open" : ""}>
+    <SidebarShell controller={sidebar} className={visibleRightPanel !== null && !btwExpanded ? "panel-open" : ""}>
       <SidebarState controller={sidebar}>{sidebarOpen => <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}
@@ -6128,6 +6167,10 @@ export default function App() {
               };
             })}
             active="btw" hasArtifact={!!state.artifact}
+            expanded={btwExpanded}
+            onToggleExpanded={btwExpanded ? dockBtw : toggleBtwExpanded}
+            onDismissExpanded={toggleBtwExpanded}
+            chatViewRef={btwChatViewRef}
             artifactKind={state.artifact?.kind}
             onTab={switchRight}
             onNew={createBtw}

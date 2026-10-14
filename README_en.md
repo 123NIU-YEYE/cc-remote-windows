@@ -112,6 +112,15 @@ On desktop, **Enter sends and Shift+Enter inserts a newline** by default. Assist
 question dialogs use the same keys; **Esc** dismisses the dialog while leaving
 the question unanswered. Confirming an IME composition does not submit it.
 
+Side conversations support a right panel and a larger centered view.
+**⌘/Ctrl+Shift+K** opens or collapses the side panel. **⌘/Ctrl+Shift+E** opens the
+centered view; pressing it again, clicking outside, or pressing **Esc** restores
+the previous state: hidden if opened directly, docked if expanded from the right
+panel. The header button explicitly expands or docks the chat. Layout changes
+preserve the conversation and draft, and leave running tasks active.
+Use the paperclip to add attachments; images, files and pasted-text
+cards appear above the input of the corresponding chat.
+
 ### Context and automatic compaction
 
 In **Codex Code**, `/autocompact 300k` sets the session's maximum usable context

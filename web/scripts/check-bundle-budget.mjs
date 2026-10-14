@@ -36,10 +36,13 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // They add <0.1 KiB, with no extra request/dependency; round the cap to a KiB.
 // Shared Claude/Codex continuation splitting and the existing task dock add
 // <1 KiB. No new dependency/request; keep entry and compressed-size caps fixed.
-const MAX_INITIAL_BYTES = 940 * 1024;
+// Centered BTW shortcuts, viewport anchoring and shared attachment icons add
+// ~1.1 KiB initial JS / 0.4 KiB gzip. Panel UI/styles remain lazy, with no new
+// dependency or initial request; retain the entry and request-count caps.
+const MAX_INITIAL_BYTES = 941 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
-const MAX_INITIAL_GZIP_BYTES = 282 * 1024;
+const MAX_INITIAL_GZIP_BYTES = 283 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");
