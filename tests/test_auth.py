@@ -186,6 +186,52 @@ def test_machine_bound_wrapper_tokens_replace_legacy_wildcard_token():
     assert authenticate(f"Bearer {cfg.wrapper_token}", cfg) is None
 
 
+def test_shared_wrapper_token_binds_to_first_declared_machine():
+    """Two machines sharing one token must not depend on JSON iteration order."""
+    token = "d" * 48
+    forward = _cfg(wrapper_tokens_json=json.dumps(
+        {"alpha": token, "beta": token}))
+    backward = _cfg(wrapper_tokens_json=json.dumps(
+        {"beta": token, "alpha": token}))
+    # First declared entry wins, deterministically and without surprising a
+    # later-declared machine with a silent rebind.
+    assert wrapper_machine_scope(token, forward) == "alpha"
+    assert wrapper_machine_scope(token, backward) == "beta"
+
+    # Repeated calls are stable (no dependence on prior call state).
+    assert wrapper_machine_scope(token, forward) == "alpha"
+
+    # A unique token still binds to its own machine.
+    unique = _cfg(wrapper_tokens_json=json.dumps(
+        {"alpha": token, "beta": "e" * 48}))
+    assert wrapper_machine_scope(token, unique) == "alpha"
+    assert wrapper_machine_scope("e" * 48, unique) == "beta"
+
+
+def test_websocket_upgrade_to_static_path_is_rejected_not_500():
+    """A WS upgrade hitting the static mount must not raise AssertionError.
+
+    StaticFiles is mounted at "/" and asserts scope["type"] == "http"; before
+    the guard, any non-/ws WebSocket upgrade answered HTTP 500 with a traceback.
+    """
+    static_dir = Path(tempfile.mkdtemp(prefix="cc-remote-static-test-"))
+    (static_dir / "index.html").write_text("<html>hi</html>", encoding="utf-8")
+    cfg = _cfg(static_dir=str(static_dir))
+    app = create_app(cfg)
+    with TestClient(app, base_url=cfg.public_origin) as client:
+        for path in ("/", "/index.html", "/nope"):
+            # A rejected upgrade must surface as a clean close, never a 500.
+            with pytest.raises(WebSocketDisconnect) as excinfo:
+                with client.websocket_connect(path):
+                    pass
+            assert excinfo.value.code == 1008, path
+
+        # The static client itself must still serve HTTP normally.
+        response = client.get("/index.html")
+        assert response.status_code == 200
+        assert "hi" in response.text
+
+
 def test_session_token_round_trips_subject_and_machine_authority():
     token, _ = make_session_token(
         "s" * 48,

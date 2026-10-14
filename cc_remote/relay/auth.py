@@ -37,7 +37,12 @@ def wrapper_machine_scope(token: str, cfg: RelayConfig) -> Optional[str]:
         matched: str | None = None
         for machine_id, expected in configured.items():
             if hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
-                matched = machine_id
+                # First match wins, so the binding is deterministic (JSON
+                # declaration order) even if two machines are configured with
+                # the same token. Every entry is still compared, keeping the
+                # loop constant-time in the number of configured tokens.
+                if matched is None:
+                    matched = machine_id
         return matched
     if hmac.compare_digest(token.encode("utf-8"), cfg.wrapper_token.encode("utf-8")):
         return "*"

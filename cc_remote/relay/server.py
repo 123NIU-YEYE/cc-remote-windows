@@ -221,6 +221,35 @@ class _BodyTooLarge(ValueError):
     pass
 
 
+class _HttpOnlyStaticFiles:
+    """ASGI wrapper that rejects non-HTTP scopes before serving static files.
+
+    The static client is mounted at ``/``, so a WebSocket upgrade aimed at any
+    path other than ``/ws`` (a port scanner, a stale client, or a bare-probe
+    request such as ``WS /``) reaches this mount. ``StaticFiles.__call__`` starts
+    with ``assert scope["type"] == "http"``, so such a request raised an
+    unhandled ``AssertionError`` and answered HTTP 500 with a full traceback.
+    Rejecting the websocket scope up front turns that into a bounded 403 and
+    keeps the access log free of tracebacks, without narrowing the static tree.
+
+    ``__init__`` deliberately does not subclass or introspect ``StaticFiles``:
+    the wrapped instance owns all path resolution and caching.
+    """
+
+    def __init__(self, **kwargs):
+        from fastapi.staticfiles import StaticFiles
+
+        self._static = StaticFiles(**kwargs)
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            # Only websockets/lifespan can reach here; answer and close cleanly.
+            websocket = WebSocket(scope, receive=receive, send=send)
+            await websocket.close(code=1008, reason="not a websocket endpoint")
+            return
+        await self._static(scope, receive, send)
+
+
 def _private_origin_allowed(origin: str, cfg: RelayConfig) -> bool:
     """Allow only a literal private IP on the relay's direct listening port."""
     if not cfg.allow_private_origins:
@@ -1086,7 +1115,8 @@ def create_app(
     # Static web client. Mounted last so /api/login and /ws and /healthz win.
     if cfg.static_dir and os.path.isdir(cfg.static_dir):
         from fastapi.staticfiles import StaticFiles
-        app.mount("/", StaticFiles(directory=cfg.static_dir, html=True), name="static")
+        app.mount("/", _HttpOnlyStaticFiles(
+            directory=cfg.static_dir, html=True), name="static")
         log.info("serving static web client", dir=cfg.static_dir)
 
     return app
