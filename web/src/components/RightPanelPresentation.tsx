@@ -23,7 +23,9 @@ export function PanelFrame({ children, className = "", label, ...props }:
     if (!expanded || !panel) return;
     const previous = document.activeElement as HTMLElement | null;
     if (!panel.contains(previous)) panel.focus({ preventScroll: true });
-    const hasNestedDialog = () => [...document.querySelectorAll<HTMLElement>('[role="dialog"], dialog[open]')]
+    const hasNestedDialog = (modalOnly = false) => [...document.querySelectorAll<HTMLElement>(modalOnly
+      ? '[role="dialog"][aria-modal="true"], dialog:modal'
+      : '[role="dialog"], dialog[open]')]
       .some(node => node !== panel && node.getClientRects().length);
     const onPreviewEscape = (event: MessageEvent) => {
       if (event.data?.type !== "cc-remote-preview-escape" || hasNestedDialog()) return;
@@ -40,9 +42,9 @@ export function PanelFrame({ children, className = "", label, ...props }:
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
-      // Nested pickers/lightboxes own Escape and focus until they close.
-      if (hasNestedDialog()) return;
       if (event.key === "Escape") {
+        // Informational popovers also own Escape, but do not trap focus.
+        if (hasNestedDialog()) return;
         event.preventDefault();
         event.stopPropagation();
         dismissRef.current();
@@ -50,6 +52,9 @@ export function PanelFrame({ children, className = "", label, ...props }:
         // Keep native traversal, but do not let App's Shift+Tab mode shortcut
         // consume it after this dialog's document-level handler returns.
         event.stopPropagation();
+        // A real nested modal keeps its own focus navigation. Informational
+        // role=dialog portals leave the expanded panel's boundary in charge.
+        if (hasNestedDialog(true)) return;
         const nodes = focusable(panel);
         const current = nodes.indexOf(document.activeElement as HTMLElement);
         // Let native traversal enter iframe documents and visit their controls.
