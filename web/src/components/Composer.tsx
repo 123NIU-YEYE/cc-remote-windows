@@ -923,7 +923,7 @@ export function Composer(p: Props) {
             <div className="work-compose-foot">
               <AttachmentPicker key={p.draftKey} className="work-compose-tool"
                 onPick={onPickFiles} disabled={locked || importing} label="添加资料">
-                <Icon name="plus" size={15} /><span>添加资料</span>
+                <Icon name="paperclip" size={15} /><span>添加资料</span>
               </AttachmentPicker>
               {!!p.workArtifactCount && (
                 <button type="button" className="work-compose-tool"

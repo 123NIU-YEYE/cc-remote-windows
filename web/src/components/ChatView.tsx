@@ -3,11 +3,13 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent,
+  type Ref,
   type PointerEvent,
   type TouchEvent,
   type WheelEvent,
@@ -311,7 +313,11 @@ function detailTurnFingerprint(turn: Turn): string {
   ].join("\u0000");
 }
 
-export function ChatView({ sid, turnUsage, turns: incomingTurns, engine = "claude", loading,
+export interface ChatViewHandle {
+  prepareLayoutChange: () => void;
+}
+
+export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "claude", loading,
   hasMore: incomingHasMore,
   historyPagingReady = true,
   historyRevision = null, historyViewRevision = historyRevision,
@@ -332,6 +338,7 @@ export function ChatView({ sid, turnUsage, turns: incomingTurns, engine = "claud
   activeTurnId = null,
   ambiguousActiveTurnIds = [],
   surface = "code" }: {
+  ref?: Ref<ChatViewHandle>;
   sessionLink?: (nativeId: string) => { title: string; available: boolean };
   onOpenSession?: (nativeId: string) => void;
   turnUsage?: TurnUsageReadings;
@@ -1822,6 +1829,24 @@ export function ChatView({ sid, turnUsage, turns: incomingTurns, engine = "claud
       });
     }
   };
+
+  useImperativeHandle(ref, () => ({
+    prepareLayoutChange: () => {
+      // An explicit dock/expand action ends a completed wheel gesture. Capture
+      // the reading row before its width changes; otherwise the gesture's idle
+      // timer can capture the reflowed DOM and replace the original anchor.
+      // Active touch/selection/scrollbar interactions still own their viewport.
+      if (touchYRef.current !== null || scrollbarDragIntentRef.current
+          || scrollCoordinatorRef.current.isInteractionLocked()) return;
+      if (wheelGestureTimerRef.current !== null) {
+        window.clearTimeout(wheelGestureTimerRef.current);
+        wheelGestureTimerRef.current = null;
+      }
+      wheelGestureActiveRef.current = false;
+      wheelHistoryLoadGateRef.current.endGesture();
+      settleUserScrollIntent();
+    },
+  }));
 
   const markUserScrollIntent = (direction: UserScrollDirection) => {
     // A real wheel/touch/key/pointer action transfers ownership back to the
