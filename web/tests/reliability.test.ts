@@ -11158,7 +11158,7 @@ assert.match(appSource, /draftKey=\{focusedComposerDraftKey\}/);
 assert.match(appSource, /composerDraftsRef\.current\.rekey/,
   "temp session id capture must retain the focused composer draft");
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
-assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
+assert.match(appSource, /<EngineSwitcher selected=\{dshOpen \? "dsh" : engine\} onSelect=\{selectEngineSurface\}/);
 assert.match(appSource, /setNewChatAutoFocus\(false\)/,
   "switching engines must not summon the new-chat keyboard");
 assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, space\)/,

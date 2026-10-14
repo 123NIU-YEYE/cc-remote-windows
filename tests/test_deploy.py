@@ -800,3 +800,40 @@ def test_caddy_image_policy_allows_only_image_blob_urls(template):
         for name, sources in directives.items()
         if name != "img-src"
     )
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_caddy_routes_dsh_panel_to_its_own_upstream(template):
+    """The DSH panel is same-origin and must reach the desktop tunnel port.
+
+    ``handle_path`` strips the ``/dsh`` prefix because the DSH shell declares
+    ``<base href="./">`` and relative asset URLs while its own Host answers
+    ``/``; forwarding ``/dsh/...`` verbatim would 404 every asset.
+    """
+    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
+
+    assert "handle_path /dsh/* {" in source
+    assert "reverse_proxy 127.0.0.1:3082" in source
+    # The relay must stay the catch-all upstream for everything else.
+    assert "reverse_proxy 127.0.0.1:8765" in source
+    # Order matters for readability: the specific route is declared first.
+    assert source.index("handle_path /dsh/*") < source.index(
+        "reverse_proxy 127.0.0.1:8765")
+
+
+@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
+def test_dsh_panel_is_exempt_from_unframeable_application_headers(template):
+    """@application sets ``frame-ancestors 'none'`` and ``X-Frame-Options DENY``.
+
+    The cc-remote page embeds the DSH panel in an iframe, so ``/dsh/*`` must not
+    inherit either header or every browser refuses to render the panel.
+    """
+    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
+    matcher = re.search(r"@application \{\s*\n\s*not path ([^\n}]+)\n", source)
+    assert matcher is not None, "expected an @application path matcher"
+    assert "/dsh/*" in matcher.group(1)
+
+    # The unframeable directives must still be present for every other path.
+    application = source.split("header @application", 1)[1].split("}", 1)[0]
+    assert "frame-ancestors 'none'" in application
+    assert 'X-Frame-Options "DENY"' in application

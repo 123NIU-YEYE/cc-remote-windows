@@ -61,6 +61,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import App from "../src/App";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -2187,7 +2188,9 @@ function ArtifactPreviewFixture({ kind }: {
 
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
-  rootParams.has("artifact-html")
+  rootParams.has("assistant-switcher")
+    ? <App />
+    : rootParams.has("artifact-html")
     ? <ArtifactPreviewFixture kind="html" />
     : rootParams.has("artifact-svg")
     ? <ArtifactPreviewFixture kind="svg" />
