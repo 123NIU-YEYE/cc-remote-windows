@@ -9,8 +9,9 @@ async def preview_html(stream, helper: bytes):
 
     Inserting before the doctype would put standards-mode pages into quirks
     mode. Only scan the prologue; after its first content token, pass bytes
-    through unchanged. Even a huge leading comment/doctype is streamed with
-    at most a partial marker retained between resource chunks.
+    through unchanged. UTF-16 documents pass through without this byte-oriented
+    helper so their encoding remains intact. Even a huge leading comment/doctype
+    is streamed with at most a partial marker retained between resource chunks.
     """
     pending = b""
     state = "bom"
@@ -22,6 +23,12 @@ async def preview_html(stream, helper: bytes):
                 yield pending
                 pending = b""
             elif state == "bom":
+                if pending.startswith((b"\xff\xfe", b"\xfe\xff")):
+                    # The parser and helper use ASCII-compatible bytes. Preserve
+                    # UTF-16, including split BOMs and BOM-only documents, rather
+                    # than corrupting the page to add optional keyboard controls.
+                    state = "done"
+                    continue
                 if len(pending) < 3:
                     break
                 if pending.startswith(b"\xef\xbb\xbf"):

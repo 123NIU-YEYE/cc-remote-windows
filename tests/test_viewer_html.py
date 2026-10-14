@@ -5,6 +5,23 @@ from cc_remote.relay.viewer_html import preview_html
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("encoding,bom", [
+    ("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff"),
+])
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 7, 65536])
+@pytest.mark.parametrize("markup", ["", "<!doctype html><p>中文 preview</p>"])
+async def test_preview_preserves_utf16_bytes_without_injecting_ascii(encoding, bom, chunk_size, markup):
+    source = bom + markup.encode(encoding)
+
+    async def chunks():
+        for start in range(0, len(source), chunk_size):
+            yield source[start:start + chunk_size]
+
+    actual = b"".join([part async for part in preview_html(chunks(), b"<script>helper()</script>")])
+    assert actual == source
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("prologue", [
     b"", b"\xef\xbb\xbf", b" \n\t", b"<!doctype html>",
     b'<!DOCTYPE HTML PUBLIC "legacy>id" "system">',
