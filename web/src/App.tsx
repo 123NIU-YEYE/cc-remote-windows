@@ -4134,7 +4134,7 @@ export default function App() {
       const k = e.key.toLowerCase();
       // Let a nested picker/confirmation finish before moving its owner panel.
       if ((k === "e" || k === "k") && e.shiftKey
-          && [...document.querySelectorAll<HTMLElement>('[role="dialog"], dialog[open]')]
+          && [...document.querySelectorAll<HTMLElement>('[role="dialog"], [role="menu"], dialog[open]')]
             .some(node => !node.classList.contains("right-panel-frame") && node.getClientRects().length)) return;
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
