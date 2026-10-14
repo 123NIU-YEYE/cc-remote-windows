@@ -3367,6 +3367,34 @@ for (const engine of ["claude", "codex"] as const) {
   });
 }
 
+for (const engine of ["claude", "codex"] as const) {
+  test(`side chat scope centered Shift+Tab navigates without changing ${engine} mode`, async ({ page, browserName }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { visible: true, engine });
+    await page.goto("/");
+    const panel = page.locator(".btw-panel");
+    const input = panel.getByRole("textbox");
+    await expect(input).toBeEnabled();
+    await panel.getByRole("button", { name: "居中展开侧边对话", exact: true }).click();
+    const dock = panel.getByRole("button", { name: "收回右侧", exact: true });
+    const close = panel.getByRole("button", { name: "收起侧边对话", exact: true });
+    await close.focus();
+    await expect(close).toBeFocused();
+    await page.keyboard.press("Shift+Tab");
+    await expect(close).not.toBeFocused();
+    // Mobile WebKit's native Tab order skips buttons, unlike desktop Chromium.
+    if (browserName === "chromium") await expect(dock).toBeFocused();
+    expect(await panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+    const changes = () => relay.commands.filter(c =>
+      ["set_perm", "set_collaboration_mode"].includes(String(c.type)));
+    expect(changes()).toEqual([]);
+    await page.keyboard.press("Escape");
+    await page.locator("textarea[data-chat-composer]").first().focus();
+    await page.keyboard.press("Shift+Tab");
+    await expect.poll(() => changes().length).toBe(1);
+  });
+}
+
 test("side chat scope centered speed menu keeps keyboard focus inside its owner", async ({ page }) => {
   await page.setViewportSize({ width: 1568, height: 1000 });
   const relay = await mockRightPanelRelay(page, { visible: true, engine: "codex" });
@@ -3388,7 +3416,8 @@ test("side chat scope centered speed menu keeps keyboard focus inside its owner"
   }
   await page.keyboard.press("Escape");
   await expect(panel).not.toHaveClass(/btw-expanded/);
-  expect(relay.commands.some(c => ["query", "steer", "interrupt", "set_service_tier"].includes(String(c.type)))).toBe(false);
+  expect(relay.commands.some(c => ["query", "steer", "interrupt", "set_service_tier",
+    "set_perm", "set_collaboration_mode"].includes(String(c.type)))).toBe(false);
 });
 
 test("side chat scope centered attachments fit a narrow viewport", async ({ page }, testInfo) => {

@@ -25,7 +25,7 @@ from cc_remote.protocol import PROTOCOL_VERSION
 from cc_remote.relay.server import create_app
 from cc_remote.relay.viewer import (
     MAX_GRANTS, ViewerError, main_cookie_name, validate_origin_template,
-    effective_viewer_mode,
+    effective_viewer_mode, PREVIEW_ESCAPE_SCRIPT,
 )
 from cc_remote.viewer import (
     CHUNK_SIZE, MAX_REQUESTS, ViewerSite, clean_path, edit_sites, load_sites, open_resource,
@@ -808,7 +808,8 @@ async def test_real_resource_channel_multifile_range_cache_and_close(tmp_path, p
                               "Range": "bytes=0-4"}
         navigated = await client.get(grant["origin"] + site.entry, headers=navigation_headers)
         assert navigated.status_code == 200
-        assert navigated.content.startswith(html.content)
+        assert navigated.content.replace(PREVIEW_ESCAPE_SCRIPT, b"", 1) == html.content
+        assert navigated.content.index(PREVIEW_ESCAPE_SCRIPT) < navigated.content.index(b'<script type="module"')
         assert "cc-remote-preview-escape" in navigated.text
         assert int(navigated.headers["content-length"]) == len(navigated.content)
         assert navigated.headers["vary"] == "Sec-Fetch-Dest, Accept, Upgrade-Insecure-Requests"

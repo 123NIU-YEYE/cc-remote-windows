@@ -47,6 +47,9 @@ export function PanelFrame({ children, className = "", label, ...props }:
         event.stopPropagation();
         dismissRef.current();
       } else if (event.key === "Tab") {
+        // Keep native traversal, but do not let App's Shift+Tab mode shortcut
+        // consume it after this dialog's document-level handler returns.
+        event.stopPropagation();
         const nodes = focusable(panel);
         const current = nodes.indexOf(document.activeElement as HTMLElement);
         // Let native traversal enter iframe documents and visit their controls.

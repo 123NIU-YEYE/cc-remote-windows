@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cc_remote.protocol import PROTOCOL_VERSION
+from cc_remote.relay.viewer_html import preview_html
 from cc_remote.viewer import (
     CHUNK_SIZE, ID_RE, MAX_FILE_BYTES, MAX_REQUESTS, MAX_SITES, PULL_WINDOW, REQUEST_ID_RE,
     SCRIPT_ORIGINS, clean_path,
@@ -32,9 +33,9 @@ MAX_PENDING = 512
 GRANT_TTL = 3600
 LEASE_TTL = 90
 
-# Isolated pages navigate away from the bootstrap document. A tiny footer in
-# iframe HTML responses forwards only unhandled Escape; the parent validates
-# the focused frame's WindowProxy and origin before docking its own panel.
+# Isolated pages navigate away from the bootstrap document. Install this before
+# the page's meta CSP, without removing or relaxing that policy. The parent
+# validates the focused frame's WindowProxy and origin before docking its panel.
 PREVIEW_ESCAPE_SCRIPT = b"""\n<script>
 if(window!==parent)window.addEventListener('keydown',event=>{
   if(event.key==='Escape'&&!event.isComposing&&event.keyCode!==229)
@@ -660,13 +661,13 @@ class ViewerRelay:
         except BaseException:
             await grant.peer.cancel(request_id)
             raise
-        suffix = b""
+        helper = b""
         if response_headers.get("content-type", "").split(";", 1)[0] == "text/html":
             response_headers = {**response_headers,
                                 "vary": "Sec-Fetch-Dest, Accept, Upgrade-Insecure-Requests"}
         if navigation and status == 200 and "vary" in response_headers:
-            suffix = PREVIEW_ESCAPE_SCRIPT
-            response_headers["content-length"] = str(int(response_headers["content-length"]) + len(suffix))
+            helper = PREVIEW_ESCAPE_SCRIPT
+            response_headers["content-length"] = str(int(response_headers["content-length"]) + len(helper))
             response_headers.pop("etag", None)
             response_headers.pop("accept-ranges", None)
         if req.method == "HEAD" or status in {304, 416}:
@@ -677,12 +678,11 @@ class ViewerRelay:
         stream = grant.peer.stream(request_id, authorized)
         async def body():
             try:
-                async for chunk in stream:
+                async for chunk in preview_html(stream, helper):
                     yield chunk
-                yield suffix
             finally:
                 await stream.aclose()
-        return StreamingResponse(body() if suffix else stream,
+        return StreamingResponse(body() if helper else stream,
                                  status_code=status, headers=response_headers)
 
     def headers(self, grant_id: str):
