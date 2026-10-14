@@ -1,12 +1,14 @@
 import { PROTOCOL_VERSION } from "../protocol";
 import { Compiler } from "./compiler";
 import { Resources, VIRTUAL_ORIGIN } from "./resources";
+import { installPreviewEscape } from "../preview-keyboard";
 
 const id = /^\/__cc_viewer\/bridge\/([a-f0-9]{32})$/.exec(location.pathname)?.[1];
 let opaque = false;
 try { opaque = parent !== window && !parent.document; } catch { opaque = true; }
 // Never execute source when opened directly or when the HTTP sandbox is absent.
 if (id && parent !== window && opaque) {
+  installPreviewEscape();
   let initialized = false;
   const ready = () => parent.postMessage({ type: "cc-viewer-bridge-ready", v: PROTOCOL_VERSION, id }, "*");
   const interval = window.setInterval(ready, 500);

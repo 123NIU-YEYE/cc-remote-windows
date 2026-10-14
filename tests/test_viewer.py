@@ -804,6 +804,27 @@ async def test_real_resource_channel_multifile_range_cache_and_close(tmp_path, p
         assert html.status_code == 200 and 'src="./app.js"' in html.text
         assert "frame-ancestors " + cfg.public_origin in html.headers["content-security-policy"]
         assert "connect-src 'self'" in html.headers["content-security-policy"]
+        navigation_headers = {"Sec-Fetch-Dest": "iframe", "If-None-Match": html.headers["etag"],
+                              "Range": "bytes=0-4"}
+        navigated = await client.get(grant["origin"] + site.entry, headers=navigation_headers)
+        assert navigated.status_code == 200
+        assert navigated.content.startswith(html.content)
+        assert "cc-remote-preview-escape" in navigated.text
+        assert int(navigated.headers["content-length"]) == len(navigated.content)
+        assert navigated.headers["vary"] == "Sec-Fetch-Dest, Accept, Upgrade-Insecure-Requests"
+        assert "etag" not in navigated.headers and "accept-ranges" not in navigated.headers
+        nav_head = await client.head(grant["origin"] + site.entry, headers=navigation_headers)
+        assert nav_head.headers["content-length"] == navigated.headers["content-length"]
+        assert not nav_head.content
+        legacy_navigation = await client.get(grant["origin"] + site.entry, headers={
+            "Accept": "text/html,application/xhtml+xml", "Upgrade-Insecure-Requests": "1",
+        })
+        assert legacy_navigation.content == navigated.content
+        # Raw resource reads, ranges and validators retain their byte contract.
+        assert html.content == (Path(site.root) / "viewer/index.html").read_bytes()
+        raw_cached = await client.get(grant["origin"] + site.entry,
+                                      headers={"If-None-Match": html.headers["etag"]})
+        assert raw_cached.status_code == 304 and not raw_cached.content
         script = await client.get(grant["origin"] + "/viewer/app.js")
         assert script.status_code == 200 and b"fetch" in script.content
         mesh = await client.get(grant["origin"] + "/meshes/part.stl?v=2")

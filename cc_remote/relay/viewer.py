@@ -32,6 +32,16 @@ MAX_PENDING = 512
 GRANT_TTL = 3600
 LEASE_TTL = 90
 
+# Isolated pages navigate away from the bootstrap document. A tiny footer in
+# iframe HTML responses forwards only unhandled Escape; the parent validates
+# the focused frame's WindowProxy and origin before docking its own panel.
+PREVIEW_ESCAPE_SCRIPT = b"""\n<script>
+if(window!==parent)window.addEventListener('keydown',event=>{
+  if(event.key==='Escape'&&!event.isComposing&&event.keyCode!==229)
+    setTimeout(()=>{if(!event.defaultPrevented)parent.postMessage({type:'cc-remote-preview-escape'},'*');},0);
+});
+</script>"""
+
 
 def effective_viewer_mode(cfg) -> str:
     return cfg.viewer_mode or ("isolated" if cfg.viewer_origin_template else "bridge")
@@ -634,6 +644,15 @@ class ViewerRelay:
                    ("range", "if-none-match", "if-range") if name in req.headers}
         if any(len(value) > 256 for value in headers.values()):
             raise ViewerError(400, "invalid_headers")
+        # A navigated document is a separate representation from raw resource
+        # fetches. Do not reuse a raw cached/ranged HTML body without the helper.
+        destination = req.headers.get("sec-fetch-dest")
+        navigation = (path.lower().endswith((".html", ".htm")) and (
+            destination == "iframe" or (not destination
+                and req.headers.get("upgrade-insecure-requests") == "1"
+                and "text/html" in req.headers.get("accept", ""))))
+        if navigation:
+            headers = {}
         request_id, status, response_headers = await grant.peer.read(
             grant.site, raw_path, req.method, headers)
         try:
@@ -641,12 +660,29 @@ class ViewerRelay:
         except BaseException:
             await grant.peer.cancel(request_id)
             raise
+        suffix = b""
+        if response_headers.get("content-type", "").split(";", 1)[0] == "text/html":
+            response_headers = {**response_headers,
+                                "vary": "Sec-Fetch-Dest, Accept, Upgrade-Insecure-Requests"}
+        if navigation and status == 200 and "vary" in response_headers:
+            suffix = PREVIEW_ESCAPE_SCRIPT
+            response_headers["content-length"] = str(int(response_headers["content-length"]) + len(suffix))
+            response_headers.pop("etag", None)
+            response_headers.pop("accept-ranges", None)
         if req.method == "HEAD" or status in {304, 416}:
             await grant.peer.cancel(request_id)
             return Response(status_code=status, headers=response_headers)
         async def authorized():
             await self.authorize(grant)
-        return StreamingResponse(grant.peer.stream(request_id, authorized),
+        stream = grant.peer.stream(request_id, authorized)
+        async def body():
+            try:
+                async for chunk in stream:
+                    yield chunk
+                yield suffix
+            finally:
+                await stream.aclose()
+        return StreamingResponse(body() if suffix else stream,
                                  status_code=status, headers=response_headers)
 
     def headers(self, grant_id: str):

@@ -3546,6 +3546,51 @@ test("right panel layout centered diff and agent details keep their own content"
   expect(relay.commands.some(c => ["query", "open_btw", "interrupt"].includes(String(c.type)))).toBe(false);
 });
 
+for (const key of ["Tab", "Escape"]) {
+  test(`right panel layout HTML iframe ${key} stays in the expanded boundary`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const path = "/tmp/layout/index.html";
+    const relay = await mockRightPanelRelay(page, { seedTurns: [{
+      id: "html-turn", prompt: "查看文件", done: true,
+      blocks: [{ kind: "text", message_id: "html-answer", channel: "final", done: true,
+        text: `[文件](${path})` }],
+    }] });
+    await page.goto("/");
+    await page.getByRole("button", { name: `在 Remote 中打开 ${path}`, exact: true }).click();
+    await expect.poll(() => relay.commands.some(c => c.type === "get_file_preview")).toBe(true);
+    const request = relay.commands.find(c => c.type === "get_file_preview")!;
+    relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(request.request_id),
+      path, format: "html", content: '<input aria-label="Draft"><button>Last control</button>', size: 62 });
+    const panel = page.locator(".artifact-panel");
+    const frame = panel.frameLocator("iframe");
+    await frame.getByRole("textbox").fill("keep this");
+    const original = await panel.locator("iframe").elementHandle();
+    await panel.getByRole("button", { name: "居中展开文件预览", exact: true }).click();
+    await frame.getByRole("button", { name: "Last control" }).click();
+    if (key === "Escape") {
+      await frame.locator("body").evaluate(() => {
+        window.addEventListener("keydown", event => event.preventDefault(), { once: true });
+      });
+      await page.keyboard.press("Escape");
+      await expect(panel).toHaveClass(/panel-expanded/);
+      await frame.locator("body").evaluate(() => window.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Escape", isComposing: true, bubbles: true, cancelable: true,
+      })));
+      await expect(panel).toHaveClass(/panel-expanded/);
+    }
+    await page.keyboard.press(key);
+    if (key === "Escape") await expect(panel).not.toHaveClass(/panel-expanded/);
+    else {
+      await expect.poll(() => panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+      await expect(panel).toHaveClass(/panel-expanded/);
+      await expect(panel.locator("button:visible").first()).toBeFocused();
+    }
+    await expect(frame.getByRole("textbox")).toHaveValue("keep this");
+    expect(await original!.evaluate(node => node.isConnected)).toBe(true);
+    await expect(panel.locator("iframe")).toHaveAttribute("sandbox", "allow-scripts");
+  });
+}
+
 test("remote Viewer centered expansion keeps the iframe and grant alive", async ({ page, context }) => {
   await page.setViewportSize({ width: 1568, height: 1000 });
   await mockRightPanelRelay(page, { seedTurns: [{
