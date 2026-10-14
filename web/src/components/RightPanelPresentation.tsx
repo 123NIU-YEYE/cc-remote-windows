@@ -4,6 +4,9 @@ import { RightPanelPresentation } from "../right-panel-presentation";
 import "./RightPanelPresentation.css";
 
 const InsidePanel = createContext(false);
+const focusable = (panel: HTMLElement) => [...panel.querySelectorAll<HTMLElement>(
+  'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary, a[href], iframe, [tabindex="0"]',
+)].filter(node => !node.hasAttribute("data-panel-focus-guard") && node.getClientRects().length > 0);
 
 /** Change presentation in place: editors, media and chat history stay mounted. */
 export function PanelFrame({ children, className = "", label, ...props }:
@@ -20,20 +23,35 @@ export function PanelFrame({ children, className = "", label, ...props }:
     if (!expanded || !panel) return;
     const previous = document.activeElement as HTMLElement | null;
     if (!panel.contains(previous)) panel.focus({ preventScroll: true });
+    const hasNestedDialog = () => [...document.querySelectorAll<HTMLElement>('[role="dialog"], dialog[open]')]
+      .some(node => node !== panel && node.getClientRects().length);
+    const onPreviewEscape = (event: MessageEvent) => {
+      if (event.data?.type !== "cc-remote-preview-escape" || hasNestedDialog()) return;
+      const frame = document.activeElement;
+      // Preview messages are untrusted. Only the exact, currently focused frame
+      // in this expanded panel may request docking; no other command is exposed.
+      if (!(frame instanceof HTMLIFrameElement) || !panel.contains(frame)
+          || event.source !== frame.contentWindow) return;
+      const origin = frame.sandbox.contains("allow-same-origin")
+        ? new URL(frame.src, location.href).origin : "null";
+      if (event.origin !== origin) return;
+      panel.focus({ preventScroll: true });
+      dismissRef.current();
+    };
     const onKey = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
       // Nested pickers/lightboxes own Escape and focus until they close.
-      if ([...document.querySelectorAll<HTMLElement>('[role="dialog"], dialog[open]')]
-        .some(node => node !== panel && node.getClientRects().length)) return;
+      if (hasNestedDialog()) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
         dismissRef.current();
       } else if (event.key === "Tab") {
-        const nodes = [...panel.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary, a[href], iframe, [tabindex="0"]',
-        )].filter(node => node.getClientRects().length > 0);
+        const nodes = focusable(panel);
         const current = nodes.indexOf(document.activeElement as HTMLElement);
+        // Let native traversal enter iframe documents and visit their controls.
+        // Focus guards catch exits whose keydown never reaches this document.
+        if (current >= 0 && (event.shiftKey ? current > 0 : current < nodes.length - 1)) return;
         const next = current < 0 ? (event.shiftKey ? nodes.length - 1 : 0)
           : (current + (event.shiftKey ? -1 : 1) + nodes.length) % nodes.length;
         event.preventDefault();
@@ -42,11 +60,20 @@ export function PanelFrame({ children, className = "", label, ...props }:
       }
     };
     document.addEventListener("keydown", onKey);
+    window.addEventListener("message", onPreviewEscape);
     return () => {
       document.removeEventListener("keydown", onKey);
+      window.removeEventListener("message", onPreviewEscape);
       if (previous?.isConnected && !panel.contains(previous)) previous.focus({ preventScroll: true });
     };
   }, [expanded]);
+
+  const wrapFocus = (last: boolean) => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    const nodes = focusable(panel);
+    (nodes[last ? nodes.length - 1 : 0] ?? panel).focus({ preventScroll: true });
+  };
 
   return <InsidePanel.Provider value={true}>
     {expanded && <div className="panel-expanded-backdrop" aria-hidden="true"
@@ -56,7 +83,11 @@ export function PanelFrame({ children, className = "", label, ...props }:
       role={expanded ? "dialog" : props.role}
       aria-modal={expanded || undefined} aria-label={label}
       tabIndex={expanded ? -1 : undefined} data-lock-horizontal-swipe="true">
+      {expanded && <span className="panel-focus-guard" data-panel-focus-guard="" tabIndex={0}
+        aria-hidden="true" onFocus={() => wrapFocus(true)} />}
       {children}
+      {expanded && <span className="panel-focus-guard" data-panel-focus-guard="" tabIndex={0}
+        aria-hidden="true" onFocus={() => wrapFocus(false)} />}
     </div>
   </InsidePanel.Provider>;
 }

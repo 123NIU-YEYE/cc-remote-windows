@@ -12,6 +12,7 @@ import { MessageBlock } from "../src/components/MessageBlock";
 import type { Turn } from "../src/domain/conversation";
 import { useViewerPages } from "../src/viewer-pages-context";
 import { ChatView } from "../src/components/ChatView";
+import { RightPanelPresentation } from "../src/right-panel-presentation";
 
 function RefreshPages() {
   const pages = useViewerPages();
@@ -25,6 +26,7 @@ export default function Fixture() {
   const [homeArtifact, setHomeArtifact] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const [messages, setMessages] = useState(0);
+  const [expanded, setExpanded] = useState(false);
   const chatLayout = new URLSearchParams(location.search).has("chat-layout");
   const [values, setValues] = useState(() => readViewerSelections(sessionStorage));
   const scope = { machineId: "render-device", sid, space: "code", engine: "codex" };
@@ -62,10 +64,13 @@ export default function Fixture() {
       </div>
       {chatLayout && showArtifact && <ChatView sid={sid} turns={[turn]} engine="codex" />}
       </main>
+    <RightPanelPresentation.Provider value={{ expanded, onExpand: () => setExpanded(true),
+      onDock: () => setExpanded(false), onDismiss: () => setExpanded(false) }}>
     {Object.hasOwn(values, key) && <RemoteViewerPanel key={key} scope={scope} selection={values[key]}
       devices={[{ machine_id: "render-device", label: "开发设备" }]}
       onSelect={(selection) => setValues((current) => ({ ...current, [key]: selection }))}
       onClose={() => setValues((current) => { const next = { ...current }; delete next[key]; return next; })} />}
+    </RightPanelPresentation.Provider>
   </div></ViewerPagesProvider>;
 }
 createRoot(document.getElementById("root")!).render(<Fixture />);
