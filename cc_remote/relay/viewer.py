@@ -667,12 +667,18 @@ class ViewerRelay:
                                 "vary": "Sec-Fetch-Dest, Accept, Upgrade-Insecure-Requests"}
         if navigation and status == 200 and "vary" in response_headers:
             helper = PREVIEW_ESCAPE_SCRIPT
-            response_headers["content-length"] = str(int(response_headers["content-length"]) + len(helper))
+            # Injection depends on the streamed BOM. The transformed length is
+            # unknown until then; let HTTP frame the stream instead of guessing.
+            response_headers.pop("content-length", None)
             response_headers.pop("etag", None)
             response_headers.pop("accept-ranges", None)
         if req.method == "HEAD" or status in {304, 416}:
             await grant.peer.cancel(request_id)
-            return Response(status_code=status, headers=response_headers)
+            response = Response(status_code=status, headers=response_headers)
+            if helper:
+                # Response otherwise inserts zero, which is not the GET length.
+                del response.headers["content-length"]
+            return response
         async def authorized():
             await self.authorize(grant)
         stream = grant.peer.stream(request_id, authorized)
