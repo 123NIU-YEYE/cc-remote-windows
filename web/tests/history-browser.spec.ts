@@ -369,6 +369,57 @@ test("side chat scope restores long Claude history atomically at the bottom with
   expect(relay.commands.some(c => ["query", "steer", "open_btw"].includes(String(c.type)))).toBe(false);
 });
 
+for (const engine of ["claude", "codex"] as const) {
+  test(`side chat scope reopens ${engine} history without a blank frame during sync`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { visible: true, engine });
+    const sid = "btw-layout-child";
+    const panel = page.locator(".btw-panel");
+    await page.goto("/");
+    await expect.poll(() => relay.commands.some(c => c.type === "sync_btw")).toBe(true);
+    const replayStart = () => relay.emit({ type: "replay_start", sid,
+      generation: "layout-generation", from_seq: 0, to_seq: 100, rebuild: true, truncated: false });
+    const history = (text: string) => {
+      relay.emit({ type: "user_msg", sid, msg_id: "retained-question", prompt: "保留的侧聊问题" });
+      relay.emit({ type: "delta", sid, message_id: "retained-answer", channel: "final", text });
+      relay.emit({ type: "assistant_msg_end", sid, message_id: "retained-answer", channel: "final" });
+      relay.emit({ type: "turn_end", sid, turn_id: "retained-answer", checkpoint_id: "retained-question",
+        result: { subtype: "success", duration_ms: 1000, is_error: false } });
+    };
+    replayStart();
+    history("完整的旧回答");
+    relay.emit({ type: "replay_end", sid, to_seq: 100, truncated: false });
+    relay.emit({ type: "state", sid, state: "idle" });
+    await expect(panel.getByText("完整的旧回答", { exact: true })).toBeVisible();
+    for (const centered of [false, true]) {
+      await panel.getByRole("button", { name: "收起侧边对话", exact: true }).click();
+      await expect(panel).toHaveCount(0);
+      const syncs = relay.commands.filter(c => c.type === "sync_btw").length;
+      await page.keyboard.press(centered ? "Control+Shift+e" : "Control+Shift+k");
+      await expect.poll(() => relay.commands.filter(c => c.type === "sync_btw").length).toBeGreaterThan(syncs);
+      await expect(panel.getByText("完整的旧回答", { exact: true })).toBeVisible();
+      const thread = await panel.locator(".thread").elementHandle();
+      replayStart();
+      await expect(panel.getByText("完整的旧回答", { exact: true })).toBeVisible();
+      await expect(panel.locator(".btw-chat-label")).toHaveText("保留的侧聊问题");
+      await expect(panel.getByText("正在恢复侧边对话…")).toHaveCount(0);
+      history("正在同步的新回答");
+      // A slow replay must retain the complete old projection, not its prefix.
+      await expect(panel.getByText("完整的旧回答", { exact: true })).toBeVisible();
+      await expect(panel.getByText("正在同步的新回答", { exact: true })).toHaveCount(0);
+      expect(await thread!.evaluate(node => node.isConnected)).toBe(true);
+      relay.emit({ type: "replay_end", sid, to_seq: 100, truncated: false });
+      await expect(panel.getByText("正在同步的新回答", { exact: true })).toBeVisible();
+      expect(await thread!.evaluate(node => node.isConnected)).toBe(true);
+      await expect(panel.locator(".turn-done-mark")).toHaveCount(1);
+      replayStart();
+      history("完整的旧回答");
+      relay.emit({ type: "replay_end", sid, to_seq: 100, truncated: false });
+      await expect(panel.getByText("完整的旧回答", { exact: true })).toBeVisible();
+    }
+    expect(relay.commands.some(c => ["query", "steer", "open_btw", "close_btw"].includes(String(c.type)))).toBe(false);
+  });
+}
+
 for (const running of [false, true]) {
   test(`path-prefixed prompts send verbatim as ${running ? "steering" : "a new message"}`, async ({ page }) => {
     const relay = await mockRightPanelRelay(page, { retained: false });

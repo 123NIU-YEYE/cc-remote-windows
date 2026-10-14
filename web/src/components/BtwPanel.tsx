@@ -151,7 +151,8 @@ export function BtwPanel(p: Props) {
   const input = draft.input;
   const { images, files, pastes } = draft;
   const chats = p.chats;
-  const turns = p.rt?.turns ?? [];
+  const historyView = p.rt?.btwReplayView ?? p.rt;
+  const turns = historyView?.turns ?? [];
   const runtimeState = p.rt?.state ?? "idle";
   const inputLocked = p.rt?.control
     ? sessionControlLocksInput(p.rt.control) : !!p.rt?.external;
@@ -165,11 +166,11 @@ export function BtwPanel(p: Props) {
   const activeTurnCandidates = activeTurnCandidateIds(
     turns,
     displayActiveTurnOwnerId(
-      p.rt?.liveOwner?.turnId,
-      p.rt?.acceptancePending,
+      historyView?.liveOwner?.turnId,
+      historyView?.acceptancePending,
     ),
-    runtimeState !== "idle" || p.rt?.mirroredRunning === true
-      || !!p.rt?.acceptancePending,
+    (historyView?.state ?? "idle") !== "idle" || historyView?.mirroredRunning === true
+      || !!historyView?.acceptancePending,
   );
   const activeTurnId = activeTurnCandidates.length === 1
     ? activeTurnCandidates[0] : null;
@@ -499,7 +500,7 @@ export function BtwPanel(p: Props) {
       <NoticeStack notices={p.rt?.notices ?? []}
         onDismiss={p.onDismissNotice} />
       <div className="btw-body">
-        {p.rt?.truncated && <div className="btw-history-note" role="status">
+        {historyView?.truncated && <div className="btw-history-note" role="status">
           较早的部分过程已超出临时对话保留范围
         </div>}
         {awaitingFirstChat
@@ -507,7 +508,7 @@ export function BtwPanel(p: Props) {
               <span className="thinking"><span/><span/><span/></span>
               {" "}正在打开侧边对话…
             </div>
-          : p.rt?.replaying || p.rt?.loading
+          : (p.rt?.replaying || p.rt?.loading) && !p.rt?.btwReplayView
             ? <div className="btw-empty" role="status" aria-live="polite">
                 <span className="thinking"><span/><span/><span/></span>
                 {" "}正在恢复侧边对话…
@@ -518,12 +519,12 @@ export function BtwPanel(p: Props) {
                   ? "问一个基于当前会话的侧边问题 —— 回答不会写进主线。"
                   : "暂无侧边对话。点 + 新建一个基于当前会话上下文的对话。"}
               </div>
-            // Mount only the complete replay. ChatView's layout effect then
-            // places its final tail before paint, instead of chasing every
-            // intermediate history item through the scrollport.
+            // Cold opens mount only the complete replay at its final tail.
+            // Warm syncs keep that same ChatView mounted on the prior complete
+            // view, then swap its data once without a blank/loading frame.
             : <ChatView key={p.sid} ref={p.chatViewRef} sid={p.sid ?? null} turns={turns}
                 engine={p.engine}
-                turnUsage={p.rt?.turnUsage}
+                turnUsage={historyView?.turnUsage}
                 activeTurnId={activeTurnId}
                 onEdit={() => {}} onGetDiff={() => {}}
                 onOpenFile={p.onOpenFile}

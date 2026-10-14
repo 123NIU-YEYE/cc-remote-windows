@@ -6167,7 +6167,7 @@ export default function App() {
             engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
             chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
               const runtime = state.runtimes[chat.sid];
-              const prompt = runtime?.turns.find(
+              const prompt = (runtime?.btwReplayView?.turns ?? runtime?.turns)?.find(
                 (turn) => turn.prompt.trim().length > 0)?.prompt.trim();
               return {
                 ...chat,
