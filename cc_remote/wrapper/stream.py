@@ -271,7 +271,8 @@ def replayed_user_message_id(message: Any) -> str | None:
     Tool-result user envelopes are part of the same turn and must never become
     additional aliases for the optimistic browser row.
     """
-    if not isinstance(message, UserMessage) or message.parent_tool_use_id:
+    if (not isinstance(message, UserMessage) or message.parent_tool_use_id
+            or getattr(message, "_cc_synthetic_user", False)):
         return None
     origin = getattr(message, "origin", None)
     if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):

@@ -91,6 +91,16 @@ does not activate this fix or make an unacknowledgeable terminal commit. Upgrade
 the service with the drain procedure below. Never resubmit an accepted query or
 restart a live owner just to clear its running indicator.
 
+Native compaction summaries (`isSynthetic` in the live stream or
+`isCompactSummary` in native history) are context metadata, not consumed human
+inputs. They must not replace the latest human receipt, consume a pending steer,
+or acquire a browser message alias. The Wrapper preserves that distinction after
+SDK parsing as well. This fix must reach the persistent service owner: a newer
+Wrapper cannot override an older owner's already-journaled terminal decision.
+For a previously stranded turn, retain its native events and verify the exact
+human receipt and real Result before recovery; do not fabricate a completion,
+resubmit the prompt, or restart other active sessions to clear the indicator.
+
 Native Code can also absorb a queued task notification between tool batches in
 an already-running human response. Its JSONL entry is a `queued_command`
 attachment; the SDK projects it as a replayed `UserMessage` with non-human origin

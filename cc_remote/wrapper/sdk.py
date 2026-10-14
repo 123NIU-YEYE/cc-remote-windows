@@ -35,7 +35,8 @@ from mcp.server import Server
 
 from cc_remote.config import WrapperConfig
 from cc_remote.claude_steering import (
-    ClaudeSteerRejected, PendingSteers, background_end_ids, is_human_result, is_managed_input, steer_message,
+    ClaudeSteerRejected, PendingSteers, background_end_ids, is_human_result, is_managed_input,
+    is_synthetic_user, steer_message,
 )
 from cc_remote.log import logger
 from cc_remote.protocol import MAX_SAFE_WIRE_INTEGER
@@ -1476,7 +1477,12 @@ class SdkHandle:
     def _parse_compat_message(data: Any):
         if isinstance(data, dict) and data.get("type") == "active_goal":
             return SystemMessage(subtype="active_goal", data=data)
-        return _parse_sdk_message(data)
+        message = _parse_sdk_message(data)
+        if isinstance(message, UserMessage) and is_synthetic_user(data):
+            # The pinned parser drops native summary flags. Preserve them for
+            # routing and transcript identity as well as raw Result receipts.
+            message._cc_synthetic_user = True
+        return message
 
     async def _receive_response_compat(self):
         """Preserve raw active_goal frames dropped by SDK <= 0.2.116.
@@ -1637,6 +1643,7 @@ class SdkHandle:
                     origin_kind = _message_origin_kind(message)
                     top_level_user = bool(
                         isinstance(message, UserMessage)
+                        and not getattr(message, "_cc_synthetic_user", False)
                         and not message.parent_tool_use_id
                         and not any(isinstance(block, (ToolResultBlock, ServerToolResultBlock))
                                     for block in (message.content if isinstance(message.content, list) else []))
