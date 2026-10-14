@@ -13,7 +13,7 @@ http://cc-remote.example.com {
 	}
 	header @entry Cache-Control "no-store"
 	@application {
-		not path /html-preview-runner.html /html-preview-runner.js
+		not path /html-preview-runner.html /html-preview-runner.js /dsh/*
 	}
 	@html_preview path /html-preview-runner.html /html-preview-runner.js
 	header @application {
@@ -30,6 +30,17 @@ http://cc-remote.example.com {
 		X-Frame-Options "SAMEORIGIN"
 		Referrer-Policy "no-referrer"
 		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+	# Optional DeepSeek Harness (DSH) desktop surface. A wrapper-side supervisor
+	# opens a reverse tunnel from the desktop to 127.0.0.1:3082, where its Node
+	# proxy terminates the DSH session cookie and serves its own login gate.
+	# /dsh/* is deliberately excluded from @application above: those headers set
+	# frame-ancestors 'none' and X-Frame-Options DENY, which would make the DSH
+	# panel unframeable by the cc-remote page that embeds it. handle_path strips
+	# the prefix because the DSH shell uses <base href="./"> and relative asset
+	# URLs, and its own Host answers "/" (not "/dsh/").
+	handle_path /dsh/* {
+		reverse_proxy 127.0.0.1:3082
 	}
 	reverse_proxy 127.0.0.1:8765
 	encode zstd gzip

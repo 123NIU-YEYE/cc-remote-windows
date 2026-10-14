@@ -43,6 +43,8 @@ import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
+import { EngineSwitcher, type EngineSurface } from "./components/EngineSwitcher";
+import { DshPanel } from "./components/DshPanel";
 import { parseGoalCommand } from "./goal-command";
 import { shouldOpenCodexStatus } from "./status-capabilities";
 import { permsFor } from "./data";
@@ -199,10 +201,15 @@ export default function App() {
     () => normalizeDiffTheme(localStorage.getItem(THEME_KEY)));
   const [engine, setEngine] = useState<Engine>(
     () => normalizeEngine(localStorage.getItem(ENGINE_KEY)));
+  const [dshOpen, setDshOpen] = useState(false);
+  const [dshMounted, setDshMounted] = useState(false);
   const [space, setSpace] = useState<Space>(
     () => localStorage.getItem(SPACE_KEY) === "work" ? "work" : "code");
   const [authed, setAuthed] = useState(false);
   const [authReady, setAuthReady] = useState(false);
+  useEffect(() => {
+    if (!authed) { setDshOpen(false); setDshMounted(false); }
+  }, [authed]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -870,6 +877,7 @@ export default function App() {
       && !!e.target.closest("[data-lock-horizontal-swipe]");
   };
   const onTouchEnd = (e: TouchEvent) => {
+    if (dshOpen) return;
     const touch = e.changedTouches[0];
     const action = resolveSidebarSwipe(
       touchStartX.current,
@@ -1249,9 +1257,18 @@ export default function App() {
 
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
-  const toggleEngine = () => {
+  const selectEngineSurface = (surface: EngineSurface) => {
+    if (surface === "dsh") {
+      cancelPendingNotificationTarget();
+      setSidebarOpen(false);
+      setDshMounted(true);
+      setDshOpen(true);
+      return;
+    }
+    setDshOpen(false);
+    if (surface === engine) return;
     cancelPendingNotificationTarget();
-    const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
+    const nextEngine = surface;
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
@@ -3627,7 +3644,7 @@ export default function App() {
   ) ?? rt.state;
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + (dshOpen ? " dsh-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
       <SessionsSidebar
         open={sidebarOpen}
         space={space}
@@ -3718,16 +3735,17 @@ export default function App() {
         <header className={`c-head ${space}-head`}>
           <div className="titlewrap">
             <div className="ttl">
-              <button className="surface-head-title" onClick={() => setSidebarOpen(true)}>
-                <span className="surface-head-mark"><Icon name={space === "work" ? "work" : "code"} size={18} /></span>
-                <span>{space === "work" ? "Work" : "Code"}</span>
+              <button className="surface-head-title" onClick={() => { if (!dshOpen) setSidebarOpen(true); }}
+                disabled={dshOpen}>
+                <span className="surface-head-mark"><Icon name={dshOpen ? "term" : space === "work" ? "work" : "code"} size={18} /></span>
+                {dshOpen ? <span>DeepSeek</span> : <span>{space === "work" ? "Work" : "Code"}</span>}
               </button>
             </div>
-            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
+            <div className="sub">{dshOpen ? "Harness 桌面版" : <>{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</>}</div>
           </div>
-          <span className={`hstat ${effectiveState}`}><span className="sd" />
-            <span className="hstat-label">{effectiveState}</span></span>
-          {space === "code" && focusedSid && !state.newChat && (
+          {!dshOpen && <span className={`hstat ${effectiveState}`}><span className="sd" />
+            <span className="hstat-label">{effectiveState}</span></span>}
+          {!dshOpen && space === "code" && focusedSid && !state.newChat && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -3742,8 +3760,7 @@ export default function App() {
             <Icon name="devices" size={18} />
             <span>{activeDevice?.label ?? machineId}</span><i />
           </button>
-          <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
-            title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
+          <EngineSwitcher selected={dshOpen ? "dsh" : engine} onSelect={selectEngineSurface} />
           <HeaderMenu
             engine={engine}
             theme={theme}
@@ -3757,6 +3774,8 @@ export default function App() {
           />
         </header>
 
+        {dshMounted && <DshPanel visible={dshOpen} />}
+        <div className="cc-engine-content" hidden={dshOpen}>
         <ReconnectBanner banner={state.banner}
           replaying={rt.replaying || historyView.recovering}
           truncated={rt.truncated}
@@ -3972,6 +3991,7 @@ export default function App() {
           </>
         )}
         {/* context usage now lives in the composer's ring popover (see Composer) */}
+        </div>
       </section>
       {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
       {(() => {

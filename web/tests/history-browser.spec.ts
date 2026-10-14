@@ -1,6 +1,56 @@
 import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
+test("assistant switcher embeds DSH and preserves its draft across engine switches", async ({ page }) => {
+  // Exercise the real App with isolated endpoints; never submit a model turn.
+  await page.route("**/api/**", (route) => route.fulfill({
+    json: route.request().url().includes("/api/devices")
+      ? { devices: [], pairing: { enabled: false, expires_at: null } } : {},
+  }));
+  const commands: string[] = [];
+  await page.routeWebSocket("**/ws**", (socket) => {
+    socket.onMessage((message) => commands.push(String(message)));
+  });
+  let dshLoads = 0;
+  await page.route("**/dsh/", (route) => {
+    dshLoads += 1;
+    return route.fulfill({ contentType: "text/html", body: '<label>DSH 草稿<textarea></textarea></label>' });
+  });
+  await page.goto("/tests/history-browser.html?assistant-switcher=1");
+  const switcher = page.getByRole("group", { name: "切换助手" });
+  for (const name of ["Codex", "Claude", "DSH"]) {
+    await expect(switcher.getByRole("button", { name, exact: true })).toBeVisible();
+  }
+  await expect(page.locator(".dsh-frame")).toHaveCount(0);
+  for (const width of [320, 375, 390, 768, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    const rect = await switcher.boundingBox();
+    expect(rect!.x).toBeGreaterThanOrEqual(0);
+    expect(rect!.x + rect!.width).toBeLessThanOrEqual(width);
+    for (const name of ["Codex", "Claude", "DSH"]) {
+      const button = await switcher.getByRole("button", { name, exact: true }).boundingBox();
+      expect(button!.x + button!.width).toBeLessThanOrEqual(width);
+      expect(button!.height).toBeGreaterThanOrEqual(34);
+    }
+  }
+  await switcher.getByRole("button", { name: "DSH", exact: true }).click();
+  await expect(page.locator(".cc-engine-content")).toBeHidden();
+  await expect(page.locator(".dsh-frame")).toBeVisible();
+  await expect(switcher.getByRole("button", { name: "DSH", exact: true })).toHaveAttribute("aria-pressed", "true");
+  const draft = page.frameLocator(".dsh-frame").getByLabel("DSH 草稿");
+  await draft.fill("unsent DSH draft");
+  await switcher.getByRole("button", { name: "Claude", exact: true }).click();
+  await expect(page.locator(".dsh-panel")).toBeHidden();
+  await expect(switcher.getByRole("button", { name: "Claude", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("heading", { name: "DeepSeek" })).toHaveCount(0);
+  await switcher.getByRole("button", { name: "DSH", exact: true }).click();
+  await expect(draft).toHaveValue("unsent DSH draft");
+  expect(dshLoads).toBe(1);
+  await switcher.getByRole("button", { name: "Codex", exact: true }).click();
+  await expect(switcher.getByRole("button", { name: "Codex", exact: true })).toHaveAttribute("aria-pressed", "true");
+  expect(commands.some((raw) => /"type":"(?:query|interrupt|create_session)"/.test(raw))).toBe(false);
+});
+
 test("mounted message image retries once when cache capacity is released", async ({
   page,
 }) => {

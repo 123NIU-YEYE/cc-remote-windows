@@ -111,6 +111,17 @@ body{
   color:var(--dim); background:var(--raised); border:1px solid var(--border-strong); }
 .engine-toggle:hover{ color:var(--accent-ink); border-color:var(--accent-line); }
 :root[data-engine="codex"] .engine-toggle{ color:var(--accent); background:var(--accent-weak); border-color:var(--accent-line); }
+.engine-switcher{ display:flex; flex:none; gap:2px; padding:3px; border:1px solid var(--border-strong); border-radius:11px; background:var(--raised); }
+.engine-choice{ min-height:34px; padding:6px 9px; border-radius:7px; font-size:11px; font-weight:650; color:var(--dim); white-space:nowrap; }
+.engine-choice:hover{ color:var(--accent-ink); background:var(--surface); }
+.engine-choice[aria-pressed="true"]{ color:var(--accent-ink); background:var(--accent-weak); box-shadow:inset 0 0 0 1px var(--accent-line); }
+.cc-engine-content{ display:contents; }
+.cc-engine-content[hidden],.dsh-panel[hidden]{ display:none; }
+.dsh-panel{ position:relative; display:flex; flex:1; min-height:0; overflow:hidden; }
+.dsh-frame{ width:100%; height:100%; border:0; background:var(--surface); }
+.dsh-loading{ position:absolute; inset:0; display:grid; place-items:center; margin:0; color:var(--dim); background:var(--bg); pointer-events:none; }
+.shell.dsh-open > :not(.pane){ display:none; }
+.shell.dsh-open .pane,.shell.dsh-open.panel-open .pane{ width:100%; margin-left:0; padding-right:0; }
 .newchat-engine{ display:inline-block; margin-left:8px; font-family:var(--mono); font-size:11px; font-weight:600;
   padding:3px 8px; border-radius:8px; vertical-align:middle; border:1px solid var(--border-strong); color:var(--dim); background:var(--raised); }
 .newchat-engine.codex{ color:var(--accent); background:var(--accent-weak); border-color:var(--accent-line); }
@@ -186,6 +197,9 @@ body{
 .terminal-control-takeover:hover{ filter:brightness(1.05); }
 .terminal-control-takeover:disabled{ opacity:.55; cursor:default; filter:none; }
 @media(max-width:640px){
+  .c-head{ flex-wrap:wrap; }
+  .engine-switcher{ order:1; flex-basis:100%; justify-content:flex-end; border:0; background:none; padding:2px 0 0; }
+  .engine-choice{ min-height:40px; padding:6px 14px; border:1px solid var(--border); background:var(--raised); }
   .terminal-control-scrim{ background:rgba(20,16,10,.34); }
   .terminal-control-card{ top:auto!important; right:0!important; bottom:var(--keyboard-inset,0px); left:0;
     width:100%; max-height:min(72dvh,calc(var(--app-height,100dvh) - var(--keyboard-inset,0px) - 12px));
