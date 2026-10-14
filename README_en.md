@@ -152,6 +152,9 @@ commands:
   plane. If the installed version or daemon is unavailable, cc-remote falls back
   to a private stdio app-server: Remote can still control the session on its own,
   but it no longer has live bidirectional coordination with native Codex CLI/App.
+  On Windows, where the official daemon lifecycle is unavailable, set
+  `CODEX_APP_SERVER_WS_URL` to a root loopback WebSocket URL; the wrapper and a
+  restarted Codex Desktop then attach to the same shared service.
   `CC_REMOTE_CODEX_DAEMON=off` forces this private path and is intended only for
   troubleshooting.
 - **Switching Codex accounts:** configure
@@ -675,6 +678,7 @@ HTTPS_PROXY=http://your-proxy:port      # for SOCKS use ALL_PROXY=socks5://...
 | `CLAUDE_BIN` | `~/.local/bin/claude` | Daily Claude Code executable launched by the wrapper. Empty still selects this default; use another absolute path only when the CLI is installed elsewhere. |
 | `CC_REMOTE_CODEX_PROXY` | empty | Optional HTTP(S)/SOCKS5 proxy injected only into Codex subprocesses launched by the wrapper. It does not change the wrapper-to-relay connection or the user's terminal `codex`. |
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code prefers Codex's official shared daemon; `off` forces private stdio app-server and loses live bidirectional coordination with native Codex CLI/App. Work is always private and ignores this setting. |
+| `CODEX_APP_SERVER_WS_URL` | empty | On Windows, set a root loopback URL such as `ws://127.0.0.1:8766`. The wrapper starts a shared WebSocket app-server; expose the same user environment variable to Codex Desktop and restart it so phone and desktop share one live control plane. Only `localhost`, `127.0.0.1`, and `::1` are accepted. |
 | `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | Local wrapper state directory. The account-switch hook and wrapper must use the same value; the daemon generation barrier stored here contains no Codex credentials. |
 | `CC_CWD` | cwd | Default working directory for new sessions. Claude `--resume` needs it to locate `~/.claude/projects/` — **it must be correct**; Codex resume first recovers the original cwd from its rollout. |
 | `CC_RESUME_SESSION_ID` | empty | Resume a specific session UUID; empty starts fresh. The id is persisted to `~/.cc-remote/` after first start. |

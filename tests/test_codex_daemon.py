@@ -21,6 +21,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexProxyProtocolError,
     _websocket_client_frame,
 )
+from cc_remote.wrapper.codex_ws_proxy import loopback_ws_target
 from cc_remote.wrapper.process_scan import ProcessIdentity
 
 
@@ -88,6 +89,58 @@ class _Process:
 def _result(returncode: int, payload: dict | None = None):
     data = b"" if payload is None else daemon_module.json.dumps(payload).encode()
     return daemon_module._CommandResult(returncode, data, b"")
+
+
+def test_windows_loopback_websocket_target_is_strict():
+    assert loopback_ws_target("ws://127.0.0.1:8766") == (
+        "127.0.0.1", 8766)
+    assert loopback_ws_target("ws://[::1]:8766/") == ("::1", 8766)
+    for value in (
+        "wss://127.0.0.1:8766",
+        "ws://0.0.0.0:8766",
+        "ws://127.0.0.1:8766/path",
+        "ws://user@127.0.0.1:8766",
+        "ws://127.0.0.1",
+    ):
+        with pytest.raises(ValueError):
+            loopback_ws_target(value)
+
+
+def test_windows_manager_uses_shared_websocket_stdio_tunnel(monkeypatch):
+    async def run():
+        monkeypatch.setattr(daemon_module.os, "name", "nt")
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
+        manager = CodexDaemonManager(
+            "auto", websocket_url="ws://127.0.0.1:8766")
+        calls: list[tuple[str, ...]] = []
+
+        async def command(_bin, _env, *args):
+            calls.append(args)
+            return _result(0)
+
+        async def _always_ready(_host: str, _port: int) -> bool:
+            return True
+
+        # Bind after the local helper exists; the patched global is resolved
+        # when ensure_started runs.
+        monkeypatch.setattr(
+            daemon_module, "_tcp_listener_ready", _always_ready)
+        manager._run = command  # type: ignore[method-assign]
+        argv = await manager.proxy_args("C:/Codex/codex.exe", {})
+
+        assert argv == [
+            sys.executable,
+            "-m",
+            "cc_remote.wrapper.codex_ws_proxy",
+            "ws://127.0.0.1:8766",
+        ]
+        assert manager.strict_shared_affinity is True
+        assert manager.info is not None
+        assert manager.info.websocket_url == "ws://127.0.0.1:8766"
+        assert calls == [("app-server", "--help")]
+
+    asyncio.run(run())
 
 
 def test_daemon_manager_starts_enables_versions_and_reconnects(monkeypatch):

@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from cc_remote.log import logger
 from cc_remote.wrapper.os_compat import current_uid
@@ -36,6 +37,7 @@ _COMMAND_TIMEOUT = 30.0
 _OUTPUT_MAX = 64 * 1024
 _PID_RECORD_MAX = 4096
 _STALE_UPDATER_EXIT_TIMEOUT = 3.0
+_WINDOWS_WS_START_TIMEOUT = 10.0
 
 
 def codex_daemon_mode(value: Optional[str] = None) -> str:
@@ -56,6 +58,7 @@ def codex_daemon_mode(value: Optional[str] = None) -> str:
 class CodexDaemonInfo:
     socket_path: Optional[str]
     verified_remote_control: bool = False
+    websocket_url: Optional[str] = None
 
 
 class CodexDaemonUpgradeRequired(RuntimeError):
@@ -320,13 +323,59 @@ def _binary_identity(path: str) -> tuple[object, ...]:
 
 
 def _daemon_identity(
-    path: str, env: Mapping[str, str], socket_path: Optional[str],
+    path: str,
+    env: Mapping[str, str],
+    socket_path: Optional[str],
+    websocket_url: Optional[str] = None,
 ) -> tuple[object, ...]:
     return (
         *_binary_identity(path),
         env.get("CODEX_HOME"),
         socket_path,
+        websocket_url,
     )
+
+
+def _windows_ws_target(value: Optional[str]) -> Optional[tuple[str, str, int]]:
+    """Return a normalized root loopback ws URL, host and port on Windows."""
+    raw = value
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    parsed = urlsplit(raw.strip())
+    if (
+        parsed.scheme != "ws"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None or not 1 <= port <= 65535:
+        return None
+    host = parsed.hostname
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"ws://{rendered_host}:{port}", host, port
+
+
+async def _tcp_listener_ready(host: str, port: int) -> bool:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=0.5)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    del reader
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
+    return True
 
 
 class CodexDaemonManager:
@@ -337,16 +386,19 @@ class CodexDaemonManager:
         mode: Optional[str] = None,
         *,
         socket_path: Optional[str] = None,
+        websocket_url: Optional[str] = None,
         command_timeout: float = _COMMAND_TIMEOUT,
     ):
         self.mode = codex_daemon_mode(mode)
         self.socket_path = socket_path
+        self.websocket_url = websocket_url
         self.command_timeout = max(1.0, float(command_timeout))
         self._lock = asyncio.Lock()
         self._capability_identity: Optional[tuple[object, ...]] = None
         self._capable = False
         self._ready_identity: Optional[tuple[object, ...]] = None
         self._ready: Optional[CodexDaemonInfo] = None
+        self._windows_server_proc: Optional[asyncio.subprocess.Process] = None
 
     @property
     def info(self) -> Optional[CodexDaemonInfo]:
@@ -376,7 +428,23 @@ class CodexDaemonManager:
         self, codex_bin: str, env: Mapping[str, str],
     ) -> bool:
         """Check both official commands, caching by executable identity."""
-        if self.mode == "off" or os.name != "posix":
+        if self.mode == "off":
+            return False
+        if os.name == "nt":
+            if _windows_ws_target(self.websocket_url) is None:
+                return False
+            identity = _daemon_identity(
+                codex_bin, env, self.socket_path, self.websocket_url)
+            if identity == self._capability_identity:
+                return self._capable
+            help_result = await self._run(codex_bin, env, "app-server", "--help")
+            capable = help_result.returncode == 0
+            self._capability_identity = identity
+            self._capable = capable
+            if not capable:
+                self.invalidate()
+            return capable
+        if os.name != "posix":
             return False
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._capability_identity:
@@ -456,6 +524,8 @@ class CodexDaemonManager:
         """Start and remotely enable the daemon, or return ``None`` for stdio."""
         if self.mode == "off":
             return None
+        if os.name == "nt":
+            return await self._ensure_windows_ws_started(codex_bin, env)
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._ready_identity and self._ready is not None:
             return self._ready
@@ -541,12 +611,81 @@ class CodexDaemonManager:
             self._ready = info
             return info
 
+    async def _ensure_windows_ws_started(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[CodexDaemonInfo]:
+        target = _windows_ws_target(self.websocket_url)
+        if target is None:
+            return None
+        url, host, port = target
+        identity = _daemon_identity(
+            codex_bin, env, self.socket_path, self.websocket_url)
+        if identity == self._ready_identity and self._ready is not None:
+            return self._ready
+        async with self._lock:
+            identity = _daemon_identity(
+                codex_bin, env, self.socket_path, self.websocket_url)
+            if identity == self._ready_identity and self._ready is not None:
+                return self._ready
+            if not await self.capability(codex_bin, env):
+                return None
+            if not await _tcp_listener_ready(host, port):
+                creationflags = (
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    codex_bin,
+                    "app-server",
+                    "--listen",
+                    url,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=dict(env),
+                    creationflags=creationflags,
+                )
+                self._windows_server_proc = proc
+                deadline = time.monotonic() + _WINDOWS_WS_START_TIMEOUT
+                while time.monotonic() < deadline:
+                    if proc.returncode is not None:
+                        break
+                    if await _tcp_listener_ready(host, port):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    proc.terminate()
+                    await proc.wait()
+                if not await _tcp_listener_ready(host, port):
+                    self.invalidate()
+                    log.warning(
+                        "Codex Windows shared WebSocket unavailable; using stdio",
+                        url=url,
+                    )
+                    return None
+                log.info("started Codex Windows shared WebSocket", url=url)
+            info = CodexDaemonInfo(
+                socket_path=None,
+                verified_remote_control=True,
+                websocket_url=url,
+            )
+            self._ready_identity = identity
+            self._ready = info
+            return info
+
     async def proxy_args(
         self, codex_bin: str, env: Mapping[str, str],
     ) -> Optional[list[str]]:
         info = await self.ensure_started(codex_bin, env)
         if info is None:
             return None
+        if os.name == "nt" and info.websocket_url:
+            return [
+                sys.executable,
+                "-m",
+                "cc_remote.wrapper.codex_ws_proxy",
+                info.websocket_url,
+            ]
         argv = [codex_bin, "app-server", "proxy"]
         socket_path = self.socket_path or info.socket_path
         if socket_path:

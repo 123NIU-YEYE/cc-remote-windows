@@ -260,6 +260,12 @@ class WrapperConfig:
     codex_daemon_mode: str = field(
         default_factory=lambda: _env("CC_REMOTE_CODEX_DAEMON", "auto").strip().lower()
     )
+    # Windows has no official app-server daemon lifecycle. A loopback WebSocket
+    # listener supplies the same multi-client control plane to the wrapper and
+    # Codex Desktop when both processes receive this environment variable.
+    codex_app_server_ws_url: str = field(
+        default_factory=lambda: _env("CODEX_APP_SERVER_WS_URL", "").strip()
+    )
     # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
     # session = one `claude --resume` child (~190MB RAM). Over the cap → evict an
     # idle one (client keeps its cached history; viewing stays instant). Raised
