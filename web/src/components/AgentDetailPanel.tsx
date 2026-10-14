@@ -1,3 +1,4 @@
+import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
 import { useState } from "react";
 import type { AgentDetailRun } from "../agent-detail";
 import type { Engine } from "../protocol";
@@ -32,7 +33,7 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
   const final = finalTextBlocks(run.blocks);
   const done = !["running", "pending"].includes(run.status);
   return (
-    <aside className="agent-detail-panel" aria-label="协作代理详情"
+    <PanelFrame role="complementary" className="agent-detail-panel" label="协作代理详情"
       data-lock-horizontal-swipe="true">
       <PanelResizer ariaLabel="调整协作代理面板宽度" />
       <header className="agent-detail-header">
@@ -46,6 +47,7 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
             {statusLabel(run)}
           </span>
         </div>
+        <PanelExpandButton label="协作代理详情" />
         <button type="button" className="icon-btn" onClick={onClose}
           aria-label="关闭协作代理详情"><Icon name="close" size={17} /></button>
       </header>
@@ -96,6 +98,6 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
           <div className="agent-detail-empty">这个协作代理暂时没有可展示的过程。</div>
         )}
       </div>
-    </aside>
+    </PanelFrame>
   );
 }

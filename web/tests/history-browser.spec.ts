@@ -3338,13 +3338,13 @@ for (const engine of ["claude", "codex"] as const) {
         await expect(panel).toHaveClass(/btw-expanded/);
         if (dismiss === "shortcut") await page.keyboard.press("Meta+Shift+e");
         else if (dismiss === "escape") await page.keyboard.press("Escape");
-        else await page.locator(".btw-expanded-backdrop").click({ position: { x: 4, y: 4 } });
+        else await page.locator(".panel-expanded-backdrop").click({ position: { x: 4, y: 4 } });
         if (origin === "hidden") await expect(panel).toHaveCount(0);
         else {
           await expect(panel).toBeVisible();
           await expect(panel).not.toHaveClass(/btw-expanded/);
         }
-        await expect(page.locator(".btw-expanded-backdrop")).toHaveCount(0);
+        await expect(page.locator(".panel-expanded-backdrop")).toHaveCount(0);
         await expectRightPanelSpace(page, origin === "docked");
       }
       if (origin === "hidden") {
@@ -3366,6 +3366,30 @@ for (const engine of ["claude", "codex"] as const) {
       ["open_btw", "close_btw", "query", "steer", "interrupt"].includes(String(command.type)))).toEqual([]);
   });
 }
+
+test("side chat scope centered speed menu keeps keyboard focus inside its owner", async ({ page }) => {
+  await page.setViewportSize({ width: 1568, height: 1000 });
+  const relay = await mockRightPanelRelay(page, { visible: true, engine: "codex" });
+  await page.goto("/");
+  const panel = page.locator(".btw-panel");
+  await expect(panel.getByRole("textbox")).toBeEnabled();
+  await panel.getByRole("button", { name: "居中展开侧边对话", exact: true }).click();
+  const trigger = panel.getByRole("button", { name: /^速度：/ });
+  const menu = page.getByRole("menu", { name: /的速度$/ });
+  for (const key of ["Tab", "Shift+Tab", "Escape"]) {
+    await trigger.click();
+    await expect(menu).toBeVisible();
+    await expect(menu.getByRole("menuitemradio").first()).toBeFocused();
+    await page.keyboard.press(key);
+    await expect(menu).toHaveCount(0);
+    await expect(panel).toHaveClass(/btw-expanded/);
+    expect(await panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+    if (key === "Escape") await expect(trigger).toBeFocused();
+  }
+  await page.keyboard.press("Escape");
+  await expect(panel).not.toHaveClass(/btw-expanded/);
+  expect(relay.commands.some(c => ["query", "steer", "interrupt", "set_service_tier"].includes(String(c.type)))).toBe(false);
+});
 
 test("side chat scope centered attachments fit a narrow viewport", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -3391,6 +3415,189 @@ test("side chat scope centered attachments fit a narrow viewport", async ({ page
   await panel.getByRole("button", { name: "移除待发送图片 1" }).click();
   await expect(panel.locator(".attach-image-preview")).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("btw-centered-mobile.png") });
+});
+
+for (const fromBrowser of [false, true]) {
+  test(`right panel layout centered file edits survive ${fromBrowser ? "directory navigation" : "standalone preview"}`, async ({ page }, info) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const path = "/tmp/layout/README.md";
+    const relay = await mockRightPanelRelay(page, { seedTurns: [{
+      id: "preview-turn", prompt: "查看文件", done: true,
+      blocks: [{ kind: "text", message_id: "preview-answer", channel: "final", done: true,
+        text: `[文件](${path})` }],
+    }] });
+    await page.goto("/");
+    if (fromBrowser) {
+      await page.getByRole("button", { name: "更多设置", exact: true }).click();
+      await page.getByRole("button", { name: "打开会话文件", exact: true }).click();
+      await expect.poll(() => relay.commands.some(c => c.type === "browse_files")).toBe(true);
+      const request = relay.commands.find(c => c.type === "browse_files")!;
+      relay.emit({ type: "files_listed", sid: "layout-parent", request_id: String(request.request_id),
+        root: "/tmp/layout", path: "/tmp/layout", parent: null, kind: "directory", revision: "dir",
+        next_offset: null, entries: [{ name: "README.md", path, kind: "file" }] });
+      await page.getByRole("button", { name: "居中展开会话文件", exact: true }).click();
+      await page.getByRole("button", { name: "README.md", exact: true }).click();
+    } else {
+      await page.getByRole("button", { name: `在 Remote 中打开 ${path}`, exact: true }).click();
+    }
+    await expect.poll(() => relay.commands.some(c => c.type === "get_file_preview")).toBe(true);
+    const request = relay.commands.find(c => c.type === "get_file_preview")!;
+    relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(request.request_id),
+      path, format: "markdown", content: "# Preview\n\nOriginal", size: 19,
+      mtime_ns: "1", revision: "a".repeat(64), writable: true });
+    const panel = page.locator(fromBrowser ? ".file-browser-shell" : ".artifact-panel");
+    await panel.getByRole("button", { name: "源码", exact: true }).click();
+    const editor = panel.getByRole("textbox", { name: "Markdown 源码编辑器" });
+    await editor.fill("# Unsaved draft\n\nKeep this text");
+    const original = await editor.elementHandle();
+    if (!fromBrowser) await panel.getByRole("button", { name: "居中展开文件预览", exact: true }).click();
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    await expect(panel).toHaveAttribute("aria-modal", "true");
+    await expectRightPanelSpace(page, false);
+    expect((await panel.boundingBox())!.width).toBe(1080);
+    // Layout changes must not ask to discard or recreate the dirty editor.
+    let confirmations = 0;
+    page.on("dialog", async dialog => { confirmations++; await dialog.dismiss(); });
+    await page.keyboard.press("Escape");
+    await expect(panel).not.toHaveClass(/panel-expanded/);
+    await expectRightPanelSpace(page, true);
+    await page.keyboard.press("Control+Shift+e");
+    await expect(panel).toHaveClass(/panel-expanded/);
+    await expect(editor).toHaveValue("# Unsaved draft\n\nKeep this text");
+    expect(await original!.evaluate(node => node.isConnected)).toBe(true);
+    await page.locator(".panel-expanded-backdrop").click({ position: { x: 4, y: 4 } });
+    await expect(panel).not.toHaveClass(/panel-expanded/);
+    expect(confirmations).toBe(0);
+    await page.keyboard.press("Control+Shift+e");
+    await page.screenshot({ path: info.outputPath(`centered-file-desktop-${fromBrowser}.png`), animations: "disabled" });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(panel).toHaveClass(/panel-expanded/);
+    // The visualViewport controller applies its new metrics on the next frame.
+    await expect.poll(async () => {
+      const bounds = (await panel.boundingBox())!;
+      return bounds.y + bounds.height;
+    }).toBeLessThanOrEqual(844);
+    const bounds = (await panel.boundingBox())!;
+    expect(bounds.width).toBe(370);
+    expect(bounds.y + bounds.height).toBeLessThanOrEqual(844);
+    expect(await panel.evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
+    const heading = panel.locator(".artifact-title:visible, .artifact-head > .panel-tabs:visible");
+    await expect.poll(async () => {
+      const name = (await heading.boundingBox())!;
+      const action = (await panel.getByRole("button", { name: "收回右侧", exact: true }).boundingBox())!;
+      return Math.abs(name.y + name.height / 2 - action.y - action.height / 2);
+    }).toBeLessThan(4);
+    await page.screenshot({ path: info.outputPath(`centered-file-${fromBrowser}.png`), animations: "disabled" });
+    // Actual close/navigation still protects the dirty file.
+    await panel.getByRole("button", { name: fromBrowser ? "返回目录" : "收起", exact: true }).click();
+    expect(confirmations).toBe(1);
+    await expect(editor).toHaveValue("# Unsaved draft\n\nKeep this text");
+    if (fromBrowser) {
+      await editor.fill("# Preview\n\nOriginal");
+      await panel.getByRole("button", { name: "返回目录", exact: true }).click();
+      await expect(panel).toHaveClass(/panel-expanded/);
+      await expect(panel.getByRole("button", { name: "README.md", exact: true })).toBeVisible();
+      expect(relay.commands.filter(c => c.type === "browse_files")).toHaveLength(1);
+    }
+    expect(relay.commands.filter(c => ["get_file_preview", "save_markdown"].includes(String(c.type)))).toHaveLength(1);
+    expect(relay.commands.some(c => ["query", "steer", "open_btw", "interrupt"].includes(String(c.type)))).toBe(false);
+  });
+}
+
+test("right panel layout centered diff and agent details keep their own content", async ({ page }) => {
+  await page.setViewportSize({ width: 1568, height: 1000 });
+  const relay = await mockRightPanelRelay(page, { visible: true, engine: "claude" });
+  await page.goto("/");
+  await expect(page.locator(".btw-panel")).toBeVisible();
+  await page.keyboard.press("Control+Shift+b");
+  const diff = page.locator(".artifact-panel");
+  await expect(diff).toBeVisible();
+  await diff.getByRole("button", { name: "居中展开改动", exact: true }).click();
+  await expect(diff).toHaveClass(/panel-expanded/);
+  await expectRightPanelSpace(page, false);
+  const original = await diff.elementHandle();
+  await page.keyboard.press("Control+Shift+e");
+  await expect(diff).not.toHaveClass(/panel-expanded/);
+  expect(await original!.evaluate(node => node.isConnected)).toBe(true);
+  await page.keyboard.press("Control+Shift+e");
+  await diff.getByRole("button", { name: "收起", exact: true }).click();
+  await expect(page.locator(".btw-panel")).toBeVisible();
+  await expect(page.locator(".btw-panel")).not.toHaveClass(/panel-expanded/);
+  relay.emit({ type: "background_process_sync", sid: "layout-parent",
+    items: [{ item_id: "center-agent", kind: "agent", status: "succeeded", title: "Centered child" }] });
+  await page.getByRole("button", { name: /后台任务/ }).click();
+  await page.getByRole("button", { name: "Centered child" }).click();
+  const agent = page.locator(".agent-detail-panel");
+  await expect.poll(() => relay.commands.some(c => c.type === "get_agent_detail")).toBe(true);
+  const request = relay.commands.find(c => c.type === "get_agent_detail")!;
+  relay.emit({ type: "agent_detail", sid: "layout-parent", session_id: "layout-parent",
+    run_id: String(request.run_id), request_id: String(request.request_id), revision: "layout-history",
+    detail_revision: "agent-history", authoritative: true, title: "Centered child", status: "succeeded",
+    events: [], through_seq: 0, has_more: false });
+  await agent.getByRole("button", { name: "居中展开协作代理详情", exact: true }).click();
+  await expect(agent).toHaveAttribute("role", "dialog");
+  await expect(agent).toContainText("已完成");
+  await expectRightPanelSpace(page, false);
+  await agent.getByRole("button", { name: "收回右侧", exact: true }).click();
+  await expect(agent).toHaveAttribute("role", "complementary");
+  await expectRightPanelSpace(page, true);
+  expect(relay.commands.filter(c => c.type === "get_agent_detail")).toHaveLength(1);
+  expect(relay.commands.filter(c => c.type === "get_diff")).toHaveLength(1);
+  expect(relay.commands.some(c => ["query", "open_btw", "interrupt"].includes(String(c.type)))).toBe(false);
+});
+
+test("remote Viewer centered expansion keeps the iframe and grant alive", async ({ page, context }) => {
+  await page.setViewportSize({ width: 1568, height: 1000 });
+  await mockRightPanelRelay(page, { seedTurns: [{
+    id: "viewer-center", prompt: "预览", done: true,
+    blocks: [{ kind: "text", message_id: "viewer-center-answer", channel: "final", done: true,
+      text: `[结构预览](${VIEWER_LINK_SITE.urls[0]})` }],
+  }] });
+  let opens = 0;
+  let closes = 0;
+  const id = "a".repeat(32);
+  let associated = false;
+  await page.route("**/api/viewers", route => route.fulfill({ json: { enabled: true, sites: [VIEWER_LINK_SITE] } }));
+  await page.route("**/api/viewers/pages", route => {
+    const body = route.request().postDataJSON();
+    if (body.action === "associate") associated = true;
+    return route.fulfill({ json: { pages: associated ? [{
+      id: "center-page", machine_id: VIEWER_LINK_SITE.machine_id,
+      site_id: VIEWER_LINK_SITE.id, entry: VIEWER_LINK_SITE.entry, label: VIEWER_LINK_SITE.label,
+      references: [], turn_ids: [], available: true,
+    }] : [] } });
+  });
+  await page.route("**/api/viewers/open", route => {
+    opens++;
+    return route.fulfill({ json: { id, mode: "isolated", origin: "https://center-preview.example",
+      expires_at: Date.now() / 1000 + 3600 } });
+  });
+  await page.route(`**/api/viewers/${id}`, route => {
+    if (route.request().method() === "DELETE") closes++;
+    return route.fulfill({ json: { expires_at: Date.now() / 1000 + 3600 } });
+  });
+  await context.route("https://center-preview.example/**", route => route.fulfill({
+    contentType: "text/html", body: '<input aria-label="Preview state" value="original">',
+  }));
+  await page.goto("/");
+  await page.getByRole("link", { name: "结构预览", exact: true }).click();
+  const panel = page.locator(".remote-viewer-panel");
+  await expect(panel.locator("iframe")).toBeVisible();
+  const original = await panel.locator("iframe").elementHandle();
+  const input = panel.frameLocator("iframe").getByRole("textbox", { name: "Preview state" });
+  await input.fill("keep iframe state");
+  await panel.getByRole("button", { name: "居中展开远程预览", exact: true }).click();
+  await expect(panel).toHaveClass(/panel-expanded/);
+  await expectRightPanelSpace(page, false);
+  await page.keyboard.press("Escape");
+  await expect(panel).not.toHaveClass(/panel-expanded/);
+  await expect(panel).toBeVisible(); // Escape must dock, not run the Viewer's close handler too.
+  await page.keyboard.press("Control+Shift+e");
+  await expect(panel).toHaveClass(/panel-expanded/);
+  await expect(input).toHaveValue("keep iframe state");
+  expect(await original!.evaluate(node => node.isConnected)).toBe(true);
+  expect(opens).toBe(1);
+  expect(closes).toBe(0);
 });
 
 test("side chat scope follows its parent through navigation and refresh without creating forks", async ({ page }) => {
