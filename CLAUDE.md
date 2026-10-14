@@ -114,7 +114,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   CLI activity and private Codex App activity are different ownership sources
   and must not be collapsed into one "external process" heuristic. Ordinary
   shared sessions stay on the daemon; only the guarded oversized-resume path may
-  select a newer official private app-server for compatibility.
+  select a newer official private app-server for compatibility. On Windows,
+  `CODEX_APP_SERVER_WS_URL` opts into the equivalent root-loopback WebSocket
+  service; the wrapper passes the explicit URL to its daemon manager and never
+  accepts a non-loopback endpoint.
 - **History = local projection + materialized summary pages; reconnect = live-tail replay**
   (protocol v24): IndexedDB paints the browser's last projection before network
   validation. `GetHistory(detail="summary")` returns a small canonical turn page

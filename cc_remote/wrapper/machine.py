@@ -127,6 +127,7 @@ from cc_remote.wrapper.codex_controls import (
     CodexControlStoreError,
 )
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager
+from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 if sys.platform != "win32":
     from cc_remote.claude_broker import BrokerClient, BrokerClientError
     from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
@@ -1091,7 +1092,9 @@ class WrapperMachine:
         # daemon. Each resident Code handle still owns only its short-lived
         # proxy connection; Work remains per-session stdio and isolated.
         self._codex_daemon = CodexDaemonManager(
-            getattr(cfg, "codex_daemon_mode", "auto"))
+            getattr(cfg, "codex_daemon_mode", "auto"),
+            websocket_url=getattr(cfg, "codex_app_server_ws_url", None),
+        )
         self._codex_daemon_restart_path = restart_state_path(cfg.state_dir)
         self._codex_turn_leases = CodexTurnLeaseStore(cfg.state_dir)
         # Claude's official SDK/CLI does not expose a supported multi-writer
@@ -3106,6 +3109,20 @@ class WrapperMachine:
         # `new_session(engine="codex")` command.
         await self.transport.start()
         try:
+            if sys.platform == "win32" and getattr(
+                self.cfg, "codex_app_server_ws_url", ""):
+                try:
+                    codex_bin = await asyncio.to_thread(resolve_codex_bin)
+                    await self._codex_daemon.ensure_started(
+                        codex_bin, codex_env(codex_bin))
+                except Exception as exc:
+                    # A missing/old Codex must not prevent Claude-only Remote
+                    # from starting; Code will report its own connection error
+                    # when a session is actually opened.
+                    log.warning(
+                        "Windows shared Codex app-server bootstrap failed",
+                        error_type=type(exc).__name__,
+                    )
             bootstrap_sid = (
                 self.cfg.resume_session_id
                 or load_session_id(self.cfg.state_dir, self.cfg.cc_cwd)
