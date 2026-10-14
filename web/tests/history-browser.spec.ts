@@ -3501,6 +3501,35 @@ for (const engine of ["claude", "codex"] as const) {
   }
 }
 
+for (const expanded of [false, true]) {
+  test(`side chat scope speed menu blocks layout shortcuts when expanded=${expanded}`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { visible: true, engine: "codex" });
+    await page.goto("/");
+    const panel = page.locator(".btw-panel");
+    await expect(panel.getByRole("textbox")).toBeEnabled();
+    if (expanded) await page.keyboard.press("Control+Shift+e");
+    await panel.getByRole("button", { name: /^速度：/ }).click();
+    const menu = page.getByRole("menu", { name: /的速度$/ });
+    await expect(menu).toBeVisible();
+    for (const key of ["Control+Shift+e", "Meta+Shift+e", "Control+Shift+k", "Meta+Shift+k"]) {
+      await page.keyboard.press(key);
+      await expect(menu).toBeVisible();
+      await expect(menu.getByRole("menuitemradio").first()).toBeFocused();
+      await expect(panel).toBeVisible();
+      if (expanded) await expect(panel).toHaveClass(/btw-expanded/);
+      else await expect(panel).not.toHaveClass(/btw-expanded/);
+    }
+    await page.keyboard.press("Escape");
+    await expect(menu).toHaveCount(0);
+    await page.keyboard.press("Control+Shift+e");
+    if (expanded) await expect(panel).not.toHaveClass(/btw-expanded/);
+    else await expect(panel).toHaveClass(/btw-expanded/);
+    expect(relay.commands.some(c => ["query", "steer", "interrupt", "set_service_tier"]
+      .includes(String(c.type)))).toBe(false);
+  });
+}
+
 test("side chat scope centered speed menu keeps keyboard focus inside its owner", async ({ page }) => {
   await page.setViewportSize({ width: 1568, height: 1000 });
   const relay = await mockRightPanelRelay(page, { visible: true, engine: "codex" });
