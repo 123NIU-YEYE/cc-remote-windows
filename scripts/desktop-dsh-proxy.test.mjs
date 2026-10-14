@@ -9,7 +9,20 @@ let host, child, base, port;
 const token = "test-only-public-key-not-a-real-credential";
 const nativeCookie = "native-desktop=test-only-private";
 let lastRequest;
+// Stand-in for the relay's /api/session. `authReply` is flipped per test so the
+// same proxy instance can be driven through every branch.
+let authServer, authPort, authReply, authCalls;
 before(async () => {
+  authCalls = [];
+  authReply = (cookie) => (cookie === "cc_remote_session=valid" ? 200 : 401);
+  authServer = http.createServer((req, res) => {
+    authCalls.push({ url: req.url, cookie: req.headers.cookie, host: req.headers.host });
+    res.writeHead(authReply(req.headers.cookie), { "content-type": "application/json" });
+    res.end("{}");
+  });
+  authServer.listen(0, "127.0.0.1"); await once(authServer, "listening");
+  authPort = authServer.address().port;
+
   host = http.createServer((req, res) => {
     lastRequest = { url: req.url, headers: req.headers };
     res.writeHead(200, { "content-type": "text/html", "set-cookie": "native-secret=must-not-leak" });
@@ -22,12 +35,19 @@ before(async () => {
   base = `http://127.0.0.1:${port}`;
   child = spawn(process.execPath, [new URL("./desktop-dsh-proxy.mjs", import.meta.url).pathname.replace(/^\/([A-Z]:)/u, "$1")], {
     env: { ...process.env, DSH_PROXY_PORT: String(port), DSH_TARGET_PORT: String(host.address().port),
-      DSH_UPSTREAM_COOKIE: nativeCookie, DSH_PUBLIC_TOKEN: token, DSH_PUBLIC_COOKIE_VALUE: token, DSH_PUBLIC_ORIGIN: base },
+      DSH_UPSTREAM_COOKIE: nativeCookie, DSH_PUBLIC_TOKEN: token, DSH_PUBLIC_COOKIE_VALUE: token, DSH_PUBLIC_ORIGIN: base,
+      DSH_CC_REMOTE_SESSION_URL: `http://127.0.0.1:${authPort}/api/session`,
+      DSH_CC_REMOTE_COOKIE: "cc_remote_session" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   await Promise.race([once(child.stdout, "data"), once(child, "exit").then(() => { throw new Error("proxy failed to start"); })]);
 });
-after(async () => { child?.kill(); host?.closeAllConnections(); await new Promise((resolve) => host?.close(resolve)); });
+after(async () => {
+  child?.kill(); host?.closeAllConnections();
+  await new Promise((resolve) => host?.close(resolve));
+  authServer?.closeAllConnections();
+  await new Promise((resolve) => authServer?.close(resolve));
+});
 const session = { cookie: `cc-remote-dsh=${token}` };
 async function login(access, origin = base) {
   return fetch(`${base}/.remote-login`, { method: "POST", redirect: "manual",
@@ -97,4 +117,86 @@ test("WebSocket requires session and trusted Origin, including static paths", as
   assert.match(await upgrade("/assets/fake", { origin: base }), /401/u);
   assert.match(await upgrade("/ws", { ...session, origin: "http://evil.invalid" }), /403/u);
   assert.match(await upgrade("/ws", { ...session, origin: base }), /101/u);
+});
+
+// --- cc-remote single sign-on ---------------------------------------------
+// The panel is embedded in the cc-remote page, so a browser holding a live
+// cc-remote session must not be asked to paste the DSH link again.
+test("a live cc-remote session signs the panel in without pasting the token", async () => {
+  authCalls.length = 0;
+  const r = await fetch(base, {
+    redirect: "manual",
+    headers: { cookie: "cc_remote_session=valid" },
+  });
+  assert.equal(r.status, 303);
+  assert.equal(r.headers.get("location"), "./");
+  assert.match(r.headers.get("set-cookie"), /cc-remote-dsh=/u);
+  // The relay was actually consulted, and only the session cookie travelled.
+  assert.equal(authCalls.length >= 1, true);
+  assert.equal(authCalls.at(-1).cookie, "cc_remote_session=valid");
+});
+
+test("signed-in panel requests then carry the minted DSH cookie", async () => {
+  const r = await fetch(base, { headers: { ...session } });
+  assert.equal(r.status, 200);
+  assert.match(await r.text(), /Mock Desktop ready/u);
+});
+
+test("an invalid or absent cc-remote session still shows the login form", async () => {
+  for (const cookie of ["cc_remote_session=wrong", ""]) {
+    const r = await fetch(base, { redirect: "manual", headers: cookie ? { cookie } : {} });
+    assert.equal(r.status, 200);
+    assert.match(await r.text(), /DeepSeek 桌面版远程登录/u);
+    assert.equal(r.headers.get("set-cookie"), null);
+  }
+});
+
+test("an unreachable relay fails closed instead of unlocking the panel", async () => {
+  // A dedicated proxy whose session probe points at a dead port. A timeout or
+  // connection error must fall back to the login form, never to a 303.
+  const reserve = net.createServer(); reserve.listen(0, "127.0.0.1");
+  await once(reserve, "listening");
+  const deadProxyPort = reserve.address().port;
+  await new Promise((resolve) => reserve.close(resolve));
+  const dead = net.createServer(); dead.listen(0, "127.0.0.1");
+  await once(dead, "listening");
+  const deadAuthPort = dead.address().port;
+  await new Promise((resolve) => dead.close(resolve));   // now nothing listens there
+
+  const proc = spawn(process.execPath,
+    [new URL("./desktop-dsh-proxy.mjs", import.meta.url).pathname.replace(/^\/([A-Z]:)/u, "$1")],
+    { env: { ...process.env, DSH_PROXY_PORT: String(deadProxyPort),
+      DSH_TARGET_PORT: String(host.address().port), DSH_UPSTREAM_COOKIE: nativeCookie,
+      DSH_PUBLIC_TOKEN: token, DSH_PUBLIC_COOKIE_VALUE: token, DSH_PUBLIC_ORIGIN: base,
+      DSH_CC_REMOTE_SESSION_URL: `http://127.0.0.1:${deadAuthPort}/api/session` },
+      stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    await Promise.race([once(proc.stdout, "data"),
+      once(proc, "exit").then(() => { throw new Error("proxy failed to start"); })]);
+    const r = await fetch(`http://127.0.0.1:${deadProxyPort}/`, {
+      redirect: "manual", headers: { cookie: "cc_remote_session=valid" },
+    });
+    assert.equal(r.status, 200, "dead relay must not sign the panel in");
+    assert.match(await r.text(), /DeepSeek 桌面版远程登录/u);
+    assert.equal(r.headers.get("set-cookie"), null);
+  } finally {
+    proc.kill();
+  }
+});
+
+test("SSO never leaks the cc-remote cookie or the upstream cookie", async () => {
+  const r = await fetch(base, {
+    redirect: "manual",
+    headers: { cookie: "cc_remote_session=valid" },
+  });
+  const text = await r.text();
+  assert.ok(!text.includes("cc_remote_session"));
+  assert.ok(!text.includes(nativeCookie));
+  assert.ok(!String(r.headers.get("set-cookie") ?? "").includes(nativeCookie));
+});
+
+test("token paste still works for a browser with no cc-remote session", async () => {
+  const r = await login(token);
+  assert.equal(r.status, 303);
+  assert.equal(r.headers.get("location"), "./");
 });

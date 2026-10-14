@@ -9,6 +9,16 @@ const publicToken = process.env.DSH_PUBLIC_TOKEN ?? "";
 const publicCookieName = process.env.DSH_PUBLIC_COOKIE_NAME ?? "cc-remote-dsh";
 const publicCookieValue = process.env.DSH_PUBLIC_COOKIE_VALUE ?? "";
 const publicOrigin = new URL(process.env.DSH_PUBLIC_ORIGIN ?? "http://106.55.19.100").origin;
+// Reuse the cc-remote browser login so the panel opens straight from the page
+// that embeds it, instead of asking the user to paste the DSH link again. The
+// check runs here rather than in Caddy: this proxy already terminates the
+// browser session, and Caddy's forward_auth does not forward the Cookie header
+// reliably (a session that /api/session accepts directly was rejected through
+// it), nor does it treat WebSocket upgrades consistently.
+const ccRemoteSessionUrl = new URL(
+  process.env.DSH_CC_REMOTE_SESSION_URL ?? `${publicOrigin}/api/session`);
+const ccRemoteCookieName = process.env.DSH_CC_REMOTE_COOKIE ?? "cc_remote_session";
+const ccRemoteHost = process.env.DSH_CC_REMOTE_HOST ?? ccRemoteSessionUrl.host;
 
 if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) throw new Error("invalid proxy port");
 if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) throw new Error("invalid desktop Host port");
@@ -32,6 +42,41 @@ function hasSession(headers) {
       && sameSecret(part.slice(at + 1).trim(), publicCookieValue)) return true;
   }
   return false;
+}
+
+function cookieValue(headers, name) {
+  const raw = headers.cookie;
+  if (typeof raw !== "string") return "";
+  for (const part of raw.split(";")) {
+    const at = part.indexOf("=");
+    if (at >= 0 && part.slice(0, at).trim() === name) return part.slice(at + 1).trim();
+  }
+  return "";
+}
+
+// Ask the relay whether this browser holds a live cc-remote session. Only the
+// boolean verdict crosses back; the session cookie itself is never logged.
+function ccRemoteSessionValid(headers) {
+  const session = cookieValue(headers, ccRemoteCookieName);
+  if (session === "") return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const probe = http.request({
+      protocol: ccRemoteSessionUrl.protocol,
+      hostname: ccRemoteSessionUrl.hostname,
+      port: ccRemoteSessionUrl.port || 80,
+      method: "GET",
+      path: `${ccRemoteSessionUrl.pathname}${ccRemoteSessionUrl.search}`,
+      // The relay validates Host/Origin against its configured PUBLIC_ORIGIN.
+      headers: { host: ccRemoteHost, cookie: `${ccRemoteCookieName}=${session}` },
+    }, (upstream) => {
+      upstream.resume();
+      resolve(upstream.statusCode === 200);
+    });
+    // Fail closed: an unreachable relay must not unlock the panel.
+    probe.setTimeout(8000, () => probe.destroy(new Error("timeout")));
+    probe.once("error", () => resolve(false));
+    probe.end();
+  });
 }
 
 function trustedOrigin(request) {
@@ -152,8 +197,24 @@ const server = http.createServer((request, response) => {
   }
 
   const safeMethod = request.method === "GET" || request.method === "HEAD";
+  const isEntryDocument = safeMethod && ["/", "/index.html"].includes(url.pathname);
+
+  // Single sign-on: the panel is embedded in the cc-remote page, so a browser
+  // that already holds a live cc-remote session should never be asked to paste
+  // the DSH link again. Mint the DSH session cookie and bounce back to the
+  // panel; the redirect target then authenticates with that cookie.
+  if (isEntryDocument && !hasSession(request.headers)) {
+    void ccRemoteSessionValid(request.headers).then((valid) => {
+      if (valid) { authenticate(response); return; }
+      if (!response.headersSent) loginPage(response);
+    }).catch(() => {
+      if (!response.headersSent) loginPage(response);
+    });
+    return;
+  }
+
   if (!hasSession(request.headers) && !(safeMethod && isStatic(url.pathname))) {
-    if (request.method === "GET" && ["/", "/index.html"].includes(url.pathname)) {
+    if (isEntryDocument) {
       loginPage(response); return;
     }
     response.writeHead(401, { "cache-control": "no-store", "content-type": "text/plain; charset=utf-8" });
