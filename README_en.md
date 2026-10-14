@@ -42,8 +42,8 @@ features or wire protocol across different commits.
 - **Read files directly.** File and directory links in messages connect to
   `/open` and the preview panel: source, Markdown, images, HTML, PDF, audio and XLSX.
 - **Connect machines and accounts.** Pair, switch and revoke devices in Device
-  Center. Claude/Codex accounts can use separate native authentication, session
-  and extension directories.
+  Center. Built-in Claude/Codex multi-account support lets you use OAuth accounts
+  and third-party API gateway accounts in one interface.
 - **Work from a phone.** Compact engine menus, light/dark themes, image zoom, PWA
   installation and optional background notifications. Notifications default to
   generic status; showing a session name requires an explicit opt-in.
@@ -321,8 +321,13 @@ procedures, independent of core deployment success.
 
 See [Configuration, accounts and data](docs/configuration_en.md) for account
 directories, proxies, device policy, notifications and environment variables.
-Claude/Codex profiles keep configuration and authentication separate; choosing an
-account does not send its credentials to the web client or relay.
+Claude/Codex can mix official OAuth accounts with third-party API gateway accounts
+supported by the native CLI. First sign in or configure API access in each account's
+native directory, then [register its profile](docs/configuration_en.md#multiple-accounts)
+to select and use it in cc-remote. Configuration, authentication, sessions and
+extensions remain separate for each account; credentials stay on the local machine
+and are never sent to the web client or relay. Without registered profiles,
+cc-remote continues using the existing default account.
 
 <a id="security-please-read"></a>
 
