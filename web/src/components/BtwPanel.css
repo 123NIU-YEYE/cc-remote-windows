@@ -5,8 +5,6 @@
 .btw-title{ font-weight:var(--font-weight-650); font-size:13px; color:var(--accent-text,var(--accent)); }
 .btw-sub{ font-size:11px; color:var(--dim); }
 .btw-new{ color:var(--accent-text,var(--accent)); }
-.btw-expand[aria-pressed="true"]{ color:var(--accent-text,var(--accent)); background:var(--accent-weak); }
-.btw-panel:focus{ outline:none; }
 .btw-head>.iconbtn{ flex:none; }
 .btw-chat-tabs{ flex:none; display:flex; gap:6px; padding:8px 10px; overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:thin; border-bottom:1px solid var(--border); background:color-mix(in srgb,var(--surface) 88%,var(--bg)); }
 .btw-chat-tab-wrap{ flex:0 0 auto; max-width:190px; display:flex; align-items:center; border:1px solid var(--border); border-radius:9px; background:var(--bg); color:var(--dim); transition:border-color .16s var(--ease),background .16s var(--ease),color .16s var(--ease); }
@@ -49,9 +47,6 @@
 
 /* Change geometry on the existing panel, never remount the chat or animate
    its width: virtual history must only reflow once per layout switch. */
-.btw-expanded-backdrop{ position:fixed; inset:0; z-index:38; background:rgba(30,22,12,.18); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); }
-:root[data-theme="dark"] .btw-expanded-backdrop{ background:rgba(0,0,0,.4); }
-.btw-panel.btw-expanded{ inset:var(--app-offset-top,0px) 0 var(--keyboard-inset,0px); margin:auto; width:min(1080px,calc(100vw - 64px)); height:min(900px,calc(var(--app-height,100dvh) - 48px)); max-height:none; z-index:39; border-radius:24px; animation:none; }
 .btw-expanded .btw-head{ padding:16px 20px; }
 .btw-expanded .btw-title{ font-size:15px; }
 .btw-expanded .btw-sub{ font-size:12px; }
@@ -60,7 +55,6 @@
 .btw-expanded .btw-composer{ width:100%; max-width:840px; margin:0 auto; padding:12px 24px 16px; border-top:0; background:var(--surface); }
 .btw-expanded .btw-controls{ padding-top:10px; }
 @media (max-width:980px){
-  .btw-panel.btw-expanded{ width:calc(100vw - 20px); height:calc(var(--app-height,100dvh) - 20px); border-radius:20px; }
   .btw-expanded .btw-head{ padding:12px 14px; }
   .btw-expanded .btw-composer{ padding:8px 12px max(10px,env(safe-area-inset-bottom)); }
   .btw-input textarea{ font-size:16px; }

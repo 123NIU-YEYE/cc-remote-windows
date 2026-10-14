@@ -1,3 +1,4 @@
+import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
 import { lazy, Suspense, isValidElement, useCallback, useEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode } from "react";
@@ -539,7 +540,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     || (artifact.kind === "html" && mode === "preview");
 
   return (
-    <div className="artifact-panel" data-lock-horizontal-swipe="true"
+    <PanelFrame className="artifact-panel" label={artifact.kind === "gitdiff" ? "改动" : "文件预览"}
       onKeyDown={handlePanelKeyDown}>
       <PanelResizer ariaLabel="调整文件面板宽度" />
       <div className="artifact-head">
@@ -583,6 +584,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         {["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) && <button className="iconbtn"
           onClick={() => onRefresh?.(artifact.file, artifact.line)}
           aria-label="刷新文件" title="重新读取文件"><Icon name="refresh" size={17} /></button>}
+        <PanelExpandButton label={artifact.kind === "gitdiff" ? "改动" : "文件预览"} />
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
       <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}${
@@ -689,6 +691,6 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
           </>
         ) : null}
       </div>
-    </div>
+    </PanelFrame>
   );
 }

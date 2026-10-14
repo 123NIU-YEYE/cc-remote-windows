@@ -1,3 +1,4 @@
+import { PanelExpandButton } from "./RightPanelPresentation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { FilesListed } from "../protocol";
 import type { RelayWs } from "../ws";
@@ -72,6 +73,7 @@ export function FileBrowserPanel({ sid, initialPath, ws, hidden, onListen,
       <span className="artifact-path" title={visibleListing?.path}>{visibleListing?.path}</span>
       <button className="iconbtn" title="刷新目录" aria-label="刷新目录"
         onClick={() => browse(listing?.path ?? path, showHidden)}><Icon name="refresh" size={17} /></button>
+      <PanelExpandButton label="会话文件" />
       <button className="iconbtn" title="关闭文件浏览" aria-label="关闭文件浏览" onClick={onClose}><Icon name="close" size={18} /></button>
     </div>
     <form className="workspace-path" onSubmit={(event) => {
