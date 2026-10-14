@@ -84,6 +84,31 @@ test("remote Viewer expanded iframe keeps Tab and Escape within its panel", asyn
   })).toBe(true);
 });
 
+for (const policy of ["self", "none"]) {
+  test(`isolated expanded iframe Escape survives page CSP ${policy}`, async ({ page }) => {
+    test.skip(process.env.VIEWER_TEST_MODE !== "isolated", "Isolated HTML navigation coverage.");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole("button", { name: "打开远程预览" }).click();
+    await page.getByRole("button", { name: new RegExp(`^CSP ${policy}`) }).click();
+    const panel = page.locator(".remote-viewer-panel");
+    const frame = panel.frameLocator("iframe");
+    const input = frame.getByRole("textbox", { name: "保留草稿" });
+    await input.fill("中文草稿");
+    await panel.getByRole("button", { name: "居中展开远程预览" }).click();
+    await input.focus();
+    await page.keyboard.press("Escape");
+    await expect(panel).not.toHaveClass(/panel-expanded/);
+    await expect(input).toHaveValue("中文草稿");
+    expect(await frame.locator("body").evaluate(() => ({
+      mode: document.compatMode, language: document.documentElement.lang,
+      charset: document.characterSet,
+      ran: Object.hasOwn(window, "inlineScriptRan"),
+      policy: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
+    }))).toEqual({ mode: "CSS1Compat", language: "zh", charset: "UTF-8",
+      ran: false, policy: `script-src '${policy}'` });
+  });
+}
+
 test("Bridge blocks storage and native network access, and logout clears the frame", async ({ page }) => {
   test.skip(process.env.VIEWER_TEST_MODE === "isolated", "Opaque-frame behavior is specific to Bridge.");
   await page.getByRole("button", { name: "打开远程预览" }).click();
