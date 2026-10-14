@@ -3256,7 +3256,12 @@ for (const engine of ["claude", "codex"] as const) {
 
     // Nested attachment dialogs own Escape; closing them must not collapse BTW.
     await panel.getByRole("button", { name: "添加附件", exact: true }).click();
-    await expect(page.getByRole("dialog", { name: "添加附件", exact: true })).toBeVisible();
+    const attachmentDialog = page.getByRole("dialog", { name: "添加附件", exact: true });
+    await expect(attachmentDialog).toBeVisible();
+    for (const key of ["Tab", "Shift+Tab"]) {
+      await page.keyboard.press(key);
+      expect(await attachmentDialog.evaluate(node => node.contains(document.activeElement))).toBe(true);
+    }
     await page.keyboard.press("Escape");
     await expect(page.getByRole("dialog", { name: "添加附件", exact: true })).toHaveCount(0);
     await expect(panel).toHaveClass(/btw-expanded/);
@@ -3393,6 +3398,56 @@ for (const engine of ["claude", "codex"] as const) {
     await page.keyboard.press("Shift+Tab");
     await expect.poll(() => changes().length).toBe(1);
   });
+}
+
+for (const engine of ["claude", "codex"] as const) {
+  for (const popover of ["Token 用量", "计划进度"]) {
+    test(`side chat scope centered ${engine} ${popover} keeps backward navigation and Escape scoped`, async ({ page }) => {
+      await page.setViewportSize({ width: 1568, height: 1000 });
+      const relay = await mockRightPanelRelay(page, { visible: true, engine });
+      await page.goto("/");
+      const panel = page.locator(".btw-panel");
+      await expect(panel.getByRole("textbox")).toBeEnabled();
+      const sid = "btw-layout-child";
+      relay.emit({ type: "user_msg", sid, msg_id: "popover-user", prompt: "检查浮层键盘操作" });
+      relay.emit({ type: "turn_binding", sid, msg_id: "popover-user", turn_id: "popover-turn" });
+      relay.emit({ type: "delta", sid, message_id: "popover-answer", text: "正在检查" });
+      relay.emit({ type: "turn_usage", sid, turn_id: "popover-turn",
+        usage: { input_tokens: 32000, output_tokens: 1200 } });
+      relay.emit({ type: "turn_plan", sid, turn_id: "popover-turn", item_id: "popover-plan",
+        plan: [{ step: "验证浮层", status: "inProgress" }] });
+      await panel.getByRole("button", { name: "居中展开侧边对话", exact: true }).click();
+      const trigger = panel.getByRole("button", { name: popover === "Token 用量"
+        ? "查看 token 用量" : /查看计划进度/ });
+      const card = page.getByRole("dialog", { name: popover, exact: true });
+      await trigger.click();
+      await expect(card).toBeVisible();
+      // The informative portal remains open, but does not own keyboard focus.
+      const close = panel.getByRole("button", { name: "收起侧边对话", exact: true });
+      await close.focus();
+      await page.keyboard.press("Shift+Tab");
+      await expect(close).not.toBeFocused();
+      expect(await panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+      await expect(card).toBeVisible();
+      // Both boundary directions stay within the expanded panel as well.
+      for (const backward of [false, true]) {
+        await panel.evaluate((node, reverse) => {
+          const buttons = [...node.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')]
+            .filter(button => button.getClientRects().length);
+          (reverse ? buttons[0] : buttons.at(-1))!.focus();
+        }, backward);
+        await page.keyboard.press(backward ? "Shift+Tab" : "Tab");
+        expect(await panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+      }
+      await page.keyboard.press("Escape");
+      await expect(card).toHaveCount(0);
+      await expect(panel).toHaveClass(/btw-expanded/);
+      await page.keyboard.press("Escape");
+      await expect(panel).not.toHaveClass(/btw-expanded/);
+      expect(relay.commands.filter(c =>
+        ["set_perm", "set_collaboration_mode"].includes(String(c.type)))).toEqual([]);
+    });
+  }
 }
 
 test("side chat scope centered speed menu keeps keyboard focus inside its owner", async ({ page }) => {
