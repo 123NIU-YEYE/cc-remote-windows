@@ -790,6 +790,39 @@ async def activate_grant(client, cfg, grant):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("encoding,bom", [
+    ("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff"),
+])
+async def test_utf16_navigation_completes_over_real_http(tmp_path, publication, encoding, bom):
+    from urllib.parse import urlsplit
+
+    site, _ = publication
+    source = bom + "<!doctype html><p>中文 preview</p>".encode(encoding)
+    (Path(site.root) / "viewer/index.html").write_bytes(source)
+    async with live_viewer(tmp_path, publication) as (client, app, cfg, site):
+        grant = await create_grant(client, cfg)
+        await activate_grant(client, cfg, grant)
+        headers = {
+            "Host": urlsplit(grant["origin"]).netloc,
+            "Cookie": "; ".join(f"{key}={value}" for key, value in client.cookies.items()),
+            "Sec-Fetch-Dest": "iframe",
+        }
+        # Unlike an ASGI transport, an HTTP client rejects truncated framing.
+        async with httpx.AsyncClient(trust_env=False) as network:
+            response = await network.get(cfg.public_origin + site.entry, headers=headers)
+            assert response.status_code == 200
+            assert response.content == source
+            assert "content-length" not in response.headers
+            head = await network.head(cfg.public_origin + site.entry, headers=headers)
+            assert head.status_code == 200 and not head.content
+            assert "content-length" not in head.headers
+        raw = await client.get(grant["origin"] + site.entry)
+        assert raw.content == source
+        assert int(raw.headers["content-length"]) == len(source)
+        assert not app.state.viewers.peers["device"].pending
+
+
+@pytest.mark.asyncio
 async def test_real_resource_channel_multifile_range_cache_and_close(tmp_path, publication):
     async with live_viewer(tmp_path, publication) as (client, app, cfg, site):
         catalog = await client.get("/api/viewers")
@@ -811,11 +844,11 @@ async def test_real_resource_channel_multifile_range_cache_and_close(tmp_path, p
         assert navigated.content.replace(PREVIEW_ESCAPE_SCRIPT, b"", 1) == html.content
         assert navigated.content.index(PREVIEW_ESCAPE_SCRIPT) < navigated.content.index(b'<script type="module"')
         assert "cc-remote-preview-escape" in navigated.text
-        assert int(navigated.headers["content-length"]) == len(navigated.content)
+        assert "content-length" not in navigated.headers
         assert navigated.headers["vary"] == "Sec-Fetch-Dest, Accept, Upgrade-Insecure-Requests"
         assert "etag" not in navigated.headers and "accept-ranges" not in navigated.headers
         nav_head = await client.head(grant["origin"] + site.entry, headers=navigation_headers)
-        assert nav_head.headers["content-length"] == navigated.headers["content-length"]
+        assert "content-length" not in nav_head.headers
         assert not nav_head.content
         legacy_navigation = await client.get(grant["origin"] + site.entry, headers={
             "Accept": "text/html,application/xhtml+xml", "Upgrade-Insecure-Requests": "1",
