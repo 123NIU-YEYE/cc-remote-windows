@@ -7,3 +7,133 @@ web/node_modules/
 web/dist/
 web/test-results/
 *.log
+
+# Local runtime state: the DSH supervisor's lock, logs, and the live public
+# token. Ignoring it also keeps `git clean -fd` from rotating that token.
+.runtime/
+.ruff_cache/
+
+# Scratch and checkouts belonging to neighbouring projects (file2md, s2s, the
+# voice assistant) that share this working directory. None of them are part of
+# cc-remote and none contain tracked files.
+.codex-remote-edit/
+.codex_tmp_file2md/
+.tmp/
+.tmp-file2md-fix/
+.work-markdown-maker-176/
+.work-markdown-maker-176-original/
+backups/
+deploy_step_edge/
+file2md-debian-staging/
+file2md-validation-*/
+package-verify-*/
+release-package-*/
+remote_patch/
+remote_tmp/
+s2s/
+s2s_source_project/
+skill_overviews/
+tmp/
+tmp_screens/
+work/
+
+# Loose scratch scripts and artefacts from those same projects, left at the
+# repo root. Every pattern MUST stay root-anchored with a leading "/": without
+# it, globs like test_* also match tests/test_*.py and scripts/live/test_*.py,
+# which are tracked files of this repository.
+/.codex_*
+/.tmp_src_*
+/remote_*
+/inspect_*
+/probe_*
+/deploy_*
+/upload_*
+/restart_*
+/verify_*
+/read_*
+/fetch_*
+/patch_*
+/compare_*
+/bench_*
+/run_*
+/check_*
+/test_*
+/clean_*
+/diff_remote.py
+/memory_peak_workers2.py
+/smoke_mfr_workers2.py
+/apply_remote_model_paths.py
+/backup_remote_runtime.py
+/remap_*.py
+/repair_frontend.py
+/review7_remote.py
+/robust_patch_cancel.py
+/rollback_remote.py
+/search_serial.py
+/set_remote_ctx.py
+/silero_vad.py
+/validation_runner_remote.py
+/fix_*.py
+/launch*.py
+/bk_index.html*
+/current_*.js
+/final_index_good.html
+/index_*.html
+/remote_*.js
+/struct_middle.json
+/qwen_*
+/alpha_*.md
+/noflow_chain.sh
+/start_s2s_*.py
+/start-speech-to-speech-local.remote.sh
+/*.cpp
+/*.hpp
+/NOTICE
+/PACKAGE_README_zh.md
+/S2S_README_DRAFT.md
+/VOICE_ASSISTANT_ACCEPTANCE.md
+/*.tmp
+/jir_*.md
+/jir_*.txt
+/first_cloud.md
+/eq.md
+/ex_*.md
+/md-*.md
+/ocr-*.jsonl
+/ocr_head.txt
+/span_mid.txt
+/workers_memory_ab.out
+/mfr_*.out
+/moss-upload.*
+/new_skill_*.tmp
+/tmp_tracked_files.txt
+/trace_jir_*
+/tts_probe_upload.py
+/update_remote_changelog.py
+/ws_probe_upload.py
+
+# Remaining root-level leftovers from those neighbouring projects, matched by
+# exact name so nothing tracked can be caught.
+/CC-REMOTE-VPS-健康体检报告.md
+/cc-remote-package-20260824-v1.zip
+/cloud_batch_runner.py
+/current_probe_upload.py
+/delete_remote_default_env.py
+/file2md-packaging-redesign.tar.gz
+/file2md-startup-trace.jsonl
+/first_noflow.md
+/matcha_onnx_impl.py
+/performance_report_remote.py
+/readme_fix.py
+/report_watch.py
+/restore_orch.py
+/restore_start.py
+/tmp_CMakeLists.txt
+/work_remote_apply_ocr.py
+/work_span_pre.py
+
+# These live under cc-remote's own scripts/live/ but belong to the s2s and
+# voice-assistant projects; the repository's own live probes are tracked.
+/scripts/live/s2s_layered_benchmark.py
+/scripts/live/voice_bargein_benchmark.py
+/scripts/live/voice_pipeline_benchmark.py
