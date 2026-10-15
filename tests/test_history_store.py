@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,8 @@ from cc_remote.wrapper.history_store import (
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
+    _sqlite_int,
+    _source_identity,
     history_source_extends,
     materialize_history_turns,
 )
@@ -614,3 +617,85 @@ def test_materialized_turn_defers_images_and_bounds_large_prompt():
     assert "完整问题请展开" in turns[0]["prompt"]
     assert "images" not in turns[0]
     assert turns[0]["detailEventCount"] == 2
+
+
+# --- Windows device/inode identity ----------------------------------------
+# Windows reports st_dev as an UNSIGNED 64-bit volume serial number, which
+# exceeds SQLite's signed INTEGER maximum. Persisting it unmodified raised
+# `OverflowError: Python int too large to convert to SQLite INTEGER` and made
+# every history page and compact-index row unwritable on Windows.
+_SQLITE_MAX = 2**63 - 1
+_SQLITE_MIN = -(2**63)
+# Observed on a real Windows volume; deliberately above the signed maximum.
+_WINDOWS_DEVICE = 10565073836593449224
+
+
+def test_unsigned_windows_device_fits_sqlite_integer_range():
+    assert _WINDOWS_DEVICE > _SQLITE_MAX, "fixture must exceed the signed range"
+    mapped = _sqlite_int(_WINDOWS_DEVICE)
+    assert _SQLITE_MIN <= mapped <= _SQLITE_MAX
+
+
+def test_device_normalization_is_idempotent_and_lossless():
+    for value in (0, 1, _SQLITE_MAX, _SQLITE_MAX + 1, 2**64 - 1, _WINDOWS_DEVICE):
+        once = _sqlite_int(value)
+        # Idempotent: stored values must equal freshly read ones on every reread.
+        assert _sqlite_int(once) == once
+        # Lossless: the low 64 bits survive the round trip.
+        assert (once & 0xFFFFFFFFFFFFFFFF) == (value & 0xFFFFFFFFFFFFFFFF)
+
+
+def test_device_normalization_does_not_collide_distinct_devices():
+    values = [0, 1, _SQLITE_MAX, _SQLITE_MAX + 1, 2**64 - 1, _WINDOWS_DEVICE]
+    mapped = [_sqlite_int(value) for value in values]
+    assert len(set(mapped)) == len(values)
+
+
+def test_source_identity_normalizes_both_stat_fields():
+    class _Stat:
+        st_dev = _WINDOWS_DEVICE
+        st_ino = _WINDOWS_DEVICE + 1
+
+    device, inode = _source_identity(_Stat())
+    for value in (device, inode):
+        assert _SQLITE_MIN <= value <= _SQLITE_MAX
+
+
+def test_history_page_roundtrip_survives_an_out_of_range_device(tmp_path, monkeypatch):
+    """A page captured from a Windows device id must persist and read back.
+
+    `capture()` is driven through a stat result whose st_dev exceeds SQLite's
+    signed range, which is what a real Windows volume reports. Constructing the
+    fingerprint directly would bypass the code under test, so the stat call is
+    patched instead.
+    """
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_text('{"type":"first"}\n')
+    real_fstat = os.fstat
+
+    def windows_fstat(fd):
+        stat = real_fstat(fd)
+        # Only the fields `capture()` reads are needed; st_dev carries the
+        # unsigned Windows value that used to overflow SQLite.
+        return SimpleNamespace(
+            st_dev=_WINDOWS_DEVICE,
+            st_ino=stat.st_ino,
+            st_size=stat.st_size,
+            st_mtime_ns=stat.st_mtime_ns,
+        )
+
+    monkeypatch.setattr(os, "fstat", windows_fstat)
+    source = HistorySourceFingerprint.capture(source_path)
+    monkeypatch.undo()
+
+    # The captured device must be storable, not the raw unsigned value.
+    assert _SQLITE_MIN <= source.device <= _SQLITE_MAX
+
+    store = HistoryIndexStore(tmp_path / "state")
+    assert store.put_page(
+        "session-1", "codex", source, before=None, limit=4,
+        page=_page("first", more=True),
+    ) is True
+    assert store.get_page(
+        "session-1", "codex", source, before=None, limit=4,
+    ) == _page("first", more=True)

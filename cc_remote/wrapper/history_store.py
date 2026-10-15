@@ -81,6 +81,29 @@ def _historical_turn_failure(value: Any) -> str:
     return _GENERIC_HISTORY_TURN_FAILURE
 
 
+def _sqlite_int(value: int) -> int:
+    """Map a filesystem identity number into SQLite's signed 64-bit range.
+
+    Windows reports `st_dev` as an UNSIGNED 64-bit volume serial number, so it
+    routinely exceeds SQLite's signed INTEGER maximum (observed:
+    10565073836593449224 > 9223372036854775807). Persisting that value raised
+    `OverflowError: Python int too large to convert to SQLite INTEGER` and made
+    every history page and compact index row unwritable on Windows.
+
+    Reinterpreting the value as two's complement is lossless and reversible, so
+    two distinct devices can never collide. The mapping is idempotent: a value
+    already inside the signed range is returned unchanged, which keeps stored
+    fingerprints equal to freshly read ones on every platform.
+    """
+    wrapped = value & 0xFFFFFFFFFFFFFFFF
+    return wrapped - (1 << 64) if wrapped >= (1 << 63) else wrapped
+
+
+def _source_identity(stat: os.stat_result) -> tuple[int, int]:
+    """Return the normalized (device, inode) pair for one open file."""
+    return _sqlite_int(int(stat.st_dev)), _sqlite_int(int(stat.st_ino))
+
+
 @dataclass(frozen=True)
 class HistorySourceFingerprint:
     """Identity of the exact transcript snapshot used to build a page."""
@@ -107,10 +130,11 @@ class HistorySourceFingerprint:
                 source.seek(max(0, stat.st_size - _FINGERPRINT_SAMPLE_BYTES))
                 tail = source.read(_FINGERPRINT_SAMPLE_BYTES)
                 digest.update(tail)
+        device, inode = _source_identity(stat)
         return cls(
             path=resolved,
-            device=int(stat.st_dev),
-            inode=int(stat.st_ino),
+            device=device,
+            inode=inode,
             size=int(stat.st_size),
             mtime_ns=int(stat.st_mtime_ns),
             head_sha256=hashlib.sha256(head).hexdigest(),
@@ -173,9 +197,10 @@ def history_source_extends(
     try:
         with open(current.path, "rb") as source:
             stat = os.fstat(source.fileno())
+            current_device, current_inode = _source_identity(stat)
             if (
-                int(stat.st_dev) != current.device
-                or int(stat.st_ino) != current.inode
+                current_device != current.device
+                or current_inode != current.inode
                 or int(stat.st_size) < current.size
             ):
                 return False
@@ -1072,8 +1097,7 @@ class HistoryIndexStore:
                 stat = os.fstat(source.fileno())
             except OSError:
                 return None
-            device = int(stat.st_dev)
-            inode = int(stat.st_ino)
+            device, inode = _source_identity(stat)
             target_size = int(stat.st_size)
             if snapshot_size is not None:
                 target_size = min(target_size, max(0, int(snapshot_size)))
@@ -1400,8 +1424,9 @@ class HistoryIndexStore:
         try:
             with open(source.path, "rb") as current:
                 stat = os.fstat(current.fileno())
-                if (int(stat.st_dev) != source.device
-                        or int(stat.st_ino) != source.inode
+                current_device, current_inode = _source_identity(stat)
+                if (current_device != source.device
+                        or current_inode != source.inode
                         or int(stat.st_size) < source.size):
                     return None
                 sample_size = min(old_size, _FINGERPRINT_SAMPLE_BYTES)
