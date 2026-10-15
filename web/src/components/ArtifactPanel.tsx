@@ -9,6 +9,7 @@ import type {
   PreviewAuthorizationState,
 } from "../reducer";
 import { Icon } from "../icons";
+import { LocalFileLink, WebLink } from "./LinkPreview";
 import { PanelTabs, type RightPanelView } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
 import { classifyPreviewTarget } from "../preview-path";
@@ -512,16 +513,13 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     a: ({ href, children, title, id }) => {
       const target = classifyPreviewTarget(artifact.file, href || "");
       if (target.kind === "external") {
-        return <a href={target.value} target="_blank" rel="noopener noreferrer"
-          title={title} id={id}>{children}</a>;
+        return <WebLink href={target.value} title={title} id={id}>{children}</WebLink>;
       }
       if (target.kind === "anchor") return <a href={target.value} title={title} id={id}>{children}</a>;
       if (target.kind === "local" && onOpenFile) {
         const source = parseLocalFileTarget(href || "");
-        return <a href="#" title={target.value} id={id} onClick={(event) => {
-          event.preventDefault();
-          onOpenFile(target.value, source?.line);
-        }}>{children}</a>;
+        return <LocalFileLink id={id} location={source?.line ? `${target.value}:${source.line}` : target.value}
+          onOpen={() => onOpenFile(target.value, source?.line)}>{children}</LocalFileLink>;
       }
       return <span id={id} className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
     },

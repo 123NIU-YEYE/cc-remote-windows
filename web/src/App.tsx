@@ -371,6 +371,10 @@ export default function App() {
     returnToDocked: boolean;
   } | null>(null);
   const btwChatViewRef = useRef<ChatViewHandle>(null);
+  // A user action owns one focus request; restored panels and streaming updates
+  // must not move the caret away from whatever the user is editing.
+  const [btwFocusScope, setBtwFocusScope] = useState<string | null>(null);
+  const consumeBtwFocus = useCallback(() => setBtwFocusScope(null), []);
   const [btwPanelScopes, setBtwPanelScopes] = useState(
     () => readBtwPanelScopes(sessionStorage));
   const [rightView, setRightView] = useState<RightPanelView>(
@@ -955,6 +959,7 @@ export default function App() {
   const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
   useEffect(() => {
     setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
+    setBtwFocusScope(current => current !== rightPanelKey ? null : current);
   }, [rightPanelKey]);
   // Questions, hydration and completion receipts must agree with the rendered
   // slot, including when an agent or artifact covers a retained side chat.
@@ -5346,6 +5351,7 @@ export default function App() {
       requestParents.delete(oldest);
     }
     setBtwOpeningFor(parentSid, true);
+    setBtwFocusScope(panelScope("btw"));
   };
   const openBtw = (expanded = false) => {
     if (!confirmArtifactDiscard()) return;
@@ -5356,6 +5362,7 @@ export default function App() {
       setFileBrowser(null);
     }
     setRightView("btw");
+    setBtwFocusScope(panelScope("btw"));
     setExpandedPanel(expanded ? { scope: panelScope("btw"), returnToDocked: false } : null);
     setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
     if (!activeBtwGroup && !btwOpening) createBtw();
@@ -5367,6 +5374,7 @@ export default function App() {
   };
   const dockPanel = () => {
     btwChatViewRef.current?.prepareLayoutChange();
+    if (visibleRightPanel === "btw") setBtwFocusScope(rightPanelKey);
     setExpandedPanel(null);
   };
   const togglePanelExpanded = () => {
@@ -5378,6 +5386,7 @@ export default function App() {
     } else if (!visibleRightPanel) openBtw(true);
     else if (rightPanelKey) {
       btwChatViewRef.current?.prepareLayoutChange();
+      if (visibleRightPanel === "btw") setBtwFocusScope(rightPanelKey);
       setExpandedPanel({ scope: rightPanelKey, returnToDocked: true });
     }
   };
@@ -5385,6 +5394,7 @@ export default function App() {
     const parentSid = visibleParentSid;
     if (!parentSid) return;
     dispatch({ type: "select_btw", parentSid, btwSid: sid });
+    setBtwFocusScope(panelScope("btw"));
   };
   const sendBtw = (
     prompt: string, images?: QueryImg[], files?: QueryFile[], steer = false,
@@ -6169,6 +6179,8 @@ export default function App() {
           return <Suspense fallback={null}>
             <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
             engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
+            focusRequested={btwFocusScope === rightPanelKey}
+            onFocusConsumed={consumeBtwFocus}
             chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
               const runtime = state.runtimes[chat.sid];
               const prompt = (runtime?.btwReplayView?.turns ?? runtime?.turns)?.find(

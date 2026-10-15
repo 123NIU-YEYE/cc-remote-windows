@@ -37,6 +37,7 @@ from cc_remote.relay.auth import (
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.devices import DeviceStore
+from cc_remote.relay.link_preview import LinkPreviewService, PreviewUnavailable
 from cc_remote.relay.viewer import ViewerError, ViewerRelay, main_cookie_name
 from cc_remote.relay.pairing import RelayHub
 from cc_remote.relay.push import (
@@ -548,6 +549,8 @@ def create_app(
     validate_relay_config(cfg)
     app = FastAPI(title="cc-remote relay")
     sessions = SessionRegistry(cfg.session_registry_cap)
+    link_previews = LinkPreviewService()
+    link_preview_limiter = LoginRateLimiter(max_per_ip=120)
     devices = device_store or DeviceStore(cfg.device_db_path)
     push_store: PushSubscriptionStore | None = None
     push_dispatcher: PushDispatcher | None = None
@@ -803,6 +806,27 @@ def create_app(
             samesite="strict",
         )
         return response
+
+    @app.post("/api/link-preview")
+    async def link_preview(req: Request):
+        headers = {"Cache-Control": "no-store"}
+        if not _request_origin_allowed(req, cfg, allow_missing=False):
+            return JSONResponse({"error": "origin_denied"}, status_code=403, headers=headers)
+        if await _active_claims(req, cfg, sessions) is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401, headers=headers)
+        if link_preview_limiter.limited(_request_ip(req)):
+            return JSONResponse({"error": "rate_limited"}, status_code=429, headers=headers)
+        try:
+            async with asyncio.timeout(2):
+                body = await _read_json_limited(req, 8192)
+            if (not isinstance(body, dict) or not isinstance(body.get("url"), str)
+                    or not isinstance(body.get("detail", "page"), str)
+                    or body.get("detail", "page") not in {"page", "icon"}):
+                raise ValueError
+            result = await link_previews.get(body["url"], icon_only=body.get("detail") == "icon")
+        except (_BodyTooLarge, ValueError, PreviewUnavailable, TimeoutError):
+            return JSONResponse({}, headers=headers)
+        return JSONResponse(result, headers=headers)
 
     @app.get("/api/session")
     async def session_status(req: Request) -> JSONResponse:

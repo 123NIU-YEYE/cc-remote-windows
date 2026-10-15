@@ -84,6 +84,8 @@ interface Props {
     needsAnswer: boolean;
   }>;
   opening?: boolean;
+  focusRequested?: boolean;
+  onFocusConsumed?: () => void;
   chatViewRef?: Ref<ChatViewHandle>;
   active: RightPanelView;
   hasArtifact: boolean;
@@ -145,6 +147,7 @@ export function BtwPanel(p: Props) {
   const importingRef = useRef(false);
   const noticeTimerRef = useRef<number | null>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const composerWasFocused = useRef(false);
   const pasteGuard = useClipboardPasteGuard(taRef, p.draftKey);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
@@ -186,6 +189,34 @@ export function BtwPanel(p: Props) {
   const hasText = input.trim().length > 0 || draft.pastes.length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
   const hasContent = hasText || hasAttachments;
+
+  const { focusRequested, onFocusConsumed, opening, sid } = p;
+  useEffect(() => {
+    if (!focusRequested) return;
+    // The first fork (or a new sibling) may arrive after the panel is visible.
+    // If the user starts doing something else in that gap, discard the intent.
+    if (opening) {
+      const cancel = () => onFocusConsumed?.();
+      document.addEventListener("pointerdown", cancel);
+      document.addEventListener("keydown", cancel);
+      return () => {
+        document.removeEventListener("pointerdown", cancel);
+        document.removeEventListener("keydown", cancel);
+      };
+    }
+    const textarea = taRef.current;
+    const panel = textarea?.closest(".btw-panel");
+    const otherOverlay = [...document.querySelectorAll<HTMLElement>(
+      '[role="dialog"], [aria-modal="true"], dialog[open], [role="menu"]',
+    )].some(node => node !== panel && node.getClientRects().length > 0);
+    if (textarea && sid && !inputLocked && !otherOverlay) {
+      // A reopened draft starts at its end; moving the mounted panel preserves
+      // the user's existing caret/selection.
+      if (!composerWasFocused.current) textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      textarea.focus({ preventScroll: true });
+    }
+    onFocusConsumed?.();
+  }, [focusRequested, onFocusConsumed, opening, sid, inputLocked]);
 
   const updateDraft = useCallback((
     update: (current: ComposerDraft) => ComposerDraft,
@@ -603,6 +634,7 @@ export function BtwPanel(p: Props) {
             <textarea
               ref={taRef}
               data-btw-composer
+              onFocus={() => { composerWasFocused.current = true; }}
               value={input}
               placeholder={lockReason ?? (awaitingFirstChat ? "正在打开…"
                 : runtimeBusy
