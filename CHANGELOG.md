@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.16
+
+Restore Claude input after completed background responses and include the centered
+side-chat slash shortcut from the unpublished v4.0.15 tag. Wire protocol v74 is
+unchanged. See the bilingual [release notes](docs/releases/v4.0.16.md).
+
+- Preserve the original response owner when later task notifications join the same response, including journal replay after reconnect.
+- Accept the next message after the real completion without confusing unrelated continuations or queued human input.
+- Focus centered Claude/Codex side-chat input with `/`; keep main-chat focus when side chat is docked or hidden.
+- Existing independent Claude services need the documented drained owner upgrade; updating only Wrapper does not activate the service fix.
+
 ## v4.0.15
 
 Focus the correct composer with `/` when a side chat is expanded in the center.
