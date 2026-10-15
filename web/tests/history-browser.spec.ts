@@ -420,6 +420,104 @@ for (const engine of ["claude", "codex"] as const) {
   });
 }
 
+test("side chat scope keeps Claude's running spark on a successor after replay", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { visible: true, engine: "claude" });
+  const sid = "btw-layout-child";
+  const panel = page.locator(".btw-panel");
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some(c => c.type === "sync_btw")).toBe(true);
+  const replay = (second = false) => {
+    relay.emit({ type: "replay_start", sid, generation: "layout-generation",
+      from_seq: 0, to_seq: second ? 200 : 100, rebuild: true, truncated: false });
+    relay.emit({ type: "user_msg", sid, msg_id: "first", prompt: "first question" });
+    relay.emit({ type: "delta", sid, message_id: "first-answer", turn_id: "first",
+      channel: "final", text: "first answer" });
+    if (second) {
+      relay.emit({ type: "turn_end", sid, turn_id: "first-answer", checkpoint_id: "native-first",
+        result: { subtype: "success", duration_ms: 1000, is_error: false } });
+      relay.emit({ type: "user_msg", sid, msg_id: "second", prompt: "second question" });
+      relay.emit({ type: "delta", sid, message_id: "second-thinking", turn_id: "second",
+        channel: "thinking", text: "second thinking" });
+    }
+    relay.emit({ type: "state", sid, state: "running", msg_id: second ? "second" : "first" });
+    relay.emit({ type: "replay_end", sid, to_seq: second ? 200 : 100, truncated: false });
+  };
+  replay();
+  await expect(panel.locator(".turn-working")).toHaveCount(1);
+  await panel.getByRole("button", { name: "收起侧边对话", exact: true }).click();
+  await page.keyboard.press("Control+Shift+e");
+  await expect(panel).toBeVisible();
+  replay();
+  await expect(panel.locator(".turn-working")).toHaveCount(1);
+  relay.emit({ type: "turn_end", sid, seq: 101, turn_id: "first-answer", checkpoint_id: "native-first",
+    result: { subtype: "success", duration_ms: 1000, is_error: false } });
+  relay.emit({ type: "state", sid, seq: 102, state: "idle" });
+  await expect(panel.locator(".turn-working")).toHaveCount(0);
+  await panel.locator("textarea").fill("second question");
+  await panel.locator("textarea").press("Enter");
+  await expect.poll(() => relay.commands.some(c => c.type === "query")).toBe(true);
+  const sent = relay.commands.findLast(c => c.type === "query")!;
+  relay.emit({ type: "state", sid, seq: 103, state: "running" });
+  relay.emit({ type: "user_msg", sid, seq: 104, msg_id: String(sent.msg_id), prompt: "second question" });
+  relay.emit({ type: "delta", sid, seq: 105, message_id: "second-thinking", turn_id: String(sent.msg_id),
+    channel: "thinking", text: "second thinking" });
+  await expect(panel.locator(".turn").filter({ hasText: "second question" }).locator(".turn-working")).toHaveCount(1);
+  await expect(panel.locator(".turn").filter({ hasText: "first question" }).locator(".turn-working")).toHaveCount(0);
+  replay(true);
+  await expect(panel.locator(".turn").filter({ hasText: "second question" }).locator(".turn-working")).toHaveCount(1);
+});
+
+test("side chat scope keeps Claude's running spark after hide, reopen and cold replay", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { visible: true, engine: "claude" });
+  const sid = "btw-layout-child";
+  const panel = page.locator(".btw-panel");
+  await page.goto("/");
+  await expect.poll(() => relay.commands.some(c => c.type === "sync_btw")).toBe(true);
+  relay.emit({ type: "user_msg", sid, msg_id: "active-question", prompt: "正在执行的侧聊", seq: 1 });
+  relay.emit({ type: "state", sid, state: "running", msg_id: "active-question", seq: 2 });
+  relay.emit({ type: "delta", sid, message_id: "active-answer", channel: "commentary",
+    text: "正在检查文件", seq: 3 });
+  await expect(panel.locator(".turn-working")).toHaveCount(1);
+  const replay = async (finished = false) => {
+    relay.emit({ type: "replay_start", sid, generation: "layout-generation",
+      from_seq: 0, to_seq: 10, rebuild: true, truncated: false });
+    relay.emit({ type: "user_msg", sid, msg_id: "active-question", prompt: "正在执行的侧聊" });
+    relay.emit({ type: "delta", sid, message_id: "active-answer", channel: "commentary",
+      text: "正在检查文件" });
+    if (finished) {
+      relay.emit({ type: "turn_end", sid, turn_id: "active-answer", checkpoint_id: "active-question",
+        result: { subtype: "success", duration_ms: 2000, is_error: false } });
+    }
+    relay.emit({ type: "state", sid, state: finished ? "idle" : "running",
+      msg_id: finished ? null : "active-question" });
+    relay.emit({ type: "replay_end", sid, to_seq: 10, truncated: false });
+    if (!finished) await expect(panel.getByText("正在检查文件", { exact: true })).toBeVisible();
+    await expect(panel.locator(".turn-working")).toHaveCount(finished ? 0 : 1);
+    if (finished) await expect(panel.locator(".turn-done-mark")).toHaveCount(1);
+  };
+  for (const centered of [false, true]) {
+    await panel.getByRole("button", { name: "收起侧边对话", exact: true }).click();
+    await expect(panel).toHaveCount(0);
+    const syncs = relay.commands.filter(c => c.type === "sync_btw").length;
+    await page.keyboard.press(centered ? "Control+Shift+e" : "Control+Shift+k");
+    await expect.poll(() => relay.commands.filter(c => c.type === "sync_btw").length).toBeGreaterThan(syncs);
+    await replay();
+    // No new model token is needed to bring back the working indicator.
+    await expect(panel.locator(".turn-working")).toBeVisible();
+  }
+  const syncs = relay.commands.filter(c => c.type === "sync_btw").length;
+  await page.reload();
+  await expect.poll(() => relay.commands.filter(c => c.type === "sync_btw").length).toBeGreaterThan(syncs);
+  await replay();
+  await panel.getByRole("button", { name: "收起侧边对话", exact: true }).click();
+  await expect(panel).toHaveCount(0);
+  const finalSyncs = relay.commands.filter(c => c.type === "sync_btw").length;
+  await page.keyboard.press("Control+Shift+k");
+  await expect.poll(() => relay.commands.filter(c => c.type === "sync_btw").length).toBeGreaterThan(finalSyncs);
+  await replay(true);
+  expect(relay.commands.some(c => ["query", "steer", "open_btw", "close_btw"].includes(String(c.type)))).toBe(false);
+});
+
 for (const running of [false, true]) {
   test(`path-prefixed prompts send verbatim as ${running ? "steering" : "a new message"}`, async ({ page }) => {
     const relay = await mockRightPanelRelay(page, { retained: false });

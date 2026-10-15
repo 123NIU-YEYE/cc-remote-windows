@@ -164,6 +164,51 @@ try {
   event({ type: "delta", message_id: "live-answer", text: "stream visible immediately", channel: "final" });
   assert.match(panel(), /stream visible immediately/,
     "the replay barrier must not hold back ordinary live streaming");
+
+  // Claude BTW has no native TurnBinding. SyncBtw must restore its exact live
+  // owner even if no further model event arrives after the panel is reopened.
+  for (const cold of [false, true]) {
+    if (cold) state = { ...state, runtimes: { ...state.runtimes, [sid]: createRuntime() } };
+    event({ type: "snapshot", state: "running", generation: "g" });
+    event({ type: "replay_start", generation: "g", from_seq: 0, to_seq: 300,
+      truncated: false, rebuild: true });
+    event({ type: "user_msg", msg_id: "old-question", prompt: "finished question" });
+    event({ type: "delta", message_id: "old-reply", text: "finished reply", channel: "final" });
+    event({ type: "turn_end", turn_id: "old-reply", checkpoint_id: "old-question",
+      result: { subtype: "success", duration_ms: 1000, is_error: false } });
+    event({ type: "user_msg", msg_id: "active-question", prompt: "still processing" });
+    event({ type: "delta", message_id: "active-reply", text: "checking files", channel: "commentary" });
+    event({ type: "state", state: "running", msg_id: "active-question" });
+    event({ type: "replay_end", to_seq: 300, truncated: false });
+    assert.equal(state.runtimes[sid].liveOwner?.turnId, "active-question");
+    assert.equal(panel().split('class="turn-working"').length - 1, 1,
+      "both warm reopen and cold refresh keep exactly one running spark");
+    event({ type: "turn_end", turn_id: "active-reply", checkpoint_id: "active-question",
+      result: { subtype: "success", duration_ms: 1000, is_error: false }, seq: 301 });
+    event({ type: "state", state: "idle", seq: 302 });
+    assert.doesNotMatch(panel(), /class="turn-working"/);
+  }
+
+  for (const [owner, continuation, expected] of [
+    ["old-question", false, null],
+    ["missing-question", false, null],
+    ["active-question", true, "active-question"],
+  ] as const) {
+    event({ type: "replay_start", generation: "g", from_seq: 0, to_seq: 302,
+      truncated: false });
+    event({ type: "state", state: "running", msg_id: owner, continuation });
+    event({ type: "replay_end", to_seq: 302, truncated: false });
+    assert.equal(state.runtimes[sid].liveOwner?.turnId ?? null, expected,
+      "only an exact live owner can restore activity on a completed row");
+    assert.equal(panel().split('class="turn-working"').length - 1, expected ? 1 : 0);
+  }
+  event({ type: "replay_start", generation: "g", from_seq: 0, to_seq: 302,
+    truncated: false });
+  event({ type: "state", state: "idle" });
+  event({ type: "replay_end", to_seq: 302, truncated: false });
+  assert.equal(state.runtimes[sid].liveOwner, null);
+  assert.doesNotMatch(panel(), /class="turn-working"/,
+    "completion while hidden must not retain the old running spark");
 } finally {
   await harness.close();
 }
