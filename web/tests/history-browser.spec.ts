@@ -3424,6 +3424,90 @@ for (const engine of ["claude", "codex"] as const) {
 }
 
 for (const engine of ["claude", "codex"] as const) {
+  test(`side chat scope slash focuses the centered ${engine} composer and otherwise the main composer`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { visible: true, engine });
+    await page.goto("/");
+    const panel = page.locator(".btw-panel");
+    const sideInput = panel.getByRole("textbox");
+    const mainInput = page.locator("textarea[data-chat-composer]").first();
+    const close = panel.getByRole("button", { name: "收起侧边对话", exact: true });
+    await expect(sideInput).toBeEnabled();
+    await expect(mainInput).toBeEnabled();
+    await mainInput.fill("主会话草稿");
+
+    // A docked side chat never takes the main composer's slash shortcut.
+    await close.focus();
+    await page.keyboard.press("/");
+    await expect(mainInput).toBeFocused();
+    await expect(mainInput).toHaveValue("主会话草稿");
+    await page.keyboard.press("/");
+    await expect(mainInput).toHaveValue("主会话草稿/");
+
+    await page.keyboard.press("Meta+Shift+e");
+    await expect(panel).toHaveClass(/btw-expanded/);
+    await close.focus();
+    await page.keyboard.press("/");
+    await expect(sideInput).toBeFocused();
+    await expect(sideInput).toHaveValue("");
+    await sideInput.fill("侧聊草稿");
+    await page.keyboard.press("/");
+    await expect(sideInput).toHaveValue("侧聊草稿/");
+
+    // A nested modal still owns focus, even when its owner is centered BTW.
+    await panel.getByRole("button", { name: "添加附件", exact: true }).click();
+    const attachments = page.getByRole("dialog", { name: "添加附件", exact: true });
+    await expect(attachments).toBeVisible();
+    await attachments.getByRole("button").first().focus();
+    await page.keyboard.press("/");
+    expect(await attachments.evaluate(node => node.contains(document.activeElement))).toBe(true);
+    await page.keyboard.press("Escape");
+    await expect(attachments).toHaveCount(0);
+    await close.focus();
+    await page.keyboard.press("/");
+    await expect(sideInput).toBeFocused();
+
+    await page.keyboard.press("Meta+Shift+e");
+    await expect(panel).not.toHaveClass(/btw-expanded/);
+    await close.focus();
+    await page.keyboard.press("/");
+    await expect(mainInput).toBeFocused();
+    await page.keyboard.press("Control+Shift+k");
+    await expect(panel).toHaveCount(0);
+    await mainInput.evaluate(node => node.blur());
+    await page.keyboard.press("/");
+    await expect(mainInput).toBeFocused();
+
+    // Opening directly from hidden also routes slash to the retained side draft.
+    await page.keyboard.press("Meta+Shift+e");
+    await expect(panel).toHaveClass(/btw-expanded/);
+    await expect(sideInput).toBeEnabled();
+    await close.focus();
+    await page.keyboard.press("/");
+    await expect(sideInput).toBeFocused();
+    await expect(sideInput).toHaveValue("侧聊草稿/");
+    await expect(mainInput).toHaveValue("主会话草稿/");
+    expect(relay.commands.some(c => ["query", "steer", "interrupt", "open_btw", "close_btw"]
+      .includes(String(c.type)))).toBe(false);
+  });
+}
+
+test("side chat scope slash never falls through a read-only centered chat", async ({ page }) => {
+  await page.setViewportSize({ width: 1568, height: 1000 });
+  await mockRightPanelRelay(page, { visible: true, btwReadOnly: true });
+  await page.goto("/");
+  const panel = page.locator(".btw-panel");
+  await expect(panel.getByRole("textbox")).toBeDisabled();
+  await page.keyboard.press("Meta+Shift+e");
+  await expect(panel).toHaveClass(/btw-expanded/);
+  const close = panel.getByRole("button", { name: "收起侧边对话", exact: true });
+  await close.focus();
+  await page.keyboard.press("/");
+  await expect(close).toBeFocused();
+  await expect(page.locator("textarea[data-chat-composer]").first()).not.toBeFocused();
+});
+
+for (const engine of ["claude", "codex"] as const) {
   test(`side chat scope centered Shift+Tab navigates without changing ${engine} mode`, async ({ page, browserName }) => {
     await page.setViewportSize({ width: 1568, height: 1000 });
     const relay = await mockRightPanelRelay(page, { visible: true, engine });
@@ -3512,7 +3596,7 @@ for (const expanded of [false, true]) {
     await panel.getByRole("button", { name: /^速度：/ }).click();
     const menu = page.getByRole("menu", { name: /的速度$/ });
     await expect(menu).toBeVisible();
-    for (const key of ["Control+Shift+e", "Meta+Shift+e", "Control+Shift+k", "Meta+Shift+k"]) {
+    for (const key of ["/", "Control+Shift+e", "Meta+Shift+e", "Control+Shift+k", "Meta+Shift+k"]) {
       await page.keyboard.press(key);
       await expect(menu).toBeVisible();
       await expect(menu.getByRole("menuitemradio").first()).toBeFocused();
@@ -3679,6 +3763,11 @@ test("right panel layout centered diff and agent details keep their own content"
   await diff.getByRole("button", { name: "居中展开改动", exact: true }).click();
   await expect(diff).toHaveClass(/panel-expanded/);
   await expectRightPanelSpace(page, false);
+  // A non-chat modal must not redirect slash to the main composer behind it.
+  const dockDiff = diff.getByRole("button", { name: "收回右侧", exact: true });
+  await dockDiff.focus();
+  await page.keyboard.press("/");
+  await expect(dockDiff).toBeFocused();
   const original = await diff.elementHandle();
   await page.keyboard.press("Control+Shift+e");
   await expect(diff).not.toHaveClass(/panel-expanded/);
