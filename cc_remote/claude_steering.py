@@ -150,7 +150,7 @@ class PendingSteers:
                 # and must settle at its Result. Keep explicit task origins;
                 # they can still have their own, later terminal boundary.
                 for entry in self._backgrounds.values():
-                    if entry["origin_key"] is None:
+                    if entry["implicit"]:
                         entry["managed"] = True
             message = value.get("message")
             content = message.get("content") if isinstance(message, dict) else None
@@ -168,6 +168,11 @@ class PendingSteers:
                     identity = start["id"]
                     origin_key, origin_data = start.get("origin_key"), start.get("origin")
                     managed = start.get("managed", managed_active)
+                    # Older journals do not record implicit provenance. Their
+                    # retained request prefix still establishes it before any
+                    # subsequent annotation refines the same identity.
+                    implicit = start.get("implicit", self._backgrounds.get(identity, {}).get(
+                        "implicit", origin_key is None))
                 else:
                     origin_key = _origin_key(origin) if injected else None
                     origin_data = origin if injected else None
@@ -177,18 +182,20 @@ class PendingSteers:
                     # response for which the CLI may never send a Result.
                     identity = next((key for key, entry in self._backgrounds.items()
                                      if entry["managed"] == managed
-                                     and entry["origin_key"] in (None, origin_key)), None)
+                                     and (entry["implicit"] or entry["origin_key"] == origin_key)), None)
+                    implicit = self._backgrounds.get(identity, {}).get("implicit", not injected)
                     identity = identity or "background-" + hashlib.sha256(json.dumps(
                         [value.get("uuid"), origin_key], sort_keys=True).encode()).hexdigest()[:32]
                 self._backgrounds[identity] = {
                     "origin_key": origin_key, "origin": origin_data, "managed": managed,
+                    "implicit": implicit,
                 }
                 self.background_id = identity
                 self.background_origin = origin_key
                 self.background_origin_data = origin_data
                 value = {**value, "__cc_background_start": {
                     "id": identity, "origin_key": self.background_origin,
-                    "origin": self.background_origin_data, "managed": managed,
+                    "origin": self.background_origin_data, "managed": managed, "implicit": implicit,
                 }}
             elif value.get("type") == "result":
                 ended = background_end_ids(value)
@@ -203,9 +210,12 @@ class PendingSteers:
                     elif kind is None:
                         local_ends = tuple(self._backgrounds)
                 elif isinstance(origin, dict) and kind not in (None, "human"):
-                    # A precise unrelated origin remains authoritative.
+                    # An implicit main response has no replayed original input.
+                    # Mid-response task inputs describe absorbed notifications,
+                    # not a replacement owner: the Result can name the omitted
+                    # original run. Explicit unrelated origins still stay open.
                     local_ends = tuple(key for key, entry in self._backgrounds.items()
-                                       if entry["origin_key"] in (None, _origin_key(origin)))
+                                       if entry["implicit"] or entry["origin_key"] == _origin_key(origin))
                 # An older service can journal some ends without knowing about
                 # the controller's implicit pre-input claim. Retain its exact
                 # boundaries and include locally established consumption too.

@@ -81,6 +81,14 @@ retain their independent lifetime: after the main response ends, normal prompts
 are accepted while those children continue, and later native activity can start
 another main continuation.
 
+An implicit response retains its original ownership when later task inputs are
+absorbed into it. Those inputs may identify different runs from the final Result;
+they do not replace the response's missing original input. This provenance is
+journaled so controller replacement preserves the same terminal boundary, while
+explicit unrelated continuations and pending human inputs remain separate. The
+fix must reach the service owner using the drain procedure below: a Wrapper-only
+upgrade cannot retire an older owner's stranded journal boundary.
+
 Owners advertising `human_result_receipts` also recognize a Result whose
 `user_message_uuid` / `user_message_uuids` includes the latest consumed human
 input, even when native Code labels its origin `task-notification`. They journal
