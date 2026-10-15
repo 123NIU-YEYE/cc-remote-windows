@@ -2,6 +2,19 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.17
+
+Add webpage previews and automatic site icons, refine file-path tooltips, and focus
+explicitly opened side chats. Wire protocol v74 is unchanged.
+See the bilingual [release notes](docs/releases/v4.0.17.md).
+
+- Preview public links in chat, side chats and Markdown files without shifting the surrounding content.
+- Discover site icons automatically; keep hover cards open while metadata loads and replace old popovers immediately when moving between links.
+- Wrap local paths in compact rounded tooltips while preserving the exact copied path.
+- Focus explicitly opened Claude/Codex side-chat composers without stealing focus when returning to a session.
+- Restore the running indicator on the exact current Claude side-chat turn after reopening or refreshing, including when an older background response claim remains present.
+- Bound source image dimensions and normalize the first frame to a static thumbnail; cap decoder concurrency and include Pillow in Relay packages.
+
 ## v4.0.16
 
 Restore Claude input after completed background responses and include the centered
