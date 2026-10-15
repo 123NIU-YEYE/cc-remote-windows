@@ -227,6 +227,10 @@ export interface SessionRuntime {
   serviceTier: string | null;
   replaying: boolean;
   btwReplayPending?: Turn[];
+  /** Last complete side-chat view, retained only while its replacement arrives. */
+  btwReplayView?: Pick<SessionRuntime,
+    "turns" | "turnUsage" | "liveOwner" | "acceptancePending"
+    | "state" | "mirroredRunning" | "truncated">;
   // True only after this connection has received this sid's Snapshot or
   // ReplayEnd. Prevents stale local "idle" state from draining work early.
   syncReady: boolean;
@@ -5767,6 +5771,17 @@ function reduceEvent(
         }
       }
       const next = patch(state, e.sid, (rt) => {
+        if (replaySid?.startsWith("btw-") && !rt.btwReplayView && !rt.replaying && !rt.loading
+            && rt.turns.length) {
+          // SyncBtw refreshes the private snapshot on every reopen. Keep the
+          // already-painted complete view while the live runtime rebuilds;
+          // overlapping replays must never replace it with a partial prefix.
+          rt.btwReplayView = {
+            turns: rt.turns, turnUsage: rt.turnUsage, liveOwner: rt.liveOwner,
+            acceptancePending: rt.acceptancePending, state: rt.state,
+            mirroredRunning: rt.mirroredRunning, truncated: rt.truncated,
+          };
+        }
         switchControlGeneration(rt, e.generation);
         rt.replaying = true;
         rt.syncReady = false;
@@ -5850,6 +5865,7 @@ function reduceEvent(
     }
     case "replay_end":
       return { ...patch(state, e.sid, (rt) => {
+        rt.btwReplayView = undefined;
         if (rt.btwReplayPending) {
           rt.turns = [...rt.turns, ...rt.btwReplayPending.filter((pending) =>
             !rt.turns.some((turn) => turnHasIdentityAlias(turn, pending.id)))];

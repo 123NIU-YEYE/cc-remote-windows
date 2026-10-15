@@ -1,3 +1,4 @@
+import { RightPanelPresentation } from "./right-panel-presentation";
 import type { ServerEvent } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
 import {
@@ -31,7 +32,7 @@ import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
-import { ChatView } from "./components/ChatView";
+import { ChatView, type ChatViewHandle } from "./components/ChatView";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
 import { SidebarToggle } from "./components/SidebarToggle";
@@ -364,7 +365,12 @@ export default function App() {
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
-  // The right slot is shared by artifacts and /btw.
+  // Every right-slot panel shares the same centered presentation.
+  const [expandedPanel, setExpandedPanel] = useState<{
+    scope: string;
+    returnToDocked: boolean;
+  } | null>(null);
+  const btwChatViewRef = useRef<ChatViewHandle>(null);
   const [btwPanelScopes, setBtwPanelScopes] = useState(
     () => readBtwPanelScopes(sessionStorage));
   const [rightView, setRightView] = useState<RightPanelView>(
@@ -795,8 +801,10 @@ export default function App() {
     getDiff: (file: string) => void;
     openBtw: () => void;
     collapseBtw: () => void;
+    togglePanelExpanded: () => void;
   }>({ artifact: null, btwSid: null, rightView: "diff",
-    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {} });
+    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {},
+    togglePanelExpanded: () => {} });
 
   useEffect(() => {
     const current = reconcileOpenMigrationSession(
@@ -939,6 +947,15 @@ export default function App() {
     : filesShowing ? "files"
     : rightView === "btw" && btwShowing ? "btw"
       : state.artifact ? "diff" : btwShowing ? "btw" : null;
+  const panelScope = (kind: string, identity?: string) =>
+    JSON.stringify([machineId, space, engine, visibleParentSid, kind, identity ?? null]);
+  const rightPanelKey = visibleRightPanel ? panelScope(visibleRightPanel,
+    visibleRightPanel === "files" ? fileBrowser?.id
+      : visibleRightPanel === "agent" ? agentPanel?.runId : undefined) : null;
+  const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
+  useEffect(() => {
+    setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
+  }, [rightPanelKey]);
   // Questions, hydration and completion receipts must agree with the rendered
   // slot, including when an agent or artifact covers a retained side chat.
   const visibleBtwSid = visibleRightPanel === "btw" ? activeBtwSid : null;
@@ -4099,9 +4116,9 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || e.repeat) return;
       if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-        if (e.defaultPrevented || e.isComposing || e.repeat
-            || e.composedPath().some((target) => target instanceof HTMLElement
+        if (e.composedPath().some((target) => target instanceof HTMLElement
               && (target.matches("input, textarea, select, [role=textbox]")
                 || target.isContentEditable))
             || document.querySelector('[role="dialog"], [aria-modal="true"], dialog[open]')) return;
@@ -4113,8 +4130,12 @@ export default function App() {
         }
         return;
       }
-      if (!(e.metaKey || e.ctrlKey)) return;
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
       const k = e.key.toLowerCase();
+      // Let a nested picker/confirmation finish before moving its owner panel.
+      if ((k === "e" || k === "k") && e.shiftKey
+          && [...document.querySelectorAll<HTMLElement>('[role="dialog"], [role="menu"], dialog[open]')]
+            .some(node => !node.classList.contains("right-panel-frame") && node.getClientRects().length)) return;
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
@@ -4130,6 +4151,9 @@ export default function App() {
           latest.collapseBtw();
         }
         else latest.openBtw();
+      } else if (k === "e" && e.shiftKey) {
+        e.preventDefault();
+        shortcutRef.current.togglePanelExpanded();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -4141,6 +4165,7 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
         if ((rt.control && sessionControlLocksInput(rt.control))
@@ -5318,17 +5343,39 @@ export default function App() {
     }
     setBtwOpeningFor(parentSid, true);
   };
-  const openBtw = () => {
+  const openBtw = (expanded = false) => {
     if (!confirmArtifactDiscard()) return;
     if (!btwPanelKey) return;
     closeViewer();
+    if (expanded) {
+      setAgentPanel(null);
+      setFileBrowser(null);
+    }
     setRightView("btw");
+    setExpandedPanel(expanded ? { scope: panelScope("btw"), returnToDocked: false } : null);
     setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
     if (!activeBtwGroup && !btwOpening) createBtw();
   };
   const collapseBtw = () => {
+    setExpandedPanel(null);
     if (btwPanelKey) setBtwPanelScopes(
       (current) => setBtwPanelScope(current, btwPanelKey, false));
+  };
+  const dockPanel = () => {
+    btwChatViewRef.current?.prepareLayoutChange();
+    setExpandedPanel(null);
+  };
+  const togglePanelExpanded = () => {
+    // Shortcut / backdrop / Escape restore the presentation that was visible
+    // before expansion. A directly opened overlay must not leave a side panel.
+    if (panelExpanded) {
+      if (expandedPanel?.returnToDocked) dockPanel();
+      else collapseBtw();
+    } else if (!visibleRightPanel) openBtw(true);
+    else if (rightPanelKey) {
+      btwChatViewRef.current?.prepareLayoutChange();
+      setExpandedPanel({ scope: rightPanelKey, returnToDocked: true });
+    }
   };
   const selectBtw = (sid: string) => {
     const parentSid = visibleParentSid;
@@ -5444,7 +5491,7 @@ export default function App() {
   };
   shortcutRef.current = {
     artifact: state.artifact, btwSid: activeBtwSid, rightView,
-    getDiff, openBtw, collapseBtw,
+    getDiff, openBtw, collapseBtw, togglePanelExpanded,
   };
   const logout = async () => {
     try {
@@ -5546,7 +5593,7 @@ export default function App() {
     <ViewerPagesProvider scope={visibleParentSid && authed
       ? { machineId, sid: visibleParentSid, space, engine } : null} onOpen={openViewerPage}>
     <RemoteViewerContext.Provider value={visibleParentSid ? openViewerLink : null}>
-    <SidebarShell controller={sidebar} className={visibleRightPanel !== null ? "panel-open" : ""}>
+    <SidebarShell controller={sidebar} className={visibleRightPanel !== null && !panelExpanded ? "panel-open" : ""}>
       <SidebarState controller={sidebar}>{sidebarOpen => <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}
@@ -6066,6 +6113,8 @@ export default function App() {
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
       {/* Share the layout's selection: retained hidden chats reserve no space. */}
+      <RightPanelPresentation.Provider value={{ expanded: panelExpanded,
+        onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
       {(() => {
         if (visibleRightPanel === "files" && fileBrowser) {
           const closeFiles = () => {
@@ -6118,7 +6167,7 @@ export default function App() {
             engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
             chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
               const runtime = state.runtimes[chat.sid];
-              const prompt = runtime?.turns.find(
+              const prompt = (runtime?.btwReplayView?.turns ?? runtime?.turns)?.find(
                 (turn) => turn.prompt.trim().length > 0)?.prompt.trim();
               return {
                 ...chat,
@@ -6128,6 +6177,7 @@ export default function App() {
               };
             })}
             active="btw" hasArtifact={!!state.artifact}
+            chatViewRef={btwChatViewRef}
             artifactKind={state.artifact?.kind}
             onTab={switchRight}
             onNew={createBtw}
@@ -6219,6 +6269,7 @@ export default function App() {
           </Suspense>;
         return null;
       })()}
+      </RightPanelPresentation.Provider>
       {queuedQueryEditor && <Suspense fallback={null}><QueuedQueryDialog
         key={queuedQueryEditor
           ? `${queuedQueryEditor.sid}:${queuedQueryEditor.msgId}`

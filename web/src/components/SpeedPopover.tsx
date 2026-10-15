@@ -52,7 +52,7 @@ export default function SpeedPopover(p: SpeedPickerProps & {
           && !trigger.current?.contains(event.target)) onClose();
     };
     const escape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (!event.defaultPrevented && !event.isComposing && event.key === "Escape") {
         event.preventDefault(); onClose(); trigger.current?.focus();
       }
     };
@@ -69,6 +69,19 @@ export default function SpeedPopover(p: SpeedPickerProps & {
   return createPortal(<div ref={popover} className="speed-pop" style={position}
       role="menu" aria-label={`${modelName} 的速度`}
       onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+        if (event.key === "Tab" || event.key === "Escape") {
+          // This portal lives outside its owner's DOM. Close it and restore
+          // the trigger before native Tab / the owner's focus trap advances.
+          // Escape belongs to the menu and must not also dismiss the panel.
+          onClose();
+          trigger.current?.focus();
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          return;
+        }
         if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
         event.preventDefault();
         const buttons = Array.from(popover.current?.querySelectorAll<HTMLButtonElement>("[role=menuitemradio]") ?? []);

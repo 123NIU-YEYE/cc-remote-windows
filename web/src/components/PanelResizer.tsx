@@ -1,5 +1,7 @@
+import { RightPanelPresentation } from "../right-panel-presentation";
 import {
   useCallback,
+  useContext,
   useEffect,
   useRef,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -10,6 +12,7 @@ import { clampPanelWidth } from "../responsive-layout";
 import { DESKTOP_PANEL_QUERY, PANEL_WIDTH_KEY } from "../use-panel-width";
 
 export function PanelResizer({ ariaLabel }: { ariaLabel: string }) {
+  const { expanded } = useContext(RightPanelPresentation);
   const handleRef = useRef<HTMLButtonElement>(null);
   const resizeRef = useRef<{
     pointerId: number;
@@ -70,6 +73,7 @@ export function PanelResizer({ ariaLabel }: { ariaLabel: string }) {
     event.preventDefault();
   };
 
+  if (expanded) return null;
   return <button ref={handleRef} type="button" className="panel-resizer"
     aria-label={ariaLabel} title="左右拖动调整面板宽度"
     onPointerDown={startResize} onPointerMove={moveResize}

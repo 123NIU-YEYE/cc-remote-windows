@@ -1,3 +1,4 @@
+import { PanelFrame } from "./RightPanelPresentation";
 import { Suspense, lazy, type ComponentProps } from "react";
 import { FileBrowserPanel } from "./FileBrowserPanel";
 import { Icon } from "../icons";
@@ -12,7 +13,7 @@ export default function SessionFilesPanel({ browser, preview, showingPreview, on
   showingPreview: boolean;
   onBack: () => void;
 }) {
-  return <div className="file-browser-shell">
+  return <PanelFrame className="file-browser-shell" label="会话文件">
     <FileBrowserPanel {...browser} />
     {showingPreview && preview.artifact && <>
       <button type="button" className="workspace-back" onClick={onBack}>
@@ -22,5 +23,5 @@ export default function SessionFilesPanel({ browser, preview, showingPreview, on
         <ArtifactPanel {...preview} artifact={preview.artifact} active="diff" hasBtw={false} onTab={() => {}} />
       </Suspense>
     </>}
-  </div>;
+  </PanelFrame>;
 }
