@@ -1,4 +1,5 @@
 import { appendFile, mkdir, readFile, writeFile, open } from "node:fs/promises";
+import { closeSync, openSync, writeFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { spawn, execFile } from "node:child_process";
@@ -34,6 +35,18 @@ function b64url(bytes) {
 
 async function log(message) {
   await appendFile(logFile, `${new Date().toISOString()} ${message}\n`, "utf8").catch(() => {});
+}
+
+// A lossy link makes the tunnel reconnect often. Logging every cycle filled the
+// log with thousands of identical lines and buried the first useful diagnosis,
+// so repeat offenders are summarised instead of repeated verbatim.
+const repeatCounts = new Map();
+async function logThrottled(key, message) {
+  const seen = (repeatCounts.get(key) ?? 0) + 1;
+  repeatCounts.set(key, seen);
+  if (seen <= 3 || seen % 20 === 0) {
+    await log(seen <= 3 ? message : `${message} (${String(seen)} occurrences so far)`);
+  }
 }
 
 async function readOrCreateToken() {
@@ -109,8 +122,29 @@ function upstreamCookie(port, credentialsText) {
   return `${name}=v1.${body}.${signature}`;
 }
 
-function spawnDetached(file, args, env) {
-  const child = spawn(file, args, { env: { ...process.env, ...env }, cwd: root, detached: true, stdio: "ignore", windowsHide: true });
+// A child's stderr used to go to NUL (stdio:"ignore"). That is why a restart
+// loop of thousands of cycles left no way to tell WHICH child died or WHY.
+// Give each child a fresh per-role log so the most recent failure is readable.
+function openChildLog(tag) {
+  try {
+    const path = join(runtime, `dsh-desktop-${tag}.log`);
+    // Truncate per spawn rather than rotate: only the latest attempt matters,
+    // and an append-only file would grow without bound across thousands of
+    // restarts.
+    writeFileSync(path, "");
+    return { fd: openSync(path, "a"), path };
+  } catch { return { fd: "ignore", path: "" }; }
+}
+
+function spawnDetached(file, args, env, tag) {
+  const { fd, path } = tag ? openChildLog(tag) : { fd: "ignore", path: "" };
+  const child = spawn(file, args, {
+    env: { ...process.env, ...env }, cwd: root, detached: true, windowsHide: true,
+    stdio: ["ignore", "ignore", fd],
+  });
+  // The child holds its own duplicate of the descriptor.
+  if (typeof fd === "number") { try { closeSync(fd); } catch {} }
+  child.childLogPath = path;
   child.unref();
   return child;
 }
@@ -120,16 +154,52 @@ function stopChild(child) {
   try { child.kill(); } catch {}
 }
 
-async function startServices(host, token, credentialsText) {
+function exitReason(child) {
+  if (!child || child.exitCode === null) return "still running";
+  const signal = child.signalCode ? `, signal ${child.signalCode}` : "";
+  const where = child.childLogPath ? `; see ${child.childLogPath}` : "";
+  return `exit code ${String(child.exitCode)}${signal}${where}`;
+}
+
+async function startProxy(host, token, credentialsText) {
   stopChild(proxyProcess);
-  stopChild(tunnelProcess);
   const cookie = upstreamCookie(host.port, credentialsText);
   proxyProcess = spawnDetached(node, [proxyScript], {
     DSH_PROXY_PORT: String(proxyPort), DSH_TARGET_PORT: String(host.port), DSH_UPSTREAM_COOKIE: cookie,
     DSH_PUBLIC_TOKEN: token, DSH_PUBLIC_COOKIE_NAME: "cc-remote-dsh", DSH_PUBLIC_COOKIE_VALUE: token,
     DSH_PUBLIC_ORIGIN: new URL(publicUrlBase).origin,
-  });
-  tunnelProcess = spawnDetached(ssh, ["-N", "-T", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=20", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10", "-R", `127.0.0.1:${String(remoteTunnelPort)}:127.0.0.1:${String(proxyPort)}`, relayTarget], {});
+  }, "proxy");
+}
+
+async function startTunnel() {
+  stopChild(tunnelProcess);
+  // Tuned for a lossy uplink. The observed failure was
+  //   ssh: connect to host ... port 22: Connection timed out
+  // on roughly a third of attempts, because the SSH handshake is a multi-round
+  // exchange and a 10 s ConnectTimeout gave up after a single dropped packet.
+  //   * ConnectTimeout=30 rides out a lost SYN or two.
+  //   * TCPKeepAlive=yes makes the OS notice a dead path instead of hanging.
+  //   * ServerAliveInterval=15/CountMax=4 both detects a silent drop sooner and
+  //     tolerates the keepalives themselves being lost.
+  // The supervisor already retries, so the goal is fewer failed attempts, not
+  // heroics on one attempt.
+  const args = [
+    "-N", "-T",
+    "-o", "BatchMode=yes",
+    "-o", "ExitOnForwardFailure=yes",
+    "-o", "ConnectTimeout=30",
+    "-o", "TCPKeepAlive=yes",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=4",
+    "-R", `127.0.0.1:${String(remoteTunnelPort)}:127.0.0.1:${String(proxyPort)}`,
+    relayTarget,
+  ];
+  tunnelProcess = spawnDetached(ssh, args, {}, "tunnel");
+}
+
+async function startServices(host, token, credentialsText) {
+  await startProxy(host, token, credentialsText);
+  await startTunnel();
   targetPort = host.port;
   targetPid = host.pid;
   await writeFile(publicUrlFile, `${publicUrlBase}?token=${token}`, { encoding: "utf8", mode: 0o600 });
@@ -157,11 +227,28 @@ async function main() {
   while (!stopped) {
     try {
       const host = await desktopHost();
-      if (host?.port && (host.port !== targetPort || host.pid !== targetPid)) await startServices(host, token, credentialsText);
-      if (!host?.port && targetPort) { stopChild(proxyProcess); stopChild(tunnelProcess); proxyProcess = void 0; tunnelProcess = void 0; targetPort = 0; targetPid = 0; await log("Desktop Host stopped; remote services paused."); }
-      if ((proxyProcess && proxyProcess.exitCode !== null) || (tunnelProcess && tunnelProcess.exitCode !== null)) {
-        targetPort = 0;
-        await log("A remote child exited; services will be restarted.");
+      const hostChanged = Boolean(host?.port) && (host.port !== targetPort || host.pid !== targetPid);
+      if (hostChanged) await startServices(host, token, credentialsText);
+      if (!host?.port && targetPort) {
+        stopChild(proxyProcess); stopChild(tunnelProcess);
+        proxyProcess = void 0; tunnelProcess = void 0; targetPort = 0; targetPid = 0;
+        await log("Desktop Host stopped; remote services paused.");
+      }
+      // Restart only what actually died. Tearing both children down because one
+      // exited turned a single flaky tunnel into a full outage of the panel, and
+      // is how thousands of reconnect cycles accumulated.
+      if (host?.port && !hostChanged) {
+        if (proxyProcess && proxyProcess.exitCode !== null) {
+          await logThrottled("proxy-exited", `The DSH proxy exited (${exitReason(proxyProcess)}); restarting it alone.`);
+          await startProxy(host, token, credentialsText);
+        }
+        if (tunnelProcess && tunnelProcess.exitCode !== null) {
+          await logThrottled("tunnel-exited", `The SSH tunnel exited (${exitReason(tunnelProcess)}); restarting it alone.`);
+          // A brief pause keeps a lossy link from being hammered the instant a
+          // handshake fails, which was making the failure rate worse.
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          await startTunnel();
+        }
       }
     } catch (error) { await log(`Supervisor error: ${error instanceof Error ? error.message : String(error)}`); }
     await new Promise((resolve) => setTimeout(resolve, 5000));
