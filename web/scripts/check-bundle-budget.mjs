@@ -39,10 +39,13 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // Centered BTW shortcuts, viewport anchoring and shared attachment icons add
 // ~1.1 KiB initial JS / 0.4 KiB gzip. Panel UI/styles remain lazy, with no new
 // dependency or initial request; retain the entry and request-count caps.
-const MAX_INITIAL_BYTES = 941 * 1024;
+// Shared mutually exclusive path popovers and the lazy webpage-link entry add
+// <3 KiB / <1 KiB gzip. Metadata fetching and rich cards stay in a lazy chunk.
+// No runtime dependency or extra initial request; retain entry/file-count caps.
+const MAX_INITIAL_BYTES = 944 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
-const MAX_INITIAL_GZIP_BYTES = 283 * 1024;
+const MAX_INITIAL_GZIP_BYTES = 284 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");

@@ -3008,7 +3008,11 @@ function CodeCopyThemeFixture({ theme }: { theme: "light" | "dark" }) {
 function LocalFileLinkFixture() {
   return <main style={{ minHeight: "100dvh", padding: 24 }}>
     <MessageBlock
-      text="[release-test](/tmp/qwen3-tts-v017-release-test:42)"
+      text={"[release-test](/tmp/qwen3-tts-v017-release-test:42) · "
+        + "[source-code](/workspace/project/packages/frontend/src/components/conversation/MessageBlock.tsx:455) · "
+        + "[official-docs](https://preview.example/docs)"
+        + (new URLSearchParams(location.search).has("same-origin-links") ? " · [changelog](https://preview.example/changelog)" : "")
+        + "\n\n正文保持原位，预览只悬浮显示。"}
       done onOpenFile={() => {}} />
   </main>;
 }

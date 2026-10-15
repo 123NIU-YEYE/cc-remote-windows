@@ -3424,6 +3424,91 @@ for (const engine of ["claude", "codex"] as const) {
 }
 
 for (const engine of ["claude", "codex"] as const) {
+  test(`side chat scope returning to ${engine} restores the panel without taking focus`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { engine, secondParent: true });
+    await page.goto("/");
+    const panel = page.locator(".btw-panel");
+    const sideInput = panel.getByRole("textbox");
+    const mainInput = page.locator("textarea[data-chat-composer]").first();
+    await expect(mainInput).toBeEnabled();
+    await mainInput.fill("原会话主聊天草稿");
+    await page.keyboard.press("Control+Shift+k");
+    await expect(sideInput).toBeFocused();
+    await page.keyboard.type("retained side draft");
+
+    await page.keyboard.press("Control+b");
+    await page.getByText("Second parent", { exact: true }).click();
+    await expect(page.getByText("session layout-o", { exact: true })).toBeVisible();
+    await expect(panel).toHaveCount(0);
+    await mainInput.fill("在另一个会话处理工作");
+    await mainInput.evaluate(node => node.blur());
+    await page.getByText("Layout parent", { exact: true }).click();
+    await expect(page.getByText("session layout-p", { exact: true })).toBeVisible();
+    await expect(sideInput).toHaveValue("retained side draft");
+    await expect(sideInput).not.toBeFocused();
+    await expect(mainInput).toHaveValue("原会话主聊天草稿");
+    await page.keyboard.press("/");
+    await expect(mainInput).toBeFocused();
+    await expect(mainInput).toHaveValue("原会话主聊天草稿");
+    await expect(sideInput).toHaveValue("retained side draft");
+
+    await page.reload();
+    await expect(sideInput).toBeEnabled();
+    await expect(sideInput).not.toBeFocused();
+    await page.keyboard.press("/");
+    await expect(mainInput).toBeFocused();
+    expect(relay.commands.some(c => ["query", "steer", "open_btw", "close_btw"]
+      .includes(String(c.type)))).toBe(false);
+  });
+
+  test(`side chat scope explicitly opening ${engine} focuses its composer once`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { engine });
+    await page.goto("/");
+    const panel = page.locator(".btw-panel");
+    const sideInput = panel.getByRole("textbox");
+    const mainInput = page.locator("textarea[data-chat-composer]").first();
+    await expect(mainInput).toBeEnabled();
+    await mainInput.fill("主会话草稿");
+
+    await page.keyboard.press("Control+Shift+k");
+    await expect(sideInput).toBeFocused();
+    await page.keyboard.type("side draft");
+    await expect(sideInput).toHaveValue("side draft");
+    await mainInput.focus();
+    await panel.getByRole("button", { name: "居中展开侧边对话", exact: true }).click();
+    await expect(sideInput).toBeFocused();
+    await panel.getByRole("button", { name: "收回右侧", exact: true }).click();
+    await expect(sideInput).toBeFocused();
+
+    // Replays and new output must not pull focus out of the main draft.
+    await mainInput.focus();
+    relay.emit({ type: "user_msg", sid: "btw-layout-child", msg_id: "focus-user", prompt: "side work" });
+    relay.emit({ type: "delta", sid: "btw-layout-child", message_id: "focus-answer",
+      channel: "final", text: "background output" });
+    await expect(panel.getByText("background output", { exact: true })).toBeVisible();
+    await expect(mainInput).toBeFocused();
+
+    await page.keyboard.press("Control+Shift+k");
+    await expect(panel).toHaveCount(0);
+    await page.keyboard.press("Meta+Shift+e");
+    await expect(sideInput).toBeFocused();
+    await expect(sideInput).toHaveValue("side draft");
+    await page.keyboard.press("Meta+Shift+e");
+    await expect(panel).toHaveCount(0);
+
+    // The command palette used to schedule a second focus back to main.
+    await mainInput.fill("/btw");
+    await page.getByRole("button", { name: /\/btw.*侧边对话/ }).click();
+    await expect(sideInput).toBeFocused();
+    await page.keyboard.type(" continues");
+    await expect(sideInput).toHaveValue("side draft continues");
+    await expect(mainInput).toHaveValue("");
+    expect(relay.commands.some(c => ["query", "steer", "open_btw", "close_btw"]
+      .includes(String(c.type)))).toBe(false);
+  });
+
   test(`side chat scope slash focuses the centered ${engine} composer and otherwise the main composer`, async ({ page }) => {
     await page.setViewportSize({ width: 1568, height: 1000 });
     const relay = await mockRightPanelRelay(page, { visible: true, engine });
@@ -3489,6 +3574,46 @@ for (const engine of ["claude", "codex"] as const) {
     await expect(mainInput).toHaveValue("主会话草稿/");
     expect(relay.commands.some(c => ["query", "steer", "interrupt", "open_btw", "close_btw"]
       .includes(String(c.type)))).toBe(false);
+  });
+}
+
+for (const afterOpen of ["wait", "type-main", "close"] as const) {
+  test(`side chat scope delayed creation respects focus intent: ${afterOpen}`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const relay = await mockRightPanelRelay(page, { retained: false });
+    await page.goto("/");
+    const mainInput = page.locator("textarea[data-chat-composer]").first();
+    await expect(mainInput).toBeEnabled();
+    await page.keyboard.press("Control+Shift+k");
+    const panel = page.locator(".btw-panel");
+    await expect(panel.getByRole("textbox")).toBeDisabled();
+    await expect.poll(() => relay.commands.filter(c => c.type === "open_btw").length).toBe(1);
+    const open = relay.commands.find(c => c.type === "open_btw")!;
+    if (afterOpen === "type-main") {
+      await mainInput.click();
+      await page.keyboard.type("keep writing here");
+    } else if (afterOpen === "close") {
+      await panel.getByRole("button", { name: "收起侧边对话", exact: true }).click();
+      await expect(panel).toHaveCount(0);
+      await mainInput.focus();
+    }
+    relay.emit({ type: "btw_opened", sid: "btw-layout-child",
+      btw_sid: "btw-layout-child", parent_sid: "layout-parent", engine: "codex",
+      created_at: 1, revision: 2, request_id: String(open.request_id) });
+    if (afterOpen === "close") {
+      // Wait for a subsequent frame so the assertion observes the late open.
+      relay.emit({ type: "delta", sid: "layout-parent", message_id: "focus-ack",
+        channel: "final", text: "late open processed" });
+      await expect(page.getByText("late open processed", { exact: true })).toBeVisible();
+      await expect(panel).toHaveCount(0);
+      await expect(mainInput).toBeFocused();
+      await page.keyboard.press("Control+Shift+k");
+      await expect(panel.getByRole("textbox")).toBeFocused();
+    } else {
+      await expect(panel.getByRole("textbox")).toBeEnabled();
+      if (afterOpen === "wait") await expect(panel.getByRole("textbox")).toBeFocused();
+      else await expect(mainInput).toBeFocused();
+    }
   });
 }
 
@@ -4819,9 +4944,9 @@ test("Markdown HTML preview renders README layout without executing active HTML"
   await expect(local).toHaveAttribute("width", "64");
   await expect.poll(() => local.evaluate((node) =>
     (node as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
-  await preview.getByRole("link", { name: "English", exact: true }).click();
+  await preview.getByRole("button", { name: "在 Remote 中打开 README.md", exact: true }).click();
   await expect(page.getByTestId("artifact-opened-file")).toHaveText("README.md:");
-  await preview.getByRole("link", { name: "安装指南", exact: true }).click();
+  await preview.getByRole("button", { name: "在 Remote 中打开 docs/install.md:12", exact: true }).click();
   await expect(page.getByTestId("artifact-opened-file")).toHaveText("docs/install.md:12");
   await expect(preview.getByRole("link", { name: "官方项目" })).toHaveAttribute("target", "_blank");
   await preview.locator("summary").click();
@@ -4831,7 +4956,7 @@ test("Markdown HTML preview renders README layout without executing active HTML"
   await expect(page).toHaveURL(/#cc-preview-installation$/);
   await expect(preview.locator("#cc-preview-installation")).toBeVisible();
 
-  await expect(preview.locator("script,style,iframe,object,embed,form,source,svg,math")).toHaveCount(0);
+  await expect(preview.locator("script,style,iframe,object,embed,form,source,math,svg:not(.message-link-icon svg)")).toHaveCount(0);
   // Screenshot capture can restore an empty style attribute on checkboxes.
   await expect(preview.locator('[style]:not([style=""]),[onclick],[onerror],[srcset]')).toHaveCount(0);
   await expect(page.locator("body")).not.toHaveAttribute("data-md-unsafe", /.+/);
@@ -5081,6 +5206,137 @@ test("local Markdown file link reveals its complete path without native title", 
   await link.focus();
   await expect(page.getByRole("tooltip")).toBeVisible();
 });
+
+test("local Markdown file links replace the previous tooltip immediately and wrap without altering the path", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 720, height: 480 });
+  await page.route("**/api/link-preview", route => route.fulfill({ json: {} }));
+  await page.goto("/tests/history-browser.html?local-file-link=1");
+  const links = page.locator(".message-file-link");
+  const fullPath = "/workspace/project/packages/frontend/src/components/conversation/MessageBlock.tsx:455";
+  for (const index of [0, 1, 0, 1]) {
+    await links.nth(index).hover();
+    expect(await page.getByRole("tooltip").count()).toBe(1);
+    await expect(page.getByRole("tooltip")).toContainText(index ? fullPath : "/tmp/qwen3-tts-v017-release-test:42");
+  }
+  const tip = page.getByRole("tooltip");
+  const box = await tip.boundingBox();
+  expect(box!.width).toBeLessThanOrEqual(360);
+  expect(box!.height).toBeGreaterThan(50);
+  await page.screenshot({ path: testInfo.outputPath("compact-file-path.png") });
+  await tip.locator(".message-file-tooltip-path").dblclick();
+  await expect.poll(() => page.evaluate(() => getSelection()?.toString())).toBe(fullPath);
+  await page.keyboard.press("Escape");
+  await expect(tip).toHaveCount(0);
+});
+
+test("local Markdown file link and webpage previews share one overlay without shifting the conversation", async ({ page }, testInfo) => {
+  const requests: string[] = [];
+  await page.route("**/api/link-preview", async route => {
+    const body = route.request().postDataJSON();
+    requests.push(body.detail);
+    await route.fulfill({ json: body.detail === "icon" ? {} : {
+      title: "Agent loop overview", description: "Messages, tools, and conversation history.",
+    } });
+  });
+  await page.goto("/tests/history-browser.html?local-file-link=1");
+  const text = page.getByText("正文保持原位，预览只悬浮显示。");
+  const before = await text.boundingBox();
+  const file = page.locator(".message-file-link").first();
+  await file.hover();
+  await expect(page.getByRole("tooltip")).toHaveCount(1);
+  const link = page.getByRole("link", { name: "official-docs" });
+  await link.hover();
+  expect(await page.getByRole("tooltip").count()).toBe(0);
+  const preview = page.getByRole("dialog", { name: "网页预览 preview.example" });
+  await expect(preview).toContainText("Agent loop overview");
+  await expect(preview).toBeInViewport();
+  await page.screenshot({ path: testInfo.outputPath("web-link-preview.png") });
+  expect(await text.boundingBox()).toEqual(before);
+  await expect(link).toHaveAttribute("href", "https://preview.example/docs");
+  await preview.hover();
+  await page.waitForTimeout(240);
+  await expect(preview).toBeVisible();
+  await file.hover();
+  await expect(preview).toHaveCount(0);
+  await expect(page.getByRole("tooltip")).toHaveCount(1);
+  await page.getByRole("button", { name: "预览 preview.example", exact: true }).click();
+  await expect(preview).toBeVisible();
+  await expect(page.getByRole("tooltip")).toHaveCount(0);
+  await preview.getByRole("button", { name: "关闭网页预览" }).click();
+  await expect(preview).toHaveCount(0);
+  expect(requests.filter(detail => detail === "page")).toHaveLength(1);
+  const icon = page.getByRole("button", { name: "预览 preview.example", exact: true });
+  await icon.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(preview.getByRole("link", { name: "打开 ↗" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(preview).toHaveCount(0);
+  await expect(icon).toBeFocused();
+});
+
+for (const top of [24, 200, 400]) {
+  test(`local Markdown file link preview stays open after loading under a stationary pointer at ${top}px`, async ({ page }) => {
+    await page.setViewportSize({ width: 720, height: 540 });
+    let finishPage!: () => void;
+    const pageGate = new Promise<void>(resolve => { finishPage = resolve; });
+    await page.route("**/api/link-preview", async route => {
+      const { detail } = route.request().postDataJSON();
+      if (detail === "page") await pageGate;
+      await route.fulfill({ json: detail === "icon" ? {} : {
+        title: "Agent loop overview", description: "Messages, tools, and conversation history.",
+        icon: `data:image/png;base64,${TEST_GENERATED_PNG}`,
+        image: `data:image/png;base64,${TEST_GENERATED_PNG}`,
+      } });
+    });
+    await page.goto("/tests/history-browser.html?local-file-link=1");
+    await page.locator("main").evaluate((node, padding) => { node.style.paddingTop = `${padding}px`; }, top);
+    const icon = page.getByRole("button", { name: "预览 preview.example", exact: true });
+    await icon.hover();
+    const preview = page.getByRole("dialog", { name: "网页预览 preview.example" });
+    await expect(preview).toContainText("正在加载预览");
+    finishPage();
+    await expect(preview).toContainText("Agent loop overview");
+    await expect(icon.locator("img")).toBeVisible();
+    await page.waitForTimeout(400);
+    await expect(preview).toBeVisible();
+    await page.mouse.move(700, 520);
+    await expect(preview).toHaveCount(0);
+  });
+}
+
+for (const previewFirst of [false, true]) {
+  test(`local Markdown file links share website icons ${previewFirst ? "after preview despite a late automatic miss" : "automatically without opening a preview"}`, async ({ page }) => {
+    const icon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6SAAAAABJRU5ErkJggg==";
+    const requests: string[] = [];
+    let releaseIcon!: () => void;
+    const iconGate = new Promise<void>((resolve) => { releaseIcon = resolve; });
+    await page.route("**/api/link-preview", async route => {
+      const body = route.request().postDataJSON();
+      requests.push(body.detail);
+      if (body.detail === "icon") {
+        expect(body.url).toBe("https://preview.example");
+        if (previewFirst) await iconGate;
+      }
+      await route.fulfill({ json: previewFirst && body.detail === "icon" ? {} : { icon } });
+    });
+    await page.goto("/tests/history-browser.html?local-file-link=1&same-origin-links=1");
+    const buttons = page.locator(".message-web-link .message-link-icon");
+    await expect(buttons).toHaveCount(2);
+    await expect.poll(() => requests.filter(detail => detail === "icon").length).toBe(1);
+    if (previewFirst) await buttons.first().click();
+    else await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(buttons.locator("img")).toHaveCount(2);
+    await expect(buttons.last().locator("img")).toHaveAttribute("src", icon);
+    if (previewFirst) {
+      const response = page.waitForResponse(response => response.url().endsWith("/api/link-preview")
+        && response.request().postDataJSON().detail === "icon");
+      releaseIcon();
+      await response;
+      await expect(buttons.locator("img")).toHaveCount(2);
+    }
+    expect(requests.filter(detail => detail === "page")).toHaveLength(previewFirst ? 1 : 0);
+  });
+}
 
 async function pinchThenPanPreview(
   page: import("@playwright/test").Page,
