@@ -1114,7 +1114,6 @@ def create_app(
 
     # Static web client. Mounted last so /api/login and /ws and /healthz win.
     if cfg.static_dir and os.path.isdir(cfg.static_dir):
-        from fastapi.staticfiles import StaticFiles
         app.mount("/", _HttpOnlyStaticFiles(
             directory=cfg.static_dir, html=True), name="static")
         log.info("serving static web client", dir=cfg.static_dir)
