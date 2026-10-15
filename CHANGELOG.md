@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.14
+
+Expand side panels into a centered view and restore side-chat and Claude completion state reliably.
+Wire protocol v74 is unchanged. See the bilingual [release notes](docs/releases/v4.0.14.md).
+
+- Expand or dock side chats, files, diffs and previews while preserving drafts and reading state.
+- Keep existing side-chat content visible during history synchronization; use paperclip attachment controls with cards above the input.
+- Contain keyboard focus across menus, dialogs and preview frames; preserve UTF-16 HTML and correct HTTP framing.
+- Keep Claude compaction summaries separate from human inputs so completed turns finish correctly.
+- Clarify built-in Claude/Codex multi-account support for native OAuth and compatible API accounts.
+
 ## v4.0.13
 
 Refine Goal dialogs and keep running indicators on the current Codex turn.
