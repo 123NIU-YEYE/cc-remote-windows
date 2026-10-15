@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cc_remote.protocol import (
-    AssistantMsgEnd, Delta, Error, ProcessEvent, SyncBtw, ToolDelta, TurnBinding,
+    AssistantMsgEnd, Delta, Error, ProcessEvent, StateEvent, SyncBtw, ToolDelta, TurnBinding,
     TurnDiff, TurnEnd, TurnPlan, TurnResult,
     TurnSteered, UserMsg,
 )
@@ -315,3 +315,121 @@ def test_btw_overflow_and_sync_use_private_snapshots_without_native_history():
         await machine._repair_codex_projection_after_overflow(ctx, "native")
         assert not transport.sent
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("state", ["running", "interrupting", "draining", "idle"])
+@pytest.mark.parametrize("continuation", [False, True])
+@pytest.mark.parametrize("unwinding", [False, True])
+def test_claude_btw_sync_restores_exact_activity_before_replay_end(state, continuation, unwinding):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("btw-claude-running")
+        ctx.engine = "claude"
+        ctx.btw = ctx.btw_announced = True
+        ctx.owner_client_id = "owner"
+        ctx.sdk = SimpleNamespace()
+        machine.sessions[ctx.key] = ctx
+        for frame in [UserMsg(msg_id="old-input", prompt="finished question"),
+                      Delta(message_id="old-answer", text="finished reply"),
+                      TurnEnd(turn_id="old-answer", checkpoint_id="old-input",
+                              result=TurnResult(subtype="success", duration_ms=1,
+                                                is_error=False))]:
+            await machine._emit(ctx, frame)
+        ctx.active_msg_id = "current-input"
+        await machine._emit(ctx, UserMsg(msg_id="current-input", prompt="still working"))
+        await machine._emit(ctx, Delta(message_id="current-answer", text="checking"))
+        if continuation:
+            ctx.claude_background_followups = {"notification": "active"}
+            ctx.claude_background_translator = SimpleNamespace(turn_id="old-input")
+        if unwinding:
+            # A real terminal hands activity back to the autonomous owner even
+            # before the managed task finishes its asynchronous cleanup.
+            ctx.turn_task = asyncio.current_task()
+            await machine._emit(ctx, TurnEnd(turn_id="current-input", result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False)))
+        ctx.state = state
+        await machine._emit(ctx, StateEvent(state=state))
+        tail = ctx.buffer.tail_seq
+        transport.sent.clear()
+        await machine._handle_sync_btw(SyncBtw(
+            sid=ctx.key, client_id="new-tab", owner_id="owner",
+            generation=machine.instance_id))
+        frames = transport.sent
+        end_index = next(i for i, e in enumerate(frames) if e.type == "replay_end")
+        activity = frames[end_index - 1]
+        assert isinstance(activity, StateEvent)
+        assert activity.state == state
+        assert activity.msg_id == (None if state == "idle" else
+                                   "old-input" if continuation else "current-input")
+        assert activity.continuation is continuation
+        assert activity.seq is None
+        assert ctx.buffer.tail_seq == tail, "a read must not append a live event"
+        assert all(e.to == "new-tab" and e.owner_id == "owner" for e in frames)
+        assert not any(isinstance(e, TurnBinding) for e in frames)
+        assert next(e for e in frames if e.type == "snapshot").state == state
+    asyncio.run(run())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_owner", [None, "previous-input"])
+async def test_claude_btw_managed_replay_ignores_pre_echo_background_owner(previous_owner):
+    """A real SDK request-before-echo leaves an absorbed background claim alive."""
+    from cc_remote.wrapper.sdk import SdkHandle
+    from cc_remote.wrapper.stream import StreamTranslator
+    from tests.test_claude_steering import NativeClient, assistant, requesting, result, until, user
+
+    machine, transport = _mk_machine()
+    ctx = _mk_ctx("btw-pre-echo")
+    ctx.btw = ctx.btw_announced = True
+    ctx.owner_client_id = "owner"
+    sdk = ctx.sdk = SdkHandle(machine.cfg)
+    sdk.client = native = NativeClient()
+    machine.sessions[ctx.key] = ctx
+    machine._configure_claude_sdk_callbacks(ctx, sdk)
+    sdk._start_message_pump()
+    consumer = None
+    try:
+        if previous_owner:
+            await machine._emit(ctx, UserMsg(msg_id=previous_owner, prompt="previous"))
+            await machine._emit(ctx, TurnEnd(turn_id=previous_owner, result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False)))
+        sdk._turn_origin_id = previous_owner
+        ctx.active_msg_id = sdk.next_turn_id = "current-input"
+        ctx.translator = StreamTranslator(1024, turn_id="current-input")
+        await sdk.query("current")
+        await machine._set_state(ctx, "running")
+        await machine._emit(ctx, UserMsg(msg_id="current-input", prompt="current"))
+
+        async def consume():
+            async for message in sdk.receive_response():
+                for event in ctx.translator.feed(message):
+                    await machine._emit(ctx, event)
+
+        consumer = ctx.turn_task = asyncio.create_task(consume())
+        await native.queue.put(requesting())
+        await until(lambda: bool(ctx.claude_background_followups))
+        await native.queue.put(user("native-human", "current"))
+        await native.queue.put(assistant("current-answer", [{"type": "text", "text": "working"}]))
+        await until(lambda: any(e.type == "delta" for e in transport.sent))
+        assert ctx.claude_background_translator.turn_id == previous_owner
+        assert machine._claude_autonomous_followup_pending(ctx)
+
+        for _ in range(2):
+            transport.sent.clear()
+            await machine._handle_sync_btw(SyncBtw(
+                sid=ctx.key, client_id="new-tab", owner_id="owner"))
+            activity = next(e for e in transport.sent if isinstance(e, StateEvent))
+            assert activity.msg_id == "current-input"
+            assert activity.state == "running" and not activity.continuation
+            assert activity.seq is None
+
+        await native.queue.put(result())
+        await asyncio.wait_for(consumer, 3)
+        sdk.release_background_messages()
+        await until(lambda: not machine._claude_autonomous_followup_pending(ctx))
+        assert native.inputs == ["current"] and native.interrupts == 0
+    finally:
+        if consumer:
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+        await sdk._stop_message_pump()

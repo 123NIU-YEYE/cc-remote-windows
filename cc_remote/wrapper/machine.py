@@ -20425,12 +20425,40 @@ class WrapperMachine:
             for native_id in tuple(completions.turns):
                 history.repair(native_id, completions.snapshots(native_id),
                                item_order=completions.item_order(native_id))
-        return history.replay(
+        frames = history.replay(
             tail_seq=ctx.buffer.tail_seq, generation=self.instance_id,
             max_bytes=self.BTW_REPLAY_MAX_BYTES,
             max_events=self.BTW_REPLAY_MAX_EVENTS,
             turn_usage=ctx.buffer.latest_turn_usage(),
         )
+        if ctx.engine == "claude":
+            # Claude BTW deliberately has no native TurnBinding. Its compacted
+            # narrative also drops wire sequence numbers, so replaying UserMsg
+            # cannot restore the browser's exact live owner. Publish the current
+            # resident owner inside the replay barrier, after all old narrative,
+            # without advancing a cursor or creating a new model turn.
+            state = ctx.buffer.latest_state() or ctx.state
+            current = history.turns.get(ctx.active_msg_id)
+            managed = bool(
+                ctx.active_msg_id
+                and ctx.turn_task is not None and not ctx.turn_task.done()
+                and (current is None or current.end is None)
+            )
+            # A request before the human echo creates an implicit background
+            # claim. It survives until Result even after the managed response
+            # consumes that input; its translator still has the previous (or
+            # empty) owner. Never let that latch steal the live managed turn.
+            # After the exact managed terminal, a real continuation may take
+            # over even while the managed task is still unwinding.
+            continuation = not managed and self._claude_autonomous_followup_pending(ctx)
+            translator = ctx.claude_background_translator if continuation else None
+            owner = translator.turn_id if translator is not None else ctx.active_msg_id
+            frames.insert(-1, StateEvent(
+                state=state,
+                msg_id=owner if state != "idle" else None,
+                continuation=continuation,
+            ))
+        return frames
 
     async def _handle_sync_btw(self, cmd: SyncBtw):
         """Hydrate one selected side chat without replaying every BTW on Hello."""
