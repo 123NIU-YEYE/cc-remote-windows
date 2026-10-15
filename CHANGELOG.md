@@ -2,6 +2,15 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.15
+
+Focus the correct composer with `/` when a side chat is expanded in the center.
+Wire protocol v74 is unchanged. See the bilingual [release notes](docs/releases/v4.0.15.md).
+
+- Focus the centered Claude/Codex side-chat composer; keep the main composer as the target when side chat is docked or hidden.
+- Preserve normal slash typing in editable fields and focus within nested dialogs and menus.
+- Keep read-only centered chats and other centered panels from redirecting focus behind themselves.
+
 ## v4.0.14
 
 Expand side panels into a centered view and restore side-chat and Claude completion state reliably.
