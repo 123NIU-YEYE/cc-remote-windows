@@ -4115,15 +4115,20 @@ export default function App() {
   // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Shift+B => open latest turn's diff.
   useEffect(() => {
     if (!authed) return;
+    const hasOtherOverlay = (owner: Element | null) => [...document.querySelectorAll<HTMLElement>(
+      '[role="dialog"], [aria-modal="true"], dialog[open], [role="menu"]',
+    )].some(node => node !== owner && node.getClientRects().length);
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || e.repeat) return;
       if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        // Only centered BTW owns this shortcut; a docked chat leaves it to main.
+        const panel = document.querySelector('.btw-panel[aria-modal="true"]');
         if (e.composedPath().some((target) => target instanceof HTMLElement
               && (target.matches("input, textarea, select, [role=textbox]")
                 || target.isContentEditable))
-            || document.querySelector('[role="dialog"], [aria-modal="true"], dialog[open]')) return;
-        const input = document.querySelector<HTMLTextAreaElement>(
-          "textarea[data-chat-composer]:not(:disabled):not([readonly])");
+            || hasOtherOverlay(panel)) return;
+        const input = (panel ?? document).querySelector<HTMLTextAreaElement>(
+          `textarea[${panel ? "data-btw-composer" : "data-chat-composer"}]:not(:disabled):not([readonly])`);
         if (input) {
           e.preventDefault();
           input.focus({ preventScroll: true });
@@ -4134,8 +4139,7 @@ export default function App() {
       const k = e.key.toLowerCase();
       // Let a nested picker/confirmation finish before moving its owner panel.
       if ((k === "e" || k === "k") && e.shiftKey
-          && [...document.querySelectorAll<HTMLElement>('[role="dialog"], [role="menu"], dialog[open]')]
-            .some(node => !node.classList.contains("right-panel-frame") && node.getClientRects().length)) return;
+          && hasOtherOverlay(document.querySelector('.right-panel-frame[aria-modal="true"]'))) return;
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;

@@ -602,6 +602,7 @@ export function BtwPanel(p: Props) {
               disabled={attachmentsLocked || importing} />
             <textarea
               ref={taRef}
+              data-btw-composer
               value={input}
               placeholder={lockReason ?? (awaitingFirstChat ? "正在打开…"
                 : runtimeBusy
