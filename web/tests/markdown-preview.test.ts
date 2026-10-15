@@ -1284,7 +1284,7 @@ $$`,
   assert.match(htmlMarkdown, /<img[^>]*src="https:\/\/preview\.example\/header\.png"/);
   assert.match(htmlMarkdown, /<img[^>]*width="820"[^>]*height="320"/);
   assert.match(htmlMarkdown, /referrerPolicy="no-referrer"/);
-  assert.match(htmlMarkdown, /<a href="#" title="docs\/README.md">English<\/a>/);
+  assert.match(htmlMarkdown, /<button[^>]*aria-label="在 Remote 中打开 docs\/README.md">English<\/button>/);
   assert.match(htmlMarkdown, /<a href="https:\/\/preview\.example\/project" target="_blank" rel="noopener noreferrer"/);
   assert.match(htmlMarkdown, /<em>通过强化学习/);
   assert.match(htmlMarkdown, /<strong>这个仓库/);
