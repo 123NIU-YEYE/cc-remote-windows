@@ -1,3 +1,4 @@
+import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "../icons";
 import { isLocalViewerUrl, matchingViewer, type ViewerScope, type ViewerSelection, type ViewerSite } from "../remote-viewer";
@@ -43,7 +44,6 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
   const [grant, setGrant] = useState<Grant | null>(null);
   const activeGrant = useRef<Grant | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const [expanded, setExpanded] = useState(false);
   const [retry, setRetry] = useState(0);
   const frame = useRef<HTMLIFrameElement>(null);
   const invalidate = useRef<(() => void) | null>(null);
@@ -237,13 +237,13 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
 
   useEffect(() => {
     const escape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (expanded) setExpanded(false);
-      else close.current();
+      if (event.defaultPrevented || event.isComposing || event.key !== "Escape") return;
+      if (document.querySelector('[role="dialog"], dialog[open]')) return;
+      close.current();
     };
     window.addEventListener("keydown", escape);
     return () => window.removeEventListener("keydown", escape);
-  }, [expanded]);
+  }, []);
 
   useEffect(() => {
     const resume = () => {
@@ -267,8 +267,7 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
     setLoading(true); setGrant(null); setError(null); setRetry((value) => value + 1);
     void pageContext?.refresh().catch(() => {});
   };
-  return <aside className={`artifact-panel remote-viewer-panel${expanded ? " viewer-expanded" : ""}`}
-    aria-label="远程预览" data-lock-horizontal-swipe>
+  return <PanelFrame role="complementary" className="artifact-panel remote-viewer-panel" label="远程预览" data-lock-horizontal-swipe>
     <PanelResizer ariaLabel="调整预览宽度" />
     <header className="viewer-header">
       <button className="iconbtn viewer-mobile-back" onClick={onClose} aria-label="返回对话"><Icon name="back" /></button>
@@ -276,9 +275,7 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
       <div className="viewer-heading"><strong>{selected?.label ?? "远程预览"}</strong>
         <small>{selected ? `本会话 · ${label(selected.machine_id)}` : "本会话的页面"}</small></div>
       <button className="iconbtn" onClick={refresh} title="刷新预览" aria-label="刷新预览"><Icon name="refresh" size={18} /></button>
-      <button className="iconbtn viewer-expand" onClick={() => setExpanded((value) => !value)}
-        title={expanded ? "还原大小" : "放大预览"} aria-label={expanded ? "还原大小" : "放大预览"} aria-pressed={expanded}>
-        <Icon name={expanded ? "chevrons-right" : "expand"} size={18} /></button>
+      <PanelExpandButton label="远程预览" />
       <button className="iconbtn viewer-desktop-close" onClick={onClose} aria-label="关闭预览"><Icon name="close" size={18} /></button>
     </header>
     {originalUrl && <div className="viewer-original">
@@ -340,5 +337,5 @@ export function RemoteViewerPanel({ scope, selection, requestedUrl, devices, onS
         : !loaded && <div className="viewer-loading" role="status"><span className="spinner" />正在连接…</div>}</>
       : <div className="viewer-empty" role="status"><span className="spinner" /><p>正在连接设备…</p></div>}
     </div>
-  </aside>;
+  </PanelFrame>;
 }

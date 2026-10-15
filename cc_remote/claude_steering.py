@@ -44,6 +44,12 @@ def background_end_ids(value: dict) -> tuple[str, ...]:
         [value["__cc_background_end"]] if value.get("__cc_background_end") else []))
 
 
+def is_synthetic_user(value: dict) -> bool:
+    """Native compaction/context rows are not human consumption receipts."""
+    return value.get("type") == "user" and (
+        value.get("isSynthetic") is True or value.get("isCompactSummary") is True)
+
+
 def is_managed_input(value: dict, *, pending_compact: bool = False) -> bool:
     """Native consumption evidence, excluding child output and tool results.
 
@@ -51,7 +57,8 @@ def is_managed_input(value: dict, *, pending_compact: bool = False) -> bool:
     Only a controller with that exact command pending may claim those frames.
     """
     origin = value.get("origin")
-    if (value.get("parent_tool_use_id") or value.get("parentToolUseID")
+    if (is_synthetic_user(value)
+            or value.get("parent_tool_use_id") or value.get("parentToolUseID")
             or (isinstance(origin, dict) and origin.get("kind") not in (None, "human"))):
         return False
     if value.get("type") == "user":
@@ -149,7 +156,7 @@ class PendingSteers:
             content = message.get("content") if isinstance(message, dict) else None
             tool_result = isinstance(content, list) and any(
                 isinstance(part, dict) and part.get("type") == "tool_result" for part in content)
-            injected = (value.get("type") == "user" and not tool_result
+            injected = (value.get("type") == "user" and not is_synthetic_user(value) and not tool_result
                         and kind not in (None, "human"))
             start = value.get("__cc_background_start")
             # Code can omit replay of an internal task-notification user row.
@@ -226,7 +233,7 @@ class PendingSteers:
                 return {**value, "__cc_steer_intermediate": True}
         if kind not in (None, "human") or child:
             return value
-        if value.get("type") == "user":
+        if value.get("type") == "user" and is_managed_input(value):
             metadata = self.pending.pop(value.get("uuid"), None)
             if metadata is not None:
                 return {**value, "__cc_steer": value.get("__cc_steer", metadata)}

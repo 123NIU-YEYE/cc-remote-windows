@@ -1,13 +1,17 @@
+import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
+import { RightPanelPresentation } from "../right-panel-presentation";
 import {
   useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
   useState,
   type ClipboardEvent,
+  type Ref,
   type SetStateAction,
 } from "react";
-import { ChatView } from "./ChatView";
+import { ChatView, type ChatViewHandle } from "./ChatView";
 import type { QueryAcceptanceResult } from "../outbox";
 import { CommandSheet } from "./CommandSheet";
 import { Icon } from "../icons";
@@ -80,6 +84,7 @@ interface Props {
     needsAnswer: boolean;
   }>;
   opening?: boolean;
+  chatViewRef?: Ref<ChatViewHandle>;
   active: RightPanelView;
   hasArtifact: boolean;
   artifactKind?: Artifact["kind"];
@@ -128,6 +133,7 @@ interface Props {
  * session's current focus.
  */
 export function BtwPanel(p: Props) {
+  const { expanded } = useContext(RightPanelPresentation);
   const draftKeyRef = useRef(p.draftKey);
   const [draft, setDraft] = useState<ComposerDraft>(
     () => p.draftStore.get(p.draftKey));
@@ -145,7 +151,8 @@ export function BtwPanel(p: Props) {
   const input = draft.input;
   const { images, files, pastes } = draft;
   const chats = p.chats;
-  const turns = p.rt?.turns ?? [];
+  const historyView = p.rt?.btwReplayView ?? p.rt;
+  const turns = historyView?.turns ?? [];
   const runtimeState = p.rt?.state ?? "idle";
   const inputLocked = p.rt?.control
     ? sessionControlLocksInput(p.rt.control) : !!p.rt?.external;
@@ -159,11 +166,11 @@ export function BtwPanel(p: Props) {
   const activeTurnCandidates = activeTurnCandidateIds(
     turns,
     displayActiveTurnOwnerId(
-      p.rt?.liveOwner?.turnId,
-      p.rt?.acceptancePending,
+      historyView?.liveOwner?.turnId,
+      historyView?.acceptancePending,
     ),
-    runtimeState !== "idle" || p.rt?.mirroredRunning === true
-      || !!p.rt?.acceptancePending,
+    (historyView?.state ?? "idle") !== "idle" || historyView?.mirroredRunning === true
+      || !!historyView?.acceptancePending,
   );
   const activeTurnId = activeTurnCandidates.length === 1
     ? activeTurnCandidates[0] : null;
@@ -307,7 +314,7 @@ export function BtwPanel(p: Props) {
   };
   useLayoutEffect(() => {
     if (taRef.current) grow(taRef.current);
-  }, [input, p.draftKey, lockReason]);
+  }, [input, p.draftKey, lockReason, expanded]);
 
   const submit = (value = taRef.current?.value ?? input) => {
     if (awaitingFirstChat || !p.sid || inputLockedRef.current) return;
@@ -436,7 +443,8 @@ export function BtwPanel(p: Props) {
     || isSettlingStopDisabled(submitState, hasContent);
 
   return (
-    <div className="btw-panel" data-lock-horizontal-swipe="true" data-attachment-target="btw">
+    <PanelFrame className={"btw-panel" + (expanded ? " btw-expanded" : "")}
+      label="侧边对话" data-attachment-target="btw">
       <PanelResizer ariaLabel="调整 BTW 面板宽度" />
       <div className="btw-head">
         {p.hasArtifact
@@ -454,6 +462,7 @@ export function BtwPanel(p: Props) {
           aria-label="新建侧边对话" title="新建侧边对话">
           <Icon name="plus" />
         </button>
+        <PanelExpandButton label="侧边对话" />
         <button className="iconbtn" onClick={p.onCollapse}
           aria-label="收起侧边对话" title="收起侧边对话">
           <Icon name="chevrons-right" />
@@ -491,7 +500,7 @@ export function BtwPanel(p: Props) {
       <NoticeStack notices={p.rt?.notices ?? []}
         onDismiss={p.onDismissNotice} />
       <div className="btw-body">
-        {p.rt?.truncated && <div className="btw-history-note" role="status">
+        {historyView?.truncated && <div className="btw-history-note" role="status">
           较早的部分过程已超出临时对话保留范围
         </div>}
         {awaitingFirstChat
@@ -499,7 +508,7 @@ export function BtwPanel(p: Props) {
               <span className="thinking"><span/><span/><span/></span>
               {" "}正在打开侧边对话…
             </div>
-          : p.rt?.replaying || p.rt?.loading
+          : (p.rt?.replaying || p.rt?.loading) && !p.rt?.btwReplayView
             ? <div className="btw-empty" role="status" aria-live="polite">
                 <span className="thinking"><span/><span/><span/></span>
                 {" "}正在恢复侧边对话…
@@ -510,12 +519,12 @@ export function BtwPanel(p: Props) {
                   ? "问一个基于当前会话的侧边问题 —— 回答不会写进主线。"
                   : "暂无侧边对话。点 + 新建一个基于当前会话上下文的对话。"}
               </div>
-            // Mount only the complete replay. ChatView's layout effect then
-            // places its final tail before paint, instead of chasing every
-            // intermediate history item through the scrollport.
-            : <ChatView key={p.sid} sid={p.sid ?? null} turns={turns}
+            // Cold opens mount only the complete replay at its final tail.
+            // Warm syncs keep that same ChatView mounted on the prior complete
+            // view, then swap its data once without a blank/loading frame.
+            : <ChatView key={p.sid} ref={p.chatViewRef} sid={p.sid ?? null} turns={turns}
                 engine={p.engine}
-                turnUsage={p.rt?.turnUsage}
+                turnUsage={historyView?.turnUsage}
                 activeTurnId={activeTurnId}
                 onEdit={() => {}} onGetDiff={() => {}}
                 onOpenFile={p.onOpenFile}
@@ -554,13 +563,13 @@ export function BtwPanel(p: Props) {
           </div>
         )}
         {(hasAttachments || pastes.length > 0) && (
-          <div className="attach show btw-pastes">
+          <div className="attach show btw-pastes" role="group" aria-label="侧聊待发送附件">
             <PendingImageAttachments key={p.draftKey} images={images}
               onRemove={(index) => updateDraft(current => ({
                 ...current, images: current.images.filter((_, candidate) => candidate !== index),
               }))} />
             {files.map((file, index) => <span key={index} className="attach-file">
-              <Icon name="read" size={14} /><span className="attach-fn">{file.filename}</span>
+              <Icon name="read" size={14} /><span className="attach-fn" title={file.filename}>{file.filename}</span>
               <button type="button" className="attach-x" aria-label={`移除 ${file.filename}`}
                 onClick={() => updateDraft(current => ({
                   ...current, files: current.files.filter((_, candidate) => candidate !== index),
@@ -587,51 +596,53 @@ export function BtwPanel(p: Props) {
             </div>
           </div>
         )}
-        <div className="btw-input">
-          <AttachmentPicker key={p.draftKey} onPick={onPickFiles}
-            disabled={attachmentsLocked || importing} />
-          <textarea
-            ref={taRef}
-            value={input}
-            placeholder={lockReason ?? (awaitingFirstChat ? "正在打开…"
-              : runtimeBusy
-                ? "输入以引导当前任务，或选择排队…"
-                : "问点什么")}
-            rows={1}
-            disabled={inputLocked || awaitingFirstChat || !p.sid}
-            onChange={(event) => {
-              setInput(event.target.value);
-              grow(event.target);
-            }}
-            onCompositionStart={() => imeSubmitRef.current.startComposition()}
-            onCompositionEnd={(event) => {
-              imeSubmitRef.current.endComposition();
-              setInput(event.currentTarget.value);
-            }}
-            onPaste={onPaste}
-            onKeyDown={(event) => {
-              if (!imeSubmitRef.current.shouldSubmitKey({
-                key: event.key,
-                shiftKey: event.shiftKey,
-                isComposing: event.nativeEvent.isComposing,
-                keyCode: event.nativeEvent.keyCode,
-              })) return;
-              event.preventDefault();
-              submit(event.currentTarget.value);
-            }}
-          />
-          <button className={sendClass}
-            onPointerDown={() => {
-              if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) {
-                taRef.current?.blur();
-              }
-            }}
-            onClick={requestButtonAction}
-            disabled={sendDisabled}
-            aria-label={interruptSettling && stopping
-              ? "正在停止" : stopping ? "停止" : "发送"}>
-            <Icon name={sendIcon} size={18} />
-          </button>
+        <div className="btw-input-card">
+          <div className="btw-input">
+            <AttachmentPicker key={p.draftKey} onPick={onPickFiles}
+              disabled={attachmentsLocked || importing} />
+            <textarea
+              ref={taRef}
+              value={input}
+              placeholder={lockReason ?? (awaitingFirstChat ? "正在打开…"
+                : runtimeBusy
+                  ? "输入以引导当前任务，或选择排队…"
+                  : "问点什么")}
+              rows={1}
+              disabled={inputLocked || awaitingFirstChat || !p.sid}
+              onChange={(event) => {
+                setInput(event.target.value);
+                grow(event.target);
+              }}
+              onCompositionStart={() => imeSubmitRef.current.startComposition()}
+              onCompositionEnd={(event) => {
+                imeSubmitRef.current.endComposition();
+                setInput(event.currentTarget.value);
+              }}
+              onPaste={onPaste}
+              onKeyDown={(event) => {
+                if (!imeSubmitRef.current.shouldSubmitKey({
+                  key: event.key,
+                  shiftKey: event.shiftKey,
+                  isComposing: event.nativeEvent.isComposing,
+                  keyCode: event.nativeEvent.keyCode,
+                })) return;
+                event.preventDefault();
+                submit(event.currentTarget.value);
+              }}
+            />
+            <button className={sendClass}
+              onPointerDown={() => {
+                if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) {
+                  taRef.current?.blur();
+                }
+              }}
+              onClick={requestButtonAction}
+              disabled={sendDisabled}
+              aria-label={interruptSettling && stopping
+                ? "正在停止" : stopping ? "停止" : "发送"}>
+              <Icon name={sendIcon} size={18} />
+            </button>
+          </div>
         </div>
         <div className="btw-controls">
           <span>BTW 设置</span>
@@ -651,7 +662,7 @@ export function BtwPanel(p: Props) {
       </div>
       {dragOver && <div className="drop-overlay drop-overlay-btw" aria-hidden="true">
         <div className="drop-card">
-          <span className="dc-ic"><Icon name="plus" size={32} /></span>
+          <span className="dc-ic"><Icon name="paperclip" size={32} /></span>
           <div className="dc-tx">添加到侧边对话</div>
           <div className="dc-sub">松开以添加图片或文件</div>
         </div>
@@ -710,6 +721,6 @@ export function BtwPanel(p: Props) {
           }}
         />
       )}
-    </div>
+    </PanelFrame>
   );
 }

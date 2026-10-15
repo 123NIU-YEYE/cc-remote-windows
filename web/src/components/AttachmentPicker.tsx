@@ -28,7 +28,7 @@ export function AttachmentPicker({ onPick, disabled = false, className = "cmdbtn
     <button type="button" className={className} disabled={disabled}
       aria-label={label} title={label} aria-haspopup="dialog" aria-expanded={open && !disabled}
       onClick={() => setOpen(!open)}>
-      {children ?? <Icon name="plus" size={19} />}
+      {children ?? <Icon name="paperclip" size={19} />}
     </button>
     <input ref={photos} type="file" accept="image/*" multiple hidden aria-label="添加照片" onChange={imported} />
     <input ref={files} type="file" multiple hidden aria-label="添加文件" onChange={imported} />

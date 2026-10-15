@@ -1,3 +1,5 @@
+import { installPreviewEscape } from "./preview-keyboard";
+
 const STATIC_PREVIEW_CSP =
   "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; "
   + "font-src data:; object-src 'none'; frame-src 'none'; form-action 'none'; "
@@ -61,5 +63,6 @@ export function buildInteractiveSandboxDocument(
   head = "",
   theme?: HtmlPreviewTheme,
 ): string {
-  return documentWithCsp(head, body, INTERACTIVE_PREVIEW_CSP, theme);
+  return documentWithCsp(`<script>(${installPreviewEscape.toString()})();</script>${head}`,
+    body, INTERACTIVE_PREVIEW_CSP, theme);
 }

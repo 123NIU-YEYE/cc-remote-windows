@@ -95,6 +95,17 @@ document.getElementById('rotate').onclick=()=>{
                 sites.append(site.model_copy(update={"id": name, "label": label,
                                                      "entry": f"/viewer/{name}.html",
                                                      "paths": [f"/viewer/{name}.html", "/viewer/app.js", "/modules/", "/meshes/"]}))
+            for policy in ("self", "none"):
+                name = f"csp-{policy}"
+                (root / f"viewer/{name}.html").write_text(
+                    '\ufeff<!-- CSP fixture -->\n<!DOCTYPE html><html lang="zh"><head>'
+                    '<meta charset="utf-8">'
+                    f'<meta http-equiv="Content-Security-Policy" content="script-src \'{policy}\'">'
+                    '<script>window.inlineScriptRan=true</script></head>'
+                    '<body><input aria-label="保留草稿"><button>最后一个控件</button></body></html>')
+                sites.append(site.model_copy(update={"id": name, "label": f"CSP {policy}",
+                                                     "entry": f"/viewer/{name}.html",
+                                                     "paths": [f"/viewer/{name}.html"]}))
             # Generated in the temporary fixture: no large data assets in Git.
             embedded = '<script id="mesh-data" type="application/octet-stream">' + "A" * (3 * 1024 * 1024) + "</script>"
             (root / "viewer/embedded.html").write_text('''<!doctype html><body>

@@ -53,6 +53,62 @@ test("remote Viewer loads modules and binary models without exposing main cookie
   await page.screenshot({ path: test.info().outputPath("viewer.png"), fullPage: true });
 });
 
+test("remote Viewer expanded iframe keeps Tab and Escape within its panel", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole("button", { name: "打开远程预览" }).click();
+  await page.getByRole("button", { name: /^机器人结构/ }).click();
+  const panel = page.locator(".remote-viewer-panel");
+  const frame = panel.frameLocator("iframe");
+  await expect(frame.locator("#status")).toContainText("模型已加载", { timeout: 30000 });
+  const original = await panel.locator("iframe").elementHandle();
+  await panel.getByRole("button", { name: "居中展开远程预览" }).click();
+  const controls = frame.locator('button, input, a[href], [tabindex="0"]');
+  await controls.last().focus();
+  await page.keyboard.press("Tab");
+  await expect.poll(() => panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+  await expect(panel.locator("button:visible").first()).toBeFocused();
+  await frame.getByRole("button", { name: "旋转模型" }).click();
+  await page.keyboard.press("Shift+Tab");
+  await expect.poll(() => panel.evaluate(node => node.contains(document.activeElement))).toBe(true);
+  await frame.getByRole("button", { name: "旋转模型" }).click();
+  // A different window cannot forge a docking request for the focused iframe.
+  await page.evaluate(() => window.postMessage({ type: "cc-remote-preview-escape" }, "*"));
+  await expect(panel).toHaveClass(/panel-expanded/);
+  await page.keyboard.press("Escape");
+  await expect(panel).not.toHaveClass(/panel-expanded/);
+  await expect(panel).toBeVisible();
+  await expect(frame.locator("#status")).toHaveText("已旋转 2 次");
+  expect(await original!.evaluate(node => node.isConnected)).toBe(true);
+  expect(await frame.locator("body").evaluate(() => {
+    try { void parent.document; return false; } catch { return true; }
+  })).toBe(true);
+});
+
+for (const policy of ["self", "none"]) {
+  test(`isolated expanded iframe Escape survives page CSP ${policy}`, async ({ page }) => {
+    test.skip(process.env.VIEWER_TEST_MODE !== "isolated", "Isolated HTML navigation coverage.");
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.getByRole("button", { name: "打开远程预览" }).click();
+    await page.getByRole("button", { name: new RegExp(`^CSP ${policy}`) }).click();
+    const panel = page.locator(".remote-viewer-panel");
+    const frame = panel.frameLocator("iframe");
+    const input = frame.getByRole("textbox", { name: "保留草稿" });
+    await input.fill("中文草稿");
+    await panel.getByRole("button", { name: "居中展开远程预览" }).click();
+    await input.focus();
+    await page.keyboard.press("Escape");
+    await expect(panel).not.toHaveClass(/panel-expanded/);
+    await expect(input).toHaveValue("中文草稿");
+    expect(await frame.locator("body").evaluate(() => ({
+      mode: document.compatMode, language: document.documentElement.lang,
+      charset: document.characterSet,
+      ran: Object.hasOwn(window, "inlineScriptRan"),
+      policy: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.getAttribute("content"),
+    }))).toEqual({ mode: "CSS1Compat", language: "zh", charset: "UTF-8",
+      ran: false, policy: `script-src '${policy}'` });
+  });
+}
+
 test("Bridge blocks storage and native network access, and logout clears the frame", async ({ page }) => {
   test.skip(process.env.VIEWER_TEST_MODE === "isolated", "Opaque-frame behavior is specific to Bridge.");
   await page.getByRole("button", { name: "打开远程预览" }).click();
