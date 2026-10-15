@@ -5336,7 +5336,18 @@ function reduceEvent(
         // A completed human row can own a new autonomous Claude continuation.
         // Its completion receipt stays intact; the explicit native owner alone
         // drives current activity until the next idle boundary.
-        if (boundCompletedTurns && e.msg_id && seq === rt.lastLiveSeq
+        if (boundCompletedTurns && e.sid?.startsWith("btw-")
+            && rt.replaying && seq == null) {
+          // SyncBtw seeds current Claude ownership after the unsequenced
+          // narrative and before ReplayEnd swaps the retained view. Never
+          // infer this from the last row or revive a completed historical turn.
+          const owners = e.msg_id ? turns.filter((candidate) =>
+            turnHasIdentityAlias(candidate, e.msg_id)) : [];
+          const owner = owners.length === 1 ? owners[0] : undefined;
+          rt.liveOwner = e.state !== "idle" && owner
+              && (!owner.done || e.continuation === true)
+            ? { turnId: owner.id, seq: rt.lastLiveSeq } : null;
+        } else if (boundCompletedTurns && e.msg_id && seq === rt.lastLiveSeq
             && (!turn?.done || e.continuation === true)) {
           rt.liveOwner = { turnId: turn?.id ?? e.msg_id, seq };
         }
