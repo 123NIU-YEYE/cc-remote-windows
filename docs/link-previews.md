@@ -22,9 +22,15 @@ and its local static-file publications.
   TLS hostname and Host header. Environment proxies and connection reuse across
   redirects are disabled. HTTPS redirects may not downgrade to HTTP.
 - At most four hops are followed. HTML reads stop after the head or 256 KiB;
-  images are limited to 256 KiB and icons to 64 KiB. Only recognized raster bytes
-  with image content types become data URLs. SVG, HTML, scripts, cookies and
-  external image URLs are never embedded in the returned card. CSP stays intact.
+  images are limited to 256 KiB and icons to 64 KiB. Recognized raster images
+  are decoded only within a 4-million-pixel budget (1 million for icons) and a
+  4096-pixel edge limit, including embedded ICO images and WebP canvases before
+  eager decoder allocation. Only the first frame is decoded and re-encoded as a
+  metadata-free static PNG, at most 1024 × 768 (128 × 128 for icons), still within
+  the same byte cap. Decoding uses at most two worker threads, keeping the
+  control-link event loop responsive. Invalid or oversized images are omitted while page text
+  remains available. SVG, HTML, scripts, cookies and external image URLs are
+  never embedded in the returned card. CSP stays intact.
 - Linked pages are fetched only on preview interaction. Visible inline favicons
   use an origin-only request, without the link's path, query or fragment. If
   `/favicon.ico` is unavailable, bounded homepage metadata discovers declared
@@ -39,7 +45,7 @@ and its local static-file publications.
   and a minimal card. A DNS setup returning virtual/private proxy addresses
   intentionally fails closed; the Relay needs public DNS results for previews.
 
-Regression coverage: `tests/test_link_preview.py`, the Markdown preview unit
+Regression coverage: `tests/test_link_preview.py`, `tests/test_link_preview_images.py`, the Markdown preview unit
 suite, and `local Markdown file` / `Markdown HTML preview` browser cases in
 `web/tests/history-browser.spec.ts`. Tests stub network metadata and do not call
 models or arbitrary live websites.

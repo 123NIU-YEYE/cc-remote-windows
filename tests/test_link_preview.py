@@ -1,17 +1,21 @@
 """Public link metadata never contacts private services or carries credentials."""
 import asyncio
-import base64
+import io
 import socket
+import threading
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from cc_remote.config import RelayConfig
 from cc_remote.relay import link_preview as preview
 from cc_remote.relay.server import create_app
 
-PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6SAAAAABJRU5ErkJggg==")
+_png = io.BytesIO()
+Image.new("RGB", (1, 1), "red").save(_png, format="PNG")
+PNG = _png.getvalue()
 
 
 @pytest.mark.parametrize("url", [
@@ -266,6 +270,74 @@ async def test_homepage_icon_cannot_fetch_private_address(monkeypatch):
     install_transport(monkeypatch, handler)
     assert await preview.LinkPreviewService().get("https://example.org/private", icon_only=True) == {"icon": None}
     assert connected == ["https://8.8.8.8/favicon.ico", "https://8.8.8.8/"]
+
+
+@pytest.mark.asyncio
+async def test_oversized_images_are_omitted_without_losing_page_metadata(monkeypatch):
+    output = io.BytesIO()
+    Image.new("RGB", (3000, 2000)).save(output, format="PNG")
+    bomb = output.getvalue()
+    assert len(bomb) < preview.ICON_LIMIT
+
+    async def fetch(url, limit, **kwargs):
+        if url.endswith((".ico", ".png")):
+            return url, "image/png", bomb
+        return url, "text/html", b'<title>Still readable</title><meta property="og:image" content="/cover.png">'
+
+    monkeypatch.setattr(preview, "fetch_public", fetch)
+    service = preview.LinkPreviewService()
+    assert await service.get("https://example.org/secret", icon_only=True) == {"icon": None}
+    result = await service.get("https://example.org/docs")
+    assert result["title"] == "Still readable"
+    assert result["image"] is None and result["icon"] is None
+
+
+@pytest.mark.asyncio
+async def test_decoding_stays_off_event_loop_and_worker_limit_survives_cancellation(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    running = 0
+    maximum = 0
+    loop_thread = threading.get_ident()
+
+    async def fetch(url, limit, **kwargs):
+        return url, "image/png", PNG
+
+    def decode(*args, **kwargs):
+        nonlocal running, maximum
+        assert threading.get_ident() != loop_thread
+        with lock:
+            running += 1
+            maximum = max(maximum, running)
+            if running == 2:
+                started.set()
+        try:
+            assert release.wait(5)
+            return "thumbnail"
+        finally:
+            with lock:
+                running -= 1
+
+    monkeypatch.setattr(preview, "fetch_public", fetch)
+    monkeypatch.setattr(preview, "raster_data", decode)
+    tasks = [asyncio.create_task(preview._image("https://example.org/icon", preview.ICON_LIMIT))
+             for _ in range(3)]
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancelling awaiters cannot replace still-running decoder threads.
+        replacement = asyncio.create_task(preview._image("https://example.org/new", preview.ICON_LIMIT))
+        tasks.append(replacement)
+        await asyncio.sleep(0)
+        assert maximum == 2
+        release.set()
+        assert await replacement == "thumbnail"
+        assert maximum == 2
+    finally:
+        release.set()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @pytest.mark.asyncio

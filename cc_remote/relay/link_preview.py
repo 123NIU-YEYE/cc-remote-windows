@@ -7,20 +7,26 @@ cookies, scripts, SVG, persistent downloads, or arbitrary-port proxying.
 from __future__ import annotations
 
 import asyncio
-import base64
 import ipaddress
 import socket
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
 import httpx
 
+from .preview_image import raster_data
+
 HTML_LIMIT = 256 * 1024
 IMAGE_LIMIT = 256 * 1024
 ICON_LIMIT = 64 * 1024
 CACHE_LIMIT = 64
+# Image decoding/encoding must not block control-link traffic. Timed-out
+# requests cannot create extra active decoders beyond these two workers.
+_IMAGE_WORKERS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="link-preview-image")
 
 
 class PreviewUnavailable(ValueError):
@@ -144,27 +150,13 @@ class Metadata(HTMLParser):
             self.title = (self.title + data)[:400]
 
 
-def raster_data(content: bytes) -> str | None:
-    mime = None
-    if content.startswith(b"\x89PNG\r\n\x1a\n"):
-        mime = "image/png"
-    elif content.startswith(b"\xff\xd8\xff"):
-        mime = "image/jpeg"
-    elif content.startswith((b"GIF87a", b"GIF89a")):
-        mime = "image/gif"
-    elif content.startswith(b"RIFF") and content[8:12] == b"WEBP":
-        mime = "image/webp"
-    elif content.startswith(b"\x00\x00\x01\x00"):
-        mime = "image/x-icon"
-    return f"data:{mime};base64,{base64.b64encode(content).decode()}" if mime else None
-
-
 async def _image(url: str, limit: int) -> str | None:
     try:
         async with asyncio.timeout(4):
             _, content_type, content = await fetch_public(url, limit)
-        if content_type.lower().startswith("image/"):
-            return raster_data(content)
+            if content_type.lower().startswith("image/"):
+                return await asyncio.get_running_loop().run_in_executor(
+                    _IMAGE_WORKERS, partial(raster_data, content, icon=limit == ICON_LIMIT))
     except (ValueError, OSError, httpx.HTTPError, TimeoutError):
         pass
     return None
