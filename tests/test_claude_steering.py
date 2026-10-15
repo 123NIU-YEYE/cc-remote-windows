@@ -161,7 +161,7 @@ async def test_task_origin_result_consumes_exact_steer_and_commits_original_root
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("persistent", [False, True])
-@pytest.mark.parametrize("finish", ["result", "steer", "stop"])
+@pytest.mark.parametrize("finish", ["result", "absorbed_result", "steer", "stop"])
 @pytest.mark.parametrize("start", [
     requesting(),
     assistant("unannounced", [{"type": "text", "text": "continue"}]),
@@ -236,7 +236,17 @@ async def test_native_continuation_without_replayed_user_is_visible_and_interact
                 if finish == "stop":
                     await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
                     assert native.interrupts == 1
-                await native.queue.put({**result(), "origin": {"kind": "task-notification"}})
+                if finish == "absorbed_result":
+                    # The originating internal prompt was not replayed. Other
+                    # task inputs arrive during its response, but its Result
+                    # still names the original run, not the absorbed inputs.
+                    for run in ("absorbed-a", "absorbed-b"):
+                        await native.queue.put({**user(run), "isReplay": True, "origin": {
+                            "kind": "task-notification", "producer": "session-task", "runId": run,
+                        }})
+                await native.queue.put({**result(), "origin": {
+                    "kind": "task-notification", "producer": "session-task", "runId": "original",
+                }})
                 await until(lambda: ctx.state == "idle")
                 assert not any(e.type == "turn_end" for e in transport.sent)
             await until(lambda: sdk._background_callbacks_pending == 0)
@@ -244,6 +254,15 @@ async def test_native_continuation_without_replayed_user_is_visible_and_interact
             if worker:
                 await until(lambda: worker.turn is None and worker.background_start is None)
                 assert not native.closed
+            if finish == "absorbed_result":
+                sdk.next_turn_id = "next-human"
+                await sdk.query("next question")
+                await native.queue.put(user("next-native", "next question"))
+                await native.queue.put(result())
+                messages = [m async for m in sdk.receive_response()]
+                await sdk.ack_service_message(messages[-1], turn_id="next-human")
+                inputs = native.prompts if persistent else native.inputs
+                assert len(inputs) == 2 and native.interrupts == 0
         finally:
             for task in (ctx.turn_task, ctx.claude_autonomous_interrupt_task):
                 if task:
@@ -409,13 +428,79 @@ def test_only_main_activity_starts_an_implicit_continuation():
     assert ended["__cc_background_end"] == identity and pending.background_id is None
 
 
-def test_human_echo_adopts_only_implicit_activity_with_legacy_terminal_annotations():
+@pytest.mark.parametrize("legacy_journal", [False, True])
+def test_implicit_response_retains_ownership_across_absorbed_task_origins(legacy_journal):
+    from cc_remote.claude_steering import background_end_ids, is_human_result
+
+    owner, replay = PendingSteers(), PendingSteers()
+
+    def emit(frame):
+        value = owner.annotate(frame)
+        if legacy_journal and value.get("__cc_background_start"):
+            value = {**value, "__cc_background_start": {
+                key: data for key, data in value["__cc_background_start"].items() if key != "implicit"
+            }}
+        return value, replay.annotate(value)
+
+    start, _ = emit(requesting())
+    identity = start["__cc_background_start"]["id"]
+    for run in ("absorbed-a", "absorbed-b", "absorbed-a"):
+        value, projected = emit({**user(run), "isReplay": True, "origin": {
+            "kind": "task-notification", "producer": "session-task", "runId": run,
+        }})
+        assert value["__cc_background_start"]["id"] == identity
+        assert projected["__cc_background_start"]["id"] == identity
+
+    for pending in (owner, replay):
+        pending.add("next-human", {"id": "next-ui"})
+    terminal = {**result(), "origin": {
+        "kind": "task-notification", "producer": "session-task", "runId": "original",
+    }}
+    for field in ("parent_tool_use_id", "parentToolUseID"):
+        for value in emit({**terminal, field: "child"}):
+            assert not background_end_ids(value)
+        assert owner.background_id == replay.background_id == identity
+
+    for value in emit(terminal):
+        assert background_end_ids(value) == (identity,)
+        assert not is_human_result(value)
+    for pending in (owner, replay):
+        assert pending.background_id is None
+        assert "next-human" in pending.pending
+
+
+def test_implicit_response_terminal_preserves_unrelated_explicit_origin():
+    from cc_remote.claude_steering import background_end_ids
+
+    pending = PendingSteers()
+    explicit = pending.annotate({**user("older-task"), "origin": ORIGIN})["__cc_background_start"]
+    pending.annotate({**requesting(), "__cc_background_start": {
+        "id": "implicit-request", "origin_key": None, "origin": None, "managed": False,
+    }})
+    pending.annotate({**user("absorbed"), "origin": {
+        "kind": "task-notification", "runId": "absorbed",
+    }})
+    terminal = pending.annotate({**result(), "origin": {
+        "kind": "task-notification", "runId": "original",
+    }})
+    assert background_end_ids(terminal) == ("implicit-request",)
+    assert pending.background_id == explicit["id"]
+    pending.annotate({**result(), "origin": ORIGIN})
+    assert pending.background_id is None
+
+
+@pytest.mark.parametrize("absorbed_before_echo", [False, True])
+def test_human_echo_adopts_only_implicit_activity_with_legacy_terminal_annotations(absorbed_before_echo):
     pending = PendingSteers()
     explicit = pending.annotate({**user("older-task"), "origin": ORIGIN})["__cc_background_start"]
     # A journal may restore an explicit older continuation beside a controller's
     # implicit request claim; neither may erase the other's provenance.
     implicit = {"id": "implicit-request", "origin_key": None, "origin": None, "managed": False}
     pending.annotate({**requesting(), "__cc_background_start": implicit})
+    if absorbed_before_echo:
+        pending.annotate({**user("in-turn-task"), "origin": {
+            "kind": "task-notification", "runId": "absorbed-before-human-echo",
+        }})
     pending.annotate(user("native-human"), managed_active=True)
     absorbed = pending.annotate({**user("absorbed"), "origin": {
         "kind": "task-notification", "taskId": "current-task",
@@ -428,6 +513,46 @@ def test_human_echo_adopts_only_implicit_activity_with_legacy_terminal_annotatio
     assert pending.background_id == explicit["id"]
     pending.annotate({**result(), "origin": ORIGIN})
     assert pending.background_id is None
+
+
+@pytest.mark.asyncio
+async def test_implicit_response_absorbs_tasks_while_detached_then_accepts_next_query():
+    from cc_remote.claude_steering import background_end_ids
+
+    async with environment() as (service, attach):
+        first = await attach()
+        worker = service.sessions[first.id]
+        native = worker.client
+        await native.queue.put(requesting())
+        await until(lambda: worker.journal.seq == 1)
+        await first.detach()
+        await released(worker)
+        for run in ("absorbed-a", "absorbed-b"):
+            await native.queue.put({**user(run), "isReplay": True, "origin": {
+                "kind": "task-notification", "producer": "session-task", "runId": run,
+            }})
+        await native.queue.put({**result(), "origin": {
+            "kind": "task-notification", "producer": "session-task", "runId": "original",
+        }})
+        await until(lambda: worker.journal.seq == 4)
+        # Native completion alone must not discard unprojected output. The new
+        # controller replays the entire response before acknowledging its end.
+        assert worker.background_start == 0 and worker.terminal_seq is None
+        second = await attach()
+        replay = PendingSteers()
+        stream = second.receive_messages()
+        for _ in range(3):
+            value = replay.annotate(await asyncio.wait_for(anext(stream), 3))
+            await second.call("ack", {"seq": value["__cc_service_seq"]})
+        assert worker.background_start == 0 and len(worker.journal.after(0)) == 4
+        terminal = replay.annotate(await asyncio.wait_for(anext(stream), 3))
+        assert background_end_ids(terminal) and replay.background_id is None
+        await second.call("ack", {"seq": terminal["__cc_service_seq"]})
+        assert worker.background_start is None and worker.journal.after(0) == []
+        second.next_turn = {"id": "next-human"}
+        await second.query("next question")
+        assert native.prompts == ["next question"]
+        assert worker.client is native and not native.closed and native.interrupts == 0
 
 
 @pytest.mark.asyncio
