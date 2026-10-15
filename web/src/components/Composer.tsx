@@ -651,7 +651,11 @@ export function Composer(p: Props) {
       growTa();
       return;
     }
-    if (clientSlashesFor(p.engine).has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
+    if (clientSlashesFor(p.engine).has(slash)) {
+      runClientSlash(slash, "");
+      if (slash !== "btw") focusTa();
+      return;
+    }
     setInput("/" + slash + " ");
     focusTa(); growTa();
   };
