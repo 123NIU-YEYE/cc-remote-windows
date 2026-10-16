@@ -2,6 +2,18 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.19
+
+Speed up large-session history loading and fix Claude conversations that remain
+marked as running after a steered reply finishes. Wire protocol v74 is unchanged.
+See the bilingual [release notes](docs/releases/v4.0.19.md).
+
+- Reuse bounded history pages and transcript metadata instead of repeatedly scanning and translating unchanged records.
+- Reuse read-only Codex readers within one history request and prefetch one older summary page when idle.
+- Validate cached pages against their source while keeping native turn identities, images and live activity current.
+- Retire the matching implicit Claude background activity when the real steered human reply ends, including after journal replay.
+- Existing independent Claude services need the documented drained owner upgrade for the steering fix; Wrapper-only updates preserve the old owner.
+
 ## v4.0.18
 
 Simplify side-chat access and headers, keep empty mobile chats at their normal
