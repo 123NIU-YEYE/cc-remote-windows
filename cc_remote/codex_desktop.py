@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import plistlib
 import select
 import shutil
@@ -37,6 +38,7 @@ from cc_remote.wrapper.process_scan import (
 
 _REPO = Path(__file__).resolve().parent.parent
 _START_TIMEOUT = 40
+_MACOS_MIN_VERSION = "13.0"
 _FORBIDDEN = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
 
 
@@ -422,10 +424,14 @@ def install(profile: Path, app: Path, target: Path) -> dict:
                 "CFBundleDisplayName": target.stem, "CFBundleExecutable": "CodexSharedLauncher",
                 "CFBundlePackageType": "APPL", "CFBundleVersion": "1",
                 "CFBundleShortVersionString": "1.0", "CFBundleIconFile": "Shared.icns",
-                "LSUIElement": True, "NSHighResolutionCapable": True}
+                "LSUIElement": True, "NSHighResolutionCapable": True,
+                "LSMinimumSystemVersion": _MACOS_MIN_VERSION}
         (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+        # swiftc's default target can exceed the running macOS version. Pin the
+        # launcher to the official App's supported baseline on both Mac architectures.
         subprocess.run(
-            ["/usr/bin/swiftc", str(Path(__file__).with_suffix(".swift")), "-o",
+            ["/usr/bin/swiftc", "-target", f"{platform.machine()}-apple-macosx{_MACOS_MIN_VERSION}",
+             str(Path(__file__).with_suffix(".swift")), "-o",
              str(contents / "MacOS/CodexSharedLauncher")], check=True, timeout=120,
             stdout=subprocess.DEVNULL,
         )
