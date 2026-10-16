@@ -5760,6 +5760,7 @@ export default function App() {
             notificationAvailable={typeof Notification !== "undefined"}
             onNotificationMode={updateNotificationMode}
             onOpenUsageActivity={openUsageActivity}
+            onOpenBtw={visibleParentSid && !archivedBrowse ? () => openBtw() : undefined}
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
             onSelectTheme={selectTheme}
