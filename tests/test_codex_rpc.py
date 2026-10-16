@@ -544,3 +544,85 @@ def test_codex_thread_list_paginates_both_archive_states_and_normalizes(monkeypa
                    for _, params, _ in calls)
 
     asyncio.run(run())
+
+
+def _history_rpc_factory(monkeypatch, processes):
+    spawned = []
+    async def create(*args, **kwargs):
+        process = processes[len(spawned)]
+        spawned.append((process, kwargs))
+        return process
+    monkeypatch.setattr(codex_rpc_module, '_resolve_codex_bin', lambda: '/bin/codex')
+    monkeypatch.setattr(codex_rpc_module, '_child_env', lambda _bin, home: {'PROFILE': home or ''})
+    monkeypatch.setattr(codex_rpc_module.asyncio, 'create_subprocess_exec', create)
+    return spawned
+
+
+def _history_process(results):
+    return _FakeProcess([{'id': 1, 'result': {}}] + [
+        {'id': i + 2, 'result': result} for i, result in enumerate(results)])
+
+
+def test_history_scope_reuses_reader_but_not_accounts_or_mutations(monkeypatch):
+    async def run():
+        processes = [_history_process([{'n': 1}, {'n': 2}]),
+                     _history_process([{'n': 3}]), _history_process([{'n': 4}])]
+        spawned = _history_rpc_factory(monkeypatch, processes)
+        async with codex_rpc_module.codex_history_rpc_scope():
+            assert await codex_rpc_module.codex_rpc('thread/turns/list', {}, codex_home='/a') == {'n': 1}
+            async with codex_rpc_module.codex_history_rpc_scope():
+                assert await codex_rpc_module.codex_rpc('thread/items/list', {}, codex_home='/a') == {'n': 2}
+            assert len(spawned) == 1 and not processes[0].terminated
+            await codex_rpc_module.codex_rpc('thread/turns/list', {}, codex_home='/b')
+            await codex_rpc_module.codex_rpc('thread/name/set', {}, codex_home='/a')
+            assert processes[2].terminated and not processes[1].terminated
+        assert all(p.terminated and p.stdin.closed for p in processes)
+        assert [json.loads(row).get('id') for row in processes[0].stdin.writes] == [1, None, 2, 3]
+        assert [args['env']['PROFILE'] for _p, args in spawned] == ['/a', '/b', '/a']
+    asyncio.run(run())
+
+
+def test_history_scope_cannot_share_parent_reader_with_child_task(monkeypatch):
+    async def run():
+        processes = [_history_process([1, 3]), _history_process([2])]
+        spawned = _history_rpc_factory(monkeypatch, processes)
+        async with codex_rpc_module.codex_history_rpc_scope():
+            assert await codex_rpc_module.codex_rpc('thread/turns/list', {}) == 1
+            assert await asyncio.create_task(codex_rpc_module.codex_rpc('thread/items/list', {})) == 2
+            assert processes[1].terminated
+            assert await codex_rpc_module.codex_rpc('thread/turns/list', {}) == 3
+        assert len(spawned) == 2 and all(p.terminated for p in processes)
+    asyncio.run(run())
+
+
+def test_history_scope_reaps_broken_pipe_before_explicit_fallback(monkeypatch):
+    async def run():
+        broken = _history_process([])
+        broken.stdout = _OversizedResponseStdout([{'id': 1, 'result': {}}])
+        fallback = _history_process([{'items': []}])
+        _history_rpc_factory(monkeypatch, [broken, fallback])
+        async with codex_rpc_module.codex_history_rpc_scope():
+            with pytest.raises(codex_rpc_module.CodexRpcResponseTooLarge):
+                await codex_rpc_module.codex_rpc('thread/turns/list', {})
+            assert broken.terminated and broken.stdin.closed
+            assert await codex_rpc_module.codex_rpc('thread/items/list', {}) == {'items': []}
+        assert fallback.terminated
+    asyncio.run(run())
+
+
+def test_cancelled_history_page_reaps_its_reader(monkeypatch):
+    async def run():
+        process = _history_process([])
+        process.stdout = _BlockingFakeStdout([{'id': 1, 'result': {}}])
+        _history_rpc_factory(monkeypatch, [process])
+        async def read():
+            async with codex_rpc_module.codex_history_rpc_scope():
+                await codex_rpc_module.codex_rpc('thread/turns/list', {})
+        task = asyncio.create_task(read())
+        while len(process.stdin.writes) < 3:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.terminated and process.stdin.closed
+    asyncio.run(run())

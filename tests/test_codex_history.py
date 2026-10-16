@@ -2004,7 +2004,8 @@ def test_active_head_fallback_retains_exact_official_client_identity():
     asyncio.run(run())
 
 
-def test_summary_recovers_expired_local_image_from_rollout():
+@pytest.mark.parametrize("page_scoped", [False, True])
+def test_summary_recovers_expired_local_image_from_rollout(page_scoped):
     recovered_calls = []
 
     async def rpc(_method, _params, cwd=None):
@@ -2034,10 +2035,15 @@ def test_summary_recovers_expired_local_image_from_rollout():
         )
 
     async def run():
+        async def unexpected_global_recovery(*args):
+            raise AssertionError("page source coordinates must take precedence")
+
         history = CodexOfficialHistory(
-            64 * 1024, rpc=rpc, recover_user=recover)
+            64 * 1024, rpc=rpc,
+            recover_user=unexpected_global_recovery if page_scoped else recover)
         page = await history.summary_page(
-            "thread-image", before=None, limit=1)
+            "thread-image", before=None, limit=1,
+            **({"source_user": recover} if page_scoped else {}))
         assert recovered_calls == [
             ("thread-image", "native-image", "user-image", 0)]
         refs = page.turns[0].get("imageRefs")
@@ -2371,7 +2377,10 @@ def test_rollout_forward_goal_recovery_does_not_bind_status_or_next_turn(
     assert recovered.users["next-goal"].prompt == "next objective"
 
 
-def test_rollout_user_recovery_selects_later_steer_images(tmp_path):
+@pytest.mark.parametrize("boundary_offset", [None, 0, 1])
+def test_rollout_user_recovery_selects_later_steer_images(
+    tmp_path, monkeypatch, boundary_offset,
+):
     rollout = tmp_path / "rollout-steer-images.jsonl"
     rollout.write_text("".join(json.dumps(row) + "\n" for row in [
         {
@@ -2416,8 +2425,13 @@ def test_rollout_user_recovery_selects_later_steer_images(tmp_path):
         },
     ]))
 
+    if boundary_offset == 0:
+        def no_reverse_scan(*args, **kwargs):
+            raise AssertionError("a proven task offset needs no reverse lookup")
+        monkeypatch.setattr(codex_stream_module, "_reverse_jsonl_records", no_reverse_scan)
     recovered = codex_history_turn_user(
-        str(rollout), "native-steer", "user-steer", 1)
+        str(rollout), "native-steer", "user-steer", 1,
+        boundary_offset=boundary_offset)
     assert recovered is not None
     assert recovered.msg_id == "user-steer"
     assert recovered.prompt == "steer"
@@ -3323,4 +3337,51 @@ def test_multi_user_detail_selects_the_requested_full_segment_after_summary_coll
             for event in events
         )
 
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('batch_failure', [None, 'oversized', 'moved'])
+@pytest.mark.parametrize('discover_segments', [False, True])
+def test_multiple_collapsed_turns_restore_in_one_bounded_full_page(
+    batch_failure, discover_segments,
+):
+    async def run():
+        calls = []
+        summaries = [_turn(f'native-{n}', [_user(f'user-{n}-a', 'first')]) for n in range(3)]
+        full = [_turn(f'native-{n}', [_user(f'user-{n}-a', 'first'),
+                    _agent(f'answer-{n}-a', 'reply'), _user(f'user-{n}-b', 'steer'),
+                    _agent(f'answer-{n}-b', 'final')], items_view='full') for n in range(3)]
+        async def rpc(method, params, cwd=None):
+            calls.append(dict(params))
+            if params['itemsView'] == 'summary':
+                return {'data': summaries, 'nextCursor': None}
+            if params['itemsView'] == 'notLoaded':
+                return {'data': [dict(row, items=[], itemsView='notLoaded')
+                                 for row in summaries[:params['limit']]],
+                        'nextCursor': f"skip-{params['limit']}"}
+            index = int(params['cursor'].split('-')[1]) if params['cursor'] else 0
+            if params['limit'] > 1:
+                if batch_failure == 'oversized':
+                    raise CodexRpcResponseTooLarge('full page too large')
+                if batch_failure == 'moved':
+                    return {'data': list(reversed(full)), 'nextCursor': None}
+            return {'data': full[index:index + params['limit']], 'nextCursor': None}
+        reader = CodexOfficialHistory(65536, rpc=rpc)
+        reader._before_cursors[('thread', 'newer')] = 'skip-0'
+        counts = {f'native-{n}': 2 for n in range(3)}
+        async def source_segments(native_ids):
+            assert native_ids == tuple(counts)
+            assert len(calls) == 1
+            return counts
+        read = reader.summary_page_with_source if discover_segments else reader.summary_page
+        page = await read('thread', before='newer', limit=4,
+                          **({'source_segments': source_segments} if discover_segments
+                             else {'minimum_user_segments': counts}))
+        assert [turn['prompt'] for turn in page.turns] == ['first', 'steer'] * 3
+        assert len({turn['id'] for turn in page.turns}) == 6
+        if batch_failure is None:
+            assert [(row['itemsView'], row['limit']) for row in calls] == [('summary', 4), ('full', 3)]
+        else:
+            assert len(calls) > 2  # exact identity-checked fallback, no lost steering inputs
+        await reader.close()
     asyncio.run(run())

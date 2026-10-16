@@ -13,7 +13,7 @@ ids.  No prompt text, model output, credentials, or account tokens are stored.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -46,6 +46,7 @@ class CodexClientMessageAliases:
     source_path: str | None = None
     source_device: int | None = None
     source_inode: int | None = None
+    native_message_turns: dict[str, str] = field(default_factory=dict)
 
     @property
     def has_aliases(self) -> bool:
@@ -288,11 +289,13 @@ class CodexClientMessageStore:
                 return CodexClientMessageAliases(
                     {}, {}, source.path, source.device, source.inode)
             native_messages: dict[str, str] = {}
+            native_message_turns: dict[str, str] = {}
             segments: dict[tuple[str, int], str] = {}
             for alias in selected.aliases:
                 if alias.native_message_id is not None:
                     native_messages[alias.native_message_id] = (
                         alias.client_message_id)
+                    native_message_turns[alias.native_message_id] = alias.native_turn_id
                 if alias.segment_index is not None:
                     segments[(
                         alias.native_turn_id,
@@ -304,6 +307,7 @@ class CodexClientMessageStore:
                 source.path,
                 source.device,
                 source.inode,
+                native_message_turns,
             )
 
     def put(

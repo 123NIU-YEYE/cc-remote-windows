@@ -28,6 +28,101 @@ def _page(label: str, *, more: bool = False) -> MaterializedHistoryPage:
     )
 
 
+def _compact_visible(row):
+    return row.get("type") == "user"
+
+
+def _compact_row(uid):
+    return json.dumps({"type": "user", "uuid": uid, "isSidechain": False}) + "\n"
+
+
+def _compact_index(store, path, **kwargs):
+    return store.get_claude_compact_index(
+        str(path), snapshot_size=kwargs.pop("snapshot_size", None),
+        max_record_bytes=1024, max_entries=kwargs.pop("max_entries", 10),
+        visible_user=_compact_visible, **kwargs,
+    )
+
+
+def test_compact_graph_reuse_does_not_share_mutable_rows(tmp_path, monkeypatch):
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(_compact_row("first"))
+    store = HistoryIndexStore(tmp_path / "state")
+    first = _compact_index(store, path)
+    expected = dict(first.rows)
+    first.rows.clear()
+
+    def no_sqlite_read(*args, **kwargs):
+        raise AssertionError("unchanged metadata must not be reloaded from SQLite")
+
+    monkeypatch.setattr(store, "_read_claude_compact_index", no_sqlite_read)
+    second = _compact_index(store, path)
+    assert second.rows == expected
+    second.rows.clear()
+    assert _compact_index(store, path).rows == expected
+
+
+@pytest.mark.parametrize("change", ["append", "truncate", "rewrite", "replace"])
+def test_compact_graph_reuse_validates_source(tmp_path, change):
+    path = tmp_path / "transcript.jsonl"
+    original = _compact_row("first") + _compact_row("later")
+    path.write_text(original)
+    store = HistoryIndexStore(tmp_path / "state")
+    assert _compact_index(store, path).leaf == "later"
+    if change == "append":
+        with path.open("a") as stream:
+            stream.write(_compact_row("newer"))
+        expected = {"first", "later", "newer"}
+    elif change == "truncate":
+        path.write_text(_compact_row("first"))
+        expected = {"first"}
+    elif change == "rewrite":
+        stat = path.stat()
+        path.write_text(original.replace("later", "other"))
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        expected = {"first", "other"}
+    else:
+        replacement = tmp_path / "replacement"
+        replacement.write_text(_compact_row("other"))
+        os.replace(replacement, path)
+        expected = {"other"}
+    assert set(_compact_index(store, path).rows) == expected
+
+
+def test_compact_graph_cache_respects_snapshots_limits_and_partial_rows(tmp_path):
+    path = tmp_path / "transcript.jsonl"
+    first = _compact_row("first")
+    path.write_text(first + _compact_row("second"))
+    store = HistoryIndexStore(tmp_path / "state")
+    assert len(_compact_index(store, path).rows) == 2
+    assert set(_compact_index(store, path, snapshot_size=len(first)).rows) == {"first"}
+    assert _compact_index(store, path, max_entries=1) is None
+    with path.open("a") as stream:
+        stream.write('{"type":"user","uuid":')
+    assert _compact_index(store, path) is None
+    with path.open("a") as stream:
+        stream.write('"third"}\n')
+    assert _compact_index(store, path).leaf == "third"
+
+
+def test_compact_graph_memory_is_bounded_and_rebuildable(tmp_path, monkeypatch):
+    import cc_remote.wrapper.history_store as history_store
+
+    monkeypatch.setattr(history_store, "_COMPACT_MEMORY_ENTRIES", 1)
+    store = HistoryIndexStore(tmp_path / "state")
+    for i in range(2):
+        path = tmp_path / f"transcript-{i}.jsonl"
+        path.write_text(_compact_row(f"user-{i}"))
+        assert _compact_index(store, path).leaf == f"user-{i}"
+        assert len(store._compact_memory) == 1
+    store.invalidate_session("unrelated")
+    assert not store._compact_memory
+    assert store._compact_memory_bytes == 0
+    monkeypatch.setattr(history_store, "_COMPACT_MEMORY_BYTES", 1)
+    assert _compact_index(store, path).leaf == "user-1"
+    assert not store._compact_memory
+
+
 @pytest.mark.parametrize("old_version", [44, 45, 46, 47])
 def test_public_codex_item_migration_invalidates_only_codex_projections(tmp_path, old_version):
     path = tmp_path / "source.jsonl"

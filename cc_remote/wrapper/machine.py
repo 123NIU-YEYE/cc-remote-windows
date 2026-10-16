@@ -99,6 +99,10 @@ from cc_remote.codex_profiles import (
     CodexProfileTopologyTransition,
 )
 from cc_remote.wrapper import claude_catalog
+from cc_remote.wrapper.history_page_cache import HistoryPageCache
+from cc_remote.wrapper.history_metrics import (
+    HistoryReadProfile, history_profile, history_stage, history_timed,
+)
 from cc_remote.wrapper.claude_models import claude_model_catalog
 from cc_remote.codex_daemon_restart import (
     CodexDaemonRestartState,
@@ -357,6 +361,7 @@ from cc_remote.wrapper.codex_models import (
     resolve_service_tier,
 )
 from cc_remote.wrapper.codex_rpc import (
+    codex_history_rpc_scope,
     CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc, codex_rpc_batch,
 )
 from cc_remote.wrapper.engine_capabilities import (
@@ -1870,6 +1875,15 @@ class _CodexHistoryProfiles:
     async def summary_page(self, thread_id: str, **kwargs):
         return await self._reader(thread_id).summary_page(thread_id, **kwargs)
 
+    async def summary_page_with_source(self, thread_id: str, **kwargs):
+        return await self._reader(thread_id).summary_page_with_source(thread_id, **kwargs)
+
+    def can_restore_page(self, thread_id, before, turn_ids):
+        return self._reader(thread_id).can_restore_page(thread_id, before, turn_ids)
+
+    def page_native_ids(self, thread_id, turn_ids):
+        return self._reader(thread_id).page_native_ids(thread_id, turn_ids)
+
     def prefetch_summary_page(self, thread_id: str, before: str) -> None:
         self._reader(thread_id).prefetch_summary_page(thread_id, before)
 
@@ -2399,6 +2413,8 @@ class WrapperMachine:
             tuple[str, str, int, str], asyncio.Task
         ] = {}
         self._history_refresh_dirty: set[tuple[str, str, int, str]] = set()
+        self._finished_history_pages = HistoryPageCache()
+        self._history_page_prefetch: tuple[tuple, asyncio.Task] | None = None
         try:
             self._turn_change_archive = TurnChangeArchive(cfg.state_dir)
         except Exception as exc:
@@ -3856,6 +3872,7 @@ class WrapperMachine:
 
     def _bump_history_revision(self, sid: str) -> str:
         """Invalidate engine-neutral projections and advance the browser epoch."""
+        self._invalidate_history_pages(sid)
         self._history_continuity_revisions.pop(sid, None)
         self._history_revision_epochs[sid] = (
             self._history_revision_epochs.get(sid, 0) + 1
@@ -3908,8 +3925,20 @@ class WrapperMachine:
                 )
         return revision
 
+    def _invalidate_history_pages(self, sid: str) -> None:
+        self._finished_history_pages.invalidate(sid)
+        pending = self._history_page_prefetch
+        if pending is not None and pending[0][0] == sid and not pending[1].done():
+            try:
+                current = asyncio.current_task()
+            except RuntimeError:
+                current = None
+            if pending[1] is not current:
+                pending[1].cancel()
+
     def _invalidate_codex_history(self, sid: str) -> None:
         """Invalidate only Codex-native supplements for one routed thread id."""
+        self._invalidate_history_pages(sid)
         self._codex_rollout_history_revisions.pop(sid, None)
         self._codex_process_witness_caches.pop(sid, None)
         for key in tuple(self._codex_history_image_views):
@@ -3962,7 +3991,42 @@ class WrapperMachine:
         max_turns: int,
         native_turn_ids: tuple[str, ...],
         stable: bool,
+        prepared_witness: CodexHistoryProcessPageWitness | None = None,
     ) -> set[str]:
+        witness = await self._read_codex_page_process(
+            sid, source, revision=revision, before=before,
+            before_offset=before_offset, max_turns=max_turns,
+            native_turn_ids=native_turn_ids, stable=stable,
+            prepared_witness=prepared_witness,
+        )
+        if witness is None:
+            return set()
+        cache = self._codex_process_witness_caches.get(sid)
+        if cache is not None:
+            cache.offsets.update(_codex_visible_process_offsets(
+                page, visible=witness.offset_by_visible_id,
+                native_segments=witness.offset_by_native_segment,
+            ))
+        return _apply_codex_process_witness(page, CodexHistoryNativeWitness(
+            process_by_visible_id=witness.process_by_visible_id,
+            process_by_native_segment=witness.process_by_native_segment,
+            offset_by_native_segment=witness.offset_by_native_segment,
+        ))
+
+    @history_timed("codex_process_metadata")
+    async def _read_codex_page_process(
+        self,
+        sid: str,
+        source: HistorySourceFingerprint,
+        *,
+        revision: str,
+        before: str,
+        before_offset: int | None,
+        max_turns: int,
+        native_turn_ids: tuple[str, ...],
+        stable: bool,
+        prepared_witness: CodexHistoryProcessPageWitness | None = None,
+    ) -> CodexHistoryProcessPageWitness | None:
         """Recover only requested process metadata, never full turn contents.
 
         Closed older native tasks are immutable across appends. A proven head
@@ -3972,9 +4036,9 @@ class WrapperMachine:
         cache = self._codex_process_witness_cache(sid, source)
         key = (before, max_turns, native_turn_ids)
         cached = cache.pages.get(key)
-        witness = None
+        witness = prepared_witness
         try:
-            if cached is not None:
+            if witness is None and cached is not None:
                 cached_source, cached_witness, cached_stable = cached
                 if cached_source == source:
                     witness = cached_witness
@@ -4001,11 +4065,11 @@ class WrapperMachine:
             after = await asyncio.to_thread(
                 HistorySourceFingerprint.capture, source.path)
         except OSError:
-            return set()
+            return None
         if self._history_revision(sid) != revision or not (
             source == after or history_source_extends(source, after)
         ):
-            return set()
+            return None
         complete_coordinates = bool(native_turn_ids) and all(
             (native, 0) in witness.offset_by_native_segment
             for native in native_turn_ids
@@ -4015,15 +4079,7 @@ class WrapperMachine:
         cache.pages.move_to_end(key)
         while len(cache.pages) > 256:
             cache.pages.popitem(last=False)
-        cache.offsets.update(_codex_visible_process_offsets(
-            page, visible=witness.offset_by_visible_id,
-            native_segments=witness.offset_by_native_segment,
-        ))
-        return _apply_codex_process_witness(page, CodexHistoryNativeWitness(
-            process_by_visible_id=witness.process_by_visible_id,
-            process_by_native_segment=witness.process_by_native_segment,
-            offset_by_native_segment=witness.offset_by_native_segment,
-        ))
+        return witness
 
     def _codex_rollout_history_active(self, sid: str) -> bool:
         return self._codex_rollout_history_revisions.get(
@@ -4595,6 +4651,7 @@ class WrapperMachine:
             native_message_id=user.message_id,
         )
 
+    @history_timed("codex_aliases")
     async def _backfill_official_codex_client_message_ids(
         self,
         ctx: SessionContext | None,
@@ -4623,8 +4680,20 @@ class WrapperMachine:
             or source_after.inode != source_before.inode
         ):
             return
+        profile = history_profile.get()
+        aliases = await asyncio.to_thread(self._codex_history_client_message_ids, source_path)
+        if profile is not None and profile.prefetch:
+            if any(client in known_client_ids and (
+                aliases.native_messages.get(native) != client
+                or aliases.native_message_turns.get(native) != turn)
+                   for turn, native, client in identities):
+                profile.cache_allowed = False
+            return
         for native_turn_id, native_message_id, client_message_id in identities:
             if client_message_id not in known_client_ids:
+                continue
+            if (aliases.native_messages.get(native_message_id) == client_message_id
+                    and aliases.native_message_turns.get(native_message_id) == native_turn_id):
                 continue
             if ctx is not None:
                 inserted = await self._remember_codex_client_message_id(
@@ -9281,6 +9350,10 @@ class WrapperMachine:
             if history_tasks:
                 await asyncio.gather(*history_tasks, return_exceptions=True)
             self._history_command_tasks.clear()
+            if self._history_page_prefetch is not None:
+                self._history_page_prefetch[1].cancel()
+                await asyncio.gather(self._history_page_prefetch[1], return_exceptions=True)
+                self._history_page_prefetch = None
             page_tasks = list(self._history_page_tasks.values())
             for task in page_tasks:
                 task.cancel()
@@ -14186,6 +14259,7 @@ class WrapperMachine:
             except Exception:
                 log.exception("transcript watch loop error")
 
+    @history_timed("file_changes")
     def _history_file_changes(
         self, sid: str, engine: str, turns: list[dict] | tuple[dict, ...],
         sources: dict[str, list[dict]], *, cwd: str | None,
@@ -14350,7 +14424,7 @@ class WrapperMachine:
         source_window_native_turn_id = None
         source_window_segment_index = None
         source_window_process_started_ms = None
-        oversized_compact_page = None
+        claude_source_page = None
         codex_client_aliases = CodexClientMessageAliases({}, {})
         codex_process_clocks = CodexProcessClocks({})
         try:
@@ -14644,8 +14718,11 @@ class WrapperMachine:
                         detail=detail,
                     )
             return cached_history
-        if source_too_large:
-            oversized_compact_page = await asyncio.to_thread(
+        if source_too_large or (
+            not is_codex_hist and before is not None and detail == "summary"
+            and source_path is not None
+        ):
+            claude_source_page = await asyncio.to_thread(
                 transcript_compact_history_page,
                 claude_native_sid or sid,
                 path=source_path,
@@ -14662,7 +14739,7 @@ class WrapperMachine:
                         self.cfg.history_source_max_bytes),
                 ),
             )
-            if oversized_compact_page is None:
+            if claude_source_page is None and source_too_large:
                 message = (
                     "历史页游标已失效，请刷新会话后重试"
                     if before is not None
@@ -14691,8 +14768,9 @@ class WrapperMachine:
                     compaction_continuation_turn_ids=(
                         compaction_continuation_turn_ids),
                 )
-            source_window_has_more = oversized_compact_page.has_more
-            source_window_oldest_cursor = oversized_compact_page.oldest_cursor
+            if claude_source_page is not None:
+                source_window_has_more = claude_source_page.has_more
+                source_window_oldest_cursor = claude_source_page.oldest_cursor
         history_error = None
         if is_codex_hist:
             # Codex history lives in ~/.codex/sessions rollout files, not the
@@ -14859,10 +14937,10 @@ class WrapperMachine:
                     if claude_profile is None or claude_native_sid is None:
                         raise ValueError("invalid Claude session route")
                     compact_snapshot = None
-                    if oversized_compact_page is not None:
-                        messages = oversized_compact_page.messages
-                        timestamps = oversized_compact_page.timestamps
-                        internal_events = oversized_compact_page.internal_events
+                    if claude_source_page is not None:
+                        messages = claude_source_page.messages
+                        timestamps = claude_source_page.timestamps
+                        internal_events = claude_source_page.internal_events
                     else:
                         compact_snapshot = transcript_compact_snapshot(
                             claude_native_sid or sid,
@@ -14935,7 +15013,7 @@ class WrapperMachine:
                             path=source_path, timestamps=timestamps,
                             internal_events=internal_events,
                             include_queued_prompts=(
-                                oversized_compact_page is None and compact_snapshot is None),
+                                claude_source_page is None and compact_snapshot is None),
                             index_store=self._history_index,
                             snapshot_size=(source_fingerprint.size
                                            if source_fingerprint else None),
@@ -14945,8 +15023,9 @@ class WrapperMachine:
                         self._claude_history_client_message_ids(
                             sid, source_path),
                     )
-                (msgs, tss, internal_events,
-                 client_message_ids) = await asyncio.to_thread(_read)
+                with history_stage("claude_page_read"):
+                    (msgs, tss, internal_events,
+                     client_message_ids) = await asyncio.to_thread(_read)
                 claude_history_messages = msgs
                 alias_kwargs = (
                     {"client_message_ids": client_message_ids}
@@ -15473,7 +15552,7 @@ class WrapperMachine:
                     current_fingerprint == source_fingerprint
                     or (
                         before is not None
-                        and oversized_compact_page is not None
+                        and claude_source_page is not None
                         and history_source_extends(
                             source_fingerprint, current_fingerprint)
                     )
@@ -15714,23 +15793,44 @@ class WrapperMachine:
         user_index: int,
         *,
         max_reverse_scan_bytes: int | None = None,
+        source: HistorySourceFingerprint | None = None,
+        boundary_offset: int | None = None,
     ) -> UserMsg | None:
         """Recover one exact persisted user row, including inline image bytes."""
         if user_index == 0:
             command = self._manual_codex_compact_users(sid, (native_turn_id,)).get(native_turn_id)
             if command is not None:
                 return command
-        path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
+        path = source.path if source is not None else await asyncio.to_thread(
+            self._codex_rollout_for_wire, sid)
         if not path:
             return None
-        return await asyncio.to_thread(
+        if source is not None:
+            try:
+                current = await asyncio.to_thread(HistorySourceFingerprint.capture, path)
+            except OSError:
+                return None
+            if not history_source_extends(source, current):
+                return None
+        recovery_kwargs = ({"boundary_offset": boundary_offset}
+                           if boundary_offset is not None else {})
+        recovered = await asyncio.to_thread(
             codex_history_turn_user,
             path,
             native_turn_id,
             visible_turn_id,
             user_index,
             max_reverse_scan_bytes=max_reverse_scan_bytes,
+            **recovery_kwargs,
         )
+        if source is not None:
+            try:
+                current = await asyncio.to_thread(HistorySourceFingerprint.capture, path)
+            except OSError:
+                return None
+            if not history_source_extends(source, current):
+                return None
+        return recovered
 
     async def _recover_official_codex_users(
         self,
@@ -15808,7 +15908,11 @@ class WrapperMachine:
             self._codex_goal_recovery_misses.popitem(last=False)
         return {**recovery.users, **commands}
 
-    async def _build_official_codex_history(
+    async def _build_official_codex_history(self, sid: str, **kwargs) -> History:
+        async with codex_history_rpc_scope():
+            return await self._read_official_codex_history(sid, **kwargs)
+
+    async def _read_official_codex_history(
         self,
         sid: str,
         *,
@@ -15923,8 +16027,44 @@ class WrapperMachine:
                 known_client_ids.add(pending_steer.msg_id)
             if ctx.codex_owned_initial_msg_id:
                 known_client_ids.add(ctx.codex_owned_initial_msg_id)
+        summary_reader = self._codex_history.summary_page
+        prepared_reader = getattr(self._codex_history, "summary_page_with_source", None)
+        prepared_process: CodexHistoryProcessPageWitness | None = None
+        prepared_native_ids: tuple[str, ...] = ()
+        if (before is not None and source_before is not None
+                and callable(prepared_reader)):
+            async def source_segments(native_ids: tuple[str, ...]) -> dict[str, int]:
+                nonlocal prepared_process, prepared_native_ids
+                process_cache = self._codex_process_witness_cache(sid, source_before)
+                prepared_process = await self._read_codex_page_process(
+                    sid, source_before, revision=revision, before=before,
+                    before_offset=process_cache.offsets.get(before),
+                    max_turns=max(limit or 4, len(native_ids)),
+                    native_turn_ids=native_ids, stable=True,
+                )
+                prepared_native_ids = native_ids
+                counts: dict[str, int] = {}
+                if prepared_process is not None:
+                    for native, segment in prepared_process.offset_by_native_segment:
+                        if native in native_ids:
+                            counts[native] = max(counts.get(native, 0), segment + 1)
+                return counts
+
+            async def source_user(
+                thread_id: str, native_id: str, visible_id: str, user_index: int,
+            ) -> UserMsg | None:
+                offset = (prepared_process.offset_by_native_segment.get((native_id, 0))
+                          if prepared_process is not None else None)
+                return await self._recover_official_codex_user(
+                    thread_id, native_id, visible_id, user_index,
+                    source=source_before, boundary_offset=offset,
+                )
+
+            summary_reader = prepared_reader
+            alias_kwargs["source_segments"] = source_segments
+            alias_kwargs["source_user"] = source_user
         try:
-            page = await self._codex_history.summary_page(
+            page = await summary_reader(
                 sid,
                 before=before,
                 limit=limit or 4,
@@ -16024,6 +16164,11 @@ class WrapperMachine:
                 before_offset=process_cache.offsets.get(before),
                 max_turns=max(limit or 4, len(page.native_turn_ids)),
                 native_turn_ids=page.native_turn_ids, stable=True,
+                # Keep this request's exact source proof even if a live append
+                # advanced the shared cache while official hydration awaited.
+                prepared_witness=(prepared_process
+                                  if page.native_turn_ids == prepared_native_ids
+                                  else None),
             ))
 
         projection_outcome = "not-applicable"
@@ -16286,7 +16431,139 @@ class WrapperMachine:
             history.authoritative = False
         return history
 
+    async def _history_page_source(self, sid, codex):
+        try:
+            if codex:
+                path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
+            else:
+                profile, native = self._claude_target(sid)
+                path = await asyncio.to_thread(self._claude_transcript_path, profile, native)
+            return await asyncio.to_thread(HistorySourceFingerprint.capture, path) if path else None
+        except (OSError, ValueError):
+            return None
+
+    def _history_projection_stamp(self, codex):
+        """Local receipts can change independently of native transcript bytes."""
+        stores = [self._turn_change_archive]
+        stores.extend([self._codex_client_messages, self._codex_process_clocks]
+                      if codex else [self._claude_client_messages])
+        stamp = []
+        for store in stores:
+            path = getattr(store, "path", None)
+            if path is None:
+                continue
+            for candidate in (str(path), str(path) + "-wal"):
+                try:
+                    info = os.stat(candidate, follow_symlinks=False)
+                    stamp.append((candidate, info.st_dev, info.st_ino, info.st_size,
+                                  info.st_mtime_ns, info.st_mode, info.st_uid))
+                except OSError:
+                    stamp.append((candidate, None))
+        return tuple(stamp)
+
     async def _build_requested_history(
+        self, sid, *, before, limit, cwd, detail, _background=False, _prefetch=False,
+    ) -> History:
+        profile = HistoryReadProfile(prefetch=_prefetch)
+        token = history_profile.set(profile)
+        started = time.perf_counter()
+        cache_hit = False
+        try:
+            self._watch_session(sid)
+            ctx = self._ctx_by_sid(sid)
+            watch = self._watch.get(sid) or {}
+            codex = bool((ctx is not None and ctx.engine == "codex") or watch.get("engine") == "codex")
+            if ctx is not None and ctx.engine == "claude":
+                await self._advance_claude_client_alias_probe(ctx)
+            revision = self._history_revision(sid)
+            key = (sid, before, limit, revision, None if codex else cwd)
+            source = None
+            metadata = None
+            if before is not None and detail == "summary":
+                source = await self._history_page_source(sid, codex)
+                pending = self._history_page_prefetch
+                if (not _prefetch and pending is not None and pending[0] == key
+                        and not pending[1].done() and not self._history_refresh_in_progress(sid)):
+                    with history_stage("prefetch_wait"):
+                        try:
+                            await asyncio.shield(pending[1])
+                        except asyncio.CancelledError:
+                            if asyncio.current_task().cancelling():
+                                raise
+                    source = await self._history_page_source(sid, codex)
+                metadata = await asyncio.to_thread(self._history_projection_stamp, codex)
+                key = (*key, metadata)
+                if source is not None:
+                    with history_stage("page_cache"):
+                        cached = await asyncio.to_thread(
+                            self._finished_history_pages.get, key, source, codex=codex)
+                    can_restore = getattr(self._codex_history, "can_restore_page", None)
+                    if (cached is not None and self._history_revision(sid) == revision
+                            and (not codex or (callable(can_restore) and can_restore(
+                                sid, before, [turn.id for turn in cached.turns])))
+                            and source == await self._history_page_source(sid, codex)
+                            and metadata == await asyncio.to_thread(self._history_projection_stamp, codex)
+                            and self._history_revision(sid) == revision):
+                        ctx = self._ctx_by_sid(sid)
+                        watch = self._watch.get(sid) or {}
+                        cached.live_seq = ctx.seq if ctx else None
+                        cached.build_seq = self._history_build_sequences.get(sid, 0)
+                        cached.in_progress = self._history_refresh_in_progress(sid)
+                        cached.control = self._session_control(ctx) if ctx else None
+                        cached.external = self._is_external(sid)
+                        cached.takeover_pending = bool(watch.get("takeover_pending"))
+                        if codex:
+                            cached = await self._annotate_timed_history(sid, cached)
+                        if self._history_revision(sid) == revision:
+                            cache_hit = True
+                            return cached
+            history = await self._read_requested_history(
+                sid, before=before, limit=limit, cwd=cwd, detail=detail,
+                _background=_background)
+            if (source is not None and profile.cache_allowed
+                    and revision == self._history_revision(sid)
+                    and source == await self._history_page_source(sid, codex)
+                    and metadata == await asyncio.to_thread(self._history_projection_stamp, codex)):
+                native_ids = getattr(self._codex_history, "page_native_ids", None)
+                self._finished_history_pages.put(
+                    key, source, history,
+                    native_ids=native_ids(sid, [turn.id for turn in history.turns])
+                    if codex and callable(native_ids) else frozenset())
+            return history
+        finally:
+            history_profile.reset(token)
+            log.info("history page profile", session_id=sid, before=before is not None,
+                     prefetch=_prefetch, cache_hit=cache_hit,
+                     elapsed_ms=round((time.perf_counter() - started) * 1000),
+                     stages_ms={key: round(value) for key, value in profile.stages.items()},
+                     calls=profile.calls)
+
+    def _prefetch_finished_history_page(self, sid, history):
+        if self._history_page_prefetch is not None and not self._history_page_prefetch[1].done():
+            return
+        revision = self._history_revision(sid)
+        key = (sid, history.oldest_id, 12, revision, None)
+
+        async def prepare():
+            try:
+                # Yield to foreground/live messages before speculative work.
+                await asyncio.sleep(0.1)
+                if self._history_refresh_in_progress(sid) or self._history_revision(sid) != revision:
+                    return
+                source = await self._history_page_source(sid, True)
+                if source is None or source.size < 32 * 1024 * 1024:
+                    return
+                await self._build_requested_history(
+                    sid, before=history.oldest_id, limit=12, cwd=None,
+                    detail="summary", _background=True, _prefetch=True)
+            except Exception:
+                # A speculative failure never hides the next explicit error.
+                pass
+
+        task = asyncio.create_task(prepare())
+        self._history_page_prefetch = (key, task)
+
+    async def _read_requested_history(
         self,
         sid: str,
         *,
@@ -16590,9 +16867,12 @@ class WrapperMachine:
             # or changes the cursor family. Only explicit browser reads schedule
             # it; moving turns and watcher/terminal refreshes must not create
             # repeated speculative scans competing with the live model stream.
-            prefetch = getattr(self._codex_history, "prefetch_summary_page", None)
-            if callable(prefetch):
-                prefetch(sid, hist.oldest_id)
+            if callable(getattr(self._codex_history, "can_restore_page", None)):
+                self._prefetch_finished_history_page(sid, hist)
+            else:
+                prefetch = getattr(self._codex_history, "prefetch_summary_page", None)
+                if callable(prefetch):
+                    prefetch(sid, hist.oldest_id)
         return hist
 
     async def _supplement_codex_history_image_views(

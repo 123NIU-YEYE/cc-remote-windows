@@ -3233,6 +3233,94 @@ def test_large_head_process_metadata_reads_only_appends(monkeypatch, tmp_path):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("change", ["append", "rewrite", "revision"])
+def test_prepared_codex_page_proof_is_reused_only_for_compatible_source(
+    monkeypatch, tmp_path, change,
+):
+    rollout = tmp_path / "prepared.jsonl"
+    rollout.write_text("original\n")
+    calls = []
+
+    def scan(*args, **kwargs):
+        calls.append(kwargs)
+        # The live session may append while the worker reads the frozen prefix.
+        with rollout.open("a") as stream:
+            stream.write("append during scan\n")
+        return CodexHistoryProcessPageWitness(
+            offset_by_native_segment={("native", 0): 0},
+            process_by_native_segment={
+                ("native", 0): CodexHistoryProcessWitness(
+                    started_ms=1000, done_ms=4000, generated_images=True),
+            },
+        )
+
+    monkeypatch.setattr(mm, "codex_history_process_witnesses", scan)
+
+    async def run():
+        machine, _ = _mk_machine()
+        source = HistorySourceFingerprint.capture(rollout)
+        kwargs = dict(revision=machine._history_revision("session"),
+                      before="newer", before_offset=None, max_turns=1,
+                      native_turn_ids=("native",), stable=True)
+        prepared = await machine._read_codex_page_process("session", source, **kwargs)
+        assert prepared is not None
+        if change == "rewrite":
+            rollout.write_text("other history\n")
+        elif change == "revision":
+            machine._bump_history_revision("session")
+        page = CodexHistoryPage(
+            events=(), turns=(_empty_summary_turn("visible"),),
+            has_more=False, oldest_id="visible", newest_id="visible",
+            native_turn_ids=("native",),
+            native_segment_by_visible_id={"visible": ("native", 0)},
+        )
+        images = await machine._refine_codex_page_process(
+            "session", page, source, prepared_witness=prepared, **kwargs)
+        assert len(calls) == 1
+        if change == "append":
+            assert images == {"visible"}
+            assert page.turns[0]["processDoneTs"] == 4000
+            assert machine._codex_process_witness_caches["session"].offsets["visible"] == 0
+        else:
+            assert images == set()
+            assert page.turns[0].get("processDoneTs") is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["append", "rewrite"])
+def test_codex_page_image_recovery_validates_source_after_read(
+    monkeypatch, tmp_path, change,
+):
+    rollout = tmp_path / "images.jsonl"
+    rollout.write_text("original\n")
+    source = HistorySourceFingerprint.capture(rollout)
+
+    def recover(path, native_id, visible_id, user_index, **kwargs):
+        assert (path, native_id, visible_id, user_index) == (
+            str(rollout), "native", "user", 1)
+        assert kwargs["boundary_offset"] == 0
+        if change == "append":
+            with rollout.open("a") as stream:
+                stream.write("new suffix\n")
+        else:
+            rollout.write_text("different history\n")
+        return UserMsg(msg_id="user", prompt="steered image")
+
+    monkeypatch.setattr(mm, "codex_history_turn_user", recover)
+
+    async def run():
+        machine, _ = _mk_machine()
+        recovered = await machine._recover_official_codex_user(
+            "session", "native", "user", 1, source=source, boundary_offset=0)
+        if change == "append":
+            assert recovered.prompt == "steered image"
+        else:
+            assert recovered is None
+
+    asyncio.run(run())
+
+
 def test_requested_codex_older_process_pages_continue_from_cached_offset(
     monkeypatch, tmp_path,
 ):
@@ -7765,8 +7853,9 @@ def test_oversized_transcript_is_rejected_before_full_parse(monkeypatch, tmp_pat
     assert parsed is False
 
 
+@pytest.mark.parametrize("oversized", [False, True])
 def test_oversized_compacted_claude_transcript_uses_bounded_turn_pages(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, oversized):
     source = tmp_path / "huge-compact.jsonl"
     rows = [
         {"type": "user", "uuid": "user-old", "parentUuid": None,
@@ -7808,7 +7897,8 @@ def test_oversized_compacted_claude_transcript_uses_bounded_turn_pages(
         "cc_remote.wrapper.stream.transcript_path",
         lambda _sid: str(source),
     )
-    monkeypatch.setattr(mm.os.path, "getsize", lambda _path: 100_000_000)
+    if oversized:
+        monkeypatch.setattr(mm.os.path, "getsize", lambda _path: 100_000_000)
     monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
     monkeypatch.setattr(mm, "get_session_messages", should_not_parse)
     monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
@@ -7818,11 +7908,12 @@ def test_oversized_compacted_claude_transcript_uses_bounded_turn_pages(
         machine.cfg.history_source_max_bytes = 64 * 1024 * 1024
         machine._history_index = HistoryIndexStore(tmp_path / "huge-state")
 
-        newest = await machine._build_history(
-            "claude-compact", limit=1, detail="summary")
-        assert [turn.prompt for turn in newest.turns] == ["new question"]
-        assert newest.oldest_id == "user-new"
-        assert newest.has_more is True
+        if oversized:
+            newest = await machine._build_history(
+                "claude-compact", limit=1, detail="summary")
+            assert [turn.prompt for turn in newest.turns] == ["new question"]
+            assert newest.oldest_id == "user-new"
+            assert newest.has_more is True
 
         older = await machine._build_history(
             "claude-compact", before="user-new", limit=1,
@@ -7840,13 +7931,14 @@ def test_oversized_compacted_claude_transcript_uses_bounded_turn_pages(
         assert exhausted.oldest_id is None
         assert exhausted.has_more is False
 
-        stale = await machine._build_history(
-            "claude-compact", before="stale-cursor", limit=1,
-            detail="summary",
-        )
-        assert stale.events[0]["type"] == "error"
-        assert "游标已失效" in stale.events[0]["message"]
-        assert "HISTORY_SOURCE_MAX_BYTES" not in stale.events[0]["message"]
+        if oversized:
+            stale = await machine._build_history(
+                "claude-compact", before="stale-cursor", limit=1,
+                detail="summary",
+            )
+            assert stale.events[0]["type"] == "error"
+            assert "游标已失效" in stale.events[0]["message"]
+            assert "HISTORY_SOURCE_MAX_BYTES" not in stale.events[0]["message"]
 
     asyncio.run(go())
     assert parsed_by_sdk is False

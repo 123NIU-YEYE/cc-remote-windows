@@ -30,6 +30,8 @@ from claude_agent_sdk.types import (
     TaskNotificationMessage, HookEventMessage,
 )
 
+from cc_remote.wrapper.history_scan_cache import IncrementalJsonlProjection
+from cc_remote.wrapper.history_metrics import history_stage
 from cc_remote.claude_paths import claude_projects_dir
 from cc_remote.protocol import (
     MAX_BACKGROUND_PROCESS_COMMAND_CHARS, MAX_BACKGROUND_PROCESS_ITEMS,
@@ -3627,6 +3629,117 @@ def _parse_timestamp(value: Any) -> float | None:
         return None
 
 
+_subagent_projection = IncrementalJsonlProjection()
+
+
+def _new_subagent_projection():
+    return {"records": {}, "agent_tools": {}, "order": [], "current_turn": None}
+
+
+def _update_subagent_projection(state, row, index):
+    records, agent_tools, order = state["records"], state["agent_tools"], state["order"]
+    current_turn = state["current_turn"]
+    msg = row.get("message") if isinstance(row.get("message"), dict) else {}
+    role = msg.get("role") or row.get("type")
+    content = msg.get("content")
+    if role == "user":
+        origin = row.get("origin")
+        visible = (isinstance(content, str) and content
+                   and not _is_meta_user_text(content))
+        if (isinstance(origin, dict)
+                and origin.get("kind") == "task-notification"):
+            visible = False
+        if isinstance(content, list):
+            visible = any(
+                isinstance(block, dict) and block.get("type") == "text"
+                and block.get("text")
+                and not _is_meta_user_text(block.get("text"))
+                for block in content)
+        if visible:
+            current_turn = _wire_id(row.get("uuid"), "msg", str(index))
+        result_meta = row.get("toolUseResult")
+        if isinstance(result_meta, dict):
+            agent_id = result_meta.get("agentId")
+            tool_id = next((
+                block.get("tool_use_id") for block in (content or [])
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ), None) if isinstance(content, list) else None
+            if agent_id:
+                agent_key = str(agent_id)
+                known_tool = agent_tools.get(agent_key)
+                candidate = _wire_id(tool_id, "tool") if tool_id else None
+                if known_tool is None and candidate in records:
+                    known_tool = candidate
+                    agent_tools[agent_key] = candidate
+                if known_tool is not None:
+                    record = records[known_tool]
+                    record["agent_id"] = agent_key
+                    title = _short_text(
+                        result_meta.get("description"), 1000)
+                    if title:
+                        record["title"] = title
+                    raw_status = result_meta.get("status")
+                    if (bool(result_meta.get("isAsync"))
+                            or str(raw_status).lower()
+                            == "async_launched"):
+                        # The same agent can resume after an earlier
+                        # notification. A later launch re-opens the
+                        # same public run rather than creating a ghost.
+                        record["async"] = True
+                        record["terminal"] = None
+        origin = row.get("origin")
+        if (isinstance(origin, dict)
+                and origin.get("kind") == "task-notification"
+                and isinstance(content, str)):
+            task_match = re.search(
+                r"<task-id>([^<]{1,256})</task-id>", content)
+            tool_match = re.search(
+                r"<tool-use-id>([^<]{1,256})</tool-use-id>", content)
+            status_match = re.search(
+                r"<status>([^<]{1,64})</status>", content)
+            summary_match = re.search(
+                r"<summary>([\s\S]{0,65536}?)</summary>", content)
+            agent_key = task_match.group(1) if task_match else None
+            parent = (
+                _wire_id(tool_match.group(1), "tool")
+                if tool_match else agent_tools.get(agent_key or "")
+            )
+            if parent in records:
+                record = records[parent]
+                record["terminal"] = _task_status(
+                    status_match.group(1) if status_match else None)
+                record["terminal_ts"] = _parse_timestamp(
+                    row.get("timestamp"))
+                if summary_match:
+                    record["summary"] = _short_text(
+                        summary_match.group(1), 64 * 1024)
+    elif role == "assistant" and isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if str(block.get("name") or "").lower() not in {"agent", "task"}:
+                continue
+            tool_id = _wire_id(
+                block.get("id"), "tool", f"{index}-agent")
+            tool_input = block.get("input") if isinstance(
+                block.get("input"), dict) else {}
+            if tool_id not in records:
+                order.append(tool_id)
+            records[tool_id] = {
+                **records.get(tool_id, {}),
+                "tool_id": tool_id,
+                "turn": current_turn,
+                "start_ts": _parse_timestamp(row.get("timestamp")),
+                "async": records.get(tool_id, {}).get("async", False),
+                "terminal": records.get(tool_id, {}).get("terminal"),
+                "title": (
+                _short_text(tool_input.get("description"), 1000)
+                or _short_text(tool_input.get("subagent_type"), 1000)
+                or "协作代理"),
+            }
+    state["current_turn"] = current_turn
+
+
 def translate_subagent_history(
     session_id: str,
     tool_result_max: int,
@@ -3644,117 +3757,14 @@ def translate_subagent_history(
     if not main_path:
         return []
 
-    records: dict[str, dict[str, Any]] = {}
-    agent_tools: dict[str, str] = {}
-    order: list[str] = []
-    current_turn: str | None = None
     try:
-        with open(main_path, encoding="utf-8") as source:
-            for index, line in enumerate(_bounded_jsonl_lines(source)):
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                msg = row.get("message") if isinstance(row.get("message"), dict) else {}
-                role = msg.get("role") or row.get("type")
-                content = msg.get("content")
-                if role == "user":
-                    origin = row.get("origin")
-                    visible = (isinstance(content, str) and content
-                               and not _is_meta_user_text(content))
-                    if (isinstance(origin, dict)
-                            and origin.get("kind") == "task-notification"):
-                        visible = False
-                    if isinstance(content, list):
-                        visible = any(
-                            isinstance(block, dict) and block.get("type") == "text"
-                            and block.get("text")
-                            and not _is_meta_user_text(block.get("text"))
-                            for block in content)
-                    if visible:
-                        current_turn = _wire_id(row.get("uuid"), "msg", str(index))
-                    result_meta = row.get("toolUseResult")
-                    if isinstance(result_meta, dict):
-                        agent_id = result_meta.get("agentId")
-                        tool_id = next((
-                            block.get("tool_use_id") for block in (content or [])
-                            if isinstance(block, dict) and block.get("type") == "tool_result"
-                        ), None) if isinstance(content, list) else None
-                        if agent_id:
-                            agent_key = str(agent_id)
-                            known_tool = agent_tools.get(agent_key)
-                            candidate = _wire_id(tool_id, "tool") if tool_id else None
-                            if known_tool is None and candidate in records:
-                                known_tool = candidate
-                                agent_tools[agent_key] = candidate
-                            if known_tool is not None:
-                                record = records[known_tool]
-                                record["agent_id"] = agent_key
-                                title = _short_text(
-                                    result_meta.get("description"), 1000)
-                                if title:
-                                    record["title"] = title
-                                raw_status = result_meta.get("status")
-                                if (bool(result_meta.get("isAsync"))
-                                        or str(raw_status).lower()
-                                        == "async_launched"):
-                                    # The same agent can resume after an earlier
-                                    # notification. A later launch re-opens the
-                                    # same public run rather than creating a ghost.
-                                    record["async"] = True
-                                    record["terminal"] = None
-                    origin = row.get("origin")
-                    if (isinstance(origin, dict)
-                            and origin.get("kind") == "task-notification"
-                            and isinstance(content, str)):
-                        task_match = re.search(
-                            r"<task-id>([^<]{1,256})</task-id>", content)
-                        tool_match = re.search(
-                            r"<tool-use-id>([^<]{1,256})</tool-use-id>", content)
-                        status_match = re.search(
-                            r"<status>([^<]{1,64})</status>", content)
-                        summary_match = re.search(
-                            r"<summary>([\s\S]{0,65536}?)</summary>", content)
-                        agent_key = task_match.group(1) if task_match else None
-                        parent = (
-                            _wire_id(tool_match.group(1), "tool")
-                            if tool_match else agent_tools.get(agent_key or "")
-                        )
-                        if parent in records:
-                            record = records[parent]
-                            record["terminal"] = _task_status(
-                                status_match.group(1) if status_match else None)
-                            record["terminal_ts"] = _parse_timestamp(
-                                row.get("timestamp"))
-                            if summary_match:
-                                record["summary"] = _short_text(
-                                    summary_match.group(1), 64 * 1024)
-                elif role == "assistant" and isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict) or block.get("type") != "tool_use":
-                            continue
-                        if str(block.get("name") or "").lower() not in {"agent", "task"}:
-                            continue
-                        tool_id = _wire_id(
-                            block.get("id"), "tool", f"{index}-agent")
-                        tool_input = block.get("input") if isinstance(
-                            block.get("input"), dict) else {}
-                        if tool_id not in records:
-                            order.append(tool_id)
-                        records[tool_id] = {
-                            **records.get(tool_id, {}),
-                            "tool_id": tool_id,
-                            "turn": current_turn,
-                            "start_ts": _parse_timestamp(row.get("timestamp")),
-                            "async": records.get(tool_id, {}).get("async", False),
-                            "terminal": records.get(tool_id, {}).get("terminal"),
-                            "title": (
-                            _short_text(tool_input.get("description"), 1000)
-                            or _short_text(tool_input.get("subagent_type"), 1000)
-                            or "协作代理"),
-                        }
+        with history_stage("claude_agents"):
+            state = _subagent_projection.read(
+                main_path, _new_subagent_projection, _update_subagent_projection,
+                _bounded_jsonl_lines)
     except (OSError, UnicodeError):
         return []
+    records, order = state["records"], state["order"]
 
     events: list = []
     for tool_id in order[:_MAX_SUBAGENT_FILES]:
