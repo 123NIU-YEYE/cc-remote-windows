@@ -415,3 +415,165 @@ def test_only_one_speculative_request_per_reader_and_close_stops_new_work(tmp_pa
         assert not cache._tasks and len(calls) == 1
 
     asyncio.run(run())
+
+
+def test_materialized_prefetch_is_reused_and_refreshes_live_state(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from cc_remote.wrapper.history_metrics import history_profile
+
+    path = tmp_path / 'rollout'
+    path.write_text('fixture\n')
+    source = replace(HistorySourceFingerprint.capture(path), size=32 * 1024 * 1024)
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx('thread', 'thread')
+        ctx.engine = 'codex'
+        machine.sessions[ctx.key] = ctx
+        locators_valid = True
+        machine._codex_history = SimpleNamespace(can_restore_page=lambda *_a: locators_valid)
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        async def read_source(*args):
+            return source
+        async def read(sid, **kwargs):
+            calls.append(kwargs)
+            if history_profile.get().prefetch:
+                started.set()
+                await release.wait()
+            return History(session_id=sid, revision=machine._history_revision(sid),
+                detail='summary', before=kwargs['before'], has_more=True, oldest_id='old',
+                turns=[{'id': 'old', 'prompt': 'previous', 'done': True, 'forkPointId': 'native'}])
+        monkeypatch.setattr(machine, '_history_page_source', read_source)
+        monkeypatch.setattr(machine, '_read_requested_history', read)
+        head = History(session_id='thread', revision=machine._history_revision('thread'),
+                       detail='summary', oldest_id='cursor', has_more=True)
+        machine._prefetch_finished_history_page('thread', head)
+        await started.wait()
+        async def foreground():
+            return await machine._build_requested_history('thread', before='cursor', limit=12,
+                                                          cwd=None, detail='summary')
+        pending = asyncio.create_task(foreground())
+        await asyncio.sleep(0)
+        release.set()
+        first = await pending
+        assert len(calls) == 1 and first.turns[0].id == 'old'
+        ctx.state = 'running'
+        ctx.seq = 123
+        cached = await foreground()
+        assert len(calls) == 1 and cached.in_progress and cached.live_seq == 123
+        # Native locator eviction requires a rebuild even if narrative bytes survive.
+        locators_valid = False
+        await foreground()
+        assert len(calls) == 2
+        locators_valid = True
+        machine._bump_history_revision('thread')
+        await foreground()
+        assert len(calls) == 3
+        assert machine._history_page_prefetch[1].done()  # no recursive crawl
+    asyncio.run(run())
+
+
+def test_cancelled_prefetch_does_not_cancel_foreground_history(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from cc_remote.wrapper.history_metrics import history_profile
+    path = tmp_path / 'rollout'
+    path.write_text('fixture\n')
+    source = replace(HistorySourceFingerprint.capture(path), size=32 * 1024 * 1024)
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx('thread', 'thread')
+        ctx.engine = 'codex'
+        machine.sessions[ctx.key] = ctx
+        machine._codex_history = SimpleNamespace(can_restore_page=lambda *_a: True)
+        started = asyncio.Event()
+        async def read_source(*args):
+            return source
+        async def read(sid, **kwargs):
+            if history_profile.get().prefetch:
+                started.set()
+                await asyncio.Event().wait()
+            return History(session_id=sid, revision=machine._history_revision(sid),
+                           detail='summary', before=kwargs['before'])
+        monkeypatch.setattr(machine, '_history_page_source', read_source)
+        monkeypatch.setattr(machine, '_read_requested_history', read)
+        head = History(session_id='thread', revision=machine._history_revision('thread'), oldest_id='cursor')
+        machine._prefetch_finished_history_page('thread', head)
+        await started.wait()
+        request = asyncio.create_task(machine._build_requested_history(
+            'thread', before='cursor', limit=12, cwd=None, detail='summary'))
+        await asyncio.sleep(0.01)
+        machine._history_page_prefetch[1].cancel()
+        assert (await request).before == 'cursor'
+    asyncio.run(run())
+
+
+def test_prefetch_never_learns_new_browser_aliases(tmp_path, monkeypatch):
+    from cc_remote.wrapper.codex_client_messages import CodexClientMessageAliases
+    from cc_remote.wrapper.history_metrics import HistoryReadProfile, history_profile
+    path = tmp_path / 'rollout'
+    path.write_text('fixture\n')
+    source = HistorySourceFingerprint.capture(path)
+    async def run():
+        machine, _ = _mk_machine()
+        monkeypatch.setattr(machine, '_codex_history_client_message_ids',
+                            lambda _path: CodexClientMessageAliases({}, {}))
+        def put(*args, **kwargs):
+            pytest.fail('speculative history must not persist a browser identity')
+        monkeypatch.setattr(machine._codex_client_messages, 'put', put)
+        profile = HistoryReadProfile(prefetch=True)
+        token = history_profile.set(profile)
+        revision = machine._history_revision('thread')
+        try:
+            await machine._backfill_official_codex_client_message_ids(
+                None, 'thread', str(path), source, {'client'}, (('native', 'item', 'client'),))
+        finally:
+            history_profile.reset(token)
+        assert not profile.cache_allowed and machine._history_revision('thread') == revision
+    asyncio.run(run())
+
+
+def test_revision_change_cancels_pending_materialized_prefetch():
+    async def run():
+        machine, _ = _mk_machine()
+        task = asyncio.create_task(asyncio.Event().wait())
+        machine._history_page_prefetch = (('thread', 'cursor', 12, 'r', None), task)
+        machine._bump_history_revision('thread')
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not machine._finished_history_pages.pages
+    asyncio.run(run())
+
+
+def test_sidecar_change_invalidates_finished_page_without_transcript_append(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    path = tmp_path / 'rollout'
+    path.write_text('fixture\n')
+    source = HistorySourceFingerprint.capture(path)
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx('thread', 'thread')
+        ctx.engine = 'codex'
+        machine.sessions[ctx.key] = ctx
+        machine._codex_history = SimpleNamespace(can_restore_page=lambda *_args: True)
+        calls = []
+        async def read_source(*args):
+            return source
+        async def build(sid, **kwargs):
+            calls.append(1)
+            return History(session_id=sid, revision=machine._history_revision(sid), before='cursor',
+                           turns=[{'id': 'old', 'prompt': 'question', 'done': True}])
+        monkeypatch.setattr(machine, '_history_page_source', read_source)
+        monkeypatch.setattr(machine, '_read_requested_history', build)
+        async def read():
+            return await machine._build_requested_history('thread', before='cursor', limit=12,
+                                                          cwd=None, detail='summary')
+        await read()
+        await read()
+        assert len(calls) == 1
+        machine._codex_process_clocks.path.write_text('sidecar update')
+        await read()
+        assert len(calls) == 2
+    asyncio.run(run())

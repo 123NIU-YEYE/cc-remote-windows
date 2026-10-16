@@ -2144,6 +2144,7 @@ def codex_history_turn_user(
     user_index: int = 0,
     *,
     max_reverse_scan_bytes: int | None = None,
+    boundary_offset: int | None = None,
 ) -> UserMsg | None:
     """Recover one visible user row for one native Codex turn.
 
@@ -2165,6 +2166,16 @@ def codex_history_turn_user(
     ):
         return None
     try:
+        if (isinstance(boundary_offset, int)
+                and not isinstance(boundary_offset, bool) and boundary_offset >= 0):
+            # The caller binds this coordinate to a verified source snapshot.
+            # Still require the exact native task marker before using it.
+            with open(path, "rb") as source:
+                source.seek(boundary_offset)
+                boundary = source.readline(_MAX_HISTORY_REVERSE_RECORD_BYTES + 1)
+            if _history_turn_cursor(boundary) == turn_id:
+                return codex_history_boundary_user(
+                    path, boundary_offset, cursor, user_index=user_index)
         for offset, line in _reverse_jsonl_records(
             path,
             max_scan_bytes=max_reverse_scan_bytes,
