@@ -89,6 +89,15 @@ explicit unrelated continuations and pending human inputs remain separate. The
 fix must reach the service owner using the drain procedure below: a Wrapper-only
 upgrade cannot retire an older owner's stranded journal boundary.
 
+When a background Result precedes a queued human input, Code may emit the next
+request before replaying that input's UUID. The exact steering echo adopts that
+implicit request even though the managed route activates only after the echo is
+annotated. Its real human Result then retires the temporary background claim as
+well; unrelated explicit continuations remain independent. This applies to live
+delivery and journal replay and must reach both the service owner and Wrapper.
+Use the drain procedure below for existing owners, rather than restarting active
+sessions or clearing their running state without a terminal.
+
 Owners advertising `human_result_receipts` also recognize a Result whose
 `user_message_uuid` / `user_message_uuids` includes the latest consumed human
 input, even when native Code labels its origin `task-notification`. They journal

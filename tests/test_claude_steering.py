@@ -276,7 +276,7 @@ async def test_native_continuation_without_replayed_user_is_visible_and_interact
 @pytest.mark.asyncio
 @pytest.mark.parametrize("origin", [{"kind": "task-notification"}, ORIGIN])
 @pytest.mark.parametrize("uncertain", [False, True])
-@pytest.mark.parametrize("background_result", ["before", "after", "none"])
+@pytest.mark.parametrize("background_result", ["before", "before_request", "after", "none"])
 async def test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn(uncertain, background_result, origin):
     sdk = SdkHandle(WrapperConfig())
     machine, transport, ctx = _machine_with_sdk(sdk)
@@ -295,9 +295,13 @@ async def test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn(uncer
         assert native.inputs[0][0]["priority"] == "next"
         uid = native.inputs[0][0]["uuid"]
         await native.queue.put(user("old-tool", [{"type": "tool_result", "tool_use_id": "old", "content": "done"}]))
-        if background_result == "before":
+        if background_result in {"before", "before_request"}:
             await native.queue.put({**result(), "origin": origin})
             await until(lambda: sdk._background_callbacks_pending == 0 and not sdk._steers.background_id)
+        if background_result == "before_request":
+            # The queued human request starts before Code replays its UUID.
+            await native.queue.put(requesting("human-request"))
+            await until(lambda: sdk._steers.background_id is not None)
         assert ctx.state == "running" and ctx.turn_task is None
         assert not any(e.type in {"turn_end", "turn_steered"} for e in transport.sent)
         with pytest.raises(RuntimeError, match="active response"):
@@ -306,12 +310,13 @@ async def test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn(uncer
         if background_result == "after":
             await native.queue.put({**result(), "origin": origin})
         await native.queue.put(assistant("guided-reply", [{"type": "text", "text": "guided answer"}]))
-        await native.queue.put(result())
+        await native.queue.put({**result(), "user_message_uuid": uid})
         await until(lambda: any(e.type == "turn_end" for e in transport.sent))
         await until(lambda: ctx.turn_task is None)
         assert [e.msg_id for e in transport.sent if e.type == "turn_steered"] == ["guide-ui"]
         assert sum(e.type == "turn_end" for e in transport.sent) == 1
         assert ctx.state == "idle" and not sdk._autonomous_steer_root
+        assert not ctx.claude_background_followups and not sdk._steers.background_id
         assert native.consumers == 1 and native.interrupts == 0 and len(native.inputs) == 1
     finally:
         if ctx.turn_task:
@@ -515,6 +520,46 @@ def test_human_echo_adopts_only_implicit_activity_with_legacy_terminal_annotatio
     assert pending.background_id is None
 
 
+@pytest.mark.parametrize("journaled", [False, True])
+def test_exact_steer_echo_adopts_request_before_managed_route_activates(journaled):
+    pending = PendingSteers()
+    explicit = pending.annotate({**user("unrelated-task"), "origin": ORIGIN})["__cc_background_start"]
+    implicit = {"id": "human-request", "origin_key": None, "origin": None,
+                "managed": False, "implicit": True}
+    pending.annotate({**requesting(), "__cc_background_start": implicit})
+    metadata = {"id": "human-ui"}
+    echo = user("native-human")
+    if journaled:
+        echo["__cc_steer"] = metadata
+    else:
+        pending.add("native-human", metadata)
+    # Both owners activate their managed route only AFTER annotating this echo.
+    value = pending.annotate(echo, managed_active=False)
+    assert value["__cc_steer"] == metadata
+    terminal = pending.annotate({**result(), "user_message_uuid": "native-human"}, managed_active=True)
+    assert terminal["__cc_background_ends"] == [implicit["id"]]
+    assert pending.background_id == explicit["id"]
+
+
+@pytest.mark.parametrize("echo", [
+    user("foreign"),
+    {**user("expected"), "isSynthetic": True},
+    {**user("expected"), "isCompactSummary": True},
+    {**user("expected"), "parent_tool_use_id": "child"},
+    {**user("expected"), "origin": ORIGIN},
+    user("expected", [{"type": "tool_result", "tool_use_id": "tool", "content": "done"}]),
+], ids=["foreign", "synthetic", "compact", "child", "task", "tool-result"])
+def test_unmatched_input_cannot_adopt_an_implicit_request(echo):
+    pending = PendingSteers()
+    identity = pending.annotate(requesting())["__cc_background_start"]["id"]
+    pending.add("expected", {"id": "human-ui"})
+    pending.annotate(echo, managed_active=False)
+    terminal = pending.annotate({**result(), "user_message_uuid": "expected"}, managed_active=True)
+    assert not terminal["__cc_managed_result"]
+    assert not terminal.get("__cc_background_ends")
+    assert pending.background_id == identity and "expected" in pending.pending
+
+
 @pytest.mark.asyncio
 async def test_implicit_response_absorbs_tasks_while_detached_then_accepts_next_query():
     from cc_remote.claude_steering import background_end_ids
@@ -558,7 +603,7 @@ async def test_implicit_response_absorbs_tasks_while_detached_then_accepts_next_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replayed_user", [False, True])
 @pytest.mark.parametrize("echo_before_detach", [False, True])
-@pytest.mark.parametrize("background_result", [False, True])
+@pytest.mark.parametrize("background_result", ["pending", "finished", "finished_before_request"])
 async def test_service_background_steer_recovery_does_not_resubmit(echo_before_detach, background_result, replayed_user):
     guide_id = "22222222-2222-4222-8222-222222222222"
     metadata = {"id": "guide-ui", "prompt": "guide", "fingerprint": "a" * 64}
@@ -572,9 +617,12 @@ async def test_service_background_steer_recovery_does_not_resubmit(echo_before_d
         await first.steer("guide", native_id=guide_id, metadata=metadata,
                           turn_id="guide-ui", background_id=target)
         assert worker.turn["awaiting_steer"]
-        if background_result:
+        if background_result != "pending":
             await native.queue.put({**result(), "origin": ORIGIN})
             await until(lambda: worker.steers.background_id is None)
+        if background_result == "finished_before_request":
+            await native.queue.put({**requesting("human-request"), "user_message_uuids": [guide_id]})
+            await until(lambda: worker.steers.background_id is not None)
         assert worker.terminal_seq is None
         if echo_before_detach:
             await native.queue.put(user(guide_id))
@@ -599,7 +647,7 @@ async def test_service_background_steer_recovery_does_not_resubmit(echo_before_d
                 await sdk.steer("guide", native_id=guide_id, metadata=metadata)
                 await native.queue.put(user(guide_id))
             await native.queue.put(assistant("answer", [{"type": "text", "text": "recovered"}]))
-            await native.queue.put(result())
+            await native.queue.put({**result(), "user_message_uuid": guide_id})
             await until(lambda: worker.turn is None)
             await until(lambda: ctx.turn_task is None)
             assert len(native.prompts) == 1 and native.interrupts == 0
@@ -607,11 +655,50 @@ async def test_service_background_steer_recovery_does_not_resubmit(echo_before_d
             assert sum(e.type == "turn_end" for e in transport.sent) == 1
             assert worker.background_start is None
             assert ctx.state == "idle"
+            assert not ctx.claude_background_followups and not sdk._steers.background_id
         finally:
             if ctx.turn_task:
                 ctx.turn_task.cancel()
                 await asyncio.gather(ctx.turn_task, return_exceptions=True)
             await sdk.detach_for_shutdown()
+
+
+@pytest.mark.asyncio
+async def test_steered_request_finishing_offline_retires_its_durable_background_claim():
+    async with environment() as (service, attach):
+        first = await attach()
+        worker = service.sessions[first.id]
+        native = worker.client
+        await native.queue.put({**user("old-task"), "origin": ORIGIN})
+        await until(lambda: worker.steers.background_id is not None)
+        await first.steer("guide", native_id="human", metadata={"id": "human-ui"},
+                          turn_id="human-ui", background_id=worker.steers.background_id)
+        await first.detach()
+        await released(worker)
+        await native.queue.put({**result(), "origin": ORIGIN})
+        await native.queue.put(requesting("human-request"))
+        await native.queue.put(user("human"))
+        await native.queue.put({**result(), "user_message_uuid": "human"})
+        await until(lambda: worker.terminal_seq is not None)
+        terminal_seq = worker.terminal_seq
+        assert worker.background_start is not None  # Unacknowledged output stays durable.
+
+        second = await attach()
+        stream = second.receive_messages()
+        terminal = None
+        async with asyncio.timeout(3):
+            while second.last_seq < terminal_seq:
+                terminal = await anext(stream)
+        assert terminal["__cc_managed_result"]
+        assert terminal["__cc_background_ends"]
+        await second.call("commit", {"turn_id": "human-ui", "seq": terminal_seq})
+        assert worker.turn is None and worker.background_start is None
+        assert not worker.steers.background_id and not worker.journal.after(0)
+        assert len(native.prompts) == 1 and native.interrupts == 0
+        # A normal next query must be accepted without another steering workaround.
+        second.next_turn = {"id": "next-human"}
+        await second.query("next question")
+        assert len(native.prompts) == 2 and not native.closed
 
 
 @pytest.mark.asyncio

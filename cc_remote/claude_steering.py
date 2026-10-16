@@ -128,6 +128,10 @@ class PendingSteers:
                 and isinstance(uid, str) and uid
                 and (managed_active or uid in self.pending or value.get("__cc_steer"))):
             self._consumed_user_id = uid
+            # Service/controller routes activate after this exact steering echo
+            # is annotated. Adopt its pre-echo request now, including on replay,
+            # so the human Result also retires that implicit activity claim.
+            managed_active = True
         if value.get("type") == "result" and not child:
             receipts = value.get("user_message_uuids")
             receipts = receipts if isinstance(receipts, list) else []
