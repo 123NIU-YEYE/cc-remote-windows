@@ -280,7 +280,8 @@ async def test_fresh_launch_then_quit_then_reopen(monkeypatch, tmp_path):
     assert len(opened) == 2
 
 
-def test_install_separate_bundle_and_never_overwrites(monkeypatch, tmp_path):
+@pytest.mark.parametrize("architecture", ["arm64", "x86_64"])
+def test_install_separate_bundle_and_never_overwrites(monkeypatch, tmp_path, architecture):
     app = tmp_path / "Official.app"
     resources = app / "Contents/Resources"
     resources.mkdir(parents=True)
@@ -290,9 +291,12 @@ def test_install_separate_bundle_and_never_overwrites(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher.desktop, "_signed", lambda _app: None)
     monkeypatch.setattr(launcher, "daemon_socket", lambda _profile: tmp_path)
     monkeypatch.setattr(launcher, "state_root", lambda: tmp_path / "state")
+    monkeypatch.setattr(launcher.platform, "machine", lambda: architecture)
+    monkeypatch.setenv("MACOSX_DEPLOYMENT_TARGET", "99.0")
 
     def command(args, **_kwargs):
         if args[0] == "/usr/bin/swiftc":
+            assert args[args.index("-target") + 1] == f"{architecture}-apple-macosx13.0"
             Path(args[-1]).write_bytes(b"test binary")
 
     monkeypatch.setattr(launcher.subprocess, "run", command)
@@ -300,6 +304,7 @@ def test_install_separate_bundle_and_never_overwrites(monkeypatch, tmp_path):
     assert launcher.install(tmp_path, app, target)["ok"]
     info = plistlib.loads((target / "Contents/Info.plist").read_bytes())
     assert info["LSUIElement"]
+    assert info["LSMinimumSystemVersion"] == "13.0"
     assert info["CFBundleIdentifier"] != "com.openai.codex"
     config = json.loads((target / "Contents/Resources/launcher.json").read_text())
     assert config["profile"] == str(tmp_path)

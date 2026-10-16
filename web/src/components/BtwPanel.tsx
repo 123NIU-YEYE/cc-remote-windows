@@ -15,6 +15,7 @@ import { ChatView, type ChatViewHandle } from "./ChatView";
 import type { QueryAcceptanceResult } from "../outbox";
 import { CommandSheet } from "./CommandSheet";
 import { Icon } from "../icons";
+import { SideChatIcon } from "./SideChatIcon";
 import { SpeedPicker } from "./SpeedPicker";
 import { PanelTabs, type RightPanelView } from "./PanelTabs";
 import { NoticeStack } from "./NoticeStack";
@@ -483,10 +484,11 @@ export function BtwPanel(p: Props) {
               hasArtifact={p.hasArtifact} hasBtw
               onTab={p.onTab} />
           : <div className="btw-titles">
-              <span className="btw-title">
-                btw · 侧边对话{p.engine === "codex" ? " · Codex" : ""}
+              <SideChatIcon />
+              <span className="btw-title">侧边聊天</span>
+              <span className="btw-engine-badge">
+                {p.engine === "codex" ? "Codex" : "Claude"}
               </span>
-              <span className="btw-sub">基于当前会话上下文,不写回主线</span>
             </div>}
         <button className="iconbtn btw-new" onClick={p.onNew}
           disabled={!!p.opening}
