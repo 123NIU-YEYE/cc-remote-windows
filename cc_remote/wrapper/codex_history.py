@@ -33,6 +33,7 @@ from cc_remote.wrapper.codex_stream import (
     MIN_PROCESS_DURATION_MS,
 )
 from cc_remote.wrapper.history_store import HistorySourceFingerprint, materialize_history_turns
+from cc_remote.wrapper.history_metrics import history_timed
 
 
 _Rpc = Callable[
@@ -589,6 +590,20 @@ class CodexOfficialHistory:
         except CodexHistoryInvalidResponse:
             return False
 
+    def can_restore_page(self, thread_id, before, turn_ids):
+        return (bool(turn_ids) and (thread_id, before) in self._before_cursors
+                and all((thread_id, turn_id) in self._locators
+                        and (thread_id, turn_id) in self._summary_events
+                        for turn_id in turn_ids)
+                and (thread_id, turn_ids[0]) in self._before_cursors)
+
+    def page_native_ids(self, thread_id, turn_ids):
+        """Native ownership comes from locators, never visible/fork user ids."""
+        locators = [self._locators.get((thread_id, turn_id)) for turn_id in turn_ids]
+        if not locators or any(locator is None for locator in locators):
+            return frozenset()
+        return frozenset(locator.native_turn_id for locator in locators)
+
     def prefetch_summary_page(self, thread_id: str, before: str) -> None:
         """Read only one next page, after the requested History was delivered."""
         cursor = self._before_cursors.get((thread_id, before))
@@ -683,6 +698,11 @@ class CodexOfficialHistory:
         ):
             self._terminal_refresh_fallbacks.popitem(last=False)
 
+    async def summary_page_with_source(self, thread_id: str, **kwargs) -> CodexHistoryPage:
+        """Advertise support for discovering source segments before projection."""
+        return await self.summary_page(thread_id, **kwargs)
+
+    @history_timed("codex_summary")
     async def summary_page(
         self,
         thread_id: str,
@@ -698,7 +718,12 @@ class CodexOfficialHistory:
         ) = None,
         source: HistorySourceFingerprint | None = None,
         minimum_user_segments: dict[str, int] | None = None,
+        source_segments: Callable[
+            [tuple[str, ...]], Awaitable[dict[str, int]]
+        ] | None = None,
+        source_user: _RecoverUser | None = None,
     ) -> CodexHistoryPage:
+        recover_user = source_user or self._recover_user
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
             raise ValueError("Codex history limit must be between 1 and 200")
         if (
@@ -740,6 +765,16 @@ class CodexOfficialHistory:
             _validated_turn(row, expected_view="summary")
             for row in rows
         ]
+        if source_segments is not None:
+            # Resolve source-proven steering boundaries before translating the
+            # page. Otherwise the first projection drops those users and the
+            # caller has to repeat the entire projection to restore them.
+            counts = await source_segments(tuple(
+                _wire_id(turn["id"], "turn") for turn in validated_rows))
+            minimum_user_segments = dict(minimum_user_segments or {})
+            for native, count in counts.items():
+                minimum_user_segments[native] = max(
+                    count, minimum_user_segments.get(native, 0))
         prefetched_full: dict[int, dict[str, Any]] = {}
         terminal_refresh_indices: dict[int, tuple[str, str]] = {}
         for index, turn in enumerate(validated_rows):
@@ -770,6 +805,20 @@ class CodexOfficialHistory:
                 )
             )
         ]
+        retained_full_indices = set(range(max(hydration_indices) + 1)) if hydration_indices else set()
+        # A page with several source-proven steering inputs previously needed
+        # a separate cursor walk + full read for every collapsed native turn.
+        # Read that bounded prefix once. Oversized/unsupported full pages keep
+        # the existing exact-turn/item fallback below.
+        collapsed_indices = [
+            index for index, turn in enumerate(validated_rows)
+            if (minimum_user_segments or {}).get(_wire_id(turn["id"], "turn"), 0)
+            > sum(item.get("type") == "userMessage" for item in self._native_full_turns.get(
+                (thread_id, _wire_id(turn["id"], "turn")), turn)["items"])
+        ]
+        if before is not None and len(collapsed_indices) >= 2:
+            hydration_indices.extend(collapsed_indices)
+            retained_full_indices.update(collapsed_indices)
         failed_terminal_prefetch: set[tuple[str, str]] = set()
         # A single descending full page is cheaper than walking an opaque cursor
         # once per recent row. Include any preceding cached row only when needed
@@ -798,7 +847,8 @@ class CodexOfficialHistory:
                     ) != _wire_id(validated_rows[index]["id"], "turn"):
                         raise CodexHistoryInvalidResponse(
                             "Codex recent full page changed identity")
-                    prefetched_full[index] = full_turn
+                    if index in retained_full_indices:
+                        prefetched_full[index] = full_turn
             except CodexRpcRejected as exc:
                 if not _unsupported(exc):
                     raise
@@ -968,18 +1018,18 @@ class CodexOfficialHistory:
                 self._remember(self._native_full_turns, (thread_id, native_id), dict(turn))
                 while len(self._native_full_turns) > _MAX_ACTIVE_TURN_CACHE_ENTRIES:
                     self._native_full_turns.popitem(last=False)
-            if self._recover_user is not None or self._recover_users is not None:
+            if recover_user is not None or self._recover_users is not None:
                 copied_items = None
                 user_index = 0
                 for item_index, item in enumerate(turn["items"]):
                     if item.get("type") != "userMessage":
                         continue
-                    if self._recover_user is not None and any(
+                    if recover_user is not None and any(
                         part.get("type") == "localImage"
                         for part in item.get("content", [])
                     ):
                         visible_id = _wire_id(item.get("id"), "user")
-                        recovered = await self._recover_user(
+                        recovered = await recover_user(
                             thread_id,
                             native_id,
                             visible_id,
@@ -1002,7 +1052,7 @@ class CodexOfficialHistory:
                         recovered = self._automatic_users[automatic_key]
                         self._automatic_users.move_to_end(automatic_key)
                     elif self._recover_users is None:
-                        recovered = await self._recover_user(
+                        recovered = await recover_user(
                             thread_id,
                             native_id,
                             native_id,

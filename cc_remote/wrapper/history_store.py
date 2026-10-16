@@ -13,9 +13,12 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
 
 from cc_remote.wrapper.codex_delegation import codex_message_target
@@ -103,6 +106,8 @@ json_set(
 )
 """.strip()
 _COMPACT_SOURCE_LIMIT = 16
+_COMPACT_MEMORY_BYTES = 32 * 1024 * 1024
+_COMPACT_MEMORY_ENTRIES = 2
 _SAFE_COMPACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _DETAIL_SNAPSHOT_TOKEN = re.compile(r"^[0-9a-f]{64}$")
 _DETAIL_SNAPSHOT_TURN_HASH = re.compile(r"^[0-9a-f]{16}$")
@@ -1309,6 +1314,9 @@ class HistoryIndexStore:
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max(1024, int(max_bytes))
         self._summary_json_sql_available: bool | None = None
+        self._compact_memory: OrderedDict[tuple, tuple] = OrderedDict()
+        self._compact_memory_bytes = 0
+        self._compact_memory_lock = RLock()
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -1737,6 +1745,71 @@ class HistoryIndexStore:
         max_entries: int,
         visible_user: Callable[[dict[str, Any]], bool | str | None],
     ) -> ClaudeCompactChainIndex | None:
+        """Reuse bounded metadata across readers of the exact same snapshot.
+
+        Pagination, delayed-result recovery and native metadata restoration all
+        need this graph. Reconstructing it from SQLite for each reader can cost
+        more than reading the selected turn bodies. No message payloads are
+        cached, and callers receive their own mutable row dictionary.
+        """
+        try:
+            source = HistorySourceFingerprint.capture(source_path)
+        except OSError:
+            return None
+        key = (source, snapshot_size, max_record_bytes, max_entries, id(visible_user))
+        with self._compact_memory_lock:
+            cached = self._compact_memory.get(key)
+            if cached is not None and cached[0] is visible_user:
+                self._compact_memory.move_to_end(key)
+                index = cached[1]
+                return ClaudeCompactChainIndex(
+                    index.leaf, dict(index.rows), index.queued_notifications,
+                    index.indexed_size,
+                )
+        index = self._read_claude_compact_index(
+            source_path, snapshot_size=snapshot_size,
+            max_record_bytes=max_record_bytes, max_entries=max_entries,
+            visible_user=visible_user,
+        )
+        if index is None:
+            return None
+        try:
+            if HistorySourceFingerprint.capture(source_path) != source:
+                return index
+        except OSError:
+            return index
+        # Count referenced strings conservatively even when SQLite reused them.
+        size = sys.getsizeof(index.rows) + sys.getsizeof(index.queued_notifications)
+        size += sum(sys.getsizeof(uid) + sys.getsizeof(row)
+                    + sum(sys.getsizeof(value) for value in row)
+                    for uid, row in index.rows.items())
+        size += sum(sys.getsizeof(row) + sum(sys.getsizeof(value) for value in row)
+                    for row in index.queued_notifications)
+        if size <= _COMPACT_MEMORY_BYTES:
+            saved = ClaudeCompactChainIndex(
+                index.leaf, dict(index.rows), index.queued_notifications,
+                index.indexed_size,
+            )
+            with self._compact_memory_lock:
+                previous = self._compact_memory.pop(key, None)
+                if previous is not None:
+                    self._compact_memory_bytes -= previous[2]
+                self._compact_memory[key] = (visible_user, saved, size)
+                self._compact_memory_bytes += size
+                while (len(self._compact_memory) > _COMPACT_MEMORY_ENTRIES
+                       or self._compact_memory_bytes > _COMPACT_MEMORY_BYTES):
+                    self._compact_memory_bytes -= self._compact_memory.popitem(last=False)[1][2]
+        return index
+
+    def _read_claude_compact_index(
+        self,
+        source_path: str,
+        *,
+        snapshot_size: int | None,
+        max_record_bytes: int,
+        max_entries: int,
+        visible_user: Callable[[dict[str, Any]], bool | str | None],
+    ) -> ClaudeCompactChainIndex | None:
         """Incrementally index compact ancestry without retaining row payloads.
 
         The SQLite rows are rebuildable metadata. An append verifies the exact
@@ -1961,6 +2034,8 @@ class HistoryIndexStore:
                     """,
                     (resolved, device, inode, min(target_size, indexed_size)),
                 ).fetchall()
+                if len(rows) > bounded_entries:
+                    return None
                 queued = connection.execute(
                     """
                     SELECT content_length, content_sha256
@@ -2783,6 +2858,9 @@ class HistoryIndexStore:
             total_bytes -= int(victim["payload_bytes"])
 
     def invalidate_session(self, session_id: str) -> None:
+        with self._compact_memory_lock:
+            self._compact_memory.clear()
+            self._compact_memory_bytes = 0
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM history_pages WHERE session_id=?", (session_id,))
@@ -2805,3 +2883,6 @@ class HistoryIndexStore:
         The store uses operation-scoped connections, so there is no live handle
         to close.  Keeping an explicit hook makes future connection pooling safe.
         """
+        with self._compact_memory_lock:
+            self._compact_memory.clear()
+            self._compact_memory_bytes = 0
