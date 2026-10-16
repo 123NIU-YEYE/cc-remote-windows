@@ -1,9 +1,10 @@
 /* /btw ephemeral side-fork panel (mini chat over a forked session) */
 .btw-panel{ position:fixed; top:14px; right:14px; bottom:14px; width:var(--panel-w); z-index:36; background:var(--surface); border:1px solid var(--border-strong); border-radius:var(--r-panel); box-shadow:var(--shadow-lg); display:flex; flex-direction:column; overflow:hidden; animation:panel-in .24s var(--ease); }
 .btw-head{ display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid var(--border); flex:none; padding-top:max(12px, env(safe-area-inset-top)); }
-.btw-titles{ flex:1; display:flex; flex-direction:column; gap:1px; min-width:0; }
-.btw-title{ font-weight:var(--font-weight-650); font-size:13px; color:var(--accent-text,var(--accent)); }
-.btw-sub{ font-size:11px; color:var(--dim); }
+.btw-titles{ flex:1; display:flex; align-items:center; gap:8px; min-width:0; }
+.btw-titles > svg{ flex:none; color:var(--accent-text,var(--accent)); }
+.btw-title{ font-weight:var(--font-weight-650); font-size:13px; color:var(--text); white-space:nowrap; }
+.btw-engine-badge{ flex:none; padding:2px 6px; border-radius:5px; font-size:10px; line-height:1.5; font-weight:var(--font-weight-650); color:var(--accent-text,var(--accent)); background:color-mix(in srgb,var(--accent) 10%,transparent); }
 .btw-new{ color:var(--accent-text,var(--accent)); }
 .btw-head>.iconbtn{ flex:none; }
 .btw-chat-tabs{ flex:none; display:flex; gap:6px; padding:8px 10px; overflow-x:auto; overscroll-behavior-x:contain; scrollbar-width:thin; border-bottom:1px solid var(--border); background:color-mix(in srgb,var(--surface) 88%,var(--bg)); }
@@ -43,13 +44,14 @@
 .btw-controls>span{ margin-right:auto; white-space:nowrap; }
 .btw-controls .hint-ctl{ max-width:42%; overflow:hidden; text-overflow:ellipsis; }
 .btw-controls .fast-chip{ flex:none; max-width:none; }
-@media (max-width:980px){ .btw-panel{ top:auto; left:10px; right:10px; bottom:calc(10px + var(--keyboard-inset,0px)); width:auto; max-height:min(82vh,calc(var(--app-height,100dvh) - 20px)); animation:panel-in-m .24s var(--ease); } }
+/* Empty and populated chats share the same mobile sheet height. The visual
+   viewport still limits the sheet when the on-screen keyboard is open. */
+@media (max-width:980px){ .btw-panel{ top:auto; left:10px; right:10px; bottom:calc(10px + var(--keyboard-inset,0px)); width:auto; height:min(82vh,calc(var(--app-height,100dvh) - 20px)); max-height:min(82vh,calc(var(--app-height,100dvh) - 20px)); animation:panel-in-m .24s var(--ease); } }
 
 /* Change geometry on the existing panel, never remount the chat or animate
    its width: virtual history must only reflow once per layout switch. */
 .btw-expanded .btw-head{ padding:16px 20px; }
 .btw-expanded .btw-title{ font-size:15px; }
-.btw-expanded .btw-sub{ font-size:12px; }
 .btw-expanded .btw-chat-tabs{ padding:9px 20px; }
 .btw-expanded .btw-body{ padding-top:12px; }
 .btw-expanded .btw-composer{ width:100%; max-width:840px; margin:0 auto; padding:12px 24px 16px; border-top:0; background:var(--surface); }

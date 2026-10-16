@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "../icons";
+import { SideChatIcon } from "./SideChatIcon";
 import type { NotificationMode } from "../notification-mode";
 import type { PushBindingState } from "../push";
 import { themeLabel, type ThemeChoice } from "../themes";
@@ -18,6 +19,7 @@ interface Props {
   notificationAvailable: boolean;
   onNotificationMode: (mode: NotificationMode) => Promise<boolean>;
   onOpenUsageActivity: () => void;
+  onOpenBtw?: () => void;
   onOpenViewer?: () => void;
   onOpenFiles?: () => void;
   onSelectTheme: (choice: ThemeChoice) => void;
@@ -46,6 +48,7 @@ export function HeaderMenu({
   notificationAvailable,
   onNotificationMode,
   onOpenUsageActivity,
+  onOpenBtw,
   onOpenViewer,
   onOpenFiles,
   onSelectTheme,
@@ -160,7 +163,16 @@ export function HeaderMenu({
                   <b>设置</b>
                 </header>
                 <div className="header-menu-items">
-                  {onOpenViewer && <button ref={firstRef} type="button" className="header-menu-item" onClick={() => {
+                  {onOpenBtw && <button ref={firstRef} type="button"
+                    className="header-menu-item" aria-label="打开侧边聊天" onClick={() => {
+                      close();
+                      onOpenBtw();
+                    }}>
+                    <SideChatIcon size={18} />
+                    <span><b>侧边聊天</b><small>基于当前会话，独立提问</small></span>
+                    <Icon name="chevron-right" size={16} />
+                  </button>}
+                  {onOpenViewer && <button ref={onOpenBtw ? undefined : firstRef} type="button" className="header-menu-item" onClick={() => {
                     close();
                     onOpenViewer();
                   }}>
@@ -168,7 +180,7 @@ export function HeaderMenu({
                     <span><b>远程预览</b><small>打开设备上的交互页面</small></span>
                     <Icon name="chevron-right" size={16} />
                   </button>}
-                  {onOpenFiles && <button ref={onOpenViewer ? undefined : firstRef} type="button"
+                  {onOpenFiles && <button ref={onOpenBtw || onOpenViewer ? undefined : firstRef} type="button"
                     className="header-menu-item" aria-label="打开会话文件" onClick={() => {
                       close();
                       onOpenFiles();
@@ -177,7 +189,7 @@ export function HeaderMenu({
                     <span><b>会话文件</b><small>浏览目录并预览文件</small></span>
                     <Icon name="chevron-right" size={16} />
                   </button>}
-                  {engine === "codex" && <button ref={onOpenViewer || onOpenFiles ? undefined : firstRef} type="button"
+                  {engine === "codex" && <button ref={onOpenBtw || onOpenViewer || onOpenFiles ? undefined : firstRef} type="button"
                     className="header-menu-item" onClick={() => {
                       close();
                       onOpenUsageActivity();
@@ -186,7 +198,7 @@ export function HeaderMenu({
                     <span><b>使用活动</b><small>每日 Token、峰值与连续使用记录</small></span>
                     <Icon name="chevron-right" size={16} />
                   </button>}
-                  <button ref={engine === "codex" || onOpenViewer || onOpenFiles ? undefined : firstRef}
+                  <button ref={engine === "codex" || onOpenBtw || onOpenViewer || onOpenFiles ? undefined : firstRef}
                     type="button" className="header-menu-item"
                     onClick={() => setPage("notifications")}>
                     <Icon name="notify" size={18} />
