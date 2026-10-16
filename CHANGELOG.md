@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.18
+
+Simplify side-chat access and headers, keep empty mobile chats at their normal
+height, and fix shared launcher compatibility on macOS. Wire protocol v74 is
+unchanged. See the bilingual [release notes](docs/releases/v4.0.18.md).
+
+- Open side chat from the session menu using the existing chat and composer focus behavior.
+- Use a chat icon, short title and Codex/Claude badge in the side-chat header.
+- Give empty and populated mobile chats the same sheet height while respecting the keyboard viewport.
+- Compile new macOS shared launchers with an explicit macOS 13.0 target and matching bundle metadata, avoiding an unsupported toolchain default.
+
 ## v4.0.17
 
 Add webpage previews and automatic site icons, refine file-path tooltips, and focus
