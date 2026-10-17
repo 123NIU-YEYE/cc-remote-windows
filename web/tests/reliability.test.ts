@@ -1,3 +1,4 @@
+import "./push-binding.test.ts";
 import "./session-messages.test.ts";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";

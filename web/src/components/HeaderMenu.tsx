@@ -17,6 +17,8 @@ interface Props {
   notificationMode: NotificationMode;
   notificationBinding: PushBindingState;
   notificationAvailable: boolean;
+  notificationNative?: boolean;
+  notificationError?: string;
   onNotificationMode: (mode: NotificationMode) => Promise<boolean>;
   onOpenUsageActivity: () => void;
   onOpenBtw?: () => void;
@@ -46,6 +48,8 @@ export function HeaderMenu({
   notificationMode,
   notificationBinding,
   notificationAvailable,
+  notificationNative = false,
+  notificationError = "",
   onNotificationMode,
   onOpenUsageActivity,
   onOpenBtw,
@@ -136,11 +140,12 @@ export function HeaderMenu({
   } as CSSProperties;
   const bindingLabel = notificationMode === "off"
     ? "已关闭"
+    : notificationError ? "推送未连接"
     : notificationBinding === "remote"
-      ? "后台 Push"
+      ? notificationNative ? "鸿蒙推送" : "后台 Push"
       : notificationBinding === "binding"
         ? "正在同步"
-        : "页面后台提醒";
+        : notificationNative ? "推送未连接" : "页面后台提醒";
 
   return (
     <>
@@ -237,6 +242,10 @@ export function HeaderMenu({
                 <p className="header-menu-help">
                   通用提醒不会把会话名称或编号发送给 Push 服务；会话提醒可从通知精确打开对应对话。
                 </p>
+                {notificationNative && <p className="header-menu-help">
+                  使用华为 Push Kit 发送系统通知；开启后会向华为提供设备推送标识及所选模式的通知内容。
+                </p>}
+                {notificationError && <p className="header-menu-warning">{notificationError}</p>}
                 {!notificationAvailable && (
                   <p className="header-menu-warning">当前浏览器不支持系统通知。</p>
                 )}

@@ -252,6 +252,14 @@ class RelayConfig:
     )
     push_db_path: str = field(default_factory=lambda: _env(
         "PUSH_DB_PATH", str(Path.home() / ".cc-remote" / "relay-push.sqlite3")))
+    # Optional HarmonyOS channel. The private Huawei service-account JSON stays
+    # outside releases; Web Push keeps its independent VAPID configuration.
+    harmony_push_service_account: str = field(default_factory=lambda: _env(
+        "HARMONY_PUSH_SERVICE_ACCOUNT", "").strip())
+    harmony_push_category: str = field(default_factory=lambda: _env(
+        "HARMONY_PUSH_CATEGORY", "MARKETING").strip())
+    harmony_push_test_message: bool = field(default_factory=lambda: _bool(
+        "HARMONY_PUSH_TEST_MESSAGE"))
     # Persistent enrollment metadata and hashed per-device credentials. This
     # database never contains conversations, artifacts, or plaintext tokens.
     device_db_path: str = field(default_factory=lambda: _env(
@@ -524,6 +532,13 @@ def validate_relay_config(cfg: RelayConfig) -> None:
             "DEVICE_DB_PATH must be a non-empty path of at most 4096 UTF-8 bytes")
     if not (60 <= cfg.device_pairing_ttl_seconds <= 3600):
         errors.append("DEVICE_PAIRING_TTL_SECONDS must be between 60 and 3600")
+
+    if cfg.harmony_push_category not in {"MARKETING", "WORK"}:
+        errors.append("HARMONY_PUSH_CATEGORY must be MARKETING or WORK")
+    if cfg.harmony_push_service_account and (
+            not Path(cfg.harmony_push_service_account).expanduser().is_absolute()
+            or "\x00" in cfg.harmony_push_service_account):
+        errors.append("HARMONY_PUSH_SERVICE_ACCOUNT must be an absolute path")
 
     origin = cfg.public_origin.strip()
     try:
