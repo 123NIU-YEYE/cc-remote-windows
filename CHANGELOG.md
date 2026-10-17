@@ -2,6 +2,18 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.20
+
+Add preview Android and native HarmonyOS clients, optional Huawei Push Kit
+notifications, and a Codex checkpoint correction. Wire protocol v74 is unchanged.
+See the bilingual [release notes](docs/releases/v4.0.20.md).
+
+- Keep chat and drafts mounted while browsing links inside either mobile client.
+- Add opt-in HarmonyOS completion push without changing Web/PWA notifications.
+- Recover from lazy notification adapter failures and revoke ambiguous native subscriptions before retrying.
+- Allow unchanged pre-existing untracked files after a clean forward Git commit without a false checkpoint warning; committed turns still use conversation-only rollback.
+- Publish a signed Android APK and an unsigned HarmonyOS HAP requiring the user's own device signing profile; retain preview acceptance limitations.
+
 ## v4.0.19
 
 Speed up large-session history loading and fix Claude conversations that remain
