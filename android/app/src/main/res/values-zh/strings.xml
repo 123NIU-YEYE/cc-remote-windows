@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">cc-remote</string>
+    <string name="load_error_retry">页面加载失败，请检查网络和服务地址。点此重试。</string>
+    <string name="welcome">随时回到你的会话</string>
+    <string name="address_hint">https://your-server.example</string>
+    <string name="address_label">cc-remote 服务地址</string>
+    <string name="connect">连接</string>
+    <string name="invalid_address">请输入 HTTPS 服务地址，不要包含路径、用户名、查询参数或片段。</string>
+    <string name="settings">设置</string>
+    <string name="client_settings">客户端设置</string>
+    <string name="reload">刷新页面</string>
+    <string name="server">更换服务地址</string>
+    <string name="change_warning">这会关闭当前页面，未发送的草稿可能丢失。服务端正在执行的任务会继续。</string>
+    <string name="change">更换</string>
+    <string name="cancel">取消</string>
+    <string name="close_browser">返回聊天</string>
+    <string name="browser_back">后退</string>
+    <string name="open_browser">在浏览器打开</string>
+    <string name="external_confirm">是否使用其他应用打开此链接？</string>
+    <string name="open">打开</string>
+    <string name="unsupported_link">暂不支持打开此链接。</string>
+    <string name="no_handler">没有可打开此链接的应用。</string>
+    <string name="missing_webview">Android System WebView 不可用。请在安卓运行环境中启用或更新 WebView 组件，再打开 cc-remote。</string>
+    <string name="choose_files">添加附件</string>
+    <string name="download_unavailable">试用版暂不支持保存下载文件，请使用浏览器保存。</string>
+    <string name="about">关于试用版</string>
+    <string name="about_detail">Android 客户端 %1$s\nWebView：%2$s\n\n聊天和预览使用服务端当前的网页界面。本试用版暂不包含原生推送、麦克风／相机调用及文件下载。</string>
+</resources>

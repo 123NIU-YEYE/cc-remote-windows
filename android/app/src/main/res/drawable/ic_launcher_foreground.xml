@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Same terminal mark as web/public/favicon.svg; the launcher supplies its mask. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="512" android:viewportHeight="512">
+    <path android:pathData="M163,178 L270,256 L163,334"
+        android:strokeColor="#171716" android:strokeWidth="46"
+        android:strokeLineCap="round" android:strokeLineJoin="round" />
+    <path android:pathData="M306,326 L369,326"
+        android:strokeColor="#171716" android:strokeWidth="46" android:strokeLineCap="round" />
+</vector>
