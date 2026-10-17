@@ -85,7 +85,13 @@ export class PushBindingCoordinator {
       }
       this.refresh = false;
       this.publish("binding");
-      const enabled = await this.apply(target);
+      let enabled = false;
+      try {
+        enabled = await this.apply(target);
+      } catch {
+        // A failed adapter must settle through the same path as a rejected
+        // binding, including any newer target queued while it was in flight.
+      }
       if (enabled) this.bound = target;
 
       // A newer request arrived while the network mutation was in flight.
@@ -108,11 +114,19 @@ export class PushBindingCoordinator {
 }
 
 export async function enableRemotePush(machineId: string, mode: RemoteNotificationMode = "generic"): Promise<boolean> {
-  if (hasHarmonyPush()) return enableHarmonyPush(machineId, mode);
-  return (await import("./web-push.ts")).enableRemotePush(machineId, mode);
+  try {
+    if (hasHarmonyPush()) return await enableHarmonyPush(machineId, mode);
+    return await (await import("./web-push.ts")).enableRemotePush(machineId, mode);
+  } catch {
+    return false;
+  }
 }
 
 export async function disableRemotePush(): Promise<boolean> {
-  if (hasHarmonyPush()) return disableHarmonyPush();
-  return (await import("./web-push.ts")).disableRemotePush();
+  try {
+    if (hasHarmonyPush()) return await disableHarmonyPush();
+    return await (await import("./web-push.ts")).disableRemotePush();
+  } catch {
+    return false;
+  }
 }

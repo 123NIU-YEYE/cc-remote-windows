@@ -52,14 +52,31 @@ async function refresh(): Promise<void> {
 export function confirmHarmonyPermission(): void {
   publish({ available: true, granted: true, error: "" });
 }
+function unavailable(): false {
+  // Chunk loading can fail before the client handles provider/network errors.
+  publish({ error: "鸿蒙通知暂不可用，请检查网络或刷新后重试。" });
+  return false;
+}
 export async function requestHarmonyPermission(): Promise<boolean> {
-  return (await import("./harmony-push-client.ts")).requestHarmonyPermission();
+  try {
+    return await (await import("./harmony-push-client.ts")).requestHarmonyPermission();
+  } catch {
+    return unavailable();
+  }
 }
 export async function enableHarmonyPush(machineId: string, mode: RemoteNotificationMode): Promise<boolean> {
-  return (await import("./harmony-push-client.ts")).enableHarmonyPush(machineId, mode);
+  try {
+    return await (await import("./harmony-push-client.ts")).enableHarmonyPush(machineId, mode);
+  } catch {
+    return unavailable();
+  }
 }
 export async function disableHarmonyPush(): Promise<boolean> {
-  return (await import("./harmony-push-client.ts")).disableHarmonyPush();
+  try {
+    return await (await import("./harmony-push-client.ts")).disableHarmonyPush();
+  } catch {
+    return unavailable();
+  }
 }
 
 if (typeof window !== "undefined") {
