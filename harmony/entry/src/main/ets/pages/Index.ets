@@ -2,6 +2,8 @@ import { common } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 import { webview } from '@kit.ArkWeb';
 import { util } from '@kit.ArkTS';
+import { PushBridge } from '../model/PushBridge';
+import { PushTarget } from '../model/PushRoute';
 import { httpsOrigin, navigationAction, sameOrigin, serverOrigin } from '../model/UrlPolicy';
 
 @Entry
@@ -26,6 +28,11 @@ struct Index {
   private store: preferences.Preferences | undefined = undefined;
   private shellScript: string = '';
   private settingsOpen: boolean = false;
+  private push: PushBridge | undefined = undefined;
+  private pushScript: string = '';
+  private pushAttached: boolean = false;
+  @StorageLink('pushTarget') @Watch('deliverNotification') private pushTarget: string = '';
+  @StorageLink('pushRefresh') @Watch('refreshPush') private pushRefresh: number = 0;
 
   aboutToAppear(): void {
     try {
@@ -34,6 +41,9 @@ struct Index {
       this.store = preferences.getPreferencesSync(context, { name: 'client' });
       const bytes = context.resourceManager.getRawFileContentSync('shell.js');
       this.shellScript = new util.TextDecoder().decodeToString(bytes);
+      this.pushScript = new util.TextDecoder().decodeToString(
+        context.resourceManager.getRawFileContentSync('push-bridge.js'));
+      this.push = new PushBridge(context, this.store);
       this.server = serverOrigin(this.store.getSync('server', '') as string);
       this.address = this.server;
       this.configuring = this.server === '';
@@ -44,6 +54,7 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.push?.detach();
     this.cancelPendingPopup();
     webview.WebCookieManager.saveCookieAsync().catch(() => {});
   }
@@ -83,6 +94,8 @@ struct Index {
     try {
       if (this.server !== '' && this.server !== next) {
         this.closeBrowser();
+        await this.push?.resetServer();
+        this.pushTarget = '';
         // Explicit server change clears only this app's control-link cookies.
         // Never read/export cookies, account files, or model credentials.
         await webview.WebCookieManager.clearAllCookies();
@@ -95,7 +108,8 @@ struct Index {
       this.setupError = '';
       this.configuring = false;
     } catch (_) {
-      this.setupError = '保存失败，请重试。';
+      this.setupError = '保存失败，请检查网络后重试；旧通知绑定尚未解除时不会切换服务。';
+      if (this.server !== '') this.pageFinished(this.chat.getUrl(), true);
     } finally {
       this.saving = false;
     }
@@ -120,7 +134,7 @@ struct Index {
       }
       if (result.index === 2) this.getUIContext().getPromptAction().showDialog({
         title: 'cc-remote · 鸿蒙版',
-        message: '0.1.0-preview.1\n直接使用鸿蒙 ArkWeb。聊天与任务仍在你的设备上运行。',
+        message: '0.1.0-preview.2\n直接使用鸿蒙 ArkWeb。聊天与任务仍在你的设备上运行。',
         buttons: [{ text: '知道了', color: '#2962E8' }]
       });
     }).catch(() => {}).finally(() => { this.settingsOpen = false; });
@@ -201,11 +215,35 @@ struct Index {
 
   private pageFinished(value: string, isChat: boolean): void {
     if (isChat && sameOrigin(this.server, value)) {
+      this.push?.attach(this.chat, this.server, this.pushScript).then(() => {
+        this.pushAttached = true;
+        this.deliverNotification();
+      }).catch(() => {});
       this.chat.runJavaScript(this.shellScript + '(' + JSON.stringify(this.server) + ');').catch(() => {
         this.chatError = true;
       });
     }
     webview.WebCookieManager.saveCookieAsync().catch(() => {});
+  }
+
+  private refreshPush(): void {
+    if (!this.pushAttached || !sameOrigin(this.server, this.chat.getUrl())) return;
+    this.chat.runJavaScript("window.dispatchEvent(new Event('cc-remote-harmony-refresh'));").catch(() => {});
+  }
+
+  private deliverNotification(): void {
+    if (!this.pushAttached || !this.pushTarget || !sameOrigin(this.server, this.chat.getUrl())) return;
+    let target: PushTarget;
+    try { target = JSON.parse(this.pushTarget) as PushTarget; } catch (_) { this.pushTarget = ''; return; }
+    if (target.origin !== this.server) { this.pushTarget = ''; return; }
+    const current = this.pushTarget;
+    this.closeBrowser();
+    this.configuring = false;
+    // A warm notification never reloads the document or destroys an input draft.
+    this.chat.runJavaScript("window.ccRemoteHarmonyNotification = " + JSON.stringify(target.route)
+      + ";window.dispatchEvent(new Event('cc-remote-harmony-notification'));").then(() => {
+      if (this.pushTarget === current) this.pushTarget = '';
+    }).catch(() => {});
   }
 
   @Builder
@@ -229,8 +267,11 @@ struct Index {
       .onWindowNew(event => this.newWindow(event))
       .onWindowExit(() => { if (!isChat) this.closeBrowser(); })
       .onPageBegin(event => {
-        if (isChat) this.chatError = false;
-        else {
+        if (isChat) {
+          this.chatError = false;
+          this.pushAttached = false;
+          this.push?.detach();
+        } else {
           this.browserError = false;
           this.browserAddress = event ? httpsOrigin(event.url) : '';
         }

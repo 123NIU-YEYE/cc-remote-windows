@@ -18,6 +18,7 @@ import ipaddress
 import json
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -37,6 +38,10 @@ from cc_remote.relay.auth import (
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.devices import DeviceStore
+from cc_remote.relay.harmony_push import (
+    HarmonyPushDispatcher, HarmonyPushStore, HarmonySubscription, HuaweiPushSender,
+    TOKEN_RE as HARMONY_TOKEN_RE,
+)
 from cc_remote.relay.link_preview import LinkPreviewService, PreviewUnavailable
 from cc_remote.relay.viewer import ViewerError, ViewerRelay, main_cookie_name
 from cc_remote.relay.pairing import RelayHub
@@ -564,9 +569,23 @@ def create_app(
                 subscription.session_jti, subscription.expires_at),
         )
 
+    harmony_store: HarmonyPushStore | None = None
+    harmony_dispatcher: HarmonyPushDispatcher | None = None
+    if cfg.harmony_push_service_account:
+        try:
+            harmony_sender = HuaweiPushSender(cfg.harmony_push_service_account)
+            harmony_store = HarmonyPushStore(cfg.push_db_path)
+            harmony_dispatcher = HarmonyPushDispatcher(
+                harmony_store, origin=cfg.public_origin, sender=harmony_sender,
+                category=cfg.harmony_push_category,
+                test_message=cfg.harmony_push_test_message,
+                session_active=lambda sub: sessions.active_id(sub.session_jti, sub.expires_at),
+            )
+        except (ValueError, OSError, sqlite3.Error):
+            harmony_store = None
+            log.warning("Harmony push disabled: check service-account configuration")
+
     async def on_live_turn_end(machine_id: str, msg: object) -> None:
-        if push_dispatcher is None:
-            return
         result = getattr(msg, "result", None)
         raw_context = getattr(msg, "notification_context", None)
         context = (
@@ -576,11 +595,13 @@ def create_app(
         )
         if context is not None:
             context["sid"] = getattr(msg, "sid", None)
-        await push_dispatcher.notify_turn_end(
-            machine_id,
-            outcome=_turn_push_outcome(result),
-            context=context,
-        )
+        # One provider's outage must not prevent delivery through the other.
+        await asyncio.gather(*(
+            dispatcher.notify_turn_end(
+                machine_id, outcome=_turn_push_outcome(result), context=context)
+            for dispatcher in (push_dispatcher, harmony_dispatcher)
+            if dispatcher is not None
+        ), return_exceptions=True)
 
     hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end)
     login_slots = asyncio.Semaphore(cfg.login_inflight_cap)
@@ -589,6 +610,8 @@ def create_app(
     app.state.login_slots = login_slots
     app.state.push_store = push_store
     app.state.push_dispatcher = push_dispatcher
+    app.state.harmony_push_store = harmony_store
+    app.state.harmony_push_dispatcher = harmony_dispatcher
     app.state.device_store = devices
     viewers = ViewerRelay(
         cfg, lambda req: _active_claims(req, cfg, sessions), sessions.active,
@@ -720,6 +743,51 @@ def create_app(
         await push_store.remove_endpoint(_push_subject(claims), endpoint)
         return JSONResponse(
             {"ok": True}, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/push/harmony/config")
+    async def harmony_push_config(req: Request) -> JSONResponse:
+        if await _active_claims(req, cfg, sessions) is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        return JSONResponse({"enabled": harmony_dispatcher is not None},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/push/harmony/{operation}")
+    async def harmony_push_binding(operation: str, req: Request) -> JSONResponse:
+        if operation not in {"subscribe", "unsubscribe"}:
+            return JSONResponse({"ok": False}, status_code=404)
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        if harmony_store is None:
+            return JSONResponse({"error": "harmony_push_disabled"}, status_code=503)
+        try:
+            body = await _read_json_limited(req, _PUSH_BODY_MAX_BYTES)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        token = body.get("token") if isinstance(body, dict) else None
+        if not isinstance(token, str) or not HARMONY_TOKEN_RE.fullmatch(token):
+            return JSONResponse({"error": "invalid_subscription"}, status_code=400)
+        if operation == "unsubscribe":
+            await harmony_store.remove_token(_push_subject(claims), token)
+        else:
+            machine = body.get("machine_id")
+            mode = body.get("notification_mode", "generic")
+            if (not isinstance(machine, str) or not valid_machine_id(machine)
+                    or not isinstance(mode, str) or mode not in {"generic", "session"}
+                    or not await _claims_allow_machine(claims, machine, devices)):
+                return JSONResponse({"error": "invalid_subscription"}, status_code=400)
+            try:
+                await harmony_store.upsert(HarmonySubscription(
+                    subject=_push_subject(claims), machine_id=machine, token=token,
+                    notification_mode=mode, session_jti=claims.jti, expires_at=claims.expires_at,
+                ))
+            except ValueError:
+                return JSONResponse({"error": "subscription_limit"}, status_code=429)
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/login")
     async def login(req: Request) -> JSONResponse:
@@ -859,6 +927,8 @@ def create_app(
         if claims is not None:
             if push_store is not None:
                 await push_store.remove_session(claims.jti)
+            if harmony_store is not None:
+                await harmony_store.remove_session(claims.jti)
             await sessions.revoke(claims.jti)
         response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(

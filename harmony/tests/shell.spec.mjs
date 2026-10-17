@@ -61,3 +61,169 @@ test('other origins and iframe documents receive no native settings link', async
   await install(frame);
   await expect(frame.locator('#cc-remote-harmony-style')).toHaveCount(0);
 });
+
+const pushAdapter = readFileSync(new URL('../entry/src/main/resources/rawfile/push-bridge.js', import.meta.url), 'utf8');
+async function attachPush(page, options = {}) {
+  const origin = 'http://127.0.0.1:4177';
+  await page.evaluate(`${pushAdapter}(${JSON.stringify(origin)}, 'test-handshake');`);
+  await page.evaluate((options) => {
+    const channel = new MessageChannel();
+    window.pushCalls = [];
+    window.pushEnabled = options.enabled ?? false;
+    channel.port1.onmessage = (event) => {
+      const request = JSON.parse(event.data);
+      window.pushCalls.push(request.method);
+      const result = { id: request.id };
+      if (request.method === 'status') result.enabled = window.pushEnabled;
+      if (request.method === 'enable') {
+        window.pushEnabled = !options.deny;
+        result.enabled = window.pushEnabled;
+      }
+      if (request.method === 'token') {
+        if (options.unconfigured) result.error = 'push_not_configured';
+        else result.token = 'private-native-token-'.repeat(8);
+      }
+      channel.port1.postMessage(JSON.stringify(result));
+    };
+    window.postMessage('test-handshake', location.origin, [channel.port2]);
+  }, options);
+  await expect.poll(() => page.evaluate(() => !!window.ccRemoteHarmonyPush)).toBe(true);
+}
+
+test('native push bridge rejects wrong origin, iframe and forged port handshake', async ({ page }) => {
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await page.evaluate(`${pushAdapter}('https://wrong.example', 'known');`);
+  expect(await page.evaluate(() => !!window.ccRemoteHarmonyPush)).toBe(false);
+  await page.evaluate(`${pushAdapter}(location.origin, 'unpredictable');`);
+  await page.evaluate(() => {
+    const fake = new MessageChannel();
+    window.postMessage('wrong-nonce', location.origin, [fake.port1]);
+  });
+  expect(await page.evaluate(() => !!window.ccRemoteHarmonyPush)).toBe(false);
+  await page.evaluate(() => {
+    const frame = document.createElement('iframe');
+    frame.src = '/tests/history-browser.html';
+    document.body.append(frame);
+  });
+  await expect.poll(() => page.frames().length).toBe(2);
+  const frame = page.frames()[1];
+  await frame.waitForLoadState();
+  await frame.evaluate(`${pushAdapter}(location.origin, 'frame');`);
+  expect(await frame.evaluate(() => !!window.ccRemoteHarmonyPush)).toBe(false);
+  await attachPush(page);
+  expect(await page.evaluate(async () => {
+    try { await window.ccRemoteHarmonyPush.request('readFiles'); return false; } catch { return true; }
+  })).toBe(true);
+});
+
+test('native notification permission, binding and off use only Harmony endpoints', async ({ page }) => {
+  const calls = [];
+  await page.route('**/api/push/harmony/**', route => {
+    calls.push([route.request().url(), route.request().postDataJSON()]);
+    return route.fulfill({ json: route.request().url().endsWith('/config') ? { enabled: true } : { ok: true } });
+  });
+  await page.route('**/api/push-config', () => { throw new Error('native must not call Web Push'); });
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await page.evaluate(() => import('/src/harmony-push.ts'));
+  await attachPush(page);
+  expect(await page.evaluate(async () => {
+    const native = await import('/src/harmony-push.ts');
+    const push = await import('/src/push.ts');
+    if (!await native.requestHarmonyPermission()) return false;
+    if (!await push.enableRemotePush('device-a', 'session')) return false;
+    return push.disableRemotePush();
+  })).toBe(true);
+  const subscribed = calls.find(([path]) => path.endsWith('/subscribe'))[1];
+  expect(subscribed.machine_id).toBe('device-a');
+  expect(subscribed.notification_mode).toBe('session');
+  expect(calls.some(([path]) => path.endsWith('/unsubscribe'))).toBe(true);
+  expect(await page.evaluate(() => window.pushCalls)).toContain('delete');
+});
+
+test('disabled Relay and missing signed capability do not report push enabled', async ({ page }) => {
+  let enabled = false;
+  let subscriptions = 0;
+  await page.route('**/api/push/harmony/**', route => {
+    const config = route.request().url().endsWith('/config');
+    if (!config) subscriptions++;
+    return route.fulfill({ json: config ? { enabled } : { ok: true } });
+  });
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await page.evaluate(() => import('/src/harmony-push.ts'));
+  await attachPush(page, { unconfigured: true });
+  expect(await page.evaluate(async () => (await import('/src/harmony-push.ts')).requestHarmonyPermission())).toBe(false);
+  expect(await page.evaluate(() => window.pushCalls)).not.toContain('enable');
+  enabled = true;
+  expect(await page.evaluate(async () => (await import('/src/push.ts')).enableRemotePush('device-a', 'generic'))).toBe(false);
+  expect(await page.evaluate(async () => (await import('/src/harmony-push.ts')).harmonyPushSnapshot().error)).toContain('开通 Push Kit');
+  expect(subscriptions).toBe(0);
+});
+
+test('ordinary Web keeps VAPID registration and does not call Harmony endpoints', async ({ page }) => {
+  const calls = [];
+  await page.route('**/api/push-config', route => route.fulfill({ json: { enabled: true, public_key: 'YQ' } }));
+  await page.route('**/api/push/subscribe', route => {
+    calls.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ok: true } });
+  });
+  await page.route('**/api/push/harmony/**', () => { throw new Error('Web must not call native API'); });
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  expect(await page.evaluate(async () => {
+    const subscription = { toJSON: () => ({ endpoint: 'https://push.example/sub', keys: { p256dh: 'public', auth: 'private' } }) };
+    Object.defineProperty(navigator, 'serviceWorker', { configurable: true, value: { ready: Promise.resolve({
+      pushManager: { getSubscription: async () => subscription },
+    }) } });
+    window.PushManager ??= class {};
+    return (await import('/src/push.ts')).enableRemotePush('device-a', 'generic');
+  })).toBe(true);
+  expect(calls).toEqual([{ machine_id: 'device-a', notification_mode: 'generic',
+    endpoint: 'https://push.example/sub', keys: { p256dh: 'public', auth: 'private' } }]);
+});
+
+test('denied native permission never requests a provider token', async ({ page }) => {
+  await page.route('**/api/push/harmony/config', route => route.fulfill({ json: { enabled: true } }));
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await page.evaluate(() => import('/src/harmony-push.ts'));
+  await attachPush(page, { deny: true });
+  expect(await page.evaluate(async () => (await import('/src/harmony-push.ts')).requestHarmonyPermission())).toBe(false);
+  expect(await page.evaluate(() => window.pushCalls)).not.toContain('token');
+});
+
+test('foreground reconciliation and changed target serialize without stale final binding', async ({ page }) => {
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  expect(await page.evaluate(async () => {
+    const { PushBindingCoordinator } = await import('/src/push.ts');
+    const calls = [];
+    let release;
+    const coordinator = new PushBindingCoordinator(async target => {
+      calls.push(target);
+      if (calls.length === 1) await new Promise(resolve => { release = resolve; });
+      return true;
+    });
+    const first = coordinator.setTarget({ machineId: 'device-a', mode: 'session' });
+    const second = coordinator.setTarget({ machineId: 'device-b', mode: 'generic' }, true);
+    release();
+    await Promise.all([first, second]);
+    await coordinator.setTarget({ machineId: 'device-b', mode: 'generic' }, true);
+    await coordinator.setTarget(null, true);
+    return { calls, snapshot: coordinator.snapshot() };
+  })).toEqual({ calls: [
+    { machineId: 'device-a', mode: 'session' },
+    { machineId: 'device-b', mode: 'generic' },
+    { machineId: 'device-b', mode: 'generic' }, null,
+  ], snapshot: { state: 'off', target: null, bound: null } });
+});
+
+test('native Off invalidates provider token even when Relay is unreachable', async ({ page }) => {
+  await page.route('**/api/push/harmony/config', route => route.fulfill({ json: { enabled: true } }));
+  await page.route('**/api/push/harmony/subscribe', route => route.fulfill({ json: { ok: true } }));
+  await page.route('**/api/push/harmony/unsubscribe', route => route.abort());
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await attachPush(page, { enabled: true });
+  expect(await page.evaluate(async () => {
+    const push = await import('/src/push.ts');
+    if (!await push.enableRemotePush('device-a', 'generic')) return false;
+    return push.disableRemotePush();
+  })).toBe(true);
+  expect(await page.evaluate(() => window.pushCalls)).toContain('delete');
+});
