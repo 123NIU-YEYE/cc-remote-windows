@@ -1,4 +1,5 @@
 import type { RemoteNotificationMode } from "./notification-mode";
+import type { PushBindingResult } from "./push";
 
 // Installed by the signed shell in the configured top-level document only.
 // Ordinary Web/PWA clients never enter this channel or call its endpoints.
@@ -64,7 +65,7 @@ export async function requestHarmonyPermission(): Promise<boolean> {
     return unavailable();
   }
 }
-export async function enableHarmonyPush(machineId: string, mode: RemoteNotificationMode): Promise<boolean> {
+export async function enableHarmonyPush(machineId: string, mode: RemoteNotificationMode): Promise<PushBindingResult> {
   try {
     return await (await import("./harmony-push-client.ts")).enableHarmonyPush(machineId, mode);
   } catch {
