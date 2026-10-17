@@ -1,3 +1,7 @@
+import {
+  harmonyPushSnapshot, subscribeHarmonyPush, hasHarmonyPush,
+  requestHarmonyPermission, confirmHarmonyPermission,
+} from "./harmony-push";
 import { RightPanelPresentation } from "./right-panel-presentation";
 import type { ServerEvent } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
@@ -350,6 +354,10 @@ export default function App() {
   const [space, setSpace] = useState<Space>(initialSpacesRef.current[initialEngineRef.current]);
   const spacesByEngineRef = useRef<Record<Engine, Space>>(initialSpacesRef.current);
   const [authed, setAuthed] = useState(false);
+  const changingNotificationModeRef = useRef(false);
+  const [notificationBindingRevision, recheckNotificationBinding] = useReducer((value: number) => value + 1, 0);
+  const [harmonyPush, setHarmonyPush] = useState(harmonyPushSnapshot);
+  useEffect(() => subscribeHarmonyPush(() => setHarmonyPush(harmonyPushSnapshot())), []);
   const [authReady, setAuthReady] = useState(false);
   const sidebar = useSidebarController();
   const setSidebarOpen = sidebar.setOpen;
@@ -432,6 +440,8 @@ export default function App() {
   });
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
+  const notificationScopeRef = useRef({ machineId, authed });
+  notificationScopeRef.current = { machineId, authed };
   const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
   const [devicesLoadState, setDevicesLoadState] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -1622,8 +1632,11 @@ export default function App() {
   }, [authed, machineId, state.connState, state.wrapperOnline]);
 
   useEffect(() => {
-    if (!("serviceWorker" in navigator)) return;
-    const onMessage = (event: MessageEvent) => {
+    const onMessage = (event: MessageEvent | CustomEvent) => {
+      if (event instanceof CustomEvent) {
+        if (!hasHarmonyPush()) return;
+        event = { data: { type: "cc-remote-notification", route: event.detail } } as MessageEvent;
+      }
       if (event.data?.type !== "cc-remote-notification") return;
       const target = parseNotificationRoute(event.data.route);
       if (!target) return;
@@ -1633,22 +1646,39 @@ export default function App() {
       catch { /* retain the in-memory route below */ }
       setPendingNotificationTarget(target);
     };
-    navigator.serviceWorker.addEventListener("message", onMessage);
-    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+    const onNative = () => {
+      if (!hasHarmonyPush() || !window.ccRemoteHarmonyNotification) return;
+      onMessage(new CustomEvent("cc-remote-harmony-notification", {
+        detail: window.ccRemoteHarmonyNotification,
+      }));
+      delete window.ccRemoteHarmonyNotification;
+    };
+    window.addEventListener("cc-remote-harmony-notification", onNative);
+    window.addEventListener("cc-remote-harmony-ready", onNative);
+    onNative();
+    navigator.serviceWorker?.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("cc-remote-harmony-notification", onNative);
+      window.removeEventListener("cc-remote-harmony-ready", onNative);
+      navigator.serviceWorker?.removeEventListener("message", onMessage);
+    };
   }, []);
 
   useEffect(() => pushCoordinatorRef.current?.subscribe(setPushBinding), []);
 
   useEffect(() => {
+    if (changingNotificationModeRef.current) return;
     const enabled = notificationMode !== "off"
-      && typeof Notification !== "undefined"
-      && Notification.permission === "granted";
+      && (harmonyPush.available ? harmonyPush.granted
+        : typeof Notification !== "undefined" && Notification.permission === "granted");
     void pushCoordinatorRef.current?.setTarget(
       authed && enabled
         ? { machineId, mode: notificationMode }
         : null,
+      // Reconcile native bindings after reload/foreground, including stored Off.
+      harmonyPush.available && authed,
     );
-  }, [authed, machineId, notificationMode]);
+  }, [authed, machineId, notificationMode, harmonyPush.available, harmonyPush.granted, harmonyPush.revision, notificationBindingRevision]);
 
   useEffect(() => {
     try {
@@ -5513,6 +5543,9 @@ export default function App() {
         method: "POST", credentials: "same-origin", cache: "no-store",
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      // Relay revocation is authoritative; a provider outage must not block
+      // logout. The native shell retains a failed invalidation for next login.
+      if (hasHarmonyPush()) void disableRemotePush();
       try { localStorage.removeItem(MANUAL_UNREAD_STORAGE); } catch { /* Private browsing. */ }
       await import("./cache").then((module) => module.clearCache());
       await historyPageCacheRef.current.clear();
@@ -5554,21 +5587,39 @@ export default function App() {
     }
   };
   const updateNotificationMode = async (mode: NotificationMode): Promise<boolean> => {
-    if (mode !== "off") {
-      if (typeof Notification === "undefined") {
-        dispatch({ type: "command_error", detail: "当前浏览器不支持系统通知。" });
-        return false;
+    changingNotificationModeRef.current = true;
+    const scopeChanged = () => notificationScopeRef.current.machineId !== machineId
+      || notificationScopeRef.current.authed !== authed;
+    try {
+      if (hasHarmonyPush()) {
+        if (mode !== "off" && !await requestHarmonyPermission()) return false;
+        if (scopeChanged()) return false;
+        const target = mode === "off" ? null : { machineId, mode };
+        const result = await pushCoordinatorRef.current?.setTarget(target, true);
+        if (scopeChanged()) return false;
+        if (mode === "off" ? !!harmonyPushSnapshot().error
+          : result?.bound?.mode !== mode || result?.bound?.machineId !== machineId
+            || !!harmonyPushSnapshot().error) return false;
+        if (mode !== "off") confirmHarmonyPermission();
+      } else if (mode !== "off") {
+        if (typeof Notification === "undefined") {
+          dispatch({ type: "command_error", detail: "当前浏览器不支持系统通知。" });
+          return false;
+        }
+        const permission = Notification.permission === "granted"
+          ? "granted" : await Notification.requestPermission();
+        if (permission !== "granted") {
+          dispatch({ type: "command_error", detail: "通知权限未开启，设置没有更改。" });
+          return false;
+        }
       }
-      const permission = Notification.permission === "granted"
-        ? "granted" : await Notification.requestPermission();
-      if (permission !== "granted") {
-        dispatch({ type: "command_error", detail: "通知权限未开启，设置没有更改。" });
-        return false;
-      }
+      writeNotificationMode(localStorage, mode);
+      setNotificationMode(mode);
+      return true;
+    } finally {
+      changingNotificationModeRef.current = false;
+      if (scopeChanged()) recheckNotificationBinding();
     }
-    writeNotificationMode(localStorage, mode);
-    setNotificationMode(mode);
-    return true;
   };
   const activeDevice = remoteDevices.find(
     (device) => device.machine_id === machineId);
@@ -5757,7 +5808,9 @@ export default function App() {
             boldText={boldText} onBoldText={setBoldText}
             notificationMode={notificationMode}
             notificationBinding={pushBinding.state}
-            notificationAvailable={typeof Notification !== "undefined"}
+            notificationAvailable={harmonyPush.available || typeof Notification !== "undefined"}
+            notificationNative={harmonyPush.available}
+            notificationError={harmonyPush.error}
             onNotificationMode={updateNotificationMode}
             onOpenUsageActivity={openUsageActivity}
             onOpenBtw={visibleParentSid && !archivedBrowse ? () => openBtw() : undefined}
