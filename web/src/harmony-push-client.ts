@@ -1,6 +1,9 @@
 import type { RemoteNotificationMode } from "./notification-mode";
+import type { PushBindingResult } from "./push";
 import { bridge, publish } from "./harmony-push.ts";
 let cachedToken = "";
+let cleanupPending = false;
+const cleanupError = "推送订阅清理尚未确认，可能仍收到通知；请联网后重新打开应用重试。";
 async function request(path: string, body?: object): Promise<Response> {
   return fetch(`/api/push/harmony/${path}`, {
     credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(12000),
@@ -34,7 +37,17 @@ export async function requestHarmonyPermission(): Promise<boolean> {
     return false;
   }
 }
-export async function enableHarmonyPush(machineId: string, mode: RemoteNotificationMode): Promise<boolean> {
+export async function enableHarmonyPush(machineId: string, mode: RemoteNotificationMode): Promise<PushBindingResult> {
+  // Do not issue another token/binding until an uncertain prior attempt is
+  // revoked. The native shell also persists failed token deletion across reloads.
+  let revoked = false;
+  if (cleanupPending) {
+    if (!await disableHarmonyPush()) {
+      publish({ error: cleanupError });
+      return false;
+    }
+    revoked = true;
+  }
   try {
     await checkConfig();
     const result = await bridge()?.request("token");
@@ -42,26 +55,43 @@ export async function enableHarmonyPush(machineId: string, mode: RemoteNotificat
     // Re-read on every foreground/rebind so a provider token rotation is repaired.
     const previous = cachedToken;
     cachedToken = result.token;
+    // A rejected fetch is not evidence that the Relay did not commit the POST.
+    cleanupPending = true;
     const response = await request("subscribe", {
       machine_id: machineId, notification_mode: mode, token: cachedToken,
     });
     if (!response.ok) throw new Error("subscribe_failed");
+    cleanupPending = false;
     if (previous && previous !== cachedToken) {
       await request("unsubscribe", { token: previous }).catch(() => {});
     }
     publish({ error: "" });
     return true;
   } catch (error) {
+    if (cleanupPending) {
+      if (!await disableHarmonyPush()) {
+        publish({ error: cleanupError });
+        return false;
+      }
+      revoked = true;
+    }
     publish({ error: errorMessage(error) });
-    return false;
+    return revoked ? null : false;
   }
 }
 export async function disableHarmonyPush(): Promise<boolean> {
   try {
-    if (cachedToken) await request("unsubscribe", { token: cachedToken }).catch(() => {});
-    // Provider invalidation also covers an expired login or unreachable Relay.
-    await bridge()?.request("delete");
+    cleanupPending = true;
+    const native = bridge();
+    if (!native) throw new Error("unavailable");
+    const removal = cachedToken
+      ? request("unsubscribe", { token: cachedToken }).catch(() => {})
+      : Promise.resolve();
+    // Invalidate independently of a slow/unreachable Relay. This also prevents a
+    // late subscribe commit from reviving a binding after unsubscribe completed.
+    await Promise.all([removal, native.request("delete")]);
     cachedToken = "";
+    cleanupPending = false;
     publish({ error: "" });
     return true;
   } catch (error) {

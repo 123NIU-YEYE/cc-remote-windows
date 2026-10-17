@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { PushBindingCoordinator, type PushBindingTarget } from "../src/push.ts";
+import { PushBindingCoordinator, type PushBindingTarget, type PushBindingResult } from "../src/push.ts";
 
 const bindingA: PushBindingTarget = { machineId: "machine-a", mode: "generic" };
 const bindingB: PushBindingTarget = { machineId: "machine-b", mode: "session" };
@@ -47,4 +47,36 @@ assert.deepEqual(changedAfterRejection.snapshot(), {
   state: "remote", target: bindingB, bound: bindingB,
 }, "a rejected old target must not strand the newer queued binding");
 
-console.log("push binding rejection tests passed");
+let applyResult: PushBindingResult = true;
+const revokedCoordinator = new PushBindingCoordinator(async () => applyResult);
+await revokedCoordinator.setTarget(bindingA);
+applyResult = null;
+assert.deepEqual(await revokedCoordinator.setTarget(sessionA), {
+  state: "local", target: sessionA, bound: null,
+}, "provider rollback must clear the old binding instead of claiming remote delivery");
+assert.equal(revokedCoordinator.isRemoteActive(bindingA.machineId), false);
+applyResult = true;
+assert.deepEqual(await revokedCoordinator.setTarget(bindingA), {
+  state: "remote", target: bindingA, bound: bindingA,
+}, "returning to a revoked target must apply a fresh binding");
+
+let finishRevocation!: (value: PushBindingResult) => void;
+const revocationTargets: (PushBindingTarget | null)[] = [];
+const queuedAfterRevocation = new PushBindingCoordinator(target => {
+  revocationTargets.push(target);
+  return revocationTargets.length === 2
+    ? new Promise<PushBindingResult>(resolve => { finishRevocation = resolve; })
+    : Promise.resolve(true);
+});
+await queuedAfterRevocation.setTarget(bindingA);
+const failedMode = queuedAfterRevocation.setTarget(sessionA);
+const restoreGeneric = queuedAfterRevocation.setTarget(bindingA);
+finishRevocation(null);
+await Promise.all([failedMode, restoreGeneric]);
+assert.deepEqual(revocationTargets, [bindingA, sessionA, bindingA],
+  "a newer request for the old target cannot reuse its revoked provider token");
+assert.deepEqual(queuedAfterRevocation.snapshot(), {
+  state: "remote", target: bindingA, bound: bindingA,
+});
+
+console.log("push binding failure and revocation tests passed");

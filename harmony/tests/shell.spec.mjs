@@ -70,6 +70,9 @@ async function attachPush(page, options = {}) {
     const channel = new MessageChannel();
     window.pushCalls = [];
     window.pushEnabled = options.enabled ?? false;
+    window.pushToken = 'private-native-token-'.repeat(8);
+    window.invalidatedPushTokens = [];
+    window.failPushDelete = false;
     channel.port1.onmessage = (event) => {
       const request = JSON.parse(event.data);
       window.pushCalls.push(request.method);
@@ -81,7 +84,14 @@ async function attachPush(page, options = {}) {
       }
       if (request.method === 'token') {
         if (options.unconfigured) result.error = 'push_not_configured';
-        else result.token = 'private-native-token-'.repeat(8);
+        else result.token = window.pushToken;
+      }
+      if (request.method === 'delete') {
+        if (window.failPushDelete) result.error = 'native_failed';
+        else {
+          window.invalidatedPushTokens.push(window.pushToken);
+          window.pushToken += 'next';
+        }
       }
       channel.port1.postMessage(JSON.stringify(result));
     };
@@ -226,6 +236,92 @@ test('native Off invalidates provider token even when Relay is unreachable', asy
     return push.disableRemotePush();
   })).toBe(true);
   expect(await page.evaluate(() => window.pushCalls)).toContain('delete');
+});
+
+for (const failure of ['lost response', 'timeout', 'HTTP failure']) {
+  test(`native subscribe rolls back an accepted binding after ${failure}`, async ({ page }) => {
+    const bindings = new Map();
+    let failSubscribe = true;
+    await page.route('**/api/push/harmony/**', async route => {
+      const path = new URL(route.request().url()).pathname.split('/').pop();
+      if (path === 'config') return route.fulfill({ json: { enabled: true } });
+      const body = route.request().postDataJSON();
+      if (path === 'unsubscribe') return route.abort(); // Provider revocation must suffice.
+      bindings.set(body.token, body);
+      if (!failSubscribe) return route.fulfill({ json: { ok: true } });
+      if (failure === 'timeout') return; // The real fetch must honor AbortSignal.timeout.
+      if (failure === 'HTTP failure') return route.fulfill({ status: 503 });
+      return route.abort();
+    });
+    await page.goto('/tests/history-browser.html?header-menu=1');
+    await attachPush(page, { enabled: true });
+    await page.evaluate(() => {
+      // Accelerate only the request deadline; native messages use their real timer.
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      AbortSignal.timeout = ms => timeout(ms === 12000 ? 100 : ms);
+    });
+    expect(await page.evaluate(async () =>
+      !!await (await import('/src/push.ts')).enableRemotePush('device-a', 'generic'))).toBe(false);
+    const revoked = await page.evaluate(() => window.invalidatedPushTokens);
+    expect(bindings.size).toBe(1); // Relay really committed before the response failed.
+    expect([...bindings.keys()].every(token => revoked.includes(token))).toBe(true);
+    expect(await page.evaluate(async () =>
+      (await import('/src/harmony-push.ts')).harmonyPushSnapshot().error)).not.toBe('');
+    failSubscribe = false;
+    expect(await page.evaluate(async () =>
+      (await import('/src/push.ts')).enableRemotePush('device-a', 'generic'))).toBe(true);
+    expect([...bindings.keys()].filter(token => !revoked.includes(token))).toHaveLength(1);
+  });
+}
+
+test('failed native mode update clears the revoked binding and can recover', async ({ page }) => {
+  let failSubscribe = false;
+  await page.route('**/api/push/harmony/**', route => {
+    const path = new URL(route.request().url()).pathname.split('/').pop();
+    if (path === 'subscribe' && failSubscribe) return route.abort();
+    return route.fulfill({ json: path === 'config' ? { enabled: true } : { ok: true } });
+  });
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await attachPush(page, { enabled: true });
+  await page.evaluate(async () => {
+    const push = await import('/src/push.ts');
+    window.coordinator = new push.PushBindingCoordinator(target => target
+      ? push.enableRemotePush(target.machineId, target.mode) : push.disableRemotePush());
+  });
+  const generic = { machineId: 'device-a', mode: 'generic' };
+  const session = { ...generic, mode: 'session' };
+  expect(await page.evaluate(target => window.coordinator.setTarget(target), generic))
+    .toEqual({ state: 'remote', target: generic, bound: generic });
+  failSubscribe = true;
+  expect(await page.evaluate(target => window.coordinator.setTarget(target), session))
+    .toEqual({ state: 'local', target: session, bound: null });
+  expect(await page.evaluate(() => window.coordinator.isRemoteActive('device-a'))).toBe(false);
+  failSubscribe = false;
+  expect(await page.evaluate(target => window.coordinator.setTarget(target), generic))
+    .toEqual({ state: 'remote', target: generic, bound: generic });
+});
+
+test('failed native rollback reports uncertainty and retries cleanup before subscribing', async ({ page }) => {
+  let subscriptions = 0;
+  await page.route('**/api/push/harmony/**', route => {
+    const path = new URL(route.request().url()).pathname.split('/').pop();
+    if (path === 'config') return route.fulfill({ json: { enabled: true } });
+    if (path === 'subscribe') subscriptions++;
+    return route.abort();
+  });
+  await page.goto('/tests/history-browser.html?header-menu=1');
+  await attachPush(page, { enabled: true });
+  await page.evaluate(() => { window.failPushDelete = true; });
+  for (let i = 0; i < 2; i++) {
+    expect(await page.evaluate(async () =>
+      !!await (await import('/src/push.ts')).enableRemotePush('device-a', 'generic'))).toBe(false);
+    expect(await page.evaluate(async () =>
+      (await import('/src/harmony-push.ts')).harmonyPushSnapshot().error)).toContain('清理尚未确认');
+  }
+  expect(subscriptions).toBe(1);
+  await page.evaluate(() => { window.failPushDelete = false; });
+  expect(await page.evaluate(async () => (await import('/src/push.ts')).disableRemotePush())).toBe(true);
+  expect(await page.evaluate(() => window.invalidatedPushTokens)).toHaveLength(1);
 });
 
 for (const native of [false, true]) {

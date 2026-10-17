@@ -14,7 +14,10 @@ export interface PushBindingSnapshot {
   bound: PushBindingTarget | null;
 }
 
-type PushBindingApply = (target: PushBindingTarget | null) => Promise<boolean>;
+// false preserves the previous binding; null means the adapter revoked it while
+// rolling back a failed mutation. Neither result commits the requested target.
+export type PushBindingResult = boolean | null;
+type PushBindingApply = (target: PushBindingTarget | null) => Promise<PushBindingResult>;
 type PushBindingListener = (snapshot: PushBindingSnapshot) => void;
 
 function sameTarget(
@@ -85,7 +88,7 @@ export class PushBindingCoordinator {
       }
       this.refresh = false;
       this.publish("binding");
-      let enabled = false;
+      let enabled: PushBindingResult = false;
       try {
         enabled = await this.apply(target);
       } catch {
@@ -93,6 +96,7 @@ export class PushBindingCoordinator {
         // binding, including any newer target queued while it was in flight.
       }
       if (enabled) this.bound = target;
+      else if (enabled === null) this.bound = null;
 
       // A newer request arrived while the network mutation was in flight.
       // Continue from the actual binding that just completed; never publish the
@@ -113,7 +117,7 @@ export class PushBindingCoordinator {
   }
 }
 
-export async function enableRemotePush(machineId: string, mode: RemoteNotificationMode = "generic"): Promise<boolean> {
+export async function enableRemotePush(machineId: string, mode: RemoteNotificationMode = "generic"): Promise<PushBindingResult> {
   try {
     if (hasHarmonyPush()) return await enableHarmonyPush(machineId, mode);
     return await (await import("./web-push.ts")).enableRemotePush(machineId, mode);
