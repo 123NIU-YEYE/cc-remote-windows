@@ -326,6 +326,105 @@ def test_finish_classifies_clean_empty_commit_as_conversation_only(tmp_path):
     assert journal.completed_turn_ids() == ("turn-1",)
 
 
+@pytest.mark.parametrize("empty_commit", [False, True])
+def test_finish_accepts_commit_with_unchanged_untracked_baseline(tmp_path, empty_commit):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    leftovers = {
+        "test-results/.last-run.json": b'{"status":"passed"}',
+        "notes with spaces/记录.bin": b"\x00\xffunchanged",
+        "local.sh": b"#!/bin/sh\n",
+    }
+    for name, content in leftovers.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    (root / "local.sh").chmod(0o700)
+    os.symlink("tracked.txt", root / "local-link")
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "baseline-files")
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    if not empty_commit:
+        (root / "tracked.txt").write_text("committed\n")
+        _git(root, "add", "tracked.txt")
+    _git(root, "commit", "--allow-empty", "-m", "agent commit")
+    index_before_finish = _index_bytes(root)
+    head_before_finish = _git(root, "rev-parse", "HEAD")
+
+    completed = journal.finish_turn("turn-1")
+
+    assert completed == CompletedCheckpoint("turn-1", (), files_available=False)
+    assert journal.completed_turn_ids() == ("turn-1",)
+    assert not journal.has_active_turn()
+    assert _index_bytes(root) == index_before_finish
+    assert _git(root, "rev-parse", "HEAD") == head_before_finish
+    for name, content in leftovers.items():
+        assert (root / name).read_bytes() == content
+    assert stat.S_IMODE((root / "local.sh").stat().st_mode) == 0o700
+    assert os.readlink(root / "local-link") == "tracked.txt"
+    with pytest.raises(CheckpointError, match="turn-1"):
+        journal.rollback(consume=False)
+
+
+@pytest.mark.parametrize("change", ["content", "delete", "new", "permission", "symlink", "stage"])
+def test_finish_rejects_commit_with_changed_untracked_baseline(tmp_path, change):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    leftover = root / "leftover.txt"
+    leftover.write_text("unchanged\n")
+    leftover.chmod(0o644)
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "changed-leftover")
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    (root / "tracked.txt").write_text("committed\n")
+    _git(root, "add", "tracked.txt")
+    _git(root, "commit", "-m", "agent commit")
+    if change == "content":
+        leftover.write_text("changed\n")
+    elif change == "delete":
+        leftover.unlink()
+    elif change == "new":
+        (root / "new.txt").write_text("new\n")
+    elif change == "permission":
+        leftover.chmod(0o600)  # Same Git blob/mode, different filesystem permission.
+    elif change == "symlink":
+        leftover.unlink()
+        os.symlink("tracked.txt", leftover)
+    else:
+        _git(root, "add", "leftover.txt")
+    index_before_finish = _index_bytes(root)
+
+    with pytest.raises(CheckpointIndexChanged):
+        journal.finish_turn("turn-1")
+
+    assert journal.completed_turn_ids() == ()
+    assert _index_bytes(root) == index_before_finish
+
+
+def test_finish_rejects_committed_deletion_that_leaves_a_tracked_file_untracked(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n", "keep.txt": "keep\n"})
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "untrack-file")
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    _git(root, "rm", "--cached", "tracked.txt")
+    _git(root, "commit", "-m", "stop tracking")
+
+    with pytest.raises(CheckpointIndexChanged):
+        journal.finish_turn("turn-1")
+
+
+def test_finish_accepts_committed_untracked_file_with_other_baseline_leftovers(tmp_path):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    (root / "leftover.txt").write_text("keep untracked\n")
+    (root / "new-source.txt").write_text("commit this\n")
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "commit-new-source")
+    journal.begin_turn("turn-1")
+    journal.accept_turn("turn-1")
+    _git(root, "add", "new-source.txt")
+    _git(root, "commit", "-m", "new source")
+
+    assert journal.finish_turn("turn-1").files_available is False
+    assert _git(root, "status", "--porcelain") == "?? leftover.txt"
+
+
 def test_finish_rejects_commit_followed_by_dirty_worktree(tmp_path):
     root = _repo(tmp_path, {"tracked.txt": "base\n"})
     journal = CodexCheckpointJournal(
