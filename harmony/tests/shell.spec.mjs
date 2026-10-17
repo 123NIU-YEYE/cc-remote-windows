@@ -227,3 +227,55 @@ test('native Off invalidates provider token even when Relay is unreachable', asy
   })).toBe(true);
   expect(await page.evaluate(() => window.pushCalls)).toContain('delete');
 });
+
+for (const native of [false, true]) {
+  for (const failure of ['load', 'delegate']) {
+    test(`${native ? 'Harmony' : 'Web'} push handles lazy ${failure} failure without leaving binding pending`, async ({ page }) => {
+      const errors = [];
+      page.on('pageerror', error => errors.push(error.message));
+      let chunkRequests = 0;
+      const chunk = native ? 'harmony-push-client' : 'web-push';
+      await page.route(`**/src/${chunk}.ts*`, route => {
+        chunkRequests++;
+        if (failure === 'load') return route.abort();
+        const methods = native
+          ? ['requestHarmonyPermission', 'enableHarmonyPush', 'disableHarmonyPush']
+          : ['enableRemotePush', 'disableRemotePush'];
+        return route.fulfill({ contentType: 'application/javascript', body: methods.map(method =>
+          `export async function ${method}() { throw new Error('private provider detail'); }`,
+        ).join('\n') });
+      });
+      await page.goto('/tests/history-browser.html?header-menu=1');
+      if (native) await attachPush(page, { enabled: true });
+      const result = await page.evaluate(async (native) => {
+        const push = await import('/src/push.ts');
+        const harmony = await import('/src/harmony-push.ts');
+        const coordinator = new push.PushBindingCoordinator(target => target
+          ? push.enableRemotePush(target.machineId, target.mode)
+          : push.disableRemotePush());
+        const target = { machineId: 'device-a', mode: 'generic' };
+        const states = [];
+        coordinator.subscribe(snapshot => states.push(snapshot.state));
+        const enabled = await push.enableRemotePush(target.machineId, target.mode);
+        const first = await coordinator.setTarget(target);
+        const retry = await coordinator.setTarget(target, true);
+        const disabled = await push.disableRemotePush();
+        const off = await coordinator.setTarget(null, true);
+        const permission = native ? await harmony.requestHarmonyPermission() : false;
+        return { enabled, disabled, permission, states, first, retry, off,
+          error: harmony.harmonyPushSnapshot().error };
+      }, native);
+      expect(chunkRequests).toBeGreaterThan(0);
+      expect(result.enabled).toBe(false);
+      expect(result.disabled).toBe(false);
+      expect(result.permission).toBe(false);
+      expect(result.first).toEqual({ state: 'local', target: { machineId: 'device-a', mode: 'generic' }, bound: null });
+      expect(result.retry).toEqual(result.first);
+      expect(result.off).toEqual({ state: 'off', target: null, bound: null });
+      expect(result.states).toEqual(['off', 'binding', 'local', 'binding', 'local', 'binding', 'off']);
+      if (native) expect(result.error).toContain('刷新后重试');
+      expect(result.error).not.toContain('private provider detail');
+      expect(errors).toEqual([]);
+    });
+  }
+}
