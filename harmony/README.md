@@ -18,8 +18,9 @@ The conversation UI stays web-based; it is not a rewrite of the UI in ArkUI.
   Android-specific blur override is installed.
 - App background/foreground never reloads chat or submits a model message.
 
-Native push, camera/microphone capture, download management, non-HTTPS external
-app links and browser-control MCP are outside this first preview. Persistent
+Camera/microphone capture, download management, non-HTTPS external
+app links and browser-control MCP are outside this preview. Native completion
+notifications have a separate optional Push Kit integration described below. Persistent
 login remains subject to the Relay cookie's normal expiry. No cookie, model
 credential, session payload or device-specific server address is stored in this
 repository. Only the user-entered server origin is saved in native preferences.
@@ -86,6 +87,13 @@ Cookie expiry still follows the Relay's login policy. This preview does not
 include an in-app native updater, and its debug profile must be renewed when it
 expires.
 
+The Push Kit preview uses `io.github.ccremote.client`. The first unassociated
+preview used `io.github.ccremote.harmony`, which Huawei's application registry
+rejects because `harmony` is reserved. Moving from that preview is a separate
+installation, not an in-place update: retain the old app until the new one is
+verified and sign in again. Server-side conversations stay on the Relay/Wrapper;
+local drafts, preferences and login cookies do not automatically migrate.
+
 Official references:
 
 - [Automatic signing](https://developer.huawei.com/consumer/cn/doc/doccenter-deveco-studio/ide-signing-auto)
@@ -98,7 +106,7 @@ Official references:
 With Node 24 selected and the existing `web/` development dependencies installed:
 
 ```bash
-node --test harmony/tests/url-policy.test.mjs
+node --test harmony/tests/url-policy.test.mjs harmony/tests/push-route.test.mjs harmony/tests/push-bridge.test.mjs
 node web/node_modules/@playwright/test/cli.js test -c harmony/playwright.config.mjs
 ```
 
@@ -126,6 +134,93 @@ on the target phone, and check:
 - TLS errors remain rejected, and external/iframe pages cannot open client
   settings or access privileged native methods.
 
-There are no exposed JavaScript native objects, credentials in URLs, TLS bypass,
-frame-origin relaxations, or engine/daemon changes. The only app URL command opens
-the settings dialog after an exact-origin, top-frame and user-gesture check.
+There are no exposed JavaScript proxy objects, credentials in URLs, TLS bypass,
+frame-origin relaxations, or engine/daemon changes. Settings opens only after an
+exact-origin, top-frame and user-gesture check. A narrow Push Kit message port is
+installed only in the configured chat document; external pages/preview frames do
+not receive it. Notification URLs contain navigation hints only, never login
+credentials, and can only select a session after normal Web authorization.
+
+
+## Optional HarmonyOS completion notifications
+
+This channel uses **Huawei Push Kit**, independently of the browser's Web Push
+and VAPID configuration. It does not require a running WebSocket on a locked
+phone. Android/Web/PWA notification behavior is unchanged. The default is Off;
+there is no local-notification or polling fallback pretending to be background
+push. The settings page offers the existing three modes:
+
+- **关闭**: invalidate the native token and remove its Relay subscription.
+- **通用提醒**: send the completion/failure/interruption outcome only; no machine
+  ID, session ID, title, prompt or transcript is sent to Huawei.
+- **显示会话名称**: explicitly allow a bounded title and exact device/session
+  route. Clicking a notification opens the chat without reloading an existing
+  document or losing its draft. A notification for a different configured Relay
+  is ignored. Normal device/session authorization still applies.
+
+### Huawei and Relay setup
+
+1. Register/associate the application in your Huawei developer project, enable
+   **Push Kit**, and obtain the corresponding Push capability in its signing
+   profile. Re-sign and install an in-place update. An unassociated debug profile
+   that runs the basic client is not sufficient. Preserve the installed bundle
+   and signing identity; do not uninstall or silently change the bundle to solve
+   a registration error. No application-market listing is needed for development
+   testing, but Huawei's current entitlement and classification rules apply.
+2. In Huawei API Console, create a service account for the project's Push API
+   and download its JSON key. Keep it **on the Relay only**, outside this repo and
+   release directories, with restrictive permissions readable by the service.
+   The JSON contains `project_id`, `key_id`, `sub_account` and an RSA PEM
+   `private_key`. Nothing from this file belongs in the HAP or Web bundle.
+3. Configure the Relay's external environment:
+
+   ```dotenv
+   HARMONY_PUSH_SERVICE_ACCOUNT=/absolute/private/path/service-account.json
+   HARMONY_PUSH_CATEGORY=MARKETING
+   HARMONY_PUSH_TEST_MESSAGE=0
+   ```
+
+   `WORK` is supported only if Huawei has granted the application that
+   classification. Do not assign an unauthorized category to bypass delivery
+   quotas. `HARMONY_PUSH_TEST_MESSAGE=1` is an explicit development option with
+   Huawei's test quotas; turn it off for production. The provider's successful
+   API response means accepted, not guaranteed delivery to a device.
+4. Update/restart the Relay through the normal deployment workflow, update the
+   Web assets and native package, then choose a notification mode in **⋮ → 通知**.
+   Allow the system notification permission. Missing Relay configuration or an
+   unsigned Push capability produces an actionable error instead of saving a
+   falsely enabled setting.
+
+`/api/push/harmony/config`, `/subscribe`, and `/unsubscribe` use the existing
+Relay login cookie. Mutations require the existing allowed Origin and selected
+machine authorization. Tokens bind to the current login and selected machine,
+are replaced on rebinding, expire with the login, and are removed on logout or
+provider rejection. They are stored in a separate table in `PUSH_DB_PATH`, not in
+model configuration. On server change, the shell invalidates the old provider
+token before clearing cookies; if invalidation fails, it retains the old server.
+Generic push cannot offer exact session navigation without disclosing the route.
+
+This integration intentionally does not add a PushExtensionAbility/background
+worker, a persistent foreground service, or notification-triggered model calls.
+Foreground notices are suppressed by Push Kit's `foregroundShow: false` setting.
+Token state is reconciled on reload, app foreground and provider token updates.
+Native key/API failures are isolated from the Web Push dispatcher. Neither the
+wire protocol nor Wrapper/Claude/Codex lifecycle changes.
+
+### Verification and remaining device acceptance
+
+Offline tests cover PS256 signing, HTTP/provider result codes, auth/Origin/device
+scope, logout/expiry, stale rebind protection, generic-mode privacy, native port
+isolation, disabled configurations, URL routing and the unchanged VAPID channel.
+The native project must also compile with DevEco. These checks **do not prove
+Huawei delivery**: with Push Kit enabled and the matching signed package, verify
+foreground/background/locked/process-terminated delivery, permission denial,
+server switch, logout, token refresh and cold/warm notification navigation on a
+real phone before calling push enabled for that installation.
+
+Official references:
+
+- [Push Kit setup and signing](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-config-setting)
+- [Service-account JWT](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/push-jwt-token)
+- [Push request fields and limits](https://developer.huawei.com/consumer/en/doc/harmonyos-references/push-scenariozed-api-request-param)
+- [ArkWeb message ports](https://developer.huawei.com/consumer/cn/doc/HarmonyOS-Guides/web-app-page-data-channel)
