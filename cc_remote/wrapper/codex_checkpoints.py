@@ -632,26 +632,45 @@ class CodexCheckpointJournal:
         self,
         pre_head: Optional[str],
         post_head: Optional[str],
-        post_tree: str,
+        *,
+        pre_entries: dict[str, TreeEntry],
+        post_entries: dict[str, TreeEntry],
+        pre_index_entries: dict[str, tuple[str, ...]],
+        post_index_entries: dict[str, tuple[str, ...]],
+        changed_paths: tuple[str, ...],
     ) -> bool:
-        """Accept only a forward commit with a clean index and worktree."""
+        """Accept a forward commit with only unchanged untracked leftovers."""
         if not pre_head or not post_head or pre_head == post_head:
             return False
         if self._git(
             "merge-base", "--is-ancestor", pre_head, post_head, check=False
         ).returncode != 0:
             return False
-        head_tree_result = self._git(
-            "rev-parse", "--verify", f"{post_head}^{{tree}}", check=False
-        )
-        index_tree_result = self._git(
-            "write-tree", env=self._git_env(), check=False
-        )
-        if head_tree_result.returncode != 0 or index_tree_result.returncode != 0:
+        head_entries = self._tree_entries(post_head)
+        # Use the index captured with the post-image, not a fresh write-tree:
+        # write-tree can refresh the user's real index cache as a side effect.
+        if post_index_entries.keys() != head_entries.keys():
             return False
-        head_tree = _decode(head_tree_result.stdout).strip()
-        index_tree = _decode(index_tree_result.stdout).strip()
-        return bool(head_tree) and post_tree == head_tree == index_tree
+        for path, entry in head_entries.items():
+            rows = post_index_entries[path]
+            if len(rows) != 1 or rows[0].partition(" ")[2] != (
+                f"{entry.mode} {entry.oid} 0"
+            ) or post_entries.get(path) != entry:
+                return False
+
+        pre_head_entries = self._tree_entries(pre_head)
+        untracked_before = (
+            pre_entries.keys() - pre_head_entries.keys() - pre_index_entries.keys()
+        )
+        untracked_after = post_entries.keys() - head_entries.keys()
+        # A baseline file may have been committed in this turn. Everything left
+        # outside HEAD must already have been untracked and remain byte/type/mode
+        # identical, including permission bits not represented in Git trees.
+        if untracked_after != untracked_before - head_entries.keys():
+            return False
+        if untracked_after.intersection(changed_paths):
+            return False
+        return all(post_entries[path].kind == "blob" for path in untracked_after)
 
     @staticmethod
     def _trim_turn_window(manifest: dict[str, Any]) -> None:
@@ -919,7 +938,11 @@ class CodexCheckpointJournal:
             if pre_head is not None and not isinstance(pre_head, str):
                 raise CheckpointError("Active checkpoint HEAD is invalid")
             if self._clean_head_advance(
-                pre_head, post_head, post_tree
+                pre_head, post_head,
+                pre_entries=pre_entries, post_entries=post_entries,
+                pre_index_entries=pre_index_entries,
+                post_index_entries=post_index_entries,
+                changed_paths=changed_paths,
             ):
                 # A normal commit legitimately advances both HEAD and index.
                 # File rollback cannot rewrite Git history, but this tombstone

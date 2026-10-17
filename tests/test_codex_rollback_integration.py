@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from cc_remote.protocol import (
     ArtifactInvalidated,
     CommandAck,
@@ -14,10 +16,13 @@ from cc_remote.protocol import (
     SessionListInvalidated,
     StateEvent,
 )
-from cc_remote.wrapper.codex_checkpoints import CompletedCheckpoint, CheckpointError
+from cc_remote.wrapper.codex_checkpoints import (
+    CompletedCheckpoint, CheckpointError, CodexCheckpointJournal,
+)
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
 from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
+from tests.test_codex_checkpoints import _git, _repo
 
 
 class _FakeCodex:
@@ -267,6 +272,42 @@ def test_clean_commit_checkpoint_does_not_emit_a_runtime_warning():
 
         assert not any(isinstance(item, Notice) for item in transport.sent)
         assert ctx.codex_checkpoint_turn_id is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change_leftover", [False, True])
+def test_committed_turn_only_warns_when_untracked_baseline_changes(tmp_path, change_leftover):
+    root = _repo(tmp_path, {"tracked.txt": "base\n"})
+    leftover = root / "local-result.json"
+    leftover.write_text('{"status":"passed"}')
+    journal = CodexCheckpointJournal(str(root), tmp_path / "state", "codex-session")
+    journal.begin_turn("turn-committed")
+    journal.accept_turn("turn-committed")
+    (root / "tracked.txt").write_text("committed\n")
+    _git(root, "add", "tracked.txt")
+    _git(root, "commit", "-m", "agent commit")
+    if change_leftover:
+        leftover.write_text('{"status":"changed"}')
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("codex-session", "codex-session")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.codex_checkpoint = journal
+        ctx.codex_checkpoint_turn_id = "turn-committed"
+        ctx.codex_checkpoint_ready = True
+        ctx.codex_checkpoint_accepted = True
+
+        await machine._finish_codex_checkpoint(ctx)
+
+        notices = [item for item in transport.sent if isinstance(item, Notice)]
+        assert len(notices) == int(change_leftover)
+        assert all(item.notice_id.startswith("checkpoint-") for item in notices)
+        assert ctx.codex_checkpoint_turn_id is None
+        assert journal.completed_turn_ids() == ("turn-committed",)
+        assert not journal.has_active_turn()
 
     asyncio.run(run())
 
