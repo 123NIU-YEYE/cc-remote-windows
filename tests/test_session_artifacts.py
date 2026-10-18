@@ -34,6 +34,84 @@ def test_artifact_upload_survives_reopen_and_has_isolated_identity(tmp_path):
     assert public_entry(rows[0])["available"] is True
 
 
+@pytest.mark.parametrize("name", [
+    "界" * 78 + ".txt", "é" * 118 + ".txt", "𠀀" * 59 + ".txt",
+    "a" * 236 + ".txt", "界" * 80,
+])
+def test_long_upload_names_fit_byte_limit_and_keep_preview_extension(tmp_path, name):
+    store = SessionArtifactStore(tmp_path)
+    files = [{"filename": name, "data": "aGVsbG8="}]
+    store.uploads("session", "msg", files)
+    rows = store.page("session")[0]
+    assert len(rows) == 1 and rows[0]["name"] == name
+    path = Path(rows[0]["path"])
+    assert len(path.name.encode("utf-8")) <= 255
+    assert path.suffix == Path(name).suffix
+    assert path.read_bytes() == b"hello"
+    reopened = SessionArtifactStore(tmp_path)
+    reopened.uploads("session", "msg", files)
+    assert reopened.page("session")[0][0]["path"] == str(path)
+    assert len([entry for entry in store.root.iterdir() if entry.name != "index.sqlite3"]) == 1
+
+
+def test_truncated_upload_names_keep_distinct_copies(tmp_path):
+    store = SessionArtifactStore(tmp_path)
+    names = ["界" * 77 + ending + ".txt" for ending in ("甲", "乙")]
+    store.uploads("session", "msg", [
+        {"filename": name, "data": base64.b64encode(name.encode()).decode()}
+        for name in names
+    ])
+    rows = store.page("session")[0]
+    assert len(rows) == 2 and len({row["path"] for row in rows}) == 2
+    for row in rows:
+        assert len(Path(row["path"]).name.encode("utf-8")) <= 255
+        assert Path(row["path"]).read_text() == row["name"]
+
+
+@pytest.mark.parametrize("name", [
+    "a." + "界" * 79, "界." + "é" * 94 + "x", "界." + "é" * 94,
+])
+def test_oversized_upload_extensions_still_fit_byte_limit(tmp_path, name):
+    store = SessionArtifactStore(tmp_path)
+    store.uploads("session", "msg", [{"filename": name, "data": "YQ=="}])
+    row = store.page("session")[0][0]
+    path = Path(row["path"])
+    assert row["name"] == name and path.read_bytes() == b"a"
+    assert len(path.name.encode("utf-8")) <= 255
+
+
+def test_long_name_replay_reuses_existing_legacy_copy(tmp_path):
+    import hashlib
+
+    store = SessionArtifactStore(tmp_path)
+    name = "a" * 236 + ".txt"
+    identity = f"upload:msg:0:{name}"
+    digest = hashlib.sha256(f"session\0{identity}".encode()).hexdigest()
+    legacy = store.root / f"{digest}-{name[:160]}"
+    legacy.write_bytes(b"hello")
+    store.add("session", identity, name, str(legacy), "upload", turn_id="msg")
+    store.uploads("session", "msg", [{"filename": name, "data": "aGVsbG8="}])
+    assert store.page("session")[0][0]["path"] == str(legacy)
+    assert legacy.read_bytes() == b"hello"
+    assert len([entry for entry in store.root.iterdir() if entry.name != "index.sqlite3"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_long_named_artifact_can_be_previewed(tmp_path):
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session", "session")
+    ctx.cwd = str(tmp_path)
+    machine.sessions[ctx.key] = ctx
+    name = "资料" * 39 + ".txt"
+    service = machine._artifacts
+    await service.uploads(ctx, "msg", [{"filename": name, "data": "aGVsbG8="}])
+    entry = service.store.page(service.context_scope(ctx))[0][0]
+    preview = await service.preview(GetSessionArtifactPreview(
+        sid=ctx.key, engine="claude", artifact_id=entry["id"],
+        request_id="r", client_id="browser"))
+    assert not preview.error and preview.content == "hello" and not preview.writable
+
+
 def test_artifact_pages_are_chronological_and_scoped(tmp_path):
     store = SessionArtifactStore(tmp_path)
     for i in range(95):

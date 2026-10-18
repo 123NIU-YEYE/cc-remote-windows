@@ -35,6 +35,21 @@ class ArtifactStorageFull(OSError):
     """An optional durable copy would exceed its storage budget."""
 
 
+def _upload_copy_name(name: str, digest: str) -> str:
+    """Fit one filesystem component, keeping the extension used by previews."""
+    safe = re.sub(r"[^\w. -]", "_", Path(name).name).strip(". ") or "attachment"
+    budget = 255 - len(digest) - 1  # SHA-256 hex plus the separating dash.
+    if len(safe.encode("utf-8")) > budget:
+        suffix = Path(safe).suffix
+        if len(suffix.encode("utf-8")) >= budget:
+            suffix = ""  # An oversized extension cannot be preserved intact.
+        stem = safe[:-len(suffix)] if suffix else safe
+        stem_budget = budget - len(suffix.encode("utf-8"))
+        stem = stem.encode("utf-8")[:stem_budget].decode("utf-8", errors="ignore")
+        safe = (stem.rstrip(". ") or "_") + suffix
+    return f"{digest}-{safe}"
+
+
 def image_thumbnail(data: bytes) -> bytes:
     """A static, metadata-free list thumbnail; never send original image bytes."""
     from PIL import Image, ImageOps
@@ -215,12 +230,11 @@ class SessionArtifactStore:
             pending, new_files = [], {}
             for i, (name, encoded) in enumerate(items):
                 identity = f"upload:{msg_id}:{i}:{name}"
-                safe = re.sub(r"[^\w. -]", "_", Path(name).name).strip(". ")[:160] or "attachment"
                 data = decode_attachment(encoded)
                 previous = db.execute("SELECT path FROM artifacts WHERE scope=? AND identity=?",
                                       (scope, identity)).fetchone()
                 digest = hashlib.sha256(f"{scope}\0{identity}".encode()).hexdigest()
-                path = Path(previous[0]) if previous else self.root / f"{digest}-{safe}"
+                path = Path(previous[0]) if previous else self.root / _upload_copy_name(name, digest)
                 if path.parent != self.root:
                     raise OSError("unsafe artifact upload path")
                 try:
