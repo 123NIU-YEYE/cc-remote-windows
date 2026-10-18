@@ -64,6 +64,7 @@ from uuid import uuid4
 from typing import Literal, Optional
 
 from cc_remote.wrapper import codex_readiness
+from cc_remote.wrapper.artifact_service import ArtifactService
 
 from claude_agent_sdk import (
     PermissionResultAllow, PermissionResultDeny, delete_session,
@@ -2021,6 +2022,7 @@ class WrapperMachine:
         "list_sessions", "get_history", "get_turn_detail", "get_agent_detail",
         "get_history_image",
         "get_models", "get_permission_profiles", "get_engine_capabilities",
+        "get_session_artifacts", "get_session_artifact_preview",
         "get_context", "get_status", "get_diff", "get_turn_file_changes", "get_file_preview",
         "get_preview_asset", "get_goal", "dismiss_goal",
         "acknowledge_completion",
@@ -2040,6 +2042,7 @@ class WrapperMachine:
         "set_perm", "get_permission_profiles", "set_permission_profile",
         "set_web_search",
         "get_context", "get_status", "consume_rate_limit_reset_credit",
+        "get_session_artifacts", "get_session_artifact_preview",
         "get_diff", "get_turn_file_changes", "get_file_preview", "save_markdown", "browse_files",
         "get_preview_asset", "authorize_preview",
         "answer_question", "get_goal", "set_goal", "clear_goal",
@@ -2049,6 +2052,7 @@ class WrapperMachine:
     BTW_DESTROYED_ALLOWED_COMMANDS = frozenset({
         "sync_btw", "close_btw", "open_btw", "get_queued_query",
         "cancel_queued_query", "get_file_preview", "get_preview_asset",
+        "get_session_artifacts", "get_session_artifact_preview",
         "authorize_preview", "acknowledge_completion", "dismiss_goal",
     })
     # These commands address a session through ``session_id`` instead.
@@ -2282,6 +2286,7 @@ class WrapperMachine:
         # rejected by a browser that still holds the previous control watermark.
         self._control_revision_epochs: dict[str, int] = {}
         self._preview_conversion_limit = asyncio.Semaphore(2)
+        self._artifacts = ArtifactService(self)
         self._preview_capability_store = PreviewCapabilityStore(
             Path(cfg.state_dir))
         self._preview_capability_mutation_lock = asyncio.Lock()
@@ -10733,6 +10738,10 @@ class WrapperMachine:
                 session_id=self._ctx_wire_sid(ctx),
                 error_type=type(exc).__name__,
             )
+        try:
+            await self._artifacts.observe(ctx, msg)
+        except Exception as exc:
+            log.warning("artifact discovery unavailable", error_type=type(exc).__name__)
         await self._observe_preview_image_event(ctx, msg)
         await self._observe_preview_path_event(ctx, msg)
         # Do not retain the full native patches in the replay ring. The small
@@ -11713,7 +11722,7 @@ class WrapperMachine:
         if cmd.type == "list_sessions":
             self._start_session_list_command(cmd)
             return
-        if (cmd.type in {"get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes"}
+        if (cmd.type in {"get_session_artifacts", "get_session_artifact_preview", "get_history", "get_turn_detail", "get_agent_detail", "get_turn_file_changes"}
                 or (cmd.type == "get_diff" and getattr(cmd, "turn_id", None))):
             self._start_history_command(cmd)
             return
@@ -17828,7 +17837,7 @@ class WrapperMachine:
             newer_cursor=newer,
         )
 
-    async def _handle_get_history_image(self, cmd) -> HistoryImage:
+    async def _handle_get_history_image(self, cmd, *, publish=True) -> HistoryImage:
         """Return one source-bound historical image without resuming an engine."""
         started_at = time.perf_counter()
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
@@ -17859,7 +17868,8 @@ class WrapperMachine:
                 sid=sid,
                 to=client_id,
             )
-            await self.transport.send(response)
+            if publish:
+                await self.transport.send(response)
             log.info(
                 "history image sent",
                 session_id=sid,
@@ -18711,6 +18721,7 @@ class WrapperMachine:
         try:
             image_paths: list[str] = []
             if files or images:
+                await self._artifacts.uploads(ctx, cmd.msg_id, files, images)
                 if ctx.space == "work":
                     prompt, image_paths, temp_dir = (
                         self._stash_work_attachments(
@@ -24682,6 +24693,12 @@ class WrapperMachine:
     async def _drop_preview_session(
         self, engine: str, session_id: str, *, delete_history: bool = True,
     ) -> None:
+        if delete_history:
+            try:
+                await asyncio.to_thread(self._artifacts.store.drop_session,
+                                       self.cfg.machine_id, engine, session_id)
+            except Exception as exc:
+                log.warning("artifact cleanup unavailable", error_type=type(exc).__name__)
         if delete_history and self._turn_change_archive is not None:
             try:
                 await asyncio.to_thread(self._turn_change_archive.drop, f"{engine}:{session_id}")
@@ -24710,6 +24727,12 @@ class WrapperMachine:
         old_key: str,
         session_id: str,
     ) -> None:
+        try:
+            await asyncio.to_thread(self._artifacts.store.move,
+                                   self._artifacts.context_scope(ctx, old_key),
+                                   self._artifacts.context_scope(ctx, session_id))
+        except Exception as exc:
+            log.warning("artifact rekey unavailable", error_type=type(exc).__name__)
         if self._turn_change_archive is not None:
             try:
                 await asyncio.to_thread(self._turn_change_archive.rekey,
@@ -24983,6 +25006,12 @@ class WrapperMachine:
         else:
             await self._emit(ctx, response)
         return response
+
+    async def _handle_get_session_artifacts(self, cmd):
+        return await self._artifacts.list(cmd)
+
+    async def _handle_get_session_artifact_preview(self, cmd):
+        return await self._artifacts.preview(cmd)
 
     async def _handle_get_file_preview(self, cmd):
         sid = getattr(cmd, "sid", None)
@@ -38035,6 +38064,7 @@ class WrapperMachine:
                     return
 
                 if files or images:
+                    await self._artifacts.uploads(ctx, ctx.active_msg_id or uuid4().hex, files, images)
                     temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
                     os.chmod(temp_dir, 0o700)
                 if files:
@@ -38885,6 +38915,8 @@ class WrapperMachine:
                         await close_unsubmitted_turn()
                         return
 
+                    if files:
+                        await self._artifacts.uploads(ctx, ctx.active_msg_id or uuid4().hex, files, images)
                     stage_images = bool(images and (
                         is_codex or ctx.space == "work"))
                     staged_image_paths: list[str] = []

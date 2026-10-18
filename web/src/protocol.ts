@@ -472,6 +472,23 @@ export interface GetContext extends Base {
 }
 export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: DiffTheme; turn_id?: string | null; revision?: string | null; engine?: Engine | null }
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string; request_id?: string }
+export interface SessionArtifactInfo {
+  id: string; name: string; path: string; source: "upload" | "delivered";
+  kind: "image" | "document" | "file"; created_at: number; size: number; available: boolean;
+}
+export interface GetSessionArtifacts extends Base {
+  type: "get_session_artifacts"; engine: Engine; space?: Space; request_id: string;
+  before?: number | null; scan_history?: boolean; history_before?: string | null;
+}
+export interface GetSessionArtifactPreview extends Base {
+  type: "get_session_artifact_preview"; engine: Engine; space?: Space;
+  artifact_id: string; request_id: string;
+  variant?: "full" | "thumbnail";
+}
+export interface SessionArtifacts extends Base {
+  type: "session_artifacts"; request_id: string; entries: SessionArtifactInfo[];
+  next_before?: number | null; has_more: boolean; history_before?: string | null; history_more: boolean; error?: string | null;
+}
 export interface GetFilePreview extends Base { type: "get_file_preview"; path: string; request_id: string }
 export interface FilePreview extends Base {
   directory?: boolean; type: "file_preview"; path: string; request_id: string; format: "markdown" | "text" | "html" | "image" | "pdf" | "audio" | "spreadsheet"; content: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/svg+xml" | "application/pdf" | "audio/wav" | "audio/mpeg" | "audio/mp4" | "audio/aac" | "audio/flac" | "audio/ogg" | "audio/webm" | null; data?: string | null; converted_from?: string | null; size: number; truncated: boolean; mtime_ns: string; revision?: string | null; writable?: boolean; error?: string | null }
@@ -715,7 +732,7 @@ export interface CodexContext extends Base {
   error: string | null;
 }
 
-export type ServerEvent = FilesListed | CodexContext
+export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | TurnFileChangesPage
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | BtwSync | BtwClosed | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult
@@ -725,7 +742,7 @@ export type ServerEvent = FilesListed | CodexContext
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 74;
+export const PROTOCOL_VERSION = 76;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

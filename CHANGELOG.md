@@ -2,6 +2,13 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Add session-scoped Artifacts with durable upload copies and separate list/preview views.
+- Keep centered side chat independent of file previews; Cmd/Ctrl+Shift+E only toggles side chat.
+- Refine Artifacts with date groups, bounded visible-image thumbnails, compact rounded pagination and a local back control; remove the redundant menu heading.
+- Wire protocol v76 requires Web, Relay and Wrapper to upgrade together.
+
 ## v4.0.20
 
 Add preview Android and native HarmonyOS clients, optional Huawei Push Kit

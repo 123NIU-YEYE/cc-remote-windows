@@ -18154,7 +18154,7 @@ assert.match(appSource,
   /const activeBtwGroup = visibleParentSid[\s\S]{0,100}state\.btwByParentSid\[visibleParentSid\][\s\S]{0,160}activeBtwGroup\.activeSid/,
   "only the focused parent session may expose its selected side chat");
 assert.match(appSource,
-  /const openBtw = \(expanded = false\) => \{\s*if \(!confirmArtifactDiscard\(\)\) return;/,
+  /const openBtw = \(expanded = false\) => \{[\s\S]{0,150}if \(!btwPanelKey \|\| !confirmArtifactDiscard\(\)\) return;/,
   "opening side chat must preserve the dirty Markdown discard guard");
 assert.match(appSource,
   /const closeBtw = \(btwSid = activeBtwSid\) => \{[\s\S]*?sendCloseBtw\(btwSid\)/,

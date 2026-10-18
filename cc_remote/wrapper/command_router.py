@@ -40,6 +40,8 @@ COMMAND_HANDLER_NAMES = MappingProxyType({
     "get_diff": "_handle_get_diff",
     "get_turn_file_changes": "_handle_get_turn_file_changes",
     "get_file_preview": "_handle_get_file_preview",
+    "get_session_artifacts": "_handle_get_session_artifacts",
+    "get_session_artifact_preview": "_handle_get_session_artifact_preview",
     "browse_files": "_handle_browse_files",
     "save_markdown": "_handle_save_markdown",
     "get_preview_asset": "_handle_get_preview_asset",
