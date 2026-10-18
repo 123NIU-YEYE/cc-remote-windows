@@ -19,38 +19,34 @@ test('native menu integration preserves the original sidebar rendering', async (
   await expect(page.locator('.pane')).toHaveCSS('filter', 'blur(0px)');
 });
 
-test('reload replaces client settings in chat and survives menu switches without duplicates', async ({ page }) => {
+test('chat menu stays unchanged after native adapter installation and menu switches', async ({ page }) => {
   await page.goto('/tests/history-browser.html?header-menu=1&engine=codex');
   await expect(page.getByRole('button', { name: '更多设置' })).toBeVisible();
+  await page.getByRole('button', { name: '更多设置' }).click();
+  const originalItems = await page.locator('.header-menu-items').innerText();
+  await page.keyboard.press('Escape');
   await install(page);
   await install(page);
   await expect(page.locator('#cc-remote-harmony-settings-fallback')).toBeHidden();
   for (let cycle = 0; cycle < 2; cycle++) {
     await page.getByRole('button', { name: '更多设置' }).click();
-    await expect(page.getByRole('button', { name: /^刷新页面/ })).toHaveCount(1);
-    await expect(page.getByRole('link', { name: /客户端设置/ })).toHaveCount(0);
+    await expect(page.locator('.header-menu-items')).toHaveText(originalItems, { useInnerText: true });
     await page.getByRole('button', { name: /^通知/ }).click();
-    await expect(page.getByRole('button', { name: /^刷新页面/ })).toHaveCount(0);
     await page.getByRole('button', { name: '返回设置' }).click();
-    await expect(page.getByRole('button', { name: /^刷新页面/ })).toHaveCount(1);
+    await expect(page.locator('.header-menu-items')).toHaveText(originalItems, { useInnerText: true });
     await page.keyboard.press('Escape');
   }
 });
 
-test('reload refreshes the same page without clearing saved app state', async ({ page }) => {
+test('client settings becomes visible after leaving chat without duplicating the adapter', async ({ page }) => {
   await page.goto('/tests/history-browser.html?header-menu=1');
   await expect(page.getByRole('button', { name: '更多设置' })).toBeVisible();
-  await page.evaluate(() => localStorage.setItem('reload-test-draft', '保留草稿'));
-  const url = page.url();
   await install(page);
-  await page.getByRole('button', { name: '更多设置' }).click();
-  await Promise.all([
-    page.waitForEvent('framenavigated', frame => frame === page.mainFrame()),
-    page.getByRole('button', { name: /^刷新页面/ }).click(),
-  ]);
-  await expect(page.getByRole('button', { name: '更多设置' })).toBeVisible();
-  expect(page.url()).toBe(url);
-  expect(await page.evaluate(() => localStorage.getItem('reload-test-draft'))).toBe('保留草稿');
+  await expect(page.locator('#cc-remote-harmony-settings-fallback')).toBeHidden();
+  await page.evaluate(() => document.querySelector('#root').replaceChildren());
+  await install(page);
+  await expect(page.getByRole('link', { name: '客户端设置', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('link', { name: '客户端设置', exact: true })).toBeVisible();
 });
 
 test('client settings remains reachable at login', async ({ page }) => {
