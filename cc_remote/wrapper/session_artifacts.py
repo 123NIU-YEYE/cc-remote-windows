@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import threading
@@ -19,6 +20,19 @@ from contextlib import contextmanager
 from urllib.parse import unquote, urlsplit
 
 from cc_remote.attachments import MAX_IMAGE_PIXELS, decode_attachment, validate_attachments
+
+
+# Extra durable copies, not the user's working files or native transcripts.
+# Reject new copies at the limit; never silently evict an existing attachment.
+MAX_SESSION_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_SESSION_UPLOAD_FILES = 512
+MAX_TOTAL_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TOTAL_UPLOAD_FILES = 4096
+MIN_FREE_UPLOAD_BYTES = 256 * 1024 * 1024
+
+
+class ArtifactStorageFull(OSError):
+    """An optional durable copy would exceed its storage budget."""
 
 
 def image_thumbnail(data: bytes) -> bytes:
@@ -124,10 +138,16 @@ class SessionArtifactStore:
 
     def add(self, scope, identity, name, path, source, *, created_at=None,
             turn_id=None, image_id=None):
-        identifier = hashlib.sha256(f"{scope}\0{identity}".encode()).hexdigest()
         with self.lock, self.connect() as db:
             scope = self.canonical_scope(db, scope)
-            db.execute("""INSERT INTO artifacts
+            self._add(db, scope, identity, name, path, source,
+                      created_at=created_at, turn_id=turn_id, image_id=image_id)
+
+    @staticmethod
+    def _add(db, scope, identity, name, path, source, *, created_at=None,
+             turn_id=None, image_id=None):
+        identifier = hashlib.sha256(f"{scope}\0{identity}".encode()).hexdigest()
+        db.execute("""INSERT INTO artifacts
                 (scope,id,identity,name,path,source,created_at,turn_id,image_id)
                 VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(scope,identity) DO UPDATE SET
                 image_id=COALESCE(excluded.image_id, artifacts.image_id),
@@ -136,6 +156,48 @@ class SessionArtifactStore:
                 (scope, identifier, identity, name[:1024], path, source,
                  created_at if created_at is not None else time.time(), turn_id, image_id))
 
+    def _check_upload_budget(self, db, scope, incoming, new_files):
+        """Check physical bytes under the SQLite writer lock, before any copy.
+
+        Count legacy and crash-orphan files too; database-only accounting would
+        forget those bytes on restart. Scans stop as soon as a limit is exceeded.
+        """
+        session_files = dict(incoming)
+        for row in db.execute("""SELECT path FROM artifacts WHERE scope=?
+                AND source='upload' AND image_id IS NULL""", (scope,)):
+            path = Path(row[0])
+            if path.parent != self.root:
+                continue
+            try:
+                session_files[path] = path.lstat().st_size
+            except FileNotFoundError:
+                continue
+            if len(session_files) > MAX_SESSION_UPLOAD_FILES:
+                raise ArtifactStorageFull("session attachment count limit")
+        if (len(session_files) > MAX_SESSION_UPLOAD_FILES
+                or sum(session_files.values()) > MAX_SESSION_UPLOAD_BYTES):
+            raise ArtifactStorageFull("session attachment storage limit")
+        if not new_files:
+            return  # Idempotent replay consumes no additional disk space.
+        total_count, total_bytes = len(new_files), sum(new_files.values())
+        database_files = {"index.sqlite3", "index.sqlite3-journal",
+                          "index.sqlite3-wal", "index.sqlite3-shm"}
+        with os.scandir(self.root) as entries:
+            for entry in entries:
+                if entry.name in database_files:
+                    continue
+                info = entry.stat(follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError("unsafe artifact storage entry")
+                total_count += 1
+                total_bytes += info.st_size
+                if total_count > MAX_TOTAL_UPLOAD_FILES or total_bytes > MAX_TOTAL_UPLOAD_BYTES:
+                    raise ArtifactStorageFull("total attachment storage limit")
+        if total_count > MAX_TOTAL_UPLOAD_FILES or total_bytes > MAX_TOTAL_UPLOAD_BYTES:
+            raise ArtifactStorageFull("total attachment storage limit")
+        if shutil.disk_usage(self.root).free - sum(new_files.values()) < MIN_FREE_UPLOAD_BYTES:
+            raise ArtifactStorageFull("attachment disk reserve")
+
     def uploads(self, scope, msg_id, files=None, images=None):
         if validate_attachments(images, files):
             raise ValueError("invalid artifact upload")
@@ -143,40 +205,55 @@ class SessionArtifactStore:
         extensions = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp"}
         items.extend((f"image-{i:02d}" + extensions.get(f["media_type"], ".png"), f["data"])
                      for i, f in enumerate(images or []))
-        for i, (name, encoded) in enumerate(items):
-            identity = f"upload:{msg_id}:{i}:{name}"
-            safe = re.sub(r"[^\w. -]", "_", Path(name).name).strip(". ")[:160] or "attachment"
-            data = decode_attachment(encoded)
-            with self.lock:
-                with self.connect() as db:
-                    scope = self.canonical_scope(db, scope)
-                    previous = db.execute("SELECT path FROM artifacts WHERE scope=? AND identity=?",
-                                          (scope, identity)).fetchone()
+        if not items:
+            return
+        with self.lock, self.connect() as db:
+            # Serializes quota check, file creation and metadata across store
+            # instances/processes, including deletion and session re-keying.
+            db.execute("BEGIN IMMEDIATE")
+            scope = self.canonical_scope(db, scope)
+            pending, new_files = [], {}
+            for i, (name, encoded) in enumerate(items):
+                identity = f"upload:{msg_id}:{i}:{name}"
+                safe = re.sub(r"[^\w. -]", "_", Path(name).name).strip(". ")[:160] or "attachment"
+                data = decode_attachment(encoded)
+                previous = db.execute("SELECT path FROM artifacts WHERE scope=? AND identity=?",
+                                      (scope, identity)).fetchone()
                 digest = hashlib.sha256(f"{scope}\0{identity}".encode()).hexdigest()
                 path = Path(previous[0]) if previous else self.root / f"{digest}-{safe}"
                 if path.parent != self.root:
                     raise OSError("unsafe artifact upload path")
                 try:
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                except FileExistsError:
-                    info = path.lstat()
-                    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                            or info.st_uid != os.geteuid()):
-                        raise OSError("unsafe artifact upload")
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except FileNotFoundError:
+                    new_files[path] = len(data)
+                else:
                     with os.fdopen(fd, "rb") as existing:
+                        info = os.fstat(existing.fileno())
+                        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                                or info.st_uid != os.geteuid()):
+                            raise OSError("unsafe artifact upload")
                         if existing.read(len(data) + 1) != data:
                             raise OSError("artifact upload content changed")
-                else:
-                    try:
+                pending.append((identity, name, path, data))
+            self._check_upload_budget(db, scope,
+                {path: len(data) for _, _, path, data in pending}, new_files)
+            created = []
+            try:
+                for identity, name, path, data in pending:
+                    if path in new_files:
+                        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                        created.append(path)
                         with os.fdopen(fd, "wb") as out:
                             out.write(data)
                             out.flush()
                             os.fsync(out.fileno())
-                    except BaseException:
-                        path.unlink(missing_ok=True)
-                        raise
-                self.add(scope, identity, name, str(path), "upload", turn_id=msg_id)
+                    self._add(db, scope, identity, name, str(path), "upload", turn_id=msg_id)
+                db.commit()
+            except BaseException:
+                for path in created:
+                    path.unlink(missing_ok=True)
+                raise
 
     def text(self, scope, text, cwd, *, created_at=None):
         for path in local_links(text, cwd):
@@ -246,6 +323,7 @@ class SessionArtifactStore:
 
     def drop_session(self, machine_id, engine, sid):
         with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             scopes = [row[0] for row in db.execute("SELECT DISTINCT scope FROM artifacts")]
             for scope in scopes:
                 parts = json.loads(scope)
@@ -259,6 +337,7 @@ class SessionArtifactStore:
 
     def move(self, old_scope, new_scope):
         with self.lock, self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             old_scope = self.canonical_scope(db, old_scope)
             new_scope = self.canonical_scope(db, new_scope)
             if old_scope == new_scope:

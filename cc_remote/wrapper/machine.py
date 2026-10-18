@@ -24782,6 +24782,20 @@ class WrapperMachine:
                 raise ValueError("session scope mismatch")
             return scope.model_copy(update={"sid": self._ctx_wire_sid(ctx)}), ctx.cwd
         # History-only/cold sessions remain browsable without creating an engine.
+        # A transcript proves identity, not Code/Work ownership. In particular,
+        # callers must not relabel a cold Work session to obtain Code file grants.
+        if (not getattr(self, f"_{scope.engine}_profile_migration_ok")
+                or not getattr(self, f"_{scope.engine}_work_profile_migration_ok")):
+            raise ValueError("session profile migration is incomplete")
+        native_sid, profile_id = self._work_session_identity(scope.engine, sid)
+        work_store = self._work.for_engine(scope.engine)
+        work_record = await asyncio.to_thread(
+            work_store.get_by_session, native_sid,
+            claude_profile_id=profile_id if scope.engine == "claude" else None,
+            codex_profile_id=profile_id if scope.engine == "codex" else None,
+        )
+        if (work_record is not None) != (scope.space == "work"):
+            raise ValueError("session scope mismatch")
         if scope.engine == "codex":
             path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
             cwd = await asyncio.to_thread(self._codex_cwd_for_wire, sid) if path else None
@@ -24797,6 +24811,12 @@ class WrapperMachine:
             cwd = getattr(info, "cwd", None)
         if not path:
             raise ValueError("unknown session")
+        if work_record is not None:
+            # Work's registered workspace is authoritative even if native
+            # metadata or a stale Code cwd override points somewhere else.
+            cwd = work_record.cwd
+        elif work_store.contains_cwd(cwd):
+            raise ValueError("unregistered Work session")
         return scope.model_copy(update={"sid": sid}), cwd
 
     async def _require_preview_authorization(

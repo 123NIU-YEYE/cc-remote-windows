@@ -3,7 +3,8 @@ import base64
 import io
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -11,7 +12,10 @@ from cc_remote.protocol import (
     AssistantMsgEnd, Delta, GetSessionArtifactPreview, GetSessionArtifacts,
     History, HistoryImage, SessionArtifacts, deserialize, serialize,
 )
-from cc_remote.wrapper.session_artifacts import SessionArtifactStore, image_thumbnail, local_links, public_entry
+from cc_remote.wrapper import session_artifacts
+from cc_remote.wrapper.session_artifacts import (
+    ArtifactStorageFull, SessionArtifactStore, image_thumbnail, local_links, public_entry,
+)
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -88,6 +92,227 @@ def test_artifact_root_symlink_is_rejected(tmp_path):
     (tmp_path / "session-artifacts").symlink_to(target)
     with pytest.raises(OSError):
         SessionArtifactStore(tmp_path)
+
+
+@pytest.mark.parametrize("limit", [
+    "MAX_SESSION_UPLOAD_BYTES", "MAX_SESSION_UPLOAD_FILES",
+    "MAX_TOTAL_UPLOAD_BYTES", "MAX_TOTAL_UPLOAD_FILES",
+])
+def test_durable_upload_limits_survive_reopen_without_eviction(tmp_path, monkeypatch, limit):
+    monkeypatch.setattr(session_artifacts, limit, 3 if limit.endswith("BYTES") else 1)
+    files = [{"filename": "note.txt", "data": "aGk="}]
+    store = SessionArtifactStore(tmp_path)
+    store.uploads("first", "one", files)
+    copied = Path(store.page("first")[0][0]["path"])
+    store = SessionArtifactStore(tmp_path)
+    store.uploads("first", "one", files)  # Replays do not consume quota twice.
+    target = "second" if "TOTAL" in limit else "first"
+    with pytest.raises(ArtifactStorageFull):
+        store.uploads(target, "two", files)
+    assert copied.read_bytes() == b"hi"
+    assert len(list(store.root.glob("*-note.txt"))) == 1
+    assert len(store.page("first")[0]) == 1
+    if "SESSION" in limit:
+        store.uploads("other-account", "two", files)
+        assert len(store.page("other-account")[0]) == 1
+
+
+def test_quota_rejects_entire_batch_before_copying(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_artifacts, "MAX_SESSION_UPLOAD_FILES", 1)
+    store = SessionArtifactStore(tmp_path)
+    with pytest.raises(ArtifactStorageFull):
+        store.uploads("session", "msg", [
+            {"filename": "one.txt", "data": "YQ=="},
+            {"filename": "two.txt", "data": "Yg=="},
+        ])
+    assert store.page("session")[0] == []
+    assert not list(store.root.glob("*.txt"))
+
+
+@pytest.mark.parametrize("limit", ["MAX_TOTAL_UPLOAD_BYTES", "MAX_TOTAL_UPLOAD_FILES"])
+def test_orphan_and_legacy_copies_count_towards_global_budget(tmp_path, monkeypatch, limit):
+    store = SessionArtifactStore(tmp_path)
+    orphan = store.root / "interrupted-copy.txt"
+    orphan.write_bytes(b"old")
+    monkeypatch.setattr(session_artifacts, limit, 3 if limit.endswith("BYTES") else 1)
+    reopened = SessionArtifactStore(tmp_path)
+    with pytest.raises(ArtifactStorageFull):
+        reopened.uploads("session", "msg", [{"filename": "new.txt", "data": "YQ=="}])
+    assert reopened.page("session")[0] == []
+    assert orphan.read_bytes() == b"old"
+    assert not list(store.root.glob("*-new.txt"))
+
+
+def test_upload_reserves_free_disk_before_creating_copy(tmp_path, monkeypatch):
+    store = SessionArtifactStore(tmp_path)
+    monkeypatch.setattr(session_artifacts.shutil, "disk_usage", lambda _: SimpleNamespace(
+        free=session_artifacts.MIN_FREE_UPLOAD_BYTES))
+    with pytest.raises(ArtifactStorageFull, match="reserve"):
+        store.uploads("session", "msg", [{"filename": "note.txt", "data": "YQ=="}])
+    assert store.page("session")[0] == []
+    assert not list(store.root.glob("*.txt"))
+
+
+def test_quota_tracks_rekey_and_session_deletion(tmp_path, monkeypatch):
+    monkeypatch.setattr(session_artifacts, "MAX_SESSION_UPLOAD_FILES", 1)
+    monkeypatch.setattr(session_artifacts, "MAX_TOTAL_UPLOAD_FILES", 1)
+    store = SessionArtifactStore(tmp_path)
+    old = json.dumps(["machine", "claude", "code", "tmp-one"])
+    new = json.dumps(["machine", "claude", "code", "account@session"])
+    files = [{"filename": "note.txt", "data": "YQ=="}]
+    store.uploads(old, "msg", files)
+    store.move(old, new)
+    store.uploads(old, "msg", files)
+    with pytest.raises(ArtifactStorageFull):
+        store.uploads(new, "second", files)
+    store.drop_session("machine", "claude", "account@session")
+    store.uploads("another-session", "third", files)
+    assert len(list(store.root.glob("*.txt"))) == 1
+
+
+def test_concurrent_stores_cannot_overbook_upload_quota(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    monkeypatch.setattr(session_artifacts, "MAX_TOTAL_UPLOAD_FILES", 1)
+    stores = [SessionArtifactStore(tmp_path), SessionArtifactStore(tmp_path)]
+    ready = Barrier(2)
+
+    def upload(i):
+        ready.wait(timeout=5)
+        try:
+            stores[i].uploads(str(i), "msg", [{"filename": "note.txt", "data": "YQ=="}])
+        except ArtifactStorageFull:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert sorted(pool.map(upload, range(2))) == [False, True]
+    assert len(list(stores[0].root.glob("*.txt"))) == 1
+    assert sum(len(stores[0].page(str(i))[0]) for i in range(2)) == 1
+
+
+@pytest.mark.parametrize("failure", ["fsync", "metadata"])
+def test_failed_upload_batch_removes_new_copies_and_rolls_back_index(tmp_path, monkeypatch, failure):
+    store = SessionArtifactStore(tmp_path)
+    if failure == "fsync":
+        original = session_artifacts.os.fsync
+        target, method = session_artifacts.os, "fsync"
+    else:
+        original = store._add
+        target, method = store, "_add"
+    calls = 0
+
+    def fail_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("disk write failed")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, method, fail_second)
+    with pytest.raises(OSError, match="disk write failed"):
+        store.uploads("session", "msg", [
+            {"filename": "one.txt", "data": "YQ=="},
+            {"filename": "two.txt", "data": "Yg=="},
+        ])
+    assert store.page("session")[0] == []
+    assert not list(store.root.glob("*.txt"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+async def test_cold_artifacts_validate_account_space_before_history_or_preview(tmp_path, monkeypatch, engine):
+    from cc_remote.viewer_pages import PageScope
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "a"))
+    key = "config_dir" if engine == "claude" else "home"
+    monkeypatch.setenv(f"CC_REMOTE_{engine.upper()}_PROFILES_JSON", json.dumps({
+        "a": {"label": "A", key: str(tmp_path / "a"), "default": True},
+        "b": {"label": "B", key: str(tmp_path / "b")},
+    }))
+    machine, _ = _mk_machine()
+    machine._spawn = AsyncMock(side_effect=AssertionError("must not spawn an engine"))
+    service = machine._artifacts
+    registry = machine._work.for_engine(engine)
+    profile = {f"{engine}_profile_id": "a"}
+    record = registry.create_session(**profile)
+    registry.bind_session(record.work_id, "native-session", **profile)
+    registry.update_archived("native-session", True, **profile)
+    # Native cwd deliberately disagrees with registered Work metadata.
+    machine._codex_rollout_for_wire = Mock(return_value=str(tmp_path / "rollout.jsonl"))
+    machine._codex_cwd_for_wire = Mock(return_value=str(tmp_path))
+    machine._claude_transcript_path_for_wire = Mock(return_value=str(tmp_path / "transcript.jsonl"))
+    machine._claude_catalog_session_info = Mock(return_value=SimpleNamespace(cwd=str(tmp_path)))
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside Work")
+    inside = Path(record.cwd) / "inside.txt"
+    inside.write_text("inside Work")
+    machine._history_page_singleflight = AsyncMock(return_value=History(
+        session_id="a@native-session", revision="r", detail="summary", turns=[{
+            "id": "turn", "ts": 1000, "blocks": [{"kind": "text", "text":
+                f"[inside]({inside}) [outside]({outside})"}]}]))
+    work_sid, code_sid = "a@native-session", "b@native-session"
+    forged = GetSessionArtifacts(sid=work_sid, engine=engine, space="code",
+        request_id="r", client_id="client", scan_history=True)
+    denied = await service.list(forged)
+    assert denied.error and denied.entries == []
+    machine._history_page_singleflight.assert_not_called()
+    assert service.store.page(service.scope(engine, "code", work_sid))[0] == []
+    # Even a catalog cached before this fix cannot authorize a forged preview.
+    poisoned_scope = service.scope(engine, "code", work_sid)
+    service.store.text(poisoned_scope, f"[file]({outside})", str(tmp_path))
+    poisoned = service.store.page(poisoned_scope)[0][0]
+    inspect = Mock(wraps=machine._preview_capability_store.inspect_path)
+    monkeypatch.setattr(machine._preview_capability_store, "inspect_path", inspect)
+    for variant in ("full", "thumbnail"):
+        result = await service.preview(GetSessionArtifactPreview(
+            sid=work_sid, engine=engine, space="code", artifact_id=poisoned["id"],
+            request_id="p", client_id="client", variant=variant))
+        assert result.error and not result.content and not result.data
+    inspect.assert_not_called()
+
+    scope, cwd = await machine._viewer_page_scope(PageScope(sid=work_sid, engine=engine, space="work"))
+    assert scope.space == "work" and cwd == record.cwd
+    legitimate = await service.list(forged.model_copy(update={"space": "work"}))
+    assert not legitimate.error and len(legitimate.entries) == 2
+    for entry in legitimate.entries:
+        result = await service.preview(GetSessionArtifactPreview(
+            sid=work_sid, engine=engine, space="work", artifact_id=entry.id,
+            request_id="p", client_id="client"))
+        if entry.name == "inside.txt":
+            assert result.content == "inside Work" and not result.error
+        else:
+            assert result.error and not result.content
+    inspect.assert_not_called()
+    # Same native id in a different account is Code, not the archived Work row.
+    code = await service.list(forged.model_copy(update={"sid": code_sid}))
+    assert not code.error
+    external = next(entry for entry in code.entries if entry.name == "outside.txt")
+    result = await service.preview(GetSessionArtifactPreview(
+        sid=code_sid, engine=engine, space="code", artifact_id=external.id,
+        request_id="p", client_id="client"))
+    assert result.content == "outside Work" and not result.error
+    rejected = await service.list(forged.model_copy(update={"sid": code_sid, "space": "work"}))
+    assert rejected.error
+    machine._spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+@pytest.mark.parametrize("failure", ["migration", "registry"])
+async def test_cold_artifact_space_lookup_fails_closed(tmp_path, monkeypatch, engine, failure):
+    machine, _ = _mk_machine()
+    if failure == "migration":
+        setattr(machine, f"_{engine}_work_profile_migration_ok", False)
+    else:
+        monkeypatch.setattr(machine._work.for_engine(engine), "get_by_session",
+                            Mock(side_effect=OSError("registry unreadable")))
+    machine._history_page_singleflight = AsyncMock()
+    result = await machine._artifacts.list(GetSessionArtifacts(
+        sid="session", engine=engine, space="code", request_id="r", scan_history=True))
+    assert result.error and not result.entries
+    machine._history_page_singleflight.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -354,12 +579,15 @@ async def test_readonly_btw_artifacts_keep_owner_isolation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_claude_steering_upload_outlives_its_temporary_prompt_files(tmp_path):
+@pytest.mark.parametrize("storage_full", [False, True])
+async def test_claude_steering_upload_outlives_its_temporary_prompt_files(tmp_path, monkeypatch, storage_full):
     from types import SimpleNamespace
     from cc_remote.protocol import Steer
     from cc_remote.wrapper import claude_steer
 
     machine, _ = _mk_machine()
+    if storage_full:
+        monkeypatch.setattr(session_artifacts, "MAX_TOTAL_UPLOAD_FILES", 0)
     ctx = _mk_ctx("session", "session")
     ctx.cwd, ctx.state, ctx.write_state = str(tmp_path), "running", "writable"
     ctx.sdk = SimpleNamespace(steer=AsyncMock())
@@ -373,5 +601,9 @@ async def test_claude_steering_upload_outlives_its_temporary_prompt_files(tmp_pa
     assert staged
     claude_steer.cleanup(ctx)
     assert all(not Path(path).exists() for path in staged)
-    row = machine._artifacts.store.page(machine._artifacts.context_scope(ctx))[0][0]
+    rows = machine._artifacts.store.page(machine._artifacts.context_scope(ctx))[0]
+    if storage_full:
+        assert rows == []  # The optional copy must not block delivery to the SDK.
+        return
+    row = rows[0]
     assert row["name"] == "notes.txt" and Path(row["path"]).read_text() == "hi"
