@@ -2,12 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
-## Unreleased
+## v4.0.21
 
-- Add session-scoped Artifacts with durable upload copies and separate list/preview views.
-- Keep centered side chat independent of file previews; Cmd/Ctrl+Shift+E only toggles side chat.
-- Refine Artifacts with date groups, bounded visible-image thumbnails, compact rounded pagination and a local back control; remove the redundant menu heading.
-- Wire protocol v76 requires Web, Relay and Wrapper to upgrade together.
+Add per-session Artifacts and preserve unfinished chat state across Claude/Codex
+navigation. Wire protocol v76 requires Web, Relay and Wrapper to upgrade together.
+See the bilingual [release notes](docs/releases/v4.0.21.md).
+
+- Collect uploaded attachments and delivered files in a compact, date-grouped catalog with separate previews and bounded thumbnails.
+- Validate cold-session account/Code/Work ownership before file access; cap durable upload storage and handle multibyte filenames safely.
+- Reserve Cmd/Ctrl+Shift+E for centered side chat and add Cmd/Ctrl+1/2 engine switching while preserving questions, drafts and file previews.
+- Center mobile question dialogs, use attributed engine icons and a replayable Claude completion animation, and refine notices.
+- Remove native-only Harmony chat controls; publish the updated unsigned preview.4 HAP alongside the unchanged Android preview.2 shell.
 
 ## v4.0.20
 
