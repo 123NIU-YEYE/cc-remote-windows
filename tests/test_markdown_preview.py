@@ -278,6 +278,48 @@ def test_rendered_artifact_rejects_mismatched_content_type(tmp_path):
         machine._read_file_preview(str(tmp_path), "fake.png")
 
 
+@pytest.mark.parametrize("actual,media_type", [
+    ("JPEG", "image/jpeg"), ("PNG", "image/png"),
+    ("GIF", "image/gif"), ("WEBP", "image/webp"),
+])
+def test_misnamed_rasters_use_content_type_without_changing_file(tmp_path, actual, media_type):
+    from PIL import Image
+    import io
+
+    output = io.BytesIO()
+    Image.new("RGB", (16, 8), "red").save(output, format=actual)
+    data = output.getvalue()
+    name = "export.jpg" if actual == "PNG" else "export.png"
+    path = tmp_path / name
+    path.write_bytes(data)
+    before = path.stat()
+    machine, _ = _mk_machine()
+    preview = machine._read_file_preview(str(tmp_path), name)
+    assert preview["format"] == "image" and preview["media_type"] == media_type
+    assert preview["data"] == data
+    assert machine._read_preview_asset(str(tmp_path), name) == (name, media_type, data)
+    assert path.read_bytes() == data and path.stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("payload", [b"<html>hi</html>", b"<svg></svg>", b"%PDF-1.7", b"unknown"])
+def test_raster_sniffing_does_not_enable_active_or_unrecognized_formats(tmp_path, payload):
+    (tmp_path / "fake.png").write_bytes(payload)
+    machine, _ = _mk_machine()
+    for read in (machine._read_file_preview, machine._read_preview_asset):
+        with pytest.raises(ValueError, match="格式不匹配"):
+            read(str(tmp_path), "fake.png")
+
+
+def test_raster_detection_preserves_external_authorization(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "misnamed.png"
+    outside.write_bytes(b"\xff\xd8\xffjpeg")
+    machine, _ = _mk_machine()
+    with pytest.raises(ValueError):
+        machine._read_file_preview(str(root), str(outside))
+
+
 def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch):
     source = tmp_path / "deck.pptx"
     source.write_bytes(b"office-source")

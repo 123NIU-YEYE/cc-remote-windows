@@ -26119,6 +26119,7 @@ class WrapperMachine:
                 allow_truncate=False,
                 allowed_external_paths=allowed_external_paths,
             )
+            media_type = cls._preview_content_type(media_type, data)
             cls._validate_rendered_preview(media_type, data)
             return {
                 "path": relative,
@@ -26140,6 +26141,23 @@ class WrapperMachine:
             "mtime_ns": mtime_ns,
             "revision": revision,
         }
+
+    @staticmethod
+    def _preview_content_type(media_type: str, data: bytes) -> str:
+        # A raster export may keep a .png filename for JPEG bytes. Only sniff
+        # supported raster signatures, never HTML/SVG/PDF or arbitrary bytes.
+        signatures = {
+            "image/png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg": data.startswith(b"\xff\xd8\xff"),
+            "image/gif": data.startswith((b"GIF87a", b"GIF89a")),
+            "image/webp": (len(data) >= 12 and data[:4] == b"RIFF"
+                           and data[8:12] == b"WEBP"),
+            "image/avif": (len(data) >= 12 and data[4:8] == b"ftyp"
+                           and data[8:12] in {b"avif", b"avis"}),
+        }
+        if media_type in signatures:
+            return next((kind for kind, valid in signatures.items() if valid), media_type)
+        return media_type
 
     @staticmethod
     def _validate_rendered_preview(media_type: str, data: bytes) -> None:
@@ -26558,6 +26576,7 @@ class WrapperMachine:
             allow_truncate=False,
             allowed_external_paths=allowed_external_paths,
         )
+        media_type = cls._preview_content_type(media_type, data)
         cls._validate_rendered_preview(media_type, data)
         return relative, media_type, data
 
