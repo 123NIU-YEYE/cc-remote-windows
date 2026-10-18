@@ -1,6 +1,7 @@
 import { appendFile, mkdir, readFile, writeFile, open } from "node:fs/promises";
 import { closeSync, openSync, writeFileSync } from "node:fs";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import net from "node:net";
 import { join } from "node:path";
 import { spawn, execFile } from "node:child_process";
 
@@ -161,8 +162,33 @@ function exitReason(child) {
   return `exit code ${String(child.exitCode)}${signal}${where}`;
 }
 
+// `kill()` only asks the process to exit; the kernel may hold the listening
+// socket for a moment afterwards. Respawning straight away lost the race and
+// the new proxy exited with EADDRINUSE, which the supervisor then retried --
+// another source of restart churn. Wait (bounded) for the port to go quiet.
+function portIsFree(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.once("listening", () => probe.close(() => resolve(true)));
+    probe.listen(port, "127.0.0.1");
+  });
+}
+
+async function waitForPortFree(port, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await portIsFree(port)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return false;
+}
+
 async function startProxy(host, token, credentialsText) {
   stopChild(proxyProcess);
+  if (!(await waitForPortFree(proxyPort))) {
+    await logThrottled("proxy-port-busy", `Port ${String(proxyPort)} is still held; starting the DSH proxy anyway.`);
+  }
   const cookie = upstreamCookie(host.port, credentialsText);
   proxyProcess = spawnDetached(node, [proxyScript], {
     DSH_PROXY_PORT: String(proxyPort), DSH_TARGET_PORT: String(host.port), DSH_UPSTREAM_COOKIE: cookie,
