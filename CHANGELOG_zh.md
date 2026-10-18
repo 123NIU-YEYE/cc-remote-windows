@@ -2,12 +2,16 @@
 
 [English](CHANGELOG.md)
 
-## 未发布
+## v4.0.21
 
-- 新增会话专属 Artifacts，保存上传附件副本，列表和预览分开展示。
-- 居中侧聊独立于文件预览，Cmd/Ctrl+Shift+E 仅控制侧聊。
-- Artifacts 改用日期分组、可见图片小缩略图、居中短胶囊按钮与左上角返回入口；移除菜单重复标题。
-- Wire protocol v76：Web、Relay 和 Wrapper 需要一同升级。
+新增会话专属 Artifacts，并在 Claude/Codex 切换时保留未完成的聊天状态。
+Wire protocol v76：Web、Relay 和 Wrapper 需要一同升级。详见[双语发布说明](docs/releases/v4.0.21.md)。
+
+- 使用紧凑日期分组整理上传附件与交付文件，列表、预览分开，缩略图按需加载。
+- 文件访问前校验冷会话的账号与 Code/Work 归属；限制附件持久存储容量，兼容多字节文件名。
+- Cmd/Ctrl+Shift+E 专用于居中侧聊；Cmd/Ctrl+1/2 切换引擎时保留询问、草稿和文件预览。
+- 手机询问弹窗居中，更新引擎图标、可点击重播的 Claude 完成动画和提示条样式。
+- 移除鸿蒙聊天中的原生专属控件；提供更新的未签名 preview.4 HAP，Android 外壳保持 preview.2。
 
 ## v4.0.20
 
