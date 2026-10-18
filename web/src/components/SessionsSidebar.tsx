@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent } from "react";
 import type { ClaudeProfileInfo, CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
 import type { CompletionBadgeKind } from "../completion-badges";
-import { Icon, ClaudeMark } from "../icons";
+import { Icon, EngineIcon } from "../icons";
 import {
   compareSessionsByActivity,
   orderCodeDirectoryGroups,
@@ -476,10 +476,10 @@ export function SessionsSidebar({ open, engine, space,
         {/* Keep the contents stable while the shell animates both surfaces. */}
         <div className="s-inner">
           <div className="s-head">
-            <div className="brand" onClick={onClose}>
-              <span className="brand-mark"><ClaudeMark size={17} /></span>
+            <button type="button" className="brand" onClick={onClose} aria-label="cc-remote，收起会话列表">
+              <span className="brand-mark"><EngineIcon engine={engine} size={20} /></span>
               <span className="name"><b>cc</b><span>·remote</span></span>
-            </div>
+            </button>
             <button className="iconbtn" onClick={onClose} aria-label="收起"><Icon name="chevrons-left" /></button>
           </div>
           <div className="space-switch" role="tablist" aria-label="切换工作空间">

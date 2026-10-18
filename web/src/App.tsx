@@ -37,6 +37,7 @@ import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
 import { ChatView, type ChatViewHandle } from "./components/ChatView";
+import type { QuestionDraft } from "./components/QuestionSheet";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
 import { SidebarToggle } from "./components/SidebarToggle";
@@ -378,7 +379,7 @@ export default function App() {
   const [expandedPanel, setExpandedPanel] = useState<{
     scope: string;
   } | null>(null);
-  const [centeredBtwScope, setCenteredBtwScope] = useState<string | null>(null);
+  const [centeredBtwScopes, setCenteredBtwScopes] = useState<string[]>([]);
   const btwChatViewRef = useRef<ChatViewHandle>(null);
   // A user action owns one focus request; restored panels and streaming updates
   // must not move the caret away from whatever the user is editing.
@@ -499,6 +500,7 @@ export default function App() {
   const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
   const composerDraftsRef = useRef(new ComposerDraftStore());
   const btwDraftsRef = useRef(new ComposerDraftStore());
+  const questionDraftsRef = useRef(new Map<string, QuestionDraft>());
   const [, bumpHistoryImageRevision] = useReducer((value: number) => value + 1, 0);
   const dismissBanner = useCallback((banner: string) => {
     dispatch({ type: "dismiss_banner", banner });
@@ -859,6 +861,8 @@ export default function App() {
     setBtwSendModeBySid({});
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
+    questionDraftsRef.current.clear();
+    setCenteredBtwScopes([]);
     setCompletionReceipts({});
     resetGoalDismissMigrationTracking(
       goalDismissMigrationsRef.current,
@@ -980,14 +984,17 @@ export default function App() {
       : visibleRightPanel === "files" ? fileBrowser?.id
       : visibleRightPanel === "agent" ? agentPanel?.runId : undefined) : null;
   const btwScope = panelScope("btw");
-  const btwExpanded = centeredBtwScope === btwScope;
+  // Keep each surface's presentation when navigating away; only an explicit
+  // open/close changes it. Returning must not request composer autofocus.
+  const setCenteredBtw = (visible: boolean) => setCenteredBtwScopes(
+    current => setBtwPanelScope(current, btwScope, visible));
+  const btwExpanded = !!btwPanelKey && centeredBtwScopes.includes(btwScope);
   const btwRendered = visibleRightPanel === "btw" || btwExpanded;
   const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
   useEffect(() => {
     setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
   }, [rightPanelKey]);
   useEffect(() => {
-    setCenteredBtwScope(current => current === btwScope ? current : null);
     setBtwFocusScope(current => current === btwScope ? current : null);
   }, [btwScope]);
   // Questions, hydration and completion receipts must agree with the rendered
@@ -2150,6 +2157,7 @@ export default function App() {
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
   const toggleEngine = (nextEngine: Engine) => {
+    if (nextEngine === engine || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
     const nextSpace = spacesByEngineRef.current[nextEngine];
     pendingCreateRef.current = null;
@@ -3398,7 +3406,8 @@ export default function App() {
               // not discard either side chat.
             }
             if (ownership) {
-              setCenteredBtwScope(current => rekeyPanelScope(current, msg.old_key, msg.session_id));
+              setCenteredBtwScopes(current => [...new Set(current.map(
+                scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
               setBtwFocusScope(current => rekeyPanelScope(current, msg.old_key, msg.session_id));
               setExpandedPanel(current => current ? { ...current,
                 scope: rekeyPanelScope(current.scope, msg.old_key, msg.session_id)! } : null);
@@ -3833,6 +3842,8 @@ export default function App() {
           setBtwOpeningByParentSid({});
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
+          questionDraftsRef.current.clear();
+          setCenteredBtwScopes([]);
           setForkingPointId(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
@@ -3880,6 +3891,8 @@ export default function App() {
           setCompletionReceipts(discardBtwCompletionReceipts);
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
+          questionDraftsRef.current.clear();
+          setCenteredBtwScopes([]);
           if (Object.keys(stateRef.current.btwByParentSid).length > 0
               || stateRef.current.btwRevision > 0
               || pendingBtwByParentRef.current.size > 0
@@ -5294,7 +5307,7 @@ export default function App() {
   ): boolean => {
     if (!targetSid) return false;
     if (!confirmArtifactDiscard()) return false;
-    if (targetSid === activeBtwSid) setCenteredBtwScope(null);
+    if (targetSid === activeBtwSid) setCenteredBtw(false);
     if (!fromBrowser) { setFileBrowser(null); setSessionArtifacts(null); }
     closeViewer();
     const requestId = uuid();
@@ -5347,7 +5360,7 @@ export default function App() {
   const openSessionArtifacts = (sid = visibleParentSid) => {
     if (!sid || !visibleParentSid || !confirmArtifactDiscard()) return;
     closeViewer();
-    setCenteredBtwScope(null);
+    setCenteredBtw(false);
     setAgentPanel(null);
     setFileBrowser(null);
     dispatch({ type: "clear_artifact" });
@@ -5447,13 +5460,13 @@ export default function App() {
   const showCenteredBtw = () => {
     if (!btwPanelKey) return;
     btwChatViewRef.current?.prepareLayoutChange();
-    setCenteredBtwScope(btwScope);
+    setCenteredBtw(true);
     setBtwFocusScope(btwScope);
     if (!activeBtwGroup && !btwOpening) createBtw();
   };
   const dismissCenteredBtw = () => {
     btwChatViewRef.current?.prepareLayoutChange();
-    setCenteredBtwScope(null);
+    setCenteredBtw(false);
   };
   const toggleCenteredBtw = () => {
     if (btwExpanded) dismissCenteredBtw();
@@ -5462,7 +5475,7 @@ export default function App() {
   const openBtw = (expanded = false) => {
     if (expanded) { showCenteredBtw(); return; }
     if (!btwPanelKey || !confirmArtifactDiscard()) return;
-    setCenteredBtwScope(null);
+    setCenteredBtw(false);
     setSessionArtifacts(null);
     closeViewer();
     setAgentPanel(null);
@@ -5638,6 +5651,8 @@ export default function App() {
       historyPageScopesRef.current.clear();
       composerDraftsRef.current.clear();
       btwDraftsRef.current.clear();
+      questionDraftsRef.current.clear();
+      setCenteredBtwScopes([]);
       setBtwSendModeBySid({});
       setCreateError(null);
       setForkingPointId(null);
@@ -6372,6 +6387,7 @@ export default function App() {
             catalog={focusedCatalog}
             onRequestModels={requestFocusedModels}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
+            questionDrafts={questionDraftsRef.current}
             sendMode={activeBtwSendMode}
             unconfirmedQueued={unconfirmedQueued}
             unconfirmedReplaceable={btwUnconfirmedReplaceable}
@@ -6424,14 +6440,15 @@ export default function App() {
             onLoadImage={loadBtwMessageImage}
             onAuthorizeImage={authorizeMessageImage}
             onAnswerQuestion={(askId, answer) => {
-              if (!activeBtwSid) return;
+              if (!activeBtwSid) return false;
               if (!wsRef.current?.sendAnswerQuestion(
-                activeBtwSid, askId, answer)) return;
+                activeBtwSid, askId, answer)) return false;
               dispatch({
                 type: "answer_question",
                 sid: activeBtwSid,
                 ask_id: askId,
               });
+              return true;
             }}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
@@ -6452,7 +6469,9 @@ export default function App() {
         <Suspense fallback={<div className="scrim show" role="dialog"
           aria-label="正在加载操作确认" aria-busy="true" />}>
         <QuestionSheet
-          key={rt.pendingQuestion.ask_id}
+          key={JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id])}
+          draft={{ key: JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id]),
+            store: questionDraftsRef.current }}
           engine={focusedEngine}
           header={rt.pendingQuestion.header}
           question={rt.pendingQuestion.question}
@@ -6462,14 +6481,15 @@ export default function App() {
           multiSelect={rt.pendingQuestion.multi_select}
           onAnswer={(answer) => {
             const question = rt.pendingQuestion;
-            if (!focusedSid || !question) return;
+            if (!focusedSid || !question) return false;
             if (!wsRef.current?.sendAnswerQuestion(
-              focusedSid, question.ask_id, answer)) return;
+              focusedSid, question.ask_id, answer)) return false;
             dispatch({
               type: "answer_question",
               sid: focusedSid,
               ask_id: question.ask_id,
             });
+            return true;
           }}
         />
         </Suspense>

@@ -3,12 +3,41 @@
 import { useEffect, useState } from "react";
 import type { Engine } from "./protocol";
 import engineMarks from "./assets/engine-marks.svg?no-inline";
+import claudeWorkingFrames from "./assets/claude-working.svg?no-inline";
 
 export function EngineIcon({ engine, size = 16 }: { engine: Engine; size?: number }) {
   return <svg viewBox="0 0 24 24" width={size} height={size}
     className={`engine-brand-icon ${engine}`} aria-hidden="true" focusable="false">
     <use href={`${engineMarks}#${engine}`} />
   </svg>;
+}
+
+// Claude uses its brand mark; keep Codex's existing spark animation unchanged.
+export function EngineWorking({ engine, size = 22 }: { engine: Engine; size?: number }) {
+  return engine === "claude"
+    ? <span className="claude-working-mark" style={{ width: size, height: size }} aria-hidden="true">
+        <img src={claudeWorkingFrames} width={size * 9} height={size} alt="" draggable={false} />
+      </span>
+    : <ClaudeWorking size={size} />;
+}
+
+export function EngineDone({ engine, size = 22, label }: {
+  engine: Engine; size?: number; label?: string;
+}) {
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    if (!playing) return;
+    const timer = window.setTimeout(() => setPlaying(false), 810);
+    return () => window.clearTimeout(timer);
+  }, [playing]);
+  return engine === "claude"
+    ? <button type="button" className="engine-done-mark spark-btn" aria-label={label ?? "Claude 已完成"}
+        title="重播完成动画" onClick={() => {
+          if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) setPlaying(true);
+        }}>
+        {playing ? <EngineWorking engine={engine} size={size} /> : <EngineIcon engine={engine} size={size} />}
+      </button>
+    : <ClaudeSpark size={size} label={label ?? "Codex"} />;
 }
 
 const PATHS: Record<string, string> = {
