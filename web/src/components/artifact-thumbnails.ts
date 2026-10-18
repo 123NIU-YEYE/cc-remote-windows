@@ -28,11 +28,15 @@ export function useArtifactThumbnails(root: RefObject<HTMLDivElement | null>, en
         if (cache.current.has(id) || attempted.has(id)) continue;
         attempted.add(id);
         const requestId = uuid();
-        if (!ws.sendGetSessionArtifactPreview(sid, engine, space, id, requestId, "thumbnail")) continue;
         pending.set(requestId, { id, timer: setTimeout(() => {
           pending.delete(requestId);
+          attempted.delete(id);
+          // Let other visible rows advance before retrying this one.
+          if (visible.delete(id)) visible.add(id);
           pump();
         }, 30_000) });
+        // A temporarily disconnected socket uses the same bounded retry delay.
+        ws.sendGetSessionArtifactPreview(sid, engine, space, id, requestId, "thumbnail");
       }
     };
     receiver.current = message => {

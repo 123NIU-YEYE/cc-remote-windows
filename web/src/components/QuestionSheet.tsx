@@ -1,9 +1,12 @@
-import { useState } from "react";
-import type { AskOption } from "../protocol";
-import { Icon } from "../icons";
+import { useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import type { AskOption, Engine } from "../protocol";
+import { EngineIcon } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
+import "./QuestionSheet.css";
 
 interface Props {
+  engine: Engine;
   question: string;
   header?: string | null;
   options: AskOption[];
@@ -14,8 +17,12 @@ interface Props {
 }
 
 export function QuestionSheet({
-  question, header, options, allowText, secret, multiSelect, onAnswer,
+  engine, question, header, options, allowText, secret, multiSelect, onAnswer,
 }: Props) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const headingRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const focusTextOnOpen = useRef(allowText && options.length === 0);
   const [text, setText] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const imeSubmit = useImeSubmit<HTMLInputElement>((value) => {
@@ -27,16 +34,44 @@ export function QuestionSheet({
       ? current.filter((value) => value !== label)
       : [...current, label]);
   };
-  return (
-    <>
-      <div className="scrim show" />
-      <div className="sheet show" role="dialog" aria-label="操作确认">
-        <div className="sheet-grip" />
-        <div className="sheet-title">
-          <span className="qa-ic"><Icon name="spark" size={15} /></span>
-          {header || "助手想确认一下"}
+  useLayoutEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    dialog.showModal();
+    // Keep the original text-only autofocus; choice questions open without a keyboard.
+    const target = focusTextOnOpen.current ? imeSubmit.inputRef.current : headingRef.current;
+    target?.focus({ preventScroll: true });
+    return () => { dialog.close(); };
+  }, [imeSubmit.inputRef]);
+  useLayoutEffect(() => {
+    const body = scrollRef.current;
+    if (!body) return;
+    const observer = new ResizeObserver(() => {
+      const input = imeSubmit.inputRef.current;
+      if (!input || document.activeElement !== input) return;
+      const viewport = body.getBoundingClientRect();
+      const editor = input.getBoundingClientRect();
+      if (editor.height > viewport.height) return;
+      const margin = Math.min(4, (viewport.height - editor.height) / 2);
+      if (editor.bottom > viewport.bottom - margin) {
+        body.scrollTop += Math.ceil(editor.bottom - viewport.bottom + margin);
+      } else if (editor.top < viewport.top + margin) {
+        body.scrollTop -= Math.ceil(viewport.top - editor.top + margin);
+      }
+    });
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [imeSubmit.inputRef]);
+  const content = (
+      <dialog ref={dialogRef} className="question-dialog" aria-label="操作确认" aria-modal="true"
+        onCancel={(event) => event.preventDefault()}
+        onKeyDown={(event) => event.stopPropagation()} data-lock-horizontal-swipe>
+        <div ref={headingRef} tabIndex={-1} className="question-dialog-title">
+          <EngineIcon engine={engine} size={26} />
+          <span>{engine === "claude" ? "Claude" : "Codex"} 想确认一下</span>
         </div>
-        <div className="sheet-scroll">
+        <div ref={scrollRef} className="sheet-scroll">
+          {header && <div className="qa-header">{header}</div>}
           <div className="qa-question">{question}</div>
           <div className="qa-options">
             {options.map((o, i) => (
@@ -77,7 +112,7 @@ export function QuestionSheet({
               onClick={imeSubmit.requestSubmit}>确定</button>
           </div>}
         </div>
-      </div>
-    </>
+      </dialog>
   );
+  return typeof document === "undefined" ? content : createPortal(content, document.body);
 }

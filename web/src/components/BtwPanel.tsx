@@ -747,6 +747,7 @@ export function BtwPanel(p: Props) {
       {!inputLocked && p.rt?.pendingQuestion && (
         <QuestionSheet
           key={p.rt.pendingQuestion.ask_id}
+          engine={p.engine}
           header={p.rt.pendingQuestion.header}
           question={p.rt.pendingQuestion.question}
           options={p.rt.pendingQuestion.options}

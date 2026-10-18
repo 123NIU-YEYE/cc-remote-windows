@@ -5889,7 +5889,10 @@ export default function App() {
           /></Suspense>
         </header>
 
-        {versionNotice && <div className="notice-bar attention" role="status">{versionNotice}</div>}
+        {versionNotice && <div className="notice-bar attention version-notice" role="status">
+          <span className="notice-icon" aria-hidden="true"><Icon name="info" size={16} /></span>
+          <span className="notice-copy">{versionNotice}</span>
+        </div>}
         <ReconnectBanner banner={state.banner}
           replaying={rt.replaying || historyView.recovering}
           truncated={rt.truncated}
@@ -6450,6 +6453,7 @@ export default function App() {
           aria-label="正在加载操作确认" aria-busy="true" />}>
         <QuestionSheet
           key={rt.pendingQuestion.ask_id}
+          engine={focusedEngine}
           header={rt.pendingQuestion.header}
           question={rt.pendingQuestion.question}
           options={rt.pendingQuestion.options}

@@ -8,6 +8,8 @@ import { ChatView } from "../src/components/ChatView";
 import { Composer } from "../src/components/Composer";
 import { HeaderMenu } from "../src/components/HeaderMenu";
 import { EngineSelector } from "../src/components/EngineSelector";
+import { ReconnectBanner } from "../src/components/ReconnectBanner";
+import { NoticeStack } from "../src/components/NoticeStack";
 import BackgroundTaskControl from "../src/components/BackgroundTaskControl";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { Icon } from "../src/icons";
@@ -54,6 +56,7 @@ export function ThemePreview() {
   const [active, setActive] = useState("preview");
   const [space, setSpace] = useState<"code" | "work">("code");
   const [sendMode, setSendMode] = useState<"steer" | "queue">("steer");
+  const [showNotice, setShowNotice] = useState(params.has("notices"));
   const drafts = useRef(new ComposerDraftStore());
   const runtime = useMemo(() => demoState(engine), [engine]);
   useEffect(() => {
@@ -97,6 +100,13 @@ export function ThemePreview() {
           notificationMode="off" notificationBinding="off" notificationAvailable={false}
           onNotificationMode={async () => false} onOpenUsageActivity={noop} onLogout={noop} />
       </header>
+      {showNotice && <ReconnectBanner banner="通知权限未开启，设置没有更改。"
+        replaying={false} truncated={false} busy={false} onDismiss={() => setShowNotice(false)} />}
+      {params.has("notices") && <NoticeStack notices={[{
+        v: PROTOCOL_VERSION, type: "notice", ts: 1, notice_id: "checkpoint-preview-warning", severity: "warning",
+        category: "runtime", title: "本轮仅支持对话回滚",
+        message: "本轮文件状态无法安全记录；对话仍可正常回滚。",
+      }]} onDismiss={noop} />}
       <ChatView sid="preview" turns={runtime.turns} engine={engine} historyScopeKey={engine} />
       <Composer draftKey={engine} draftStore={drafts.current} state="idle"
         backgroundTasks={<BackgroundTaskControl processes={runtime.backgroundProcesses} />}

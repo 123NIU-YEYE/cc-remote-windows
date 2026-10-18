@@ -47,10 +47,12 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // or an extra initial request; retain the entry/file-count caps.
 // Session Artifacts entry/routing and an independent centered-chat layer add
 // <3 KiB; catalog, preview UI and styles load on demand. Gzip/request caps stay fixed.
-const MAX_INITIAL_BYTES = 949 * 1024;
+// Brand symbols are external SVG, not an icon-library dependency. Status-card
+// markup adds <1 KiB JS / 0.3 KiB gzip; retain entry and initial request caps.
+const MAX_INITIAL_BYTES = 950 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
-const MAX_INITIAL_GZIP_BYTES = 285 * 1024;
+const MAX_INITIAL_GZIP_BYTES = 286 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");

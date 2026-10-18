@@ -43,6 +43,7 @@ export default function SessionArtifactsPanel({ sid, engine, space, ws, revision
   const [more, setMore] = useState(false);
   const [history, setHistory] = useState<{ before: string | null; more: boolean }>({ before: null, more: true });
   const pending = useRef<{ id: string; scan: boolean; append: boolean } | null>(null);
+  const refreshPending = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const firstScan = useRef(false);
   const paged = useRef(false);
@@ -53,7 +54,12 @@ export default function SessionArtifactsPanel({ sid, engine, space, ws, revision
   const receiveThumbnail = thumbnails.receive;
 
   const request = useCallback((before: number | null = null, scan = false, historyBefore: string | null = null) => {
-    if (pending.current) return;
+    if (pending.current) {
+      // Turn completions may arrive while an older page is still loading.
+      // Coalesce head refreshes without replacing that page or its cursor.
+      if (before === null && !scan) refreshPending.current = true;
+      return;
+    }
     lastRequest.current = [before, scan, historyBefore];
     const id = uuid();
     setError("");
@@ -98,10 +104,17 @@ export default function SessionArtifactsPanel({ sid, engine, space, ws, revision
       onListen(null);
       if (timer.current) clearTimeout(timer.current);
       pending.current = null;
+      refreshPending.current = false;
     };
   }, [onListen, request, sid, receiveThumbnail]);
 
   useEffect(() => { request(); }, [request, revision]);
+  useEffect(() => {
+    if (!busy && !pending.current && refreshPending.current) {
+      refreshPending.current = false;
+      request();
+    }
+  }, [busy, request]);
   return <PanelFrame className="session-artifacts-panel" label="Artifacts">
     <PanelResizer ariaLabel="调整 Artifacts 面板宽度" />
     <div className="session-artifacts-list" hidden={hasPreview}>
