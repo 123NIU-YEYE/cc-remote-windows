@@ -13,7 +13,9 @@ from cc_remote.protocol import (
     GetHistoryImage, ProcessEvent, SessionArtifactInfo, SessionArtifacts, TurnEnd, TurnSteered, UserMsg,
 )
 from cc_remote.viewer_pages import PageScope
-from cc_remote.wrapper.session_artifacts import SessionArtifactStore, image_thumbnail, public_entry
+from cc_remote.wrapper.session_artifacts import (
+    ArtifactStorageFull, SessionArtifactStore, image_thumbnail, public_entry,
+)
 
 log = logger("cc_remote.wrapper.artifacts")
 
@@ -39,6 +41,8 @@ class ArtifactService:
     async def uploads(self, ctx, msg_id, files=None, images=None):
         try:
             await asyncio.to_thread(self.store.uploads, self.context_scope(ctx), msg_id, files, images)
+        except ArtifactStorageFull as exc:
+            log.warning("artifact upload copy skipped: storage limit", reason=str(exc))
         except Exception as exc:
             log.warning("artifact upload copy unavailable", error_type=type(exc).__name__)
 

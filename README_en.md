@@ -119,6 +119,12 @@ side chats have their own Artifacts entry. Opening a file replaces the list with
 its preview; Back returns to the list. New uploads have durable private copies,
 while delivered files reference their original paths. Older sessions are indexed
 one history page at a time; previously deleted temporary uploads cannot be recovered.
+Private attachment copies are capped at 256 MiB / 512 files per session and
+2 GiB / 4096 files per Wrapper state directory, with 256 MiB of disk space reserved.
+At a limit, new copies are skipped and logged; existing attachments are preserved
+and sending continues. Later previews depend on files still available in native history.
+Deleting a session releases its copies; archiving does not. Delivered originals
+are never counted against these limits or deleted by this cleanup.
 The existing session file browser continues to browse directories independently.
 
 **⌘/Ctrl+Shift+K** opens or collapses side chat. **⌘/Ctrl+Shift+E** only toggles
