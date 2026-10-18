@@ -58,7 +58,7 @@ import {
   type AutoCompactSelection,
 } from "../auto-compact";
 import { AutoCompactControl } from "./AutoCompactControl";
-import { QuestionSheet } from "./QuestionSheet";
+import { QuestionSheet, type QuestionDraft } from "./QuestionSheet";
 import { sessionControlLocksInput } from "../protocol";
 import type { QueryImg, QueryFile } from "../protocol";
 import { AttachmentPicker } from "./AttachmentPicker";
@@ -95,6 +95,7 @@ interface Props {
   catalog: Catalog;
   draftKey: string;
   draftStore: ComposerDraftStore;
+  questionDrafts?: Map<string, QuestionDraft>;
   sendMode: SendMode;
   unconfirmedQueued: PendingQuery[];
   unconfirmedReplaceable: PendingQuery[];
@@ -125,7 +126,7 @@ interface Props {
     authorization: PreviewAuthorizationState,
     decision: "allow" | "deny",
   ) => boolean;
-  onAnswerQuestion: (askId: string, answer: string | string[]) => void;
+  onAnswerQuestion: (askId: string, answer: string | string[]) => boolean | void;
   onCollapse: () => void;
   onDismissNotice: (noticeId: string) => void;
 }
@@ -746,7 +747,11 @@ export function BtwPanel(p: Props) {
       </>}
       {!inputLocked && p.rt?.pendingQuestion && (
         <QuestionSheet
-          key={p.rt.pendingQuestion.ask_id}
+          key={JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id])}
+          draft={p.questionDrafts && p.sid ? {
+            key: JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id]),
+            store: p.questionDrafts,
+          } : undefined}
           engine={p.engine}
           header={p.rt.pendingQuestion.header}
           question={p.rt.pendingQuestion.question}
@@ -756,7 +761,7 @@ export function BtwPanel(p: Props) {
           multiSelect={p.rt.pendingQuestion.multi_select}
           onAnswer={(answer) => {
             const question = p.rt?.pendingQuestion;
-            if (question) p.onAnswerQuestion(question.ask_id, answer);
+            return question ? p.onAnswerQuestion(question.ask_id, answer) : false;
           }}
         />
       )}

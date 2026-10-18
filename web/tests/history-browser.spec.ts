@@ -365,6 +365,8 @@ test("side chat scope restores long Claude history atomically at the bottom with
     await expect.poll(() => thread.evaluate(el =>
       el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(3);
     await expect(panel.locator(".turn-done-mark")).toBeVisible();
+    await expect(panel.locator(".turn-done-mark .engine-brand-icon.claude use")).toHaveAttribute("href", /#claude$/);
+    await expect(panel.getByRole("button", { name: "Claude 已完成", exact: true })).toBeVisible();
   }
   expect(relay.commands.some(c => ["query", "steer", "open_btw"].includes(String(c.type)))).toBe(false);
 });
@@ -1085,6 +1087,140 @@ test("session workspace Claude harness switch keeps history during a deferred pr
   await expect(page.getByText("当前操作暂时无法执行，请稍后重试。", { exact: true })).toHaveCount(0);
   expect(relay.commands.some(c => ["query", "steer", "interrupt", "new_session"].includes(String(c.type)))).toBe(false);
 });
+
+function otherHarnessList(command: Record<string, unknown>): PanelRelayEvent | undefined {
+  if (command.engine !== "codex") return;
+  return { type: "session_list", engine: "codex", space: "code",
+    request_id: String(command.cmd_id), sessions: [{
+      session_id: "codex-parent", engine: "codex", space: "code",
+      summary: "Codex parent", cwd: "/tmp/codex", state: "idle",
+    }] };
+}
+
+test("session workspace harness shortcuts preserve centered side chat and composer drafts", async ({ page }) => {
+  await page.setViewportSize({ width: 1568, height: 900 });
+  const relay = await mockRightPanelRelay(page, { engine: "claude", listReply: otherHarnessList,
+    seedTurns: [{ id: "done", prompt: "已完成的任务", done: true,
+      blocks: [{ kind: "text", message_id: "final", text: "已完成", done: true }] }],
+  });
+  await page.goto("/");
+  const selector = page.getByRole("button", { name: "切换新会话引擎" });
+  await expect(page.locator(".turn-done-mark .engine-brand-icon.claude")).toBeVisible();
+  const completedMark = page.locator(".turn-done-mark .engine-done-mark");
+  await completedMark.click();
+  await expect(completedMark.locator(".claude-working-mark")).toBeVisible();
+  await expect(completedMark.locator(".engine-brand-icon.claude")).toBeVisible();
+  await completedMark.focus();
+  await page.keyboard.press("Enter");
+  await expect(completedMark.locator(".claude-working-mark")).toBeVisible();
+  await expect(completedMark.locator(".engine-brand-icon.claude")).toBeVisible();
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await completedMark.click();
+  await expect(completedMark.locator(".engine-brand-icon.claude")).toBeVisible();
+  await expect(completedMark.locator(".claude-working-mark")).toHaveCount(0);
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.keyboard.press("Meta+Shift+e");
+  const panel = page.locator(".btw-panel");
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await panel.locator("textarea").fill("Claude 侧聊草稿");
+  await page.keyboard.press("Meta+2");
+  await expect(selector).toContainText("Codex");
+  await expect(panel).toHaveCount(0);
+  await expect(page.locator(".turn-done-mark .spark-btn")).toBeVisible();
+  await page.locator("textarea[data-chat-composer]").fill("Codex 主聊草稿");
+  await page.keyboard.press("Control+1");
+  await expect(selector).toContainText("Claude");
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await expect(panel.locator("textarea")).toHaveValue("Claude 侧聊草稿");
+  await expect(panel.locator("textarea")).not.toBeFocused();
+  // Shortcut navigation also owns a pointer-opened harness menu.
+  await page.keyboard.press("Meta+2");
+  await expect(page.locator("textarea[data-chat-composer]")).toHaveValue("Codex 主聊草稿");
+  await selector.click();
+  await page.keyboard.press("Meta+1");
+  await expect(page.getByRole("menu", { name: "会话引擎" })).toHaveCount(0);
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await page.keyboard.press("Meta+Shift+e");
+  await expect(panel).toHaveCount(0);
+  await page.keyboard.press("Meta+2");
+  await expect(selector).toContainText("Codex");
+  await page.keyboard.press("Meta+1");
+  await expect(selector).toContainText("Claude");
+  await expect(panel).toHaveCount(0);
+  relay.emit({ type: "btw_sync", generation: "layout-generation", revision: 2, sessions: [
+    { btw_sid: "btw-layout-child", parent_sid: "layout-parent", engine: "claude", created_at: 1, state: "running" },
+    { btw_sid: "codex-child", parent_sid: "codex-parent", engine: "codex", created_at: 2, state: "idle" },
+  ] });
+  await page.keyboard.press("Meta+Shift+e");
+  await expect(panel.locator("textarea")).toHaveValue("Claude 侧聊草稿");
+  await page.keyboard.press("Meta+2");
+  await expect(selector).toContainText("Codex");
+  await page.keyboard.press("Meta+Shift+e");
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await panel.locator("textarea").fill("Codex 独立侧聊草稿");
+  await page.keyboard.press("Meta+1");
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await expect(panel.locator("textarea")).toHaveValue("Claude 侧聊草稿");
+  await page.keyboard.press("Meta+2");
+  await expect(panel).toHaveAttribute("aria-modal", "true");
+  await expect(panel.locator("textarea")).toHaveValue("Codex 独立侧聊草稿");
+  expect(relay.commands.some(c => ["query", "steer", "interrupt", "open_btw", "close_btw", "answer_question"].includes(String(c.type)))).toBe(false);
+});
+
+for (const sideChat of [false, true]) {
+  test(`session workspace harness shortcuts preserve ${sideChat ? "side" : "main"} question drafts and routing`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 900 });
+    const relay = await mockRightPanelRelay(page, { engine: "claude", parentState: "running", listReply: otherHarnessList });
+    await page.goto("/");
+    await expect(page.locator("textarea[data-chat-composer]")).toBeEnabled();
+    if (sideChat) {
+      await page.keyboard.press("Meta+Shift+e");
+      await expect(page.locator(".btw-panel")).toHaveAttribute("aria-modal", "true");
+    }
+    const sid = sideChat ? "btw-layout-child" : "layout-parent";
+    relay.emit({ type: "ask_user", sid, seq: 1, ask_id: "shared-ask-id",
+      question: "Claude 的待确认问题\n\n".repeat(60),
+      options: [{ label: "保留选择" }, { label: "第二选项" }], allow_text: true, multi_select: true });
+    const dialog = page.getByRole("dialog", { name: "操作确认" });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: "保留选择", exact: true }).click();
+    await dialog.getByPlaceholder("输入回答").fill("Claude 未提交的回答");
+    const scroll = await dialog.locator(".sheet-scroll").evaluate(node => node.scrollTop);
+    await page.keyboard.press("Meta+2");
+    const selector = page.getByRole("button", { name: "切换新会话引擎" });
+    await expect(selector).toContainText("Codex");
+    await expect(dialog).toHaveCount(0);
+    await expect(page.getByText("session codex-pa", { exact: true })).toBeVisible();
+    // The same provider-local ask ID must not transfer answers across sessions.
+    relay.emit({ type: "ask_user", sid: "codex-parent", seq: 1, ask_id: "shared-ask-id",
+      question: "Codex 的问题", options: [], allow_text: true });
+    await expect(dialog.getByPlaceholder("输入回答")).toHaveValue("");
+    await dialog.getByPlaceholder("输入回答").fill("Codex 未提交的回答");
+    await page.keyboard.press("Control+1");
+    await expect(selector).toContainText("Claude");
+    await expect(dialog.getByPlaceholder("输入回答")).toHaveValue("Claude 未提交的回答");
+    await expect(dialog.getByRole("button", { name: "保留选择", exact: true })).toHaveAttribute("aria-pressed", "true");
+    await expect.poll(() => dialog.locator(".sheet-scroll").evaluate(node => node.scrollTop)).toBeCloseTo(scroll, 0);
+    if (sideChat) await expect(page.locator(".btw-panel")).toHaveAttribute("aria-modal", "true");
+    expect(relay.commands.some(c => ["query", "steer", "interrupt", "open_btw", "close_btw", "answer_question"].includes(String(c.type)))).toBe(false);
+    await dialog.locator(".qa-text-answer").getByRole("button", { name: "确定", exact: true }).click();
+    await expect(dialog).toHaveCount(0);
+    await expect.poll(() => relay.commands.filter(c => c.type === "answer_question")
+      .map(({ sid, ask_id, answer }) => ({ sid, ask_id, answer }))).toEqual([
+      { sid, ask_id: "shared-ask-id", answer: ["保留选择", "Claude 未提交的回答"] },
+    ]);
+    await page.keyboard.press("Meta+2");
+    await expect(dialog.getByPlaceholder("输入回答")).toHaveValue("Codex 未提交的回答");
+    await page.keyboard.press("Meta+1");
+    await expect(selector).toContainText("Claude");
+    await expect(dialog).toHaveCount(0);
+    // Closing a question in the background must not resurrect its saved draft.
+    relay.emit({ type: "ask_user_closed", sid: "codex-parent", seq: 2, ask_id: "shared-ask-id" });
+    await page.keyboard.press("Meta+2");
+    await expect(selector).toContainText("Codex");
+    await expect(dialog).toHaveCount(0);
+  });
+}
 
 test("session workspace Claude context refreshes while running and keeps its last reading silently", async ({ page }) => {
   const relay = await mockRightPanelRelay(page, {

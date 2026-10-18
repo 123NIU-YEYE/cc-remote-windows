@@ -555,13 +555,21 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .thinking span{ width:4px; height:4px; border-radius:50%; background:var(--dim); animation:think 1.2s infinite ease-in-out; }
 .thinking span:nth-child(2){ animation-delay:.18s; }
 .thinking span:nth-child(3){ animation-delay:.36s; }
-/* the "working" indicator lives BELOW the streamed text (so it stays visible as
-   the reply grows). The mark itself is animated — a loop of morphing sparks. */
+/* The working indicator stays below streamed text. Animate the engine mark
+   without changing the row's layout. */
 .turn-working{ display:inline-flex; align-items:center; gap:7px; margin:8px 0 2px; color:var(--accent-text,var(--accent)); }
 .turn-working svg{ display:block; }
+.claude-working-mark{ display:inline-block; flex:none; overflow:hidden; }
+.claude-working-mark>img{ display:block; max-width:none; animation:claude-working-frames .81s steps(9,end) infinite; }
+@keyframes claude-working-frames{ to{ transform:translateX(-100%); } }
+@media (prefers-reduced-motion:reduce){
+  .claude-working-mark>img{ animation:none; transform:translateX(-33.333333%); }
+}
 .turn-working .turn-working-tx{ font-weight:var(--font-weight-600); color:var(--accent-ink); font-size:12.5px; }
-/* the spark kept under a finished reply (below the time/copy row); click to replay */
+/* Completed replies stay static; clicking replays one engine animation. */
 .turn-done-mark{ margin-top:2px; }
+.engine-done-mark{ display:inline-flex; padding:3px; color:var(--accent-text,var(--accent)); }
+.engine-done-mark .claude-working-mark>img{ animation-iteration-count:1; }
 .spark-btn{ display:inline-grid; place-items:center; padding:3px; border-radius:9px; color:var(--accent-text,var(--accent)); transition:.14s; }
 /* no hover box — the click plays the animation; just a subtle grow for affordance */
 .spark-btn:hover{ transform:scale(1.12); }
@@ -1784,7 +1792,8 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .codex-profile-filter button.active{ color:var(--accent-ink); border-color:var(--accent-line);
   background:var(--accent-weak); }
 .profile-tone{ width:7px; height:7px; border-radius:50%; flex:none; background:var(--profile-color); }
-.brand{ display:flex; align-items:center; gap:10px; margin-right:auto; cursor:pointer; }
+.brand{ display:flex; align-items:center; gap:10px; margin-right:auto; padding:0; text-align:left;
+  user-select:none; -webkit-user-select:none; }
 .brand .dot{ width:11px; height:11px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 4px var(--accent-weak); flex:none; }
 .brand-mark{ color:var(--accent-text,var(--accent)); display:grid; place-items:center; flex:none; }
 .brand .name{ font-family:var(--serif); font-size:21px; letter-spacing:-.01em; }

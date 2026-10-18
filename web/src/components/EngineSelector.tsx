@@ -1,6 +1,6 @@
-import { lazy, Suspense, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import type { Engine } from "../protocol";
-import { EngineIcon, Icon } from "../icons";
+import { EngineIcon } from "../icons";
 
 const EngineMenu = lazy(() => import("./EngineMenu"));
 
@@ -10,6 +10,22 @@ export function EngineSelector({ engine, onChange }: {
 }) {
   const button = useRef<HTMLButtonElement>(null);
   const [menu, setMenu] = useState<boolean | null>(null);
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229 || event.repeat
+          || !(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey
+          || (event.key !== "1" && event.key !== "2")) return;
+      // Harness navigation belongs to the app, even inside a modal or editor.
+      // Capture before their key handlers; never submit or dismiss their work.
+      event.preventDefault();
+      event.stopPropagation();
+      setMenu(null);
+      const next = event.key === "1" ? "claude" : "codex";
+      if (next !== engine) onChange(next);
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [engine, onChange]);
   const close = (restoreFocus: boolean) => {
     setMenu(null);
     if (restoreFocus) button.current?.focus();
@@ -29,7 +45,6 @@ export function EngineSelector({ engine, onChange }: {
       }}>
       <span className="engine-label"><EngineIcon engine={engine} />
         {engine === "codex" ? "Codex" : "Claude"}</span>
-      <Icon name="chev" size={12} />
     </button>
     {menu !== null && <Suspense fallback={null}><EngineMenu engine={engine} anchor={button}
       keyboard={menu} onClose={close} onSelect={(next, keyboard) => {
