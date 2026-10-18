@@ -23,6 +23,7 @@ interface Props {
   onOpenUsageActivity: () => void;
   onOpenBtw?: () => void;
   onOpenViewer?: () => void;
+  onOpenArtifacts?: () => void;
   onOpenFiles?: () => void;
   onSelectTheme: (choice: ThemeChoice) => void;
   onLogout: () => void;
@@ -55,6 +56,7 @@ export function HeaderMenu({
   onOpenBtw,
   onOpenViewer,
   onOpenFiles,
+  onOpenArtifacts,
   onSelectTheme,
   onLogout,
 }: Props) {
@@ -163,73 +165,74 @@ export function HeaderMenu({
             role="dialog" aria-modal="true" aria-label="应用设置" tabIndex={-1}
             onPointerDown={(event) => event.stopPropagation()}>
             {page === "main" ? (
-              <>
-                <header className="header-menu-title">
-                  <b>设置</b>
-                </header>
-                <div className="header-menu-items">
-                  {onOpenBtw && <button ref={firstRef} type="button"
-                    className="header-menu-item" aria-label="打开侧边聊天" onClick={() => {
-                      close();
-                      onOpenBtw();
-                    }}>
-                    <SideChatIcon size={18} />
-                    <span><b>侧边聊天</b><small>基于当前会话，独立提问</small></span>
-                    <Icon name="chevron-right" size={16} />
-                  </button>}
-                  {onOpenViewer && <button ref={onOpenBtw ? undefined : firstRef} type="button" className="header-menu-item" onClick={() => {
+              <div className="header-menu-items">
+                {onOpenBtw && <button ref={firstRef} type="button"
+                  className="header-menu-item" aria-label="打开侧边聊天" onClick={() => {
                     close();
-                    onOpenViewer();
+                    onOpenBtw();
                   }}>
-                    <Icon name="globe" size={18} />
-                    <span><b>远程预览</b><small>打开设备上的交互页面</small></span>
-                    <Icon name="chevron-right" size={16} />
-                  </button>}
-                  {onOpenFiles && <button ref={onOpenBtw || onOpenViewer ? undefined : firstRef} type="button"
-                    className="header-menu-item" aria-label="打开会话文件" onClick={() => {
-                      close();
-                      onOpenFiles();
-                    }}>
-                    <Icon name="folder-open" size={18} />
-                    <span><b>会话文件</b><small>浏览目录并预览文件</small></span>
-                    <Icon name="chevron-right" size={16} />
-                  </button>}
-                  {engine === "codex" && <button ref={onOpenBtw || onOpenViewer || onOpenFiles ? undefined : firstRef} type="button"
-                    className="header-menu-item" onClick={() => {
-                      close();
-                      onOpenUsageActivity();
-                    }}>
-                    <Icon name="calendar" size={18} />
-                    <span><b>使用活动</b><small>每日 Token、峰值与连续使用记录</small></span>
-                    <Icon name="chevron-right" size={16} />
-                  </button>}
-                  <button ref={engine === "codex" || onOpenBtw || onOpenViewer || onOpenFiles ? undefined : firstRef}
-                    type="button" className="header-menu-item"
-                    onClick={() => setPage("notifications")}>
-                    <Icon name="notify" size={18} />
-                    <span><b>通知</b><small>{MODE_LABELS[notificationMode]} · {bindingLabel}</small></span>
-                    <Icon name="chevron-right" size={16} />
-                  </button>
-                  <button type="button" className="header-menu-item"
-                    onClick={() => { close(); setThemeOpen(true); }}>
-                    <Icon name={theme === "dark" ? "sun" : "moon"} size={18} />
-                    <span><b>主题</b><small>{themeLabel(themeChoice)}</small></span>
-                    <Icon name="chevron-right" size={16} />
-                  </button>
-                  <button type="button" className="header-menu-item" role="switch"
-                    aria-label="加粗字体" aria-checked={boldText}
-                    onClick={() => onBoldText(!boldText)}>
-                    <Icon name="bold" size={18} />
-                    <span><b>加粗字体</b><small>整页文字加粗，更易阅读</small></span>
-                    <span className="header-menu-switch" aria-hidden="true" />
-                  </button>
-                  <button type="button" className="header-menu-item danger"
-                    onClick={onLogout}>
-                    <Icon name="logout" size={18} />
-                    <span><b>退出登录</b><small>清除本机缓存并断开连接</small></span>
-                  </button>
-                </div>
-              </>
+                  <SideChatIcon size={18} />
+                  <span><b>侧边聊天</b><small>基于当前会话，独立提问</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>}
+                {onOpenViewer && <button ref={onOpenBtw ? undefined : firstRef} type="button" className="header-menu-item" onClick={() => {
+                  close();
+                  onOpenViewer();
+                }}>
+                  <Icon name="globe" size={18} />
+                  <span><b>远程预览</b><small>打开设备上的交互页面</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>}
+                {onOpenArtifacts && <button type="button" className="header-menu-item" aria-label="打开 Artifacts" onClick={() => {
+                  close(); onOpenArtifacts();
+                }}><Icon name="archive" size={18} />
+                  <span><b>Artifacts</b><small>当前会话的附件与交付文件</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>}
+                {onOpenFiles && <button ref={onOpenBtw || onOpenViewer ? undefined : firstRef} type="button"
+                  className="header-menu-item" aria-label="打开会话文件" onClick={() => {
+                    close();
+                    onOpenFiles();
+                  }}>
+                  <Icon name="folder-open" size={18} />
+                  <span><b>会话文件</b><small>浏览目录并预览文件</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>}
+                {engine === "codex" && <button ref={onOpenBtw || onOpenViewer || onOpenFiles ? undefined : firstRef} type="button"
+                  className="header-menu-item" onClick={() => {
+                    close();
+                    onOpenUsageActivity();
+                  }}>
+                  <Icon name="calendar" size={18} />
+                  <span><b>使用活动</b><small>每日 Token、峰值与连续使用记录</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>}
+                <button ref={engine === "codex" || onOpenBtw || onOpenViewer || onOpenFiles ? undefined : firstRef}
+                  type="button" className="header-menu-item"
+                  onClick={() => setPage("notifications")}>
+                  <Icon name="notify" size={18} />
+                  <span><b>通知</b><small>{MODE_LABELS[notificationMode]} · {bindingLabel}</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>
+                <button type="button" className="header-menu-item"
+                  onClick={() => { close(); setThemeOpen(true); }}>
+                  <Icon name={theme === "dark" ? "sun" : "moon"} size={18} />
+                  <span><b>主题</b><small>{themeLabel(themeChoice)}</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>
+                <button type="button" className="header-menu-item" role="switch"
+                  aria-label="加粗字体" aria-checked={boldText}
+                  onClick={() => onBoldText(!boldText)}>
+                  <Icon name="bold" size={18} />
+                  <span><b>加粗字体</b><small>整页文字加粗，更易阅读</small></span>
+                  <span className="header-menu-switch" aria-hidden="true" />
+                </button>
+                <button type="button" className="header-menu-item danger"
+                  onClick={onLogout}>
+                  <Icon name="logout" size={18} />
+                  <span><b>退出登录</b><small>清除本机缓存并断开连接</small></span>
+                </button>
+              </div>
             ) : (
               <>
                 <header className="header-menu-title">

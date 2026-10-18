@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 74
+PROTOCOL_VERSION = 76
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -2336,6 +2336,48 @@ class FilesListed(_Base):
     error: Optional[str] = None
 
 
+class GetSessionArtifacts(_Command):
+    type: Literal["get_session_artifacts"] = "get_session_artifacts"
+    engine: Engine
+    space: Space = "code"
+    request_id: WireId
+    before: Optional[int] = Field(default=None, ge=1, le=MAX_SAFE_WIRE_INTEGER)
+    scan_history: bool = False
+    history_before: Optional[WireId] = None
+
+
+class GetSessionArtifactPreview(_Command):
+    type: Literal["get_session_artifact_preview"] = "get_session_artifact_preview"
+    engine: Engine
+    space: Space = "code"
+    artifact_id: WireId
+    request_id: WireId
+    variant: Literal["full", "thumbnail"] = "full"
+
+
+class SessionArtifactInfo(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: WireId
+    name: str = Field(max_length=1024)
+    path: PreviewPath
+    source: Literal["upload", "delivered"]
+    kind: Literal["image", "document", "file"]
+    created_at: float = Field(ge=0)
+    size: int = Field(ge=0)
+    available: bool
+
+
+class SessionArtifacts(_Base):
+    type: Literal["session_artifacts"] = "session_artifacts"
+    request_id: WireId
+    entries: list[SessionArtifactInfo] = Field(default_factory=list, max_length=40)
+    next_before: Optional[int] = None
+    has_more: bool = False
+    history_before: Optional[WireId] = None
+    history_more: bool = False
+    error: Optional[str] = Field(default=None, max_length=512)
+
+
 class GetFilePreview(_Command):
     """client -> wrapper: read one authorized, bounded file preview."""
     type: Literal["get_file_preview"] = "get_file_preview"
@@ -2888,6 +2930,7 @@ class CompletionState(_Base):
 
 AnyMessage = Union[
     ReorderQueuedQueries,
+    GetSessionArtifacts, GetSessionArtifactPreview, SessionArtifacts,
     BrowseFiles, FilesListed, SetCodexContext, CodexContext,
     GetTurnFileChanges, TurnFileChangesPage,
     Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetAutoCompact, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, SyncBtw, BtwOpened, BtwSync, BtwClosed, GetContext, GetStatus, ConsumeRateLimitResetCredit, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetAgentDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
@@ -2917,6 +2960,9 @@ DOWNSTREAM_TYPES = frozenset({
 })
 
 _TYPE_MAP: dict[str, type[BaseModel]] = {
+    "get_session_artifacts": GetSessionArtifacts,
+    "get_session_artifact_preview": GetSessionArtifactPreview,
+    "session_artifacts": SessionArtifacts,
     "browse_files": BrowseFiles,
     "files_listed": FilesListed,
     "set_codex_context": SetCodexContext,

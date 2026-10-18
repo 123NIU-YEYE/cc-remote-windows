@@ -31,6 +31,8 @@ async def handle(machine, ctx, cmd, reject):
         [cmd.sid, cmd.client_id, cmd.cmd_id])))
     try:
         prompt = cmd.prompt
+        if cmd.files or cmd.images:
+            await machine._artifacts.uploads(ctx, cmd.msg_id, cmd.files, cmd.images)
         if cmd.files:
             directory = tempfile.mkdtemp(prefix="cc-remote-steer-")
             os.chmod(directory, 0o700)

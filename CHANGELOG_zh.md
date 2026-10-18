@@ -2,6 +2,13 @@
 
 [English](CHANGELOG.md)
 
+## 未发布
+
+- 新增会话专属 Artifacts，保存上传附件副本，列表和预览分开展示。
+- 居中侧聊独立于文件预览，Cmd/Ctrl+Shift+E 仅控制侧聊。
+- Artifacts 改用日期分组、可见图片小缩略图、居中短胶囊按钮与左上角返回入口；移除菜单重复标题。
+- Wire protocol v76：Web、Relay 和 Wrapper 需要一同升级。
+
 ## v4.0.20
 
 新增 Android 与鸿蒙原生客户端预览版、可选的 Huawei Push Kit 通知，并修复 Codex 检查点误报。

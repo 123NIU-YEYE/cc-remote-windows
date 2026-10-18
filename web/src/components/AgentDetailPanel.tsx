@@ -3,7 +3,7 @@ import { useState } from "react";
 import type { AgentDetailRun } from "../agent-detail";
 import type { Engine } from "../protocol";
 import { finalTextBlocks, presentableProcessBlocks } from "../process-blocks";
-import { ClaudeSpark, ClaudeWorking, Icon } from "../icons";
+import { EngineDone, EngineWorking, Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { ProcessTimeline } from "./ProcessTimeline";
 import { PanelResizer } from "./PanelResizer";
@@ -85,12 +85,12 @@ export function AgentDetailPanel({ run, engine = "claude", canGoBack, onBack, on
         ))}
         {!done && <div className="turn-working agent-detail-working" role="status"
           aria-live="polite">
-          <ClaudeWorking size={24} />
+          <EngineWorking engine={engine} size={24} />
           <span className="turn-working-tx">子代理处理中</span>
         </div>}
         {run.status === "succeeded" && run.blocks.length > 0 && (
           <div className="turn-done-mark">
-            <ClaudeSpark size={22}
+            <EngineDone engine={engine} size={22}
               label={engine === "codex" ? "Codex 子代理已完成" : "Claude 子代理已完成"} />
           </div>
         )}

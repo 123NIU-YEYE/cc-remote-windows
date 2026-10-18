@@ -28,7 +28,7 @@ import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
 import { assistantContinuations, type AssistantContinuation } from "../assistant-continuations";
 import { TimedMessageTag } from "./TimedMessageTag";
-import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
+import { Icon, ClaudeMark, EngineWorking, EngineDone } from "../icons";
 import { canForkTurn } from "../session-worktree";
 import { sidebarDragIntent } from "../responsive-layout";
 import {
@@ -3124,7 +3124,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                   <Suspense fallback={null}><PagePreviewLinks turn={t} sid={sid} /></Suspense>
                 </div>}
                 {showCompletionFooter && !terminalProblem && ti === turns.length - 1
-                  && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
+                      && <div className="turn-done-mark"><EngineDone engine={engine} size={22} /></div>}
               </>
             )}
               {(showStandaloneDetail
@@ -3153,7 +3153,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
               )}
               {showWorking && (
                 <div className="turn-working" role="status" aria-live="polite">
-                  <ClaudeWorking size={24} />
+                  <EngineWorking engine={engine} size={24} />
                   <span className="turn-working-tx">{workingLabel}</span>
                   {usageForTurn(t, turnUsage) && <Suspense fallback={null}>
                     <TurnUsageIndicator key={`${sid}:${t.id}`} usage={usageForTurn(t, turnUsage)} />
