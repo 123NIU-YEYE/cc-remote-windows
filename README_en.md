@@ -4,7 +4,7 @@
 
 Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
 
-**Product version: v4.0.20** · Wire protocol v74
+**Product version: v4.0.20** · Wire protocol v76
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
 [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
@@ -114,8 +114,16 @@ the question unanswered. Confirming an IME composition does not submit it.
 
 Side conversations, file previews, diffs, session files, agent details and remote
 previews have a header button to expand into a centered view or dock on the right.
-**⌘/Ctrl+Shift+K** opens or collapses side chat. **⌘/Ctrl+Shift+E** expands the
-current right panel, or opens centered side chat when no panel is visible.
+**More → Artifacts** lists uploads and delivered file links for the current session;
+side chats have their own Artifacts entry. Opening a file replaces the list with
+its preview; Back returns to the list. New uploads have durable private copies,
+while delivered files reference their original paths. Older sessions are indexed
+one history page at a time; previously deleted temporary uploads cannot be recovered.
+The existing session file browser continues to browse directories independently.
+
+**⌘/Ctrl+Shift+K** opens or collapses side chat. **⌘/Ctrl+Shift+E** only toggles
+centered side chat, above any open or expanded file preview. Files keep their
+own expand/dock buttons and retain their layout and unsaved edits underneath.
 Pressing it again, clicking outside, or pressing **Esc** restores the previous
 state: hidden if opened directly, docked if expanded from the right panel.
 Layout changes preserve conversations, drafts, file edits and preview pages,

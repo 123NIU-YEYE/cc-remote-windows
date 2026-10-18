@@ -1348,14 +1348,15 @@ test("side chat scope service tier toggles only its fork and waits for the repor
   const relay = await mockRightPanelRelay(page, { visible: true });
   await page.goto("/");
   const panel = page.locator(".btw-panel");
-  const control = panel.getByRole("button", { name: "BTW 服务档位", exact: true });
+  const control = panel.getByRole("button", { name: /^速度：/ });
   await expect(control).toBeEnabled();
   relay.emit({ type: "fast", sid: "layout-parent", on: false });
   relay.emit({ type: "fast", sid: "btw-layout-child", on: false });
   await expect(control).toHaveText("标准");
   await control.click();
+  await page.getByRole("menuitemradio", { name: /标准/ }).click();
   await expect.poll(() => relay.commands.filter(c => c.type === "set_service_tier").length).toBe(1);
-  expect(relay.commands.find(c => c.type === "set_service_tier")).toMatchObject({ sid: "btw-layout-child", service_tier: "toggle" });
+  expect(relay.commands.find(c => c.type === "set_service_tier")).toMatchObject({ sid: "btw-layout-child", service_tier: "default" });
   await expect(control).toHaveText("标准");
   relay.emit({ type: "fast", sid: "btw-layout-child", on: true });
   await expect(control).toHaveText("快速");
@@ -3932,14 +3933,14 @@ for (const fromBrowser of [false, true]) {
     await page.keyboard.press("Escape");
     await expect(panel).not.toHaveClass(/panel-expanded/);
     await expectRightPanelSpace(page, true);
-    await page.keyboard.press("Control+Shift+e");
+    await panel.getByRole("button", { name: "居中展开文件预览", exact: true }).click();
     await expect(panel).toHaveClass(/panel-expanded/);
     await expect(editor).toHaveValue("# Unsaved draft\n\nKeep this text");
     expect(await original!.evaluate(node => node.isConnected)).toBe(true);
     await page.locator(".panel-expanded-backdrop").click({ position: { x: 4, y: 4 } });
     await expect(panel).not.toHaveClass(/panel-expanded/);
     expect(confirmations).toBe(0);
-    await page.keyboard.press("Control+Shift+e");
+    await panel.getByRole("button", { name: "居中展开文件预览", exact: true }).click();
     await page.screenshot({ path: info.outputPath(`centered-file-desktop-${fromBrowser}.png`), animations: "disabled" });
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(panel).toHaveClass(/panel-expanded/);
@@ -3993,7 +3994,8 @@ test("right panel layout centered diff and agent details keep their own content"
   await expect(dockDiff).toBeFocused();
   const original = await diff.elementHandle();
   await page.keyboard.press("Control+Shift+e");
-  await expect(diff).not.toHaveClass(/panel-expanded/);
+  await expect(diff).toHaveClass(/panel-expanded/);
+  await expect(page.locator(".btw-panel")).toHaveClass(/panel-expanded/);
   expect(await original!.evaluate(node => node.isConnected)).toBe(true);
   await page.keyboard.press("Control+Shift+e");
   await diff.getByRole("button", { name: "收起", exact: true }).click();
@@ -4113,7 +4115,7 @@ test("remote Viewer centered expansion keeps the iframe and grant alive", async 
   await page.keyboard.press("Escape");
   await expect(panel).not.toHaveClass(/panel-expanded/);
   await expect(panel).toBeVisible(); // Escape must dock, not run the Viewer's close handler too.
-  await page.keyboard.press("Control+Shift+e");
+  await panel.getByRole("button", { name: "居中展开远程预览", exact: true }).click();
   await expect(panel).toHaveClass(/panel-expanded/);
   await expect(input).toHaveValue("keep iframe state");
   expect(await original!.evaluate(node => node.isConnected)).toBe(true);
@@ -12185,4 +12187,251 @@ test("session message source preview returns to the same reading position", asyn
   // StrictMode reattaches effects on each open; every command remains read-only.
   expect(JSON.parse(await page.getByTestId("session-read-commands").textContent() ?? "[]"))
     .toEqual(Array(8).fill("get_history"));
+});
+
+for (const centered of [false, true]) {
+  test(`right panel layout centered side chat overlays ${centered ? "centered" : "docked"} editor without replacing it`, async ({ page }, info) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    const path = "/tmp/layout/overview.md";
+    const relay = await mockRightPanelRelay(page, { seedTurns: [{ id: "source", prompt: "查看文档", done: true,
+      blocks: [{ kind: "text", message_id: "answer", text: `[技术方案](${path})`, done: true }] }] });
+    await page.goto("/");
+    await page.getByRole("button", { name: `在 Remote 中打开 ${path}`, exact: true }).click();
+    await expect.poll(() => relay.commands.some(c => c.type === "get_file_preview")).toBe(true);
+    const request = relay.commands.find(c => c.type === "get_file_preview")!;
+    relay.emit({ type: "file_preview", sid: "layout-parent", path, request_id: String(request.request_id),
+      format: "markdown", content: "# 技术方案\n\n保留当前内容", size: 32, mtime_ns: "1", revision: "a".repeat(64), writable: true });
+    const file = page.locator(".artifact-panel");
+    await file.getByRole("button", { name: "源码", exact: true }).click();
+    const editor = file.getByRole("textbox", { name: "Markdown 源码编辑器" });
+    await editor.fill("# 未保存的草稿\n\n侧聊不应丢弃它");
+    const node = await editor.elementHandle();
+    if (centered) await file.getByRole("button", { name: "居中展开文件预览" }).click();
+    let confirmations = 0;
+    page.on("dialog", async dialog => { confirmations++; await dialog.dismiss(); });
+    for (const close of ["shortcut", "escape", "backdrop"]) {
+      await page.keyboard.press("Control+Shift+e");
+      const btw = page.locator(".btw-panel");
+      await expect(btw).toHaveAttribute("aria-modal", "true");
+      await expect(btw.locator("textarea")).toBeFocused();
+      await expect(file).toHaveAttribute("inert", "");
+      expect(await node!.evaluate(el => el.isConnected)).toBe(true);
+      expect(await editor.inputValue()).toContain("未保存的草稿");
+      await btw.getByRole("button", { name: "收回右侧", exact: true }).focus();
+      await page.keyboard.press("/");
+      await expect(btw.locator("textarea")).toBeFocused();
+      await page.keyboard.press("Shift+Tab");
+      expect(await btw.evaluate(el => el.contains(document.activeElement))).toBe(true);
+      if (close === "shortcut") await page.keyboard.press("Control+Shift+e");
+      else if (close === "escape") await page.keyboard.press("Escape");
+      else await page.locator(".panel-expanded-backdrop.panel-chat-layer").click({ position: { x: 4, y: 4 } });
+      await expect(btw).toHaveCount(0);
+      await expect(file).not.toHaveAttribute("inert");
+      if (centered) await expect(file).toHaveClass(/panel-expanded/);
+      else await expect(file).not.toHaveClass(/panel-expanded/);
+    }
+    expect(confirmations).toBe(0);
+    expect(await node!.evaluate(el => el.isConnected)).toBe(true);
+    expect(relay.commands.filter(c => ["query", "steer", "get_file_preview", "save_markdown"].includes(String(c.type)))).toHaveLength(1);
+    if (centered) {
+      await page.keyboard.press("Control+Shift+e");
+      await page.screenshot({ animations: "disabled", path: info.outputPath("file-under-centered-chat.png") });
+    }
+  });
+}
+
+const ARTIFACT_THUMBNAIL = "UklGRtwCAABXRUJQVlA4INACAABwFgCdASqgAGQAPmkskUWkIqGYrQ2AQAaEoA0yImv9/wfKu8jGc1fj1NZwv9jP2Z7D285+g70wWRO+LY6qs6n0dvyfQA/XRQB23osL5Oml9nMS4gNItz/BqkDYvgLeLSEm08g24to6NGBdwgvlda3JG+dJOhgXbkzpQgaXwvKFiucB0JgYGCCrW2xsMKYgri2Bh3wIA3LPS1vqF4VCEH5XMfezkei12+V6oH2DOqg/4rIIaAyQMsP3Su+LwAD+/L0kmiyLtH7qy5e7S7xMQ0RpoCM4bi2O9b1Hx1RUnmE+vjjVs4XHpkwxpI/pFBxd/MXRYmC1H1g1yF9yf5CD+8/A1yi0UxY0dZaaXjkNbh93x1lXGdhNwgT7ondUHCAZekBFY3IYNVfU6dMwzF4/CH7CPGiL0Teb1Dusbmu9G5dhjPkoyXCsJDeNwZ/rQ5QoRAEFaui98RXfOcyaHd6m7cEkY+yb4LukxgkFIlbgg2xc+wpZPnVjVPTOApxiG1MuiCwjW4B6PP89Yjmp9/DBbGAwutiYT+ZQrfyxzuxpfqjJ+X6QQYxqSHRJsz8ELfwjNNdtZinkYO0mP/GJzD0gijO7d74/4Mj1zKh+hWzf8VyXcCXoX141t07IRnXWHujnMfNNup2EEJVcSqC3/BGkMVAVxA+aIGPe7k3rH23ah/K4nG/Z/gtGdHuKP4dMKVMOC6+baEyer1F9psT4Zm6vo45c1o9Ac4HtZinkYO0li0Z2/nWWQ6l8f8EvIz1+mWZTwAYP/f6qSmVV876qwMQY3eCpgTJd17CWpzW05cAhbyJZaX/INkj1DPQy2hYKkNhhL1Qh567JeVGDBkbZWnAl+DFAwEO6Nm5Kd13BxrU74C3n3537tm2uoqs4xbNC9rEGo1qNpj+vM+lddxhgEdkQnTFjCo2dPrAWTZ80TDkSdWH5uqHDRaVoz/ZG6AYAAAAAAAA=";
+
+test("right panel layout session Artifacts list and preview stay separate and reject stale responses", async ({ page }, info) => {
+  await page.setViewportSize({ width: 1568, height: 1000 });
+  const relay = await mockRightPanelRelay(page, { secondParent: true, seedTurns: [{
+    id: "artifact-turn", prompt: "帮我整理项目的技术架构和路线图", done: true,
+    blocks: [{ kind: "text", message_id: "artifact-answer", done: true, text: "已整理好技术方案和路线图，可以在 Artifacts 中查看。" }],
+  }] });
+  await page.goto("/");
+  const open = async () => {
+    await page.getByRole("button", { name: "更多设置", exact: true }).click();
+    await page.getByRole("button", { name: "打开 Artifacts", exact: true }).click();
+  };
+  await open();
+  await expect.poll(() => relay.commands.filter(c => c.type === "get_session_artifacts").length).toBe(1);
+  const first = relay.commands.find(c => c.type === "get_session_artifacts")!;
+  const entries = ["技术架构.md", "路线图.png", "会议记录.txt"].map((name, i) => ({
+    id: `artifact-${i}`, name, path: `/tmp/layout/${name}`, source: i === 2 ? "upload" as const : "delivered" as const,
+    kind: i === 1 ? "image" as const : "document" as const, created_at: (Date.now() / 1000) - (i === 2 ? 86400 : i), available: true, size: 1024,
+  }));
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(first.request_id),
+    entries, next_before: 1, has_more: false, history_more: true });
+  await expect.poll(() => relay.commands.filter(c => c.type === "get_session_artifacts").length).toBe(2);
+  const scan = relay.commands.filter(c => c.type === "get_session_artifacts")[1];
+  expect(scan.scan_history).toBe(true);
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(scan.request_id),
+    entries, next_before: 1, has_more: false, history_more: true });
+  const panel = page.locator(".session-artifacts-panel");
+  await expect(panel.locator(".session-artifact-row")).toHaveCount(3);
+  await expect(panel.locator(".artifact-panel")).toHaveCount(0);
+  await expect(panel.locator(".session-artifacts-date")).toHaveText(["今天", "昨天"]);
+  await expect.poll(() => relay.commands.some(c => c.type === "get_session_artifact_preview" && c.variant === "thumbnail")).toBe(true);
+  const thumbnail = relay.commands.find(c => c.type === "get_session_artifact_preview" && c.variant === "thumbnail")!;
+  relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(thumbnail.request_id),
+    path: entries[1].path, format: "image", media_type: "image/webp", data: ARTIFACT_THUMBNAIL, size: 740, writable: false });
+  await expect(panel.locator(".session-artifact-icon img")).toHaveCount(1);
+  await page.screenshot({ animations: "disabled", path: info.outputPath("session-artifacts-list.png") });
+  await panel.getByRole("button", { name: /技术架构.md/ }).click();
+  await expect.poll(() => relay.commands.some(c => c.type === "get_session_artifact_preview" && c.variant !== "thumbnail")).toBe(true);
+  const preview = relay.commands.find(c => c.type === "get_session_artifact_preview" && c.variant !== "thumbnail")!;
+  relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(preview.request_id), path: entries[0].path,
+    format: "markdown", content: "# 技术架构\n\n## 连接方式\n\n客户端通过 Relay 连接设备上的 Wrapper。\n\n## 会话资料\n\n每个会话分别保存自己的附件和交付文件。", size: 200, mtime_ns: "1", writable: false });
+  await expect(panel.locator(".session-artifacts-list")).toBeHidden();
+  await expect(panel.locator(".artifact-panel")).toBeVisible();
+  await expect(panel.getByText("每个会话分别保存自己的附件和交付文件。", { exact: true })).toBeVisible();
+  await page.screenshot({ animations: "disabled", path: info.outputPath("session-artifacts-preview.png") });
+  await page.keyboard.press("Control+Shift+e");
+  await expect(page.locator(".btw-panel")).toHaveClass(/panel-expanded/);
+  await page.keyboard.press("Control+Shift+e");
+  await expect(panel.locator(".artifact-panel")).toBeVisible();
+  await panel.getByRole("button", { name: "返回 Artifacts" }).click();
+  await expect(panel.locator(".session-artifact-row")).toHaveCount(3);
+  await expect(panel.locator(".artifact-panel")).toHaveCount(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  const button = panel.getByRole("button", { name: "查看更早的文件", exact: true });
+  await expect(button).toBeVisible();
+  const bounds = await button.boundingBox();
+  const container = await panel.boundingBox();
+  expect(bounds!.width).toBeLessThan(220);
+  expect(Math.abs(bounds!.x + bounds!.width / 2 - container!.x - container!.width / 2)).toBeLessThan(2);
+  expect(await button.evaluate(el => Number.parseFloat(getComputedStyle(el).borderRadius))).toBeGreaterThan(20);
+  await page.screenshot({ animations: "disabled", path: info.outputPath("session-artifacts-mobile.png") });
+  await page.getByText("Second parent", { exact: true }).evaluate(el => (el as HTMLElement).click());
+  await expect(panel).toHaveCount(0);
+  await open();
+  await expect.poll(() => relay.commands.some(c => c.type === "get_session_artifacts" && c.sid === "layout-other")).toBe(true);
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(scan.request_id),
+    entries, next_before: 1, has_more: false, history_more: true });
+  await expect(panel.locator(".session-artifact-row")).toHaveCount(0);
+  expect(relay.commands.some(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toBe(false);
+});
+
+test("right panel layout Artifacts thumbnails load visible rows without replacing previews or crossing sessions", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const relay = await mockRightPanelRelay(page, { secondParent: true });
+  await page.goto("/");
+  const open = async () => {
+    await page.getByRole("button", { name: "更多设置", exact: true }).click();
+    await expect(page.locator(".header-menu-title")).toHaveCount(0);
+    await page.getByRole("button", { name: "打开 Artifacts", exact: true }).click();
+  };
+  const lists = () => relay.commands.filter(c => c.type === "get_session_artifacts");
+  const thumbs = () => relay.commands.filter(c => c.type === "get_session_artifact_preview" && c.variant === "thumbnail");
+  await open();
+  await expect.poll(() => lists().length).toBe(1);
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(lists()[0].request_id),
+    entries: [], has_more: false, history_more: false });
+  await expect.poll(() => lists().length).toBe(2);
+  const entries = Array.from({ length: 40 }, (_, i) => ({
+    id: `image-${i}`, name: `图-${i}.png`, path: `/tmp/layout/${i}.png`,
+    kind: "image" as const, source: "upload" as const, created_at: Date.now() / 1000 - i, available: true, size: 1024,
+  }));
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(lists()[1].request_id),
+    entries, has_more: false, history_more: false });
+  await expect.poll(() => thumbs().length).toBe(2);
+  const respond = (request: Record<string, unknown>, error = false, sid = "layout-parent") => {
+    relay.emit({ type: "file_preview", sid, request_id: String(request.request_id),
+      path: entries.find(e => e.id === request.artifact_id)!.path, format: "image", media_type: "image/webp",
+      ...(error ? { error: "unavailable" } : { data: ARTIFACT_THUMBNAIL }), size: 740, writable: false });
+  };
+  const panel = page.locator(".session-artifacts-panel");
+  // Even an otherwise matching request ID cannot accept a foreign session's bytes.
+  respond(thumbs()[0], false, "layout-other");
+  await expect(panel.locator("img")).toHaveCount(0);
+  respond(thumbs()[0]);
+  await expect(panel.locator(".session-artifact-icon img")).toHaveCount(1);
+  await expect.poll(() => thumbs().length).toBe(3);
+  respond(thumbs()[1], true);
+  await expect.poll(() => thumbs().length).toBe(4);
+  await expect(panel.locator(".artifact-panel")).toHaveCount(0);
+  expect(thumbs().some(c => c.artifact_id === "image-39")).toBe(false);
+  await panel.getByRole("button", { name: /图-0.png/ }).click();
+  const previewRequests = () => relay.commands.filter(c => c.type === "get_session_artifact_preview" && c.variant !== "thumbnail");
+  await expect.poll(() => previewRequests().length).toBe(1);
+  const full = previewRequests()[0];
+  respond(thumbs()[2]); // Late thumbnail must not satisfy the full-image request.
+  await expect(panel.locator(".artifact-panel")).toBeVisible();
+  relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(full.request_id), path: entries[0].path,
+    format: "image", media_type: "image/webp", data: ARTIFACT_THUMBNAIL, size: 740, writable: false });
+  await expect(panel.locator(".artifact-panel img")).toBeVisible();
+  await page.getByText("Second parent", { exact: true }).evaluate(el => (el as HTMLElement).click());
+  await expect(panel).toHaveCount(0);
+  await open();
+  respond(thumbs()[3]);
+  await expect(panel.locator("img")).toHaveCount(0);
+  await expect(panel.locator(".artifact-panel")).toHaveCount(0);
+  expect(relay.commands.some(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toBe(false);
+});
+
+test("right panel layout iframe forwards centered-chat shortcut only from the focused preview", async ({ page }) => {
+  const path = "/tmp/layout/page.html";
+  const relay = await mockRightPanelRelay(page, { seedTurns: [{ id: "html", prompt: "预览", done: true,
+    blocks: [{ kind: "text", message_id: "html-answer", text: `[页面](${path})`, done: true }] }] });
+  await page.goto("/");
+  await page.getByRole("button", { name: `在 Remote 中打开 ${path}`, exact: true }).click();
+  await expect.poll(() => relay.commands.some(c => c.type === "get_file_preview")).toBe(true);
+  const request = relay.commands.find(c => c.type === "get_file_preview")!;
+  relay.emit({ type: "file_preview", sid: "layout-parent", path, request_id: String(request.request_id),
+    format: "html", content: '<input aria-label="Preview input" value="keep this">', size: 60, mtime_ns: "1", writable: false });
+  const panel = page.locator(".artifact-panel");
+  await panel.getByRole("button", { name: "居中展开文件预览" }).click();
+  await page.evaluate(() => window.postMessage({ type: "cc-remote-preview-chat" }, "*"));
+  await expect(page.locator(".btw-panel")).toHaveCount(0);
+  const input = panel.frameLocator("iframe").getByRole("textbox");
+  await input.fill("retained frame state");
+  await input.press("Control+Shift+e");
+  await expect(page.locator(".btw-panel")).toHaveClass(/panel-expanded/);
+  await page.keyboard.press("Control+Shift+e");
+  await expect(page.locator(".btw-panel")).toHaveCount(0);
+  await expect(panel).toHaveClass(/panel-expanded/);
+  await expect(input).toHaveValue("retained frame state");
+});
+
+
+test("right panel layout Artifacts retries the failed history page and retains the file list position", async ({ page }) => {
+  await page.setViewportSize({ width: 1568, height: 1000 });
+  const relay = await mockRightPanelRelay(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "更多设置", exact: true }).click();
+  await page.getByRole("button", { name: "打开 Artifacts", exact: true }).click();
+  const requests = () => relay.commands.filter(c => c.type === "get_session_artifacts");
+  await expect.poll(() => requests().length).toBe(1);
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(requests()[0].request_id),
+    entries: [], has_more: false, history_more: false });
+  await expect.poll(() => requests().length).toBe(2);
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(requests()[1].request_id),
+    entries: [], has_more: false, history_more: false, error: "历史暂时不可用" });
+  const panel = page.locator(".session-artifacts-panel");
+  await panel.getByRole("button", { name: "重试", exact: true }).click();
+  await expect.poll(() => requests().length).toBe(3);
+  expect(requests()[2].scan_history).toBe(true);
+  const entries = Array.from({ length: 40 }, (_, i) => ({
+    id: `entry-${i}`, name: `报告-${i}.md`, path: `/tmp/layout/report-${i}.md`,
+    source: "delivered" as const, kind: "document" as const, created_at: 2000 - i, available: true, size: 1,
+  }));
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(requests()[2].request_id),
+    entries, next_before: 40, has_more: true, history_before: "older-turn", history_more: true });
+  await panel.getByRole("button", { name: "查看更早的文件", exact: true }).click();
+  await expect.poll(() => requests().length).toBe(4);
+  expect(requests()[3]).toMatchObject({ before: 40, scan_history: false });
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(requests()[3].request_id),
+    entries: [{ ...entries[0], id: "last", name: "末尾报告.md", path: "/tmp/layout/last.md", created_at: 1000 }],
+    next_before: 41, has_more: false, history_more: false });
+  await expect(panel.locator(".session-artifact-row")).toHaveCount(41);
+  const last = panel.getByRole("button", { name: /末尾报告.md/ });
+  await last.scrollIntoViewIfNeeded();
+  const scrollTop = await panel.locator(".session-artifacts-scroll").evaluate(el => el.scrollTop);
+  expect(scrollTop).toBeGreaterThan(0);
+  await last.click();
+  await panel.getByRole("button", { name: "返回 Artifacts", exact: true }).click();
+  await expect.poll(() => panel.locator(".session-artifacts-scroll").evaluate(el => el.scrollTop)).toBe(scrollTop);
+  await panel.getByRole("button", { name: "查看更早的文件", exact: true }).click();
+  await expect.poll(() => requests().length).toBe(5);
+  expect(requests()[4]).toMatchObject({ before: 41, scan_history: true, history_before: "older-turn" });
 });

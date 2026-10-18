@@ -18,17 +18,38 @@ export function PanelFrame({ children, className = "", label, ...props }:
   const dismissRef = useRef(presentation.onDismiss);
   dismissRef.current = presentation.onDismiss;
 
+  const openChatRef = useRef(presentation.onOpenChat);
+  openChatRef.current = presentation.onOpenChat;
+  useEffect(() => {
+    if (nested) return;
+    const onFrameChat = (event: MessageEvent) => {
+      const panel = panelRef.current;
+      const frame = document.activeElement;
+      if (event.data?.type !== "cc-remote-preview-chat" || !panel || panel.inert
+          || !(frame instanceof HTMLIFrameElement) || !panel.contains(frame)
+          || event.source !== frame.contentWindow) return;
+      const origin = frame.sandbox.contains("allow-same-origin")
+        ? new URL(frame.src, location.href).origin : "null";
+      if (event.origin !== origin) return;
+      if ([...document.querySelectorAll<HTMLElement>('[role="dialog"], dialog[open], [role="menu"]')]
+          .some(node => node !== panel && !node.closest("[inert]") && node.getClientRects().length)) return;
+      openChatRef.current();
+    };
+    window.addEventListener("message", onFrameChat);
+    return () => window.removeEventListener("message", onFrameChat);
+  }, [nested]);
+
   useEffect(() => {
     const panel = panelRef.current;
     if (!expanded || !panel) return;
     const previous = document.activeElement as HTMLElement | null;
-    if (!panel.contains(previous)) panel.focus({ preventScroll: true });
+    if (!panel.inert && !panel.contains(previous)) panel.focus({ preventScroll: true });
     const hasNestedDialog = (modalOnly = false) => [...document.querySelectorAll<HTMLElement>(modalOnly
       ? '[role="dialog"][aria-modal="true"], dialog:modal'
       : '[role="dialog"], dialog[open]')]
-      .some(node => node !== panel && node.getClientRects().length);
+      .some(node => node !== panel && !node.closest("[inert]") && node.getClientRects().length);
     const onPreviewEscape = (event: MessageEvent) => {
-      if (event.data?.type !== "cc-remote-preview-escape" || hasNestedDialog()) return;
+      if (panel.inert || event.data?.type !== "cc-remote-preview-escape" || hasNestedDialog()) return;
       const frame = document.activeElement;
       // Preview messages are untrusted. Only the exact, currently focused frame
       // in this expanded panel may request docking; no other command is exposed.
@@ -41,7 +62,7 @@ export function PanelFrame({ children, className = "", label, ...props }:
       dismissRef.current();
     };
     const onKey = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+      if (panel.inert || event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
         // Informational popovers also own Escape, but do not trap focus.
         if (hasNestedDialog()) return;
@@ -72,7 +93,7 @@ export function PanelFrame({ children, className = "", label, ...props }:
     return () => {
       document.removeEventListener("keydown", onKey);
       window.removeEventListener("message", onPreviewEscape);
-      if (previous?.isConnected && !panel.contains(previous)) previous.focus({ preventScroll: true });
+      if (!panel.inert && previous?.isConnected && !previous.closest("[inert]") && !panel.contains(previous)) previous.focus({ preventScroll: true });
     };
   }, [expanded]);
 
@@ -84,12 +105,14 @@ export function PanelFrame({ children, className = "", label, ...props }:
   };
 
   return <InsidePanel.Provider value={true}>
-    {expanded && <div className="panel-expanded-backdrop" aria-hidden="true"
+    {expanded && <div className={`panel-expanded-backdrop${presentation.layer ? " panel-chat-layer" : ""}`} aria-hidden="true"
+      inert={presentation.covered}
       data-lock-horizontal-swipe="true" onClick={presentation.onDismiss} />}
     <div {...props} ref={panelRef}
-      className={`${className} right-panel-frame${expanded ? " panel-expanded" : ""}`}
+      className={`${className} right-panel-frame${expanded ? " panel-expanded" : ""}${expanded && presentation.layer ? " panel-chat-layer" : ""}`}
+      inert={presentation.covered || undefined}
       role={expanded ? "dialog" : props.role}
-      aria-modal={expanded || undefined} aria-label={label}
+      aria-modal={expanded && !presentation.covered || undefined} aria-label={label}
       tabIndex={expanded ? -1 : undefined} data-lock-horizontal-swipe="true">
       {expanded && <span className="panel-focus-guard" data-panel-focus-guard="" tabIndex={0}
         aria-hidden="true" onFocus={() => wrapFocus(true)} />}
@@ -101,12 +124,12 @@ export function PanelFrame({ children, className = "", label, ...props }:
 }
 
 export function PanelExpandButton({ label }: { label: string }) {
-  const { expanded, onExpand, onDock } = useContext(RightPanelPresentation);
+  const { expanded, onExpand, onDock, chat } = useContext(RightPanelPresentation);
   return <button type="button" className="iconbtn panel-expand"
     onClick={expanded ? onDock : onExpand}
     aria-label={expanded ? "收回右侧" : `居中展开${label}`}
-    title={expanded ? "收回右侧" : "居中展开 (⌘/Ctrl+Shift+E)"}
-    aria-pressed={expanded} aria-keyshortcuts="Meta+Shift+E Control+Shift+E">
+    title={expanded ? "收回右侧" : chat ? "居中展开 (⌘/Ctrl+Shift+E)" : "居中展开"}
+    aria-pressed={expanded} aria-keyshortcuts={chat ? "Meta+Shift+E Control+Shift+E" : undefined}>
     <Icon name={expanded ? "panel-right" : "expand"} />
   </button>;
 }

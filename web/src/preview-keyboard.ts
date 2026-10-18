@@ -3,6 +3,12 @@
 export function installPreviewEscape() {
   if (window === parent) return;
   window.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.shiftKey && !event.altKey
+        && event.key.toLowerCase() === "e" && !event.repeat && !event.isComposing && event.keyCode !== 229) {
+      setTimeout(() => {
+        if (!event.defaultPrevented) parent.postMessage({ type: "cc-remote-preview-chat" }, "*");
+      }, 0);
+    }
     if (event.key === "Escape" && !event.isComposing && event.keyCode !== 229) {
       // Give the preview's own handlers (including later window listeners)
       // their normal chance to consume Escape before asking its host to dock.

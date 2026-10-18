@@ -12,3 +12,6 @@
   .artifact-panel > .artifact-head:has(.preview-modes) > :is(.artifact-title,.panel-tabs) { order: -1; flex: 1 1 calc(100% - 100px); }
   .artifact-panel > .artifact-head:has(.preview-modes) > :is(.panel-expand,.iconbtn:last-child) { order: -1; flex: none; }
 }
+
+.panel-expanded-backdrop.panel-chat-layer { z-index: 40; }
+.right-panel-frame.panel-expanded.panel-chat-layer { z-index: 41; }

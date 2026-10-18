@@ -74,6 +74,7 @@ import type { PasteReceipt } from "../clipboard-paste-guard";
 import "./BtwPanel.css";
 
 interface Props {
+  onOpenArtifacts?: () => void;
   sid?: string;
   rt: SessionRuntime | undefined;
   engine: "claude" | "codex";
@@ -209,7 +210,7 @@ export function BtwPanel(p: Props) {
     const panel = textarea?.closest(".btw-panel");
     const otherOverlay = [...document.querySelectorAll<HTMLElement>(
       '[role="dialog"], [aria-modal="true"], dialog[open], [role="menu"]',
-    )].some(node => node !== panel && node.getClientRects().length > 0);
+    )].some(node => node !== panel && !node.closest("[inert]") && node.getClientRects().length > 0);
     if (textarea && sid && !inputLocked && !otherOverlay) {
       // A reopened draft starts at its end; moving the mounted panel preserves
       // the user's existing caret/selection.
@@ -490,6 +491,8 @@ export function BtwPanel(p: Props) {
                 {p.engine === "codex" ? "Codex" : "Claude"}
               </span>
             </div>}
+        {p.onOpenArtifacts && <button className="iconbtn" onClick={p.onOpenArtifacts}
+          aria-label="打开侧聊 Artifacts" title="侧聊 Artifacts"><Icon name="archive" /></button>}
         <button className="iconbtn btw-new" onClick={p.onNew}
           disabled={!!p.opening}
           aria-label="新建侧边对话" title="新建侧边对话">
