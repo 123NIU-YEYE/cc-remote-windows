@@ -2,13 +2,16 @@
 // One <Icon name="..."/> component renders the SVG; sizes via prop.
 import { useEffect, useState } from "react";
 import type { Engine } from "./protocol";
+import engineMarks from "./assets/engine-marks.svg?no-inline";
 
 export function EngineIcon({ engine, size = 16 }: { engine: Engine; size?: number }) {
-  return engine === "claude" ? <ClaudeMark size={size} /> : <Icon name={engine} size={size} />;
+  return <svg viewBox="0 0 24 24" width={size} height={size}
+    className={`engine-brand-icon ${engine}`} aria-hidden="true" focusable="false">
+    <use href={`${engineMarks}#${engine}`} />
+  </svg>;
 }
 
 const PATHS: Record<string, string> = {
-  codex: '<path d="m12 3 9 9-9 9-9-9Z"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   paperclip: '<path d="m21 11-8.5 8.5a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.8-2.8l8.4-8.4"/>',
@@ -45,6 +48,7 @@ const PATHS: Record<string, string> = {
   shield: '<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9.2 12l2 2 3.6-4"/>',
   verify: '<circle cx="12" cy="12" r="8.5"/><path d="M8.5 12.5l2.3 2.3 4.7-5"/>',
   info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5M12 16h.01"/>',
+  warning: '<path d="M10.3 4.4 2.5 18a2 2 0 001.7 3h15.6a2 2 0 001.7-3L13.7 4.4a2 2 0 00-3.4 0Z"/><path d="M12 9v4M12 17h.01"/>',
   run: '<path d="M8 5.5v13l11-6.5-11-6.5z"/>',
   research: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.5-4.5M11 8v6M8 11h6"/>',
   simplify: '<path d="M4 7h16M7 12h10M10 17h4"/>',

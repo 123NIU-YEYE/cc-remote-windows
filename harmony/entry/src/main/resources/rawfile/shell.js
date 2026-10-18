@@ -7,10 +7,10 @@
   const style = document.createElement("style");
   style.id = "cc-remote-harmony-style";
   style.textContent = `
-    .header-menu-item[data-harmony-client-settings] {
+    .header-menu-item[data-harmony-reload] {
       text-decoration:none; cursor:pointer;
     }
-    .header-menu-item[data-harmony-client-settings] > svg { flex:none; }
+    .header-menu-item[data-harmony-reload] > svg { flex:none; }
     #cc-remote-harmony-settings-fallback {
       position:fixed; right:12px; top:12px; z-index:100;
       padding:10px 14px; border:1px solid var(--border,#d9dfeb); border-radius:20px;
@@ -30,11 +30,12 @@
   fallback.href = settingsUrl;
   fallback.textContent = chinese ? "客户端设置" : "Client settings";
   document.body.append(fallback);
-  function settingsLink() {
-    const link = document.createElement("a");
-    link.href = settingsUrl;
-    link.className = "header-menu-item";
-    link.dataset.harmonyClientSettings = "";
+  function reloadButton() {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "header-menu-item";
+    button.dataset.harmonyReload = "";
+    button.addEventListener("click", () => location.reload());
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     svg.setAttribute("width", "18");
     svg.setAttribute("height", "18");
@@ -44,23 +45,23 @@
     svg.setAttribute("stroke-width", "1.7");
     svg.setAttribute("aria-hidden", "true");
     const shape = document.createElementNS(svg.namespaceURI, "path");
-    shape.setAttribute("d", "M7 3h10a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm3 14h4");
+    shape.setAttribute("d", "M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1");
     svg.append(shape);
     const text = document.createElement("span");
     const title = document.createElement("b");
-    title.textContent = chinese ? "客户端设置" : "Client settings";
+    title.textContent = chinese ? "刷新页面" : "Reload page";
     const subtitle = document.createElement("small");
-    subtitle.textContent = chinese ? "服务地址、刷新与应用信息" : "Server, reload and app information";
+    subtitle.textContent = chinese ? "重新加载当前聊天页面" : "Reload the current chat page";
     text.append(title, subtitle);
-    link.append(svg, text);
-    return link;
+    button.append(svg, text);
+    return button;
   }
 
   const menus = new Map();
   function updateMenu(card) {
     const items = card.querySelector(".header-menu-items");
-    if (!items || items.querySelector("[data-harmony-client-settings]")) return;
-    items.insertBefore(settingsLink(), items.querySelector(".danger"));
+    if (!items || items.querySelector("[data-harmony-reload]")) return;
+    items.insertBefore(reloadButton(), items.querySelector(".danger"));
   }
   function attachMenu(scrim) {
     if (!(scrim instanceof Element) || !scrim.matches(".header-menu-scrim")) return;

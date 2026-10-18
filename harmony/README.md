@@ -8,8 +8,9 @@ The conversation UI stays web-based; it is not a rewrite of the UI in ArkUI.
 ## Current scope
 
 - HTTPS server setup, followed by the normal cc-remote cookie login.
-- No additional address bar above chat. **⋮ → 客户端设置** offers reload, server
-  selection and app information; a small settings entry remains before login.
+- No additional address bar above chat. **⋮ → 刷新页面** reloads chat directly.
+  Server selection and app information remain in **客户端设置** on the login page
+  and the native load-error screen.
 - Separate in-app web browsing with **返回聊天**, retaining the mounted chat and
   its draft. HTTPS links and user-triggered new windows are supported.
 - System file selection through ArkWeb's default file-upload handling.
@@ -78,7 +79,7 @@ server remains running, stop it with
 Keep the SDK and private signing configuration for the next native update.
 
 Most chat features come from the hosted Web UI. After a normal cc-remote server
-update, use **⋮ → 客户端设置 → 刷新聊天页面** to load the updated UI; a new HAP is
+update, use **⋮ → 刷新页面** to load the updated UI; a new HAP is
 not needed. Changes to the ArkUI/ArkWeb shell or its packaged adapter require a
 new signed HAP and an in-place installation. Preserve the bundle and signing
 identity, increment `versionCode`, and install over the existing app instead of

@@ -4412,6 +4412,85 @@ async function coverBtwPanel(
     : page.locator(".artifact-panel").getByRole("button", { name: "收起", exact: true });
 }
 
+test("native question centers long Claude prompts and retains answers above the keyboard", async ({ page }, testInfo) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude" });
+  await page.goto("/");
+  await expect(page.locator(".composer textarea")).toBeEnabled();
+  const paragraph = "写飞书前对照现有文档，发现 v0.8 端侧决策的指标和文档里已有的定义冲突。\n\n"
+    + "文档「指标说明」里的定义是：误动作率 = 不应执行却执行，或方向、动作执行错误的比例。按这个定义，端侧接手后做错的指令也算误动作。\n\n";
+  relay.emit({ type: "ask_user", sid: "layout-parent", seq: 1, ask_id: "long-ask",
+    question: paragraph.repeat(7), options: [{ label: "修正指标" }, { label: "补充说明" }],
+    allow_text: true, multi_select: true });
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator(".question-dialog-title")).toHaveText("Claude 想确认一下");
+  await expect(dialog.locator(".engine-brand-icon.claude use")).toHaveAttribute("href", /#claude$/);
+  expect(await dialog.evaluate(node => node.parentElement === document.body)).toBe(true);
+  const box = (await dialog.boundingBox())!;
+  const viewport = page.viewportSize()!;
+  expect(Math.abs(box.x + box.width / 2 - viewport.width / 2)).toBeLessThan(2);
+  expect(Math.abs(box.y + box.height / 2 - viewport.height / 2)).toBeLessThan(2);
+  expect(box.y).toBeGreaterThan(viewport.height * .1);
+  expect(viewport.height - box.y - box.height).toBeGreaterThan(viewport.height * .1);
+  const body = dialog.locator(".sheet-scroll");
+  expect(await body.evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
+  await expect(dialog.getByPlaceholder("输入回答")).not.toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath("claude-question-centered-light.png") });
+  await page.evaluate(() => document.documentElement.dataset.theme = "dark");
+  await page.screenshot({ path: testInfo.outputPath("claude-question-centered-dark.png") });
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "修正指标", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "修正指标", exact: true })).toHaveAttribute("aria-pressed", "true");
+  const input = dialog.getByPlaceholder("输入回答");
+  await input.fill("按原定义修正并补充说明");
+  await page.evaluate(() => {
+    Object.defineProperties(window.visualViewport!, {
+      height: { configurable: true, value: 340 },
+      offsetTop: { configurable: true, value: 40 },
+    });
+    window.visualViewport!.dispatchEvent(new Event("resize"));
+  });
+  await expect.poll(async () => {
+    const rect = await dialog.boundingBox();
+    return !!rect && rect.y >= 40 && rect.y + rect.height <= 380
+      && Math.abs(rect.y + rect.height / 2 - 210) < 2;
+  }).toBe(true);
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue("按原定义修正并补充说明");
+  await expect(input).toBeInViewport({ ratio: 1 });
+  await page.screenshot({ path: testInfo.outputPath("claude-question-keyboard.png") });
+  await dialog.locator(".qa-text-answer").getByRole("button", { name: "确定", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(() => relay.commands.filter(command => command.type === "answer_question")
+    .map(({ sid, ask_id, answer }) => ({ sid, ask_id, answer }))).toEqual([
+      { sid: "layout-parent", ask_id: "long-ask", answer: ["修正指标", "按原定义修正并补充说明"] },
+    ]);
+});
+
+test("native question keeps custom headings and text-only Codex answers", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "codex" });
+  await page.goto("/");
+  await expect(page.locator(".composer textarea")).toBeEnabled();
+  relay.emit({ type: "ask_user", sid: "layout-parent", seq: 1, ask_id: "text-ask",
+    header: "部署目标", question: "请选择目标环境。", options: [], allow_text: true, secret: true });
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator(".question-dialog-title")).toHaveText("Codex 想确认一下");
+  await expect(dialog.locator(".engine-brand-icon.codex use")).toHaveAttribute("href", /#codex$/);
+  await expect(dialog.locator(".qa-header")).toHaveText("部署目标");
+  const input = dialog.getByPlaceholder("输入敏感内容");
+  await expect(input).toHaveAttribute("type", "password");
+  await expect(input).toBeFocused();
+  await input.fill("staging");
+  await input.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect.poll(() => relay.commands.filter(command => command.type === "answer_question")
+    .map(({ sid, ask_id, answer }) => ({ sid, ask_id, answer }))).toEqual([
+      { sid: "layout-parent", ask_id: "text-ask", answer: "staging" },
+    ]);
+});
+
 for (const cover of ["agent", "diff"] as const) {
   test(`right panel visibility keeps parent questions answerable behind ${cover}`, async ({
     page,
@@ -12434,4 +12513,106 @@ test("right panel layout Artifacts retries the failed history page and retains t
   await panel.getByRole("button", { name: "查看更早的文件", exact: true }).click();
   await expect.poll(() => requests().length).toBe(5);
   expect(requests()[4]).toMatchObject({ before: 41, scan_history: true, history_before: "older-turn" });
+});
+
+for (const settlement of ["success", "error", "timeout"] as const) {
+  test(`right panel layout Artifacts queues a head refresh behind an older page (${settlement})`, async ({ page }) => {
+    await page.setViewportSize({ width: 1568, height: 1000 });
+    await page.clock.install();
+    const relay = await mockRightPanelRelay(page);
+    await page.goto("/");
+    await page.getByRole("button", { name: "更多设置", exact: true }).click();
+    await page.getByRole("button", { name: "打开 Artifacts", exact: true }).click();
+    const requests = () => relay.commands.filter(c => c.type === "get_session_artifacts");
+    const entry = (id: string, created_at: number) => ({ id, created_at, name: `${id}.md`,
+      path: `/tmp/layout/${id}.md`, source: "delivered" as const, kind: "document" as const,
+      available: true, size: 1 });
+    const respond = (index: number, entries: ReturnType<typeof entry>[], before: number, error?: string) => {
+      relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(requests()[index].request_id),
+        entries, next_before: before, has_more: true, history_before: "older-turn", history_more: true, error });
+    };
+    await expect.poll(() => requests().length).toBe(1);
+    respond(0, [entry("head", 100)], 40);
+    await expect.poll(() => requests().length).toBe(2);
+    respond(1, [], 40);
+    const panel = page.locator(".session-artifacts-panel");
+    await panel.getByRole("button", { name: "查看更早的文件", exact: true }).click();
+    await expect.poll(() => requests().length).toBe(3);
+    respond(2, [entry("older", 50)], 20);
+    await panel.getByRole("button", { name: "查看更早的文件", exact: true }).click();
+    await expect.poll(() => requests().length).toBe(4);
+    expect(requests()[3]).toMatchObject({ before: 20, scan_history: false });
+    // Multiple live revisions must coalesce, leaving the page request intact.
+    for (const state of ["running", "idle"] as const) {
+      relay.emit({ type: "state", sid: "layout-parent", state });
+      await expect(page.getByText(state, { exact: true }).first()).toBeVisible();
+    }
+    expect(requests()).toHaveLength(4);
+    if (settlement === "timeout") await page.clock.fastForward(30_001);
+    else respond(3, settlement === "success" ? [entry("oldest", 25)] : [], 10,
+      settlement === "error" ? "暂时不可用" : undefined);
+    await expect.poll(() => requests().length).toBe(5);
+    expect(requests()[4]).toMatchObject({ before: null, scan_history: false });
+    respond(4, [entry("new-delivery", 200)], 40);
+    await expect(panel.getByRole("button", { name: /new-delivery.md/ })).toBeVisible();
+    await expect(panel.getByRole("button", { name: /older.md/ })).toBeVisible();
+    if (settlement === "timeout") {
+      respond(3, [entry("expired-response", 300)], 1);
+      await expect(panel.getByRole("button", { name: /expired-response.md/ })).toHaveCount(0);
+    }
+    await panel.getByRole("button", { name: "查看更早的文件", exact: true }).click();
+    await expect.poll(() => requests().length).toBe(6);
+    expect(requests()[5]).toMatchObject({ before: settlement === "success" ? 10 : 20, scan_history: false });
+    expect(relay.commands.some(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toBe(false);
+  });
+}
+
+test("right panel layout Artifacts retries expired thumbnails and ignores their late responses", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.clock.install();
+  const relay = await mockRightPanelRelay(page, { secondParent: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: "更多设置", exact: true }).click();
+  await page.getByRole("button", { name: "打开 Artifacts", exact: true }).click();
+  const lists = () => relay.commands.filter(c => c.type === "get_session_artifacts");
+  const thumbs = () => relay.commands.filter(c => c.type === "get_session_artifact_preview" && c.variant === "thumbnail");
+  await expect.poll(() => lists().length).toBe(1);
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(lists()[0].request_id),
+    entries: [], has_more: false, history_more: false });
+  await expect.poll(() => lists().length).toBe(2);
+  const entries = [0, 1].map(i => ({ id: `retry-${i}`, name: `${i}.png`, path: `/tmp/layout/${i}.png`,
+    source: "upload" as const, kind: "image" as const, created_at: 100 - i, available: true, size: 1 }));
+  relay.emit({ type: "session_artifacts", sid: "layout-parent", request_id: String(lists()[1].request_id),
+    entries, has_more: false, history_more: false });
+  await expect.poll(() => thumbs().length).toBe(2);
+  await page.clock.fastForward(30_001);
+  await expect.poll(() => thumbs().length).toBe(4);
+  expect(new Set(thumbs().map(c => c.request_id)).size).toBe(4);
+  expect(thumbs().slice(2).map(c => c.artifact_id).sort()).toEqual(["retry-0", "retry-1"]);
+  const respond = (index: number) => {
+    const request = thumbs()[index];
+    relay.emit({ type: "file_preview", sid: "layout-parent", request_id: String(request.request_id),
+      path: entries.find(e => e.id === request.artifact_id)!.path,
+      format: "image", media_type: "image/webp", data: ARTIFACT_THUMBNAIL, size: 740, writable: false });
+  };
+  const panel = page.locator(".session-artifacts-panel");
+  respond(0);
+  respond(1);
+  await expect(panel.locator(".session-artifact-icon img")).toHaveCount(0);
+  respond(2);
+  await expect(panel.locator(".session-artifact-icon img")).toHaveCount(1);
+  await page.clock.fastForward(30_001);
+  await expect.poll(() => thumbs().length).toBe(5);
+  respond(4);
+  await expect(panel.locator(".session-artifact-icon img")).toHaveCount(2);
+  await page.clock.fastForward(30_001);
+  expect(thumbs()).toHaveLength(5);
+  // A new pending thumbnail must be cancelled when its owner panel unmounts.
+  await panel.getByRole("button", { name: "刷新 Artifacts", exact: true }).click();
+  await expect.poll(() => thumbs().length).toBe(7);
+  await page.getByText("Second parent", { exact: true }).evaluate(el => (el as HTMLElement).click());
+  await expect(panel).toHaveCount(0);
+  await page.clock.fastForward(30_001);
+  expect(thumbs()).toHaveLength(7);
+  expect(relay.commands.some(c => ["query", "steer", "interrupt"].includes(String(c.type)))).toBe(false);
 });
