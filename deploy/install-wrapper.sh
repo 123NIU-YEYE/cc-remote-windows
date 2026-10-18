@@ -696,6 +696,12 @@ if [ "$service_had_file" -eq 1 ]; then
   fi
 fi
 if [ "$service_was_running" -eq 1 ]; then
+  if [ "$system" = linux ] && [ "$service_manager" = systemd ]; then
+    # Old detached Codex daemons may still inherit this unit's KillMode.
+    # Abort before marking the service stopped: rollback must not restart it.
+    "$target/.venv/bin/python" "$target/deploy/check_codex_lifetime.py" \
+      --unit "$service_label" --uid "$(id -u "$target_user")"
+  fi
   # A lost stop response may still mean the original process stopped.
   # Include it in rollback recovery even when the stop call reports failure.
   service_stopped=1

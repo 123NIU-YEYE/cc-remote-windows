@@ -55,6 +55,7 @@ _WRAPPER_DEPLOY = (
     "adopt_wrapper.py",
     "atomic_symlink.py",
     "check_codex_readiness.py",
+    "check_codex_lifetime.py",
     "cleanup.py",
     "release_retention.py",
     "cc-remote-wrapper.service",

@@ -125,6 +125,9 @@ def _private_stdio_argv(argv: list[str]) -> list[str]:
 def test_daemon_lifecycle_child_raises_nofile_without_wrapping_reads(
         monkeypatch):
     captured: list[tuple[str, ...]] = []
+    # Exercise the direct launcher independently of the CI runner's cgroup.
+    # Linux service isolation and its limits are covered separately.
+    monkeypatch.setattr(daemon_module, "needs_isolation", lambda: False)
 
     def run(argv, **_kwargs):
         captured.append(tuple(argv))
