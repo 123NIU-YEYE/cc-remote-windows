@@ -323,7 +323,8 @@ function PreviewImage({ markdownPath, src, alt, title, width, height, asset, req
 
 export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
-  onSaveMarkdown, onDirtyChange, theme }: {
+  onSaveMarkdown, onDirtyChange, theme, displayName }: {
+  displayName?: string;
   artifact: Artifact;
   active: RightPanelView;
   hasBtw: boolean;
@@ -531,7 +532,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     requestAsset,
   ]);
 
-  const title = artifact.file.split("/").pop()
+  const title = displayName || artifact.file.split("/").pop()
     || (["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) ? "文件预览" : "改动");
   const mermaidFile = artifact.kind === "file" && /\.(?:mmd|mermaid)$/i.test(artifact.file);
   const renderedArtifact = ["image", "pdf", "audio"].includes(artifact.kind)
@@ -572,7 +573,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         {!loading && !artifact.error && !artifact.authorization && !artifact.truncated
           && ["md", "file", "html", "image", "pdf"].includes(artifact.kind)
           && (artifact.data != null || artifact.content != null) && <Suspense fallback={null}>
-            <ArtifactDownload id={artifactKey} file={artifact.file} data={artifact.data}
+            <ArtifactDownload id={artifactKey} file={displayName || artifact.file} data={artifact.data}
               content={artifact.content} converted={artifact.convertedFrom} />
           </Suspense>}
         {artifact.convertedFrom && <span className="artifact-converted"

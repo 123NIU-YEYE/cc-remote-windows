@@ -61,6 +61,8 @@ ACTION_CLASSES = (
     p.AuthorizePreview,
     p.GetAgentDetail,
     p.GetHistoryImage,
+    p.GetSessionArtifacts,
+    p.GetSessionArtifactPreview,
     p.ListDir,
     p.GetWorkDashboard,
     p.GetWorkArtifacts,

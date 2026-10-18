@@ -643,8 +643,6 @@
   min-height: 32px; border-radius: 9px; font: var(--font-weight-600) 11px var(--mono); letter-spacing: .02em; cursor: pointer; }
 .engine-label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .engine-label svg { flex: none; }
-.engine-toggle > svg { color: var(--dim); transition: transform 120ms ease; }
-.engine-toggle[aria-expanded="true"] > svg { transform: rotate(180deg); }
 .engine-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .engine-menu { position: fixed; z-index: 75; width: 172px; padding: 5px; border: 1px solid var(--border);
   border-radius: 13px; background: var(--surface); color: var(--text); box-shadow: 0 8px 30px #0002; }

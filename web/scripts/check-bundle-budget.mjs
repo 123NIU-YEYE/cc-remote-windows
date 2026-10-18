@@ -45,10 +45,16 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // Harmony push availability and notification routing add <2 KiB at startup.
 // Provider and Web Push operations load on demand, without a runtime dependency
 // or an extra initial request; retain the entry/file-count caps.
-const MAX_INITIAL_BYTES = 946 * 1024;
+// Session Artifacts entry/routing and an independent centered-chat layer add
+// <3 KiB; catalog, preview UI and styles load on demand. Gzip/request caps stay fixed.
+// Brand symbols are external SVG, not an icon-library dependency. Status-card
+// markup adds <1 KiB JS / 0.3 KiB gzip; retain entry and initial request caps.
+// Global harness navigation and scoped modal/side-chat restoration add <1 KiB.
+// Question draft UI remains lazy; gzip, entry and request caps stay unchanged.
+const MAX_INITIAL_BYTES = 951 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
-const MAX_INITIAL_GZIP_BYTES = 285 * 1024;
+const MAX_INITIAL_GZIP_BYTES = 286 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");

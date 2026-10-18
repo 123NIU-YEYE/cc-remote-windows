@@ -5042,6 +5042,7 @@ function reduceEvent(
     }
     case "turn_file_changes_page":
     case "files_listed":
+    case "session_artifacts":
     case "agent_detail":
       // Agent detail is a requester-correlated side panel projection. App owns
       // it separately so it can never mutate the parent conversation runtime.

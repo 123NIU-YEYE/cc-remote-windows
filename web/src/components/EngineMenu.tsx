@@ -50,6 +50,7 @@ export default function EngineMenu({ engine, anchor, keyboard, onClose, onSelect
     }}>
     {engines.map(value => <button key={value} type="button" role="menuitemradio"
       aria-checked={value === engine} tabIndex={-1} className="engine-menu-item"
+      aria-keyshortcuts={`Meta+${value === "claude" ? 1 : 2} Control+${value === "claude" ? 1 : 2}`}
       onClick={event => onSelect(value, event.detail === 0)}>
       <EngineIcon engine={value} size={18} />
       <span>{value === "codex" ? "Codex" : "Claude"}</span>

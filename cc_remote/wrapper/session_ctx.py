@@ -449,6 +449,7 @@ class SessionContext:
     # built-in file-mutation tool has completed successfully. Keep the pending
     # tool/paths binding separate so a failed or declined tool call grants no
     # read capability.  Both maps are bounded by WrapperMachine.
+    artifact_text: dict[str, str] = field(default_factory=dict)
     preview_write_candidates: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # A successful built-in image read outside cwd grants only the immutable
     # bytes observed at that exact tool boundary.  The machine owns the bounded

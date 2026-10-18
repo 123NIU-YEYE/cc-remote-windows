@@ -58,7 +58,7 @@ import {
   type AutoCompactSelection,
 } from "../auto-compact";
 import { AutoCompactControl } from "./AutoCompactControl";
-import { QuestionSheet } from "./QuestionSheet";
+import { QuestionSheet, type QuestionDraft } from "./QuestionSheet";
 import { sessionControlLocksInput } from "../protocol";
 import type { QueryImg, QueryFile } from "../protocol";
 import { AttachmentPicker } from "./AttachmentPicker";
@@ -74,6 +74,7 @@ import type { PasteReceipt } from "../clipboard-paste-guard";
 import "./BtwPanel.css";
 
 interface Props {
+  onOpenArtifacts?: () => void;
   sid?: string;
   rt: SessionRuntime | undefined;
   engine: "claude" | "codex";
@@ -94,6 +95,7 @@ interface Props {
   catalog: Catalog;
   draftKey: string;
   draftStore: ComposerDraftStore;
+  questionDrafts?: Map<string, QuestionDraft>;
   sendMode: SendMode;
   unconfirmedQueued: PendingQuery[];
   unconfirmedReplaceable: PendingQuery[];
@@ -124,7 +126,7 @@ interface Props {
     authorization: PreviewAuthorizationState,
     decision: "allow" | "deny",
   ) => boolean;
-  onAnswerQuestion: (askId: string, answer: string | string[]) => void;
+  onAnswerQuestion: (askId: string, answer: string | string[]) => boolean | void;
   onCollapse: () => void;
   onDismissNotice: (noticeId: string) => void;
 }
@@ -209,7 +211,7 @@ export function BtwPanel(p: Props) {
     const panel = textarea?.closest(".btw-panel");
     const otherOverlay = [...document.querySelectorAll<HTMLElement>(
       '[role="dialog"], [aria-modal="true"], dialog[open], [role="menu"]',
-    )].some(node => node !== panel && node.getClientRects().length > 0);
+    )].some(node => node !== panel && !node.closest("[inert]") && node.getClientRects().length > 0);
     if (textarea && sid && !inputLocked && !otherOverlay) {
       // A reopened draft starts at its end; moving the mounted panel preserves
       // the user's existing caret/selection.
@@ -490,6 +492,8 @@ export function BtwPanel(p: Props) {
                 {p.engine === "codex" ? "Codex" : "Claude"}
               </span>
             </div>}
+        {p.onOpenArtifacts && <button className="iconbtn" onClick={p.onOpenArtifacts}
+          aria-label="打开侧聊 Artifacts" title="侧聊 Artifacts"><Icon name="archive" /></button>}
         <button className="iconbtn btw-new" onClick={p.onNew}
           disabled={!!p.opening}
           aria-label="新建侧边对话" title="新建侧边对话">
@@ -743,7 +747,12 @@ export function BtwPanel(p: Props) {
       </>}
       {!inputLocked && p.rt?.pendingQuestion && (
         <QuestionSheet
-          key={p.rt.pendingQuestion.ask_id}
+          key={JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id])}
+          draft={p.questionDrafts && p.sid ? {
+            key: JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id]),
+            store: p.questionDrafts,
+          } : undefined}
+          engine={p.engine}
           header={p.rt.pendingQuestion.header}
           question={p.rt.pendingQuestion.question}
           options={p.rt.pendingQuestion.options}
@@ -752,7 +761,7 @@ export function BtwPanel(p: Props) {
           multiSelect={p.rt.pendingQuestion.multi_select}
           onAnswer={(answer) => {
             const question = p.rt?.pendingQuestion;
-            if (question) p.onAnswerQuestion(question.ask_id, answer);
+            return question ? p.onAnswerQuestion(question.ask_id, answer) : false;
           }}
         />
       )}

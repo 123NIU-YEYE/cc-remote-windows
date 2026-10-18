@@ -2,8 +2,8 @@ import {
   harmonyPushSnapshot, subscribeHarmonyPush, hasHarmonyPush,
   requestHarmonyPermission, confirmHarmonyPermission,
 } from "./harmony-push";
-import { RightPanelPresentation } from "./right-panel-presentation";
-import type { ServerEvent } from "./protocol";
+import { RightPanelPresentation, rekeyPanelScope } from "./right-panel-presentation";
+import type { ServerEvent, FilePreview } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
 import {
   lazy,
@@ -37,6 +37,7 @@ import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
 import { ChatView, type ChatViewHandle } from "./components/ChatView";
+import type { QuestionDraft } from "./components/QuestionSheet";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
 import { SidebarToggle } from "./components/SidebarToggle";
@@ -262,7 +263,7 @@ import {
   activeTurnCandidateIds,
   displayActiveTurnOwnerId,
 } from "./process-blocks";
-import type { AgentDetail, FilesListed } from "./protocol";
+import type { AgentDetail, FilesListed, SessionArtifacts, SessionArtifactInfo } from "./protocol";
 import type { AgentDetailSelection } from "./components/AgentDetailController";
 import type { RightPanelView } from "./components/PanelTabs";
 import { useTheme } from "./use-theme";
@@ -283,6 +284,7 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
 ));
+const SessionArtifactsPanel = lazy(() => import("./components/SessionArtifactsPanel"));
 const SessionFilesPanel = lazy(() => import("./components/SessionFilesPanel"));
 const DirPicker = lazy(() => import("./components/DirPicker").then(
   ({ DirPicker }) => ({ default: DirPicker }),
@@ -373,11 +375,11 @@ export default function App() {
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
-  // Every right-slot panel shares the same centered presentation.
+  // File panels share one slot; centered BTW is an independent overlay above it.
   const [expandedPanel, setExpandedPanel] = useState<{
     scope: string;
-    returnToDocked: boolean;
   } | null>(null);
+  const [centeredBtwScopes, setCenteredBtwScopes] = useState<string[]>([]);
   const btwChatViewRef = useRef<ChatViewHandle>(null);
   // A user action owns one focus request; restored panels and streaming updates
   // must not move the caret away from whatever the user is editing.
@@ -392,6 +394,14 @@ export default function App() {
     sid: string; machineId: string; engine: string; space: string;
     path: string; preview: boolean; id: string;
   } | null>(null);
+  const [sessionArtifacts, setSessionArtifacts] = useState<{
+    parentSid: string; sid: string; machineId: string; engine: Engine; space: Space;
+    selected: SessionArtifactInfo | null; id: string;
+  } | null>(null);
+  const artifactsListenerRef = useRef<((message: SessionArtifacts | FilePreview) => boolean) | null>(null);
+  const listenArtifacts = useCallback((listener: ((message: SessionArtifacts | FilePreview) => boolean) | null) => {
+    artifactsListenerRef.current = listener;
+  }, []);
   const filesListenerRef = useRef<((message: FilesListed) => void) | null>(null);
   const listenFiles = useCallback((listener: ((message: FilesListed) => void) | null) => {
     filesListenerRef.current = listener;
@@ -490,6 +500,7 @@ export default function App() {
   const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
   const composerDraftsRef = useRef(new ComposerDraftStore());
   const btwDraftsRef = useRef(new ComposerDraftStore());
+  const questionDraftsRef = useRef(new Map<string, QuestionDraft>());
   const [, bumpHistoryImageRevision] = useReducer((value: number) => value + 1, 0);
   const dismissBanner = useCallback((banner: string) => {
     dispatch({ type: "dismiss_banner", banner });
@@ -815,10 +826,10 @@ export default function App() {
     getDiff: (file: string) => void;
     openBtw: () => void;
     collapseBtw: () => void;
-    togglePanelExpanded: () => void;
+    toggleCenteredBtw: () => void;
   }>({ artifact: null, btwSid: null, rightView: "diff",
     getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {},
-    togglePanelExpanded: () => {} });
+    toggleCenteredBtw: () => {} });
 
   useEffect(() => {
     const current = reconcileOpenMigrationSession(
@@ -850,6 +861,8 @@ export default function App() {
     setBtwSendModeBySid({});
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
+    questionDraftsRef.current.clear();
+    setCenteredBtwScopes([]);
     setCompletionReceipts({});
     resetGoalDismissMigrationTracking(
       goalDismissMigrationsRef.current,
@@ -957,23 +970,36 @@ export default function App() {
   const filesShowing = fileBrowser?.sid === visibleParentSid
     && fileBrowser?.machineId === machineId && fileBrowser?.engine === engine
     && fileBrowser?.space === space;
+  const artifactsShowing = sessionArtifacts?.parentSid === visibleParentSid
+    && sessionArtifacts?.machineId === machineId && sessionArtifacts?.engine === engine
+    && sessionArtifacts?.space === space;
   const visibleRightPanel = viewerShowing ? "viewer" : agentPanel ? "agent"
-    : filesShowing ? "files"
+    : artifactsShowing ? "artifacts" : filesShowing ? "files"
     : rightView === "btw" && btwShowing ? "btw"
       : state.artifact ? "diff" : btwShowing ? "btw" : null;
   const panelScope = (kind: string, identity?: string) =>
     JSON.stringify([machineId, space, engine, visibleParentSid, kind, identity ?? null]);
   const rightPanelKey = visibleRightPanel ? panelScope(visibleRightPanel,
-    visibleRightPanel === "files" ? fileBrowser?.id
+    visibleRightPanel === "artifacts" ? sessionArtifacts?.id
+      : visibleRightPanel === "files" ? fileBrowser?.id
       : visibleRightPanel === "agent" ? agentPanel?.runId : undefined) : null;
+  const btwScope = panelScope("btw");
+  // Keep each surface's presentation when navigating away; only an explicit
+  // open/close changes it. Returning must not request composer autofocus.
+  const setCenteredBtw = (visible: boolean) => setCenteredBtwScopes(
+    current => setBtwPanelScope(current, btwScope, visible));
+  const btwExpanded = !!btwPanelKey && centeredBtwScopes.includes(btwScope);
+  const btwRendered = visibleRightPanel === "btw" || btwExpanded;
   const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
   useEffect(() => {
     setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
-    setBtwFocusScope(current => current !== rightPanelKey ? null : current);
   }, [rightPanelKey]);
+  useEffect(() => {
+    setBtwFocusScope(current => current === btwScope ? current : null);
+  }, [btwScope]);
   // Questions, hydration and completion receipts must agree with the rendered
   // slot, including when an agent or artifact covers a retained side chat.
-  const visibleBtwSid = visibleRightPanel === "btw" ? activeBtwSid : null;
+  const visibleBtwSid = btwRendered ? activeBtwSid : null;
   const visibleBtwSidRef = useRef(visibleBtwSid);
   visibleBtwSidRef.current = visibleBtwSid;
   const activeBtwQuestionVisible = !!(
@@ -1683,9 +1709,10 @@ export default function App() {
   useEffect(() => {
     try {
       sessionStorage.setItem(
-        BTW_PANEL_SCOPES_KEY, JSON.stringify(btwPanelScopes));
+        BTW_PANEL_SCOPES_KEY, JSON.stringify(btwExpanded && btwPanelKey
+          ? setBtwPanelScope(btwPanelScopes, btwPanelKey, true) : btwPanelScopes));
     } catch { /* storage is best-effort in private browsing */ }
-  }, [btwPanelScopes]);
+  }, [btwPanelScopes, btwExpanded, btwPanelKey]);
   const toggleTheme = () => selectTheme(theme === "dark" ? "light" : "dark");
 
   // `engine` selects the backend (Claude Code / Codex): the whole UI re-skins via
@@ -2130,6 +2157,7 @@ export default function App() {
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
   const toggleEngine = (nextEngine: Engine) => {
+    if (nextEngine === engine || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
     const nextSpace = spacesByEngineRef.current[nextEngine];
     pendingCreateRef.current = null;
@@ -3378,6 +3406,17 @@ export default function App() {
               // not discard either side chat.
             }
             if (ownership) {
+              setCenteredBtwScopes(current => [...new Set(current.map(
+                scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
+              setBtwFocusScope(current => rekeyPanelScope(current, msg.old_key, msg.session_id));
+              setExpandedPanel(current => current ? { ...current,
+                scope: rekeyPanelScope(current.scope, msg.old_key, msg.session_id)! } : null);
+              setSessionArtifacts(current => current && current.machineId === machineId ? { ...current,
+                parentSid: current.parentSid === msg.old_key ? msg.session_id : current.parentSid,
+                sid: current.sid === msg.old_key ? msg.session_id : current.sid } : current);
+              setFileBrowser(current => current && current.machineId === machineId && current.sid === msg.old_key
+                ? { ...current, sid: msg.session_id } : current);
+
               setViewerSelections((current) => {
                 const old = viewerScopeKey({ ...ownership, sid: msg.old_key });
                 if (!Object.hasOwn(current, old)) return current;
@@ -3594,6 +3633,11 @@ export default function App() {
               || (msg.type === "error"
                 && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
             );
+          if (msg.type === "session_artifacts") {
+            artifactsListenerRef.current?.(msg);
+            return;
+          }
+          if (msg.type === "file_preview" && artifactsListenerRef.current?.(msg)) return;
           if (msg.type === "files_listed") {
             filesListenerRef.current?.(msg);
             return;
@@ -3798,6 +3842,8 @@ export default function App() {
           setBtwOpeningByParentSid({});
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
+          questionDraftsRef.current.clear();
+          setCenteredBtwScopes([]);
           setForkingPointId(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
@@ -3845,6 +3891,8 @@ export default function App() {
           setCompletionReceipts(discardBtwCompletionReceipts);
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
+          questionDraftsRef.current.clear();
+          setCenteredBtwScopes([]);
           if (Object.keys(stateRef.current.btwByParentSid).length > 0
               || stateRef.current.btwRevision > 0
               || pendingBtwByParentRef.current.size > 0
@@ -4152,7 +4200,7 @@ export default function App() {
     if (!authed) return;
     const hasOtherOverlay = (owner: Element | null) => [...document.querySelectorAll<HTMLElement>(
       '[role="dialog"], [aria-modal="true"], dialog[open], [role="menu"]',
-    )].some(node => node !== owner && node.getClientRects().length);
+    )].some(node => node !== owner && !node.closest("[inert]") && node.getClientRects().length);
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || e.repeat) return;
       if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
@@ -4174,7 +4222,8 @@ export default function App() {
       const k = e.key.toLowerCase();
       // Let a nested picker/confirmation finish before moving its owner panel.
       if ((k === "e" || k === "k") && e.shiftKey
-          && hasOtherOverlay(document.querySelector('.right-panel-frame[aria-modal="true"]'))) return;
+          && hasOtherOverlay(document.querySelector('.btw-panel[aria-modal="true"]')
+            ?? document.querySelector('.right-panel-frame[aria-modal="true"]'))) return;
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
@@ -4186,13 +4235,14 @@ export default function App() {
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
-        if (btwPanelVisibleRef.current && latest.rightView === "btw") {
+        if (document.querySelector('.btw-panel[aria-modal="true"]')
+            || (btwPanelVisibleRef.current && latest.rightView === "btw")) {
           latest.collapseBtw();
         }
         else latest.openBtw();
       } else if (k === "e" && e.shiftKey) {
         e.preventDefault();
-        shortcutRef.current.togglePanelExpanded();
+        shortcutRef.current.toggleCenteredBtw();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -5215,6 +5265,7 @@ export default function App() {
   };
   const getDiff = (file: string) => {
     if (!confirmArtifactDiscard()) return;
+    setSessionArtifacts(null);
     closeViewer();
     const requestId = wsRef.current?.sendGetDiff(file, theme) ?? null;
     if (!requestId) return;
@@ -5236,6 +5287,7 @@ export default function App() {
     if (!confirmArtifactDiscard()) return;
     const requestId = wsRef.current?.sendGetDiff(file, theme, turnId, revision, focusedEngine) ?? null;
     if (!requestId) return;
+    setSessionArtifacts(null);
     closeViewer();
     setRightView("diff");
     dispatch({ type: "open_artifact_loading", file, sid: focusedSid, requestId });
@@ -5255,7 +5307,8 @@ export default function App() {
   ): boolean => {
     if (!targetSid) return false;
     if (!confirmArtifactDiscard()) return false;
-    if (!fromBrowser) setFileBrowser(null);
+    if (targetSid === activeBtwSid) setCenteredBtw(false);
+    if (!fromBrowser) { setFileBrowser(null); setSessionArtifacts(null); }
     closeViewer();
     const requestId = uuid();
     if (!wsRef.current?.sendGetFilePreview(
@@ -5279,6 +5332,7 @@ export default function App() {
   const openAgentDetail = (runId: string, title?: string) => {
     if (!focusedSid || space !== "code"
         || !rt.historyRevision) return;
+    setSessionArtifacts(null);
     closeViewer();
     const agent = rt.backgroundProcesses.find((block) => block.item_id === runId)
       ?? rt.turns.flatMap((turn) => turn.blocks).find((block) =>
@@ -5296,11 +5350,31 @@ export default function App() {
   const previewMarkdown = (file: string) => previewFile(file);
   const openFiles = (path = ".") => {
     if (!focusedSid || !confirmArtifactDiscard()) return;
+    setSessionArtifacts(null);
     closeViewer();
     setAgentPanel(null);
     dispatch({ type: "clear_artifact" });
     setFileBrowser({ sid: focusedSid, machineId, engine, space,
       path, preview: false, id: uuid() });
+  };
+  const openSessionArtifacts = (sid = visibleParentSid) => {
+    if (!sid || !visibleParentSid || !confirmArtifactDiscard()) return;
+    closeViewer();
+    setCenteredBtw(false);
+    setAgentPanel(null);
+    setFileBrowser(null);
+    dispatch({ type: "clear_artifact" });
+    setSessionArtifacts({ parentSid: visibleParentSid, sid, machineId,
+      engine: focusedEngine, space, selected: null, id: uuid() });
+  };
+  const selectSessionArtifact = (entry: SessionArtifactInfo) => {
+    if (!sessionArtifacts || !confirmArtifactDiscard()) return;
+    const requestId = uuid();
+    if (!wsRef.current?.sendGetSessionArtifactPreview(sessionArtifacts.sid,
+      sessionArtifacts.engine, sessionArtifacts.space, entry.id, requestId)) return;
+    setSessionArtifacts({ ...sessionArtifacts, selected: entry });
+    dispatch({ type: "open_file_loading", file: entry.path, sid: sessionArtifacts.sid,
+      requestId, kind: isMarkdownPath(entry.path) ? "md" : "file" });
   };
   const loadPreviewAsset = (file: string, previewId: string): boolean => {
     const targetSid = state.artifact?.sid ?? focusedSid;
@@ -5383,42 +5457,48 @@ export default function App() {
     setBtwOpeningFor(parentSid, true);
     setBtwFocusScope(panelScope("btw"));
   };
-  const openBtw = (expanded = false) => {
-    if (!confirmArtifactDiscard()) return;
+  const showCenteredBtw = () => {
     if (!btwPanelKey) return;
+    btwChatViewRef.current?.prepareLayoutChange();
+    setCenteredBtw(true);
+    setBtwFocusScope(btwScope);
+    if (!activeBtwGroup && !btwOpening) createBtw();
+  };
+  const dismissCenteredBtw = () => {
+    btwChatViewRef.current?.prepareLayoutChange();
+    setCenteredBtw(false);
+  };
+  const toggleCenteredBtw = () => {
+    if (btwExpanded) dismissCenteredBtw();
+    else showCenteredBtw();
+  };
+  const openBtw = (expanded = false) => {
+    if (expanded) { showCenteredBtw(); return; }
+    if (!btwPanelKey || !confirmArtifactDiscard()) return;
+    setCenteredBtw(false);
+    setSessionArtifacts(null);
     closeViewer();
-    if (expanded) {
-      setAgentPanel(null);
-      setFileBrowser(null);
-    }
+    setAgentPanel(null);
+    setFileBrowser(null);
     setRightView("btw");
-    setBtwFocusScope(panelScope("btw"));
-    setExpandedPanel(expanded ? { scope: panelScope("btw"), returnToDocked: false } : null);
-    setBtwPanelScopes((current) => setBtwPanelScope(current, btwPanelKey, true));
+    setBtwFocusScope(btwScope);
+    setBtwPanelScopes(current => setBtwPanelScope(current, btwPanelKey, true));
     if (!activeBtwGroup && !btwOpening) createBtw();
   };
   const collapseBtw = () => {
-    setExpandedPanel(null);
+    if (btwExpanded) { dismissCenteredBtw(); return; }
     if (btwPanelKey) setBtwPanelScopes(
-      (current) => setBtwPanelScope(current, btwPanelKey, false));
+      current => setBtwPanelScope(current, btwPanelKey, false));
   };
-  const dockPanel = () => {
-    btwChatViewRef.current?.prepareLayoutChange();
-    if (visibleRightPanel === "btw") setBtwFocusScope(rightPanelKey);
-    setExpandedPanel(null);
+  const dockBtw = () => {
+    if (!confirmArtifactDiscard()) return;
+    openBtw();
+    dismissCenteredBtw();
   };
+  const dockPanel = () => setExpandedPanel(null);
   const togglePanelExpanded = () => {
-    // Shortcut / backdrop / Escape restore the presentation that was visible
-    // before expansion. A directly opened overlay must not leave a side panel.
-    if (panelExpanded) {
-      if (expandedPanel?.returnToDocked) dockPanel();
-      else collapseBtw();
-    } else if (!visibleRightPanel) openBtw(true);
-    else if (rightPanelKey) {
-      btwChatViewRef.current?.prepareLayoutChange();
-      if (visibleRightPanel === "btw") setBtwFocusScope(rightPanelKey);
-      setExpandedPanel({ scope: rightPanelKey, returnToDocked: true });
-    }
+    if (panelExpanded) dockPanel();
+    else if (rightPanelKey) setExpandedPanel({ scope: rightPanelKey });
   };
   const selectBtw = (sid: string) => {
     const parentSid = visibleParentSid;
@@ -5535,7 +5615,7 @@ export default function App() {
   };
   shortcutRef.current = {
     artifact: state.artifact, btwSid: activeBtwSid, rightView,
-    getDiff, openBtw, collapseBtw, togglePanelExpanded,
+    getDiff, openBtw, collapseBtw, toggleCenteredBtw,
   };
   const logout = async () => {
     try {
@@ -5571,6 +5651,8 @@ export default function App() {
       historyPageScopesRef.current.clear();
       composerDraftsRef.current.clear();
       btwDraftsRef.current.clear();
+      questionDraftsRef.current.clear();
+      setCenteredBtwScopes([]);
       setBtwSendModeBySid({});
       setCreateError(null);
       setForkingPointId(null);
@@ -5658,7 +5740,7 @@ export default function App() {
     <ViewerPagesProvider scope={visibleParentSid && authed
       ? { machineId, sid: visibleParentSid, space, engine } : null} onOpen={openViewerPage}>
     <RemoteViewerContext.Provider value={visibleParentSid ? openViewerLink : null}>
-    <SidebarShell controller={sidebar} className={visibleRightPanel !== null && !panelExpanded ? "panel-open" : ""}>
+    <SidebarShell controller={sidebar} className={visibleRightPanel !== null && !panelExpanded && !(visibleRightPanel === "btw" && btwExpanded) ? "panel-open" : ""}>
       <SidebarState controller={sidebar}>{sidebarOpen => <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
         onOpenChange={setSidebarOpen}
@@ -5815,13 +5897,17 @@ export default function App() {
             onOpenUsageActivity={openUsageActivity}
             onOpenBtw={visibleParentSid && !archivedBrowse ? () => openBtw() : undefined}
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
+            onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
             onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
             onSelectTheme={selectTheme}
             onLogout={() => void logout()}
           /></Suspense>
         </header>
 
-        {versionNotice && <div className="notice-bar attention" role="status">{versionNotice}</div>}
+        {versionNotice && <div className="notice-bar attention version-notice" role="status">
+          <span className="notice-icon" aria-hidden="true"><Icon name="info" size={16} /></span>
+          <span className="notice-copy">{versionNotice}</span>
+        </div>}
         <ReconnectBanner banner={state.banner}
           replaying={rt.replaying || historyView.recovering}
           truncated={rt.truncated}
@@ -6181,9 +6267,33 @@ export default function App() {
         {/* context usage now lives in the composer's ring popover (see Composer) */}
       </section>
       {/* Share the layout's selection: retained hidden chats reserve no space. */}
-      <RightPanelPresentation.Provider value={{ expanded: panelExpanded,
-        onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
+      <RightPanelPresentation.Provider value={{ expanded: panelExpanded, covered: btwExpanded, layer: 0, chat: false,
+        onOpenChat: toggleCenteredBtw, onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
       {(() => {
+        if (visibleRightPanel === "artifacts" && sessionArtifacts) {
+          const owner = sessionArtifacts;
+          const close = () => {
+            if (!confirmArtifactDiscard()) return;
+            setSessionArtifacts(null);
+            dispatch({ type: "clear_artifact" });
+          };
+          return <Suspense fallback={<div className="artifact-panel" role="status">加载 Artifacts…</div>}>
+            <SessionArtifactsPanel key={owner.id} sid={owner.sid} engine={owner.engine} space={owner.space}
+              ws={wsRef.current} revision={`${state.connState}:${state.runtimes[owner.sid]?.state}:${state.runtimes[owner.sid]?.turns.length}`}
+              onListen={listenArtifacts} selected={owner.selected} onSelect={selectSessionArtifact}
+              onClose={close} onBack={() => {
+                if (!confirmArtifactDiscard()) return;
+                setSessionArtifacts({ ...owner, selected: null });
+                dispatch({ type: "clear_artifact" });
+              }} preview={{ artifact: state.artifact, theme,
+                onRefresh: (path, line) => {
+                  previewFileForSid(owner.sid, path, line, true);
+                },
+                onOpenFile: (path, line) => { previewFileForSid(owner.sid, path, line, true); },
+                onLoadPreviewAsset: loadPreviewAsset, onAuthorizePreview: authorizePreview,
+                onSaveMarkdown: saveMarkdown, onDirtyChange: setArtifactDirty, onClose: close }} />
+          </Suspense>;
+        }
         if (visibleRightPanel === "files" && fileBrowser) {
           const closeFiles = () => {
             if (!confirmArtifactDiscard()) return;
@@ -6229,11 +6339,31 @@ export default function App() {
               onOpenFile={previewAgentFile} />
           </Suspense>;
         }
-        if (visibleRightPanel === "btw")
-          return <Suspense fallback={null}>
+        if (visibleRightPanel === "diff" && state.artifact)
+          return <Suspense fallback={
+            <div className="artifact-panel empty" role="status">
+              <div className="spinner" aria-hidden="true" />
+              <p className="loading-tx">加载预览…</p>
+            </div>
+          }>
+            <ArtifactPanel artifact={state.artifact} active="diff"
+              hasBtw={!!activeBtwGroup}
+              theme={theme}
+              onTab={switchRight} onRefresh={previewArtifactFile}
+              onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
+              onAuthorizePreview={authorizePreview}
+              onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
+              onClose={() => dispatch({ type: "clear_artifact" })} />
+          </Suspense>;
+        return null;
+      })()}
+      </RightPanelPresentation.Provider>
+      <RightPanelPresentation.Provider value={{ expanded: btwExpanded, covered: false, layer: 1, chat: true,
+        onOpenChat: toggleCenteredBtw, onExpand: showCenteredBtw, onDock: dockBtw, onDismiss: dismissCenteredBtw }}>
+        {btwRendered && (<Suspense fallback={null}>
             <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
             engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
-            focusRequested={btwFocusScope === rightPanelKey}
+            focusRequested={btwFocusScope === btwScope}
             onFocusConsumed={consumeBtwFocus}
             chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
               const runtime = state.runtimes[chat.sid];
@@ -6246,16 +6376,18 @@ export default function App() {
                 needsAnswer: !!runtime?.pendingQuestion,
               };
             })}
-            active="btw" hasArtifact={!!state.artifact}
+            active="btw" hasArtifact={!!state.artifact && !btwExpanded}
             chatViewRef={btwChatViewRef}
             artifactKind={state.artifact?.kind}
             onTab={switchRight}
+            onOpenArtifacts={activeBtwSid ? () => openSessionArtifacts(activeBtwSid) : undefined}
             onNew={createBtw}
             onSelect={selectBtw}
             onCloseChat={closeBtw}
             catalog={focusedCatalog}
             onRequestModels={requestFocusedModels}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
+            questionDrafts={questionDraftsRef.current}
             sendMode={activeBtwSendMode}
             unconfirmedQueued={unconfirmedQueued}
             unconfirmedReplaceable={btwUnconfirmedReplaceable}
@@ -6308,37 +6440,20 @@ export default function App() {
             onLoadImage={loadBtwMessageImage}
             onAuthorizeImage={authorizeMessageImage}
             onAnswerQuestion={(askId, answer) => {
-              if (!activeBtwSid) return;
+              if (!activeBtwSid) return false;
               if (!wsRef.current?.sendAnswerQuestion(
-                activeBtwSid, askId, answer)) return;
+                activeBtwSid, askId, answer)) return false;
               dispatch({
                 type: "answer_question",
                 sid: activeBtwSid,
                 ask_id: askId,
               });
+              return true;
             }}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
             }} />
-          </Suspense>;
-        if (visibleRightPanel === "diff" && state.artifact)
-          return <Suspense fallback={
-            <div className="artifact-panel empty" role="status">
-              <div className="spinner" aria-hidden="true" />
-              <p className="loading-tx">加载预览…</p>
-            </div>
-          }>
-            <ArtifactPanel artifact={state.artifact} active="diff"
-              hasBtw={!!activeBtwGroup}
-              theme={theme}
-              onTab={switchRight} onRefresh={previewArtifactFile}
-              onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
-              onAuthorizePreview={authorizePreview}
-              onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
-              onClose={() => dispatch({ type: "clear_artifact" })} />
-          </Suspense>;
-        return null;
-      })()}
+          </Suspense>)}
       </RightPanelPresentation.Provider>
       {queuedQueryEditor && <Suspense fallback={null}><QueuedQueryDialog
         key={queuedQueryEditor
@@ -6354,7 +6469,10 @@ export default function App() {
         <Suspense fallback={<div className="scrim show" role="dialog"
           aria-label="正在加载操作确认" aria-busy="true" />}>
         <QuestionSheet
-          key={rt.pendingQuestion.ask_id}
+          key={JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id])}
+          draft={{ key: JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id]),
+            store: questionDraftsRef.current }}
+          engine={focusedEngine}
           header={rt.pendingQuestion.header}
           question={rt.pendingQuestion.question}
           options={rt.pendingQuestion.options}
@@ -6363,14 +6481,15 @@ export default function App() {
           multiSelect={rt.pendingQuestion.multi_select}
           onAnswer={(answer) => {
             const question = rt.pendingQuestion;
-            if (!focusedSid || !question) return;
+            if (!focusedSid || !question) return false;
             if (!wsRef.current?.sendAnswerQuestion(
-              focusedSid, question.ask_id, answer)) return;
+              focusedSid, question.ask_id, answer)) return false;
             dispatch({
               type: "answer_question",
               sid: focusedSid,
               ask_id: question.ask_id,
             });
+            return true;
           }}
         />
         </Suspense>

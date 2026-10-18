@@ -31,6 +31,7 @@ REPORT_TYPES = {
     "file_save_result",
     "preview_asset",
     "history_image",
+    "session_artifacts",
     "preview_authorization_required",
     "preview_authorization_result",
     "dir_list",

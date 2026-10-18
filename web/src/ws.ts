@@ -902,6 +902,18 @@ export class RelayWs {
     });
   }
 
+  sendGetSessionArtifacts(sid: string, engine: Engine, space: Space, requestId: string,
+                          before?: number | null, scanHistory = false, historyBefore?: string | null): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "get_session_artifacts", sid, engine, space,
+      request_id: requestId, before, scan_history: scanHistory, history_before: historyBefore, ts: nowTs() });
+  }
+
+  sendGetSessionArtifactPreview(sid: string, engine: Engine, space: Space, id: string, requestId: string,
+                                variant: "full" | "thumbnail" = "full"): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "get_session_artifact_preview", sid, engine, space,
+      artifact_id: id, request_id: requestId, variant, ts: nowTs() });
+  }
+
   sendGetFilePreview(
     path: string,
     requestId = uuid(),
