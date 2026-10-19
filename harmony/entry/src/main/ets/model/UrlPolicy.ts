@@ -38,16 +38,29 @@ export function settingsRequest(value: string, server: string, current: string,
   return value === SETTINGS_URL && mainFrame && gesture && sameOrigin(server, current);
 }
 
-export type NavigationAction = 'allow' | 'browser' | 'settings' | 'block';
+export type NavigationAction = 'allow' | 'external' | 'settings' | 'block';
+
+export function newWindowAction(value: string, server: string,
+  gesture: boolean): 'browser' | 'external' | 'block' {
+  if (!gesture) return 'block';
+  // A user-created blank window may resolve its destination after attachment.
+  if (value === '' || value === 'about:blank') return 'browser';
+  if (!httpsOrigin(value)) return 'block';
+  return sameOrigin(server, value) ? 'browser' : 'external';
+}
 
 export function navigationAction(value: string, server: string, current: string,
-  chat: boolean, mainFrame: boolean, gesture: boolean): NavigationAction {
+  chat: boolean, mainFrame: boolean, gesture: boolean, pendingPopup: boolean = false): NavigationAction {
   // Opaque viewer frames and their own CSP/origin boundary remain untouched.
   // Local/command schemes still never get privileged native handling in a frame.
   if (!mainFrame) return value === SETTINGS_URL || /^file:|^intent:/i.test(value) ? 'block' : 'allow';
   if (chat && settingsRequest(value, server, current, true, gesture)) return 'settings';
   if (!chat && value === 'about:blank') return 'allow';
   if (!httpsOrigin(value)) return 'block';
-  if (chat && !sameOrigin(server, value)) return 'browser';
+  if (!sameOrigin(server, value)) {
+    // Never launch another app for automatic redirects or an iframe load. Only
+    // a click or the first destination of a user-created popup can leave ArkWeb.
+    return gesture || (!chat && pendingPopup) ? 'external' : 'block';
+  }
   return 'allow';
 }

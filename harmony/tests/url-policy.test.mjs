@@ -32,12 +32,40 @@ test('exact origin matching cannot be widened by redirects, credentials or hostn
   }
 });
 
-test('main chat stays on its origin; other HTTPS pages open in the separate browser', () => {
+test('same-origin navigation stays mounted and external clicks go to the system browser', () => {
   assert.equal(policy.navigationAction(server + '/login', server, server, true, true, false), 'allow');
-  assert.equal(policy.navigationAction('https://docs.example/a', server, server, true, true, true), 'browser');
-  assert.equal(policy.navigationAction('https://docs.example/a', server, 'https://docs.example', false, true, true), 'allow');
+  assert.equal(policy.navigationAction('https://docs.example/a', server, server, true, true, true), 'external');
+  assert.equal(policy.navigationAction('https://docs.example/a', server, server, false, true, true), 'external');
+  assert.equal(policy.navigationAction(server + '/preview', server, server, false, true, true), 'allow');
   assert.equal(policy.navigationAction('about:blank', server, '', false, true, false), 'allow');
   assert.equal(policy.navigationAction('about:blank', server, server, true, true, false), 'block');
+});
+
+test('target-blank links dispatch directly, while authenticated and delayed popups stay isolated', () => {
+  assert.equal(policy.newWindowAction('https://github.com/org/repo/pull/73?tab=files#diff', server, true), 'external');
+  assert.equal(policy.newWindowAction(server + '/preview', server, true), 'browser');
+  for (const value of ['', 'about:blank']) {
+    assert.equal(policy.newWindowAction(value, server, true), 'browser');
+  }
+  for (const value of ['', 'about:blank', server, 'https://github.com']) {
+    assert.equal(policy.newWindowAction(value, server, false), 'block');
+  }
+  for (const value of [policy.SETTINGS_URL, 'file:///private/data', 'javascript:alert(1)',
+    'intent://open', 'http://example.com', 'https://user:password@example.com',
+    'https://example.com\\evil', 'https://example.com\n']) {
+    assert.equal(policy.newWindowAction(value, server, true), 'block', value);
+  }
+});
+
+test('automatic navigation cannot launch the browser, except an authorized popup first destination', () => {
+  const target = 'https://github.com';
+  assert.equal(policy.navigationAction(target, server, server, true, true, false), 'block');
+  assert.equal(policy.navigationAction(target, server, server, false, true, false), 'block');
+  assert.equal(policy.navigationAction(target, server, 'about:blank', false, true, false, true), 'external');
+  assert.equal(policy.navigationAction(target, server, server, true, true, false, true), 'block');
+  // Neither frame loads nor pending windows widen native settings access.
+  assert.equal(policy.navigationAction(target, server, server, false, false, false, true), 'allow');
+  assert.equal(policy.navigationAction(policy.SETTINGS_URL, server, server, false, true, false, true), 'block');
 });
 
 test('settings requires an exact command, a top-level user gesture and the chat document', () => {
