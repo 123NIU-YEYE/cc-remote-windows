@@ -26263,9 +26263,16 @@ class WrapperMachine:
         # structural sanitizer before creating any SVG blob URL.
         document = re.sub(r"^\s*<\?xml[^>]*>\s*", "", text, count=1,
                           flags=re.IGNORECASE)
-        document = re.sub(r"^\s*<!doctype[^>]*>\s*", "", document, count=1,
-                          flags=re.IGNORECASE)
-        if not re.match(r"^\s*<svg(?:\s|>)", document, re.IGNORECASE):
+        # Exporters such as Graphviz put comments before the root, including
+        # around the DOCTYPE. Skip only complete prolog tokens, without loading
+        # a DTD, expanding entities, or scanning past a non-SVG root. Advance
+        # through the original string to keep many small comments linear.
+        prolog = re.compile(r"\s*(?:<!--.*?-->|<!doctype\b[^>]*>)",
+                            re.IGNORECASE | re.DOTALL)
+        offset = 0
+        while match := prolog.match(document, offset):
+            offset = match.end()
+        if not re.match(r"^\s*<svg(?:\s|/?>)", document[offset:], re.IGNORECASE):
             raise ValueError("SVG 文件根元素无效")
 
     @classmethod
