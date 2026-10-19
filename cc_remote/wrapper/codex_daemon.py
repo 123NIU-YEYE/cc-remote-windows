@@ -8,6 +8,7 @@ process, so disconnecting one remote session cannot stop other Codex clients.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from cc_remote.log import logger
+from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
+from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
     ProcessIdentity,
@@ -110,11 +113,12 @@ def _run_command(
     if not os.path.isabs(home) or not os.path.isdir(home):
         return _CommandResult(127, b"", b"InvalidDaemonWorkingDirectory")
     command_argv = argv
-    if os.name == "posix" and any(
+    lifecycle_command = os.name == "posix" and any(
         argv[index:index + 2] == ("app-server", "daemon")
         and argv[index + 2] in _HIGH_NOFILE_DAEMON_OPERATIONS
         for index in range(max(0, len(argv) - 2))
-    ):
+    )
+    if lifecycle_command:
         # The official lifecycle command launches the durable daemon.  Its
         # resource limits are inherited at that boundary, so raising only this
         # short-lived child also raises the managed daemon without changing the
@@ -126,16 +130,20 @@ def _run_command(
             *argv,
         )
     try:
-        result = subprocess.run(
-            command_argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(env),
-            cwd=home,
-            timeout=timeout,
-            check=False,
-        )
+        with barrier.launch() if mutates_daemon(argv) else nullcontext():
+            if lifecycle_command and needs_isolation():
+                result = run_isolated(command_argv, env, home, timeout)
+            else:
+                result = subprocess.run(
+                    command_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(env),
+                    cwd=home,
+                    timeout=timeout,
+                    check=False,
+                )
     except (OSError, subprocess.SubprocessError) as exc:
         # Exception text can contain paths or command details.  The manager's
         # caller needs only a bounded failure class to select stdio fallback.

@@ -526,6 +526,34 @@ def _test_image():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["upload", "delivered"])
+async def test_misnamed_artifact_image_full_preview_and_thumbnail(tmp_path, source):
+    from PIL import Image
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session", "session")
+    ctx.cwd = str(tmp_path)
+    machine.sessions[ctx.key] = ctx
+    service = machine._artifacts
+    output = io.BytesIO()
+    Image.new("RGB", (64, 32), "red").save(output, format="JPEG")
+    data = output.getvalue()
+    if source == "upload":
+        await service.uploads(ctx, "msg", [{"filename": "export.png", "data": base64.b64encode(data).decode()}])
+    else:
+        (tmp_path / "export.png").write_bytes(data)
+        service.store.text(service.context_scope(ctx), "[picture](export.png)", ctx.cwd)
+    row = service.store.page(service.context_scope(ctx))[0][0]
+    for variant, media in [("full", "image/jpeg"), ("thumbnail", "image/webp")]:
+        response = await service.preview(GetSessionArtifactPreview(
+            sid="session", engine="claude", artifact_id=row["id"],
+            request_id="read", client_id="reader", variant=variant))
+        assert not response.error and response.media_type == media
+        assert response.to == "reader" and response.sid == "session"
+        with Image.open(io.BytesIO(base64.b64decode(response.data))) as image:
+            assert image.size == (64, 32)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["upload", "delivered"])
 async def test_thumbnail_is_small_readonly_and_never_opens_full_preview(tmp_path, source):
     from PIL import Image
     machine, transport = _mk_machine()

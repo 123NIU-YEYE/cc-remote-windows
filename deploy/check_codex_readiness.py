@@ -19,6 +19,7 @@ from cc_remote.wrapper.process_scan import ProcessIdentity, process_identity, pr
 from deploy.work_registry_snapshot import resolve_wrapper_state_dir
 
 _REASONS = {
+    "isolation_unavailable": "无法独立启动共享服务；请检查服务用户的 systemd manager 和 lingering，或先从独立终端启动 Codex daemon。",
     "daemon_unavailable": "共享服务尚不可用，请检查当前账号的 Codex 安装。",
     "account_socket_mismatch": "账号与连接地址不一致，请检查 CODEX_HOME 和账号配置。",
     "daily_cli_missing": "服务环境找不到 codex，请安装 CLI 或检查服务的 PATH。",

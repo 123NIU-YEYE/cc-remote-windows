@@ -577,6 +577,45 @@ This does not apply to Work's deliberately private app-server.
    separate cloud remote-control setting: those commands can interrupt native
    clients. Local TUI/proxy sharing uses the Unix listener without cloud remote
    control. Do not add a second daemon or another startup service.
+   On systemd, native lifecycle commands launched by a Wrapper service run
+   through a transient **user** launcher outside the Wrapper's cgroup. Only
+   that launcher uses `KillMode=process`, preserving the official CLI's detached
+   daemon; the Wrapper keeps its normal child cleanup. Account environment is
+   passed over a private stdin pipe, not command arguments or shared manager
+   configuration. This needs the service user's running systemd manager
+   (enable lingering for unattended use). If isolation is unavailable, startup
+   fails rather than creating a daemon that the next Wrapper upgrade would kill.
+   Existing reachable daemons are reused without relocation or restart.
+
+   Before a systemd upgrade, the running Wrapper must acknowledge a launch
+   barrier over its process-bound local Unix socket. This excludes new mutating
+   Codex commands across the entire inspect/stop interval. An in-flight launch
+   rejects quiescence; wait for it to finish and retry. The installer verifies
+   the socket peer, process generation and unit invocation before stopping.
+   A rejected check reopens launches without restarting the service. Once stop
+   intent is recorded, quiescence survives lost replies until the Wrapper exits;
+   retrying the installer can reacquire it. Stop intent is retained under the
+   private rollback directory so recovery distinguishes a rejected check from
+   an uncertain stop.
+
+   Older running Wrappers cannot acknowledge this barrier. Their first upgrade
+   is deliberately refused without stopping anything, even if a process scan
+   looks clear. Wait for native tasks to finish and stop the old Wrapper in a
+   maintenance window, then retry the installer. Do not bypass the check on a
+   live legacy service. New installations and already-stopped services do not
+   need this one-time step.
+
+   The installer also refuses to stop a Wrapper whose cgroup still owns a
+   native Codex listener, daemon supervisor, or mutating lifecycle command
+   (including its Python resource-limit helper before exec). Read-only daemon
+   queries and private proxy/stdio children do not block this check. If a
+   lifecycle command is still running, let it finish before retrying. For the
+   one-time migration of a daemon that remains inside the Wrapper cgroup,
+   wait for the affected account's tasks to finish, then run the official
+   `CODEX_HOME="<account-home>" <daily-codex-bin> app-server daemon restart`
+   from an independent login terminal. Verify its PID/cgroup is outside the
+   Wrapper unit before retrying the upgrade. Never weaken the Wrapper's
+   `KillMode`, move live process trees, or force a restart to pass this check.
    If sharing is unavailable, Code reports a connection error instead of silently
    starting a private stdio server. Explicit `off` retains the legacy private path.
    Startup compares the CLI found on the service's PATH with Wrapper's selected
