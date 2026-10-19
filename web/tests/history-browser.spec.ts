@@ -4662,6 +4662,17 @@ test("native question batch keeps choices across pages and reconnects until atom
   const choice = dialog.getByRole("button", { name: "最近更新优先" });
   await choice.click();
   await expect(choice).toHaveAttribute("aria-pressed", "true");
+  const customAnswer = dialog.getByRole("textbox", { name: "输入回答" });
+  // Traversing the form is not a decision to replace a valid answer.
+  await dialog.getByRole("button", { name: "按文件类型分组", exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(customAnswer).toBeFocused();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeEnabled();
+  await dialog.getByRole("button", { name: "下一题" }).focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(customAnswer).toBeFocused();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
   await expect(choice).toHaveCSS("background-color", "rgb(242, 231, 223)");
   expect(await choice.locator("svg, input, .checkbox, .radio").count()).toBe(0);
   const radius = await dialog.locator(".qa-next").evaluate(node => parseFloat(getComputedStyle(node).borderRadius));
@@ -4676,7 +4687,15 @@ test("native question batch keeps choices across pages and reconnects until atom
   await dialog.getByRole("textbox", { name: "输入回答" }).fill("包含音频");
   await dialog.getByRole("button", { name: "上一题" }).click();
   await expect(choice).toHaveAttribute("aria-pressed", "true");
-  const customAnswer = dialog.getByRole("textbox", { name: "输入回答" });
+  await customAnswer.focus();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  // Keyboard edits still select the custom-answer mode without a pointer click.
+  await customAnswer.fill("键盘输入的答案");
+  await expect(choice).toHaveAttribute("aria-pressed", "false");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeEnabled();
+  await customAnswer.fill("");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeDisabled();
+  await choice.click();
   await customAnswer.click();
   await expect(choice).toHaveAttribute("aria-pressed", "false");
   await expect(dialog.getByRole("button", { name: "下一题" })).toBeDisabled();
