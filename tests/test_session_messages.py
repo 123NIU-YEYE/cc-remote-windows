@@ -617,11 +617,52 @@ async def test_ask_schema_refresh_does_not_require_session_messaging():
 
 
 @pytest.mark.asyncio
-async def test_separate_ask_server_disabled_by_user_is_not_enabled():
+@pytest.mark.parametrize('pending', [None, 'cc_remote_messages'])
+async def test_disabled_ask_does_not_block_independent_message_refresh(pending):
     handle, control, _ = legacy_handle(dedicated=True)
     control.ask_state = 'disabled'
+    handle._message_tools_toggle_started = pending
+    control.state = 'disabled' if pending else 'connected'
+    markers = []
+    async def mark(name): markers.append(name)
+    handle.client.mark_message_tools_refresh = mark
+    client = handle.client
+    assert await handle.refresh_message_tools()
+    assert handle.client is client and not handle.needs_message_tools_refresh
+    assert handle._message_tools_toggle_started is None
+    assert control.ask_state == 'disabled' and control.state == 'connected'
+    assert {tool['name'] for tool in control.tools} == {'list_sessions', 'send_message', 'message_status'}
+    assert markers == ['cc_remote_messages', None]
+    assert [request for request in control.requests if request['subtype'] == 'mcp_toggle'] == [
+        {'subtype': 'mcp_toggle', 'serverName': 'cc_remote_messages', 'enabled': False},
+        {'subtype': 'mcp_toggle', 'serverName': 'cc_remote_messages', 'enabled': True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_disabled_ask_cannot_mask_missing_dedicated_message_tools():
+    handle, control, _ = legacy_handle(dedicated=True)
+    control.ask_state = 'disabled'
+    control.dropped_tools = {'send_message'}
     assert not await handle.refresh_message_tools()
-    assert control.requests == [{'subtype': 'mcp_status'}]
+    assert handle.needs_message_tools_refresh
+    assert handle._message_tools_toggle_started == 'cc_remote_messages'
+    assert control.ask_state == 'disabled'
+    control.dropped_tools.clear()
+    assert await handle.refresh_message_tools()
+    assert handle._message_tools_toggle_started is None
+    assert control.ask_state == 'disabled'
+
+
+@pytest.mark.asyncio
+async def test_pending_ask_toggle_is_restored_even_with_independent_messaging():
+    handle, control, _ = legacy_handle(dedicated=True)
+    control.ask_state = 'disabled'
+    handle._message_tools_toggle_started = 'cc-remote-ask'
+    assert await handle.refresh_message_tools()
+    assert control.ask_state == 'connected'
+    assert {tool['name'] for tool in control.ask_tools} == {'ask_user', 'set_mode'}
+    assert handle._message_tools_toggle_started is None
 
 
 @pytest.mark.asyncio
@@ -815,6 +856,37 @@ async def test_optional_tool_refresh_does_not_block_ordinary_chat_with_backgroun
     assert isinstance(result, Error) and result.code == 'message_tools_pending'
     assert launched == ['ordinary chat'] and not control.requests
     await machine._command_scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_message_delivery_refreshes_independent_route_with_ask_disabled(monkeypatch):
+    from cc_remote.protocol import Query
+    bus, machine, target, *_ = backend(monkeypatch)
+    handle, control, _ = legacy_handle(dedicated=True)
+    target.sdk = handle
+    client = handle.client
+    control.ask_state = 'disabled'
+    bus.active.add('message-test')
+    async def noop(*_, **__): pass
+    async def no_owner(*_): return False
+    monkeypatch.setattr(machine, '_adopt_claude_broker_handle', noop)
+    monkeypatch.setattr(machine, '_prime_claude_ownership', no_owner)
+    monkeypatch.setattr(machine, '_watch_session', lambda *_: None)
+    monkeypatch.setattr(machine, '_prepare_claude_context_before_query', noop)
+    launched = []
+    async def run(*args, **_): launched.append(args[1])
+    monkeypatch.setattr(machine, '_run_turn', run)
+    try:
+        async with target.query_lock:
+            result = await machine._handle_immediate_query(target, Query(
+                sid=target.key, prompt='reply to the other session', msg_id='message-test'))
+        assert result is None
+        await target.turn_task
+        assert launched == ['reply to the other session']
+        assert handle.client is client and not handle.needs_message_tools_refresh
+        assert control.ask_state == 'disabled' and control.state == 'connected'
+    finally:
+        await machine._command_scheduler.close()
 
 
 @pytest.mark.asyncio
