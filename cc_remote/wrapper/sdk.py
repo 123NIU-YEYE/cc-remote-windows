@@ -860,6 +860,8 @@ class SdkHandle:
         async with self._control_request_lock:
             try:
                 status = await send({"subtype": "mcp_status"}, timeout=10)
+                if not isinstance(status.get("mcpServers"), list):
+                    return False
                 servers = {row.get("name"): row for row in status.get("mcpServers", [])}
                 if self.message_server is not None:
                     name = "cc_remote_messages" if "cc_remote_messages" in servers else "cc-remote-ask"
@@ -871,6 +873,25 @@ class SdkHandle:
                         add_message_tools(self.ask_server, self.message_server)
                 names = list(required)
                 pending = self._message_tools_toggle_started
+                marker = getattr(client, "mark_message_tools_refresh", None)
+                if pending == "cc_remote_messages" and self.message_server is None:
+                    # Messaging was opted out after an interrupted refresh.
+                    # Retire its old route instead of enabling a callback the
+                    # current controller no longer supplies. Clear durable
+                    # intent only after native status confirms it is inactive.
+                    row = servers.get(pending)
+                    if row is not None and row.get("status") != "disabled":
+                        await send({"subtype": "mcp_toggle", "serverName": pending, "enabled": False}, timeout=10)
+                        status = await send({"subtype": "mcp_status"}, timeout=10)
+                        if not isinstance(status.get("mcpServers"), list):
+                            return False
+                        servers = {row.get("name"): row for row in status["mcpServers"]}
+                        row = servers.get(pending)
+                        if row is not None and row.get("status") != "disabled":
+                            return False
+                    if marker is not None:
+                        await marker(None)
+                    self._message_tools_toggle_started = pending = None
                 if pending is not None:
                     if pending not in required:
                         return False
@@ -878,7 +899,6 @@ class SdkHandle:
                     # route or overwriting the service's recovery marker.
                     names.remove(pending)
                     names.insert(0, pending)
-                marker = getattr(client, "mark_message_tools_refresh", None)
                 for name in names:
                     row = servers.get(name)
                     if row is None or (row.get("status") not in {"connected", "failed"}
