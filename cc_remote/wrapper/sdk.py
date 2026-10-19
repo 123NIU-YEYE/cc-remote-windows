@@ -646,7 +646,7 @@ class SdkHandle:
         self.service_recovery = getattr(self.client, "recovery", None)
         description = getattr(self.client, "description", {})
         self.needs_message_tools_refresh = bool(
-            description.get("attached") and self.message_server is not None
+            description.get("attached") and self.ask_server is not None
             and not self.work_mode)
         self._message_tools_toggle_started = description.get("metadata", {}).get("message_tools_refresh")
         if description.get("attached"):
@@ -836,7 +836,7 @@ class SdkHandle:
             return usage
 
     async def refresh_message_tools(self) -> bool:
-        """Refresh MCP registration without replacing the native child.
+        """Refresh owned ask/message tools without replacing the native child.
 
         The caller owns query_lock and checks idle/background/permission state.
         MCP callbacks use their own bridge, not the conversation reader.
@@ -844,54 +844,68 @@ class SdkHandle:
         if not self.needs_message_tools_refresh:
             return True
         client = self.client
-        if client is None or self.ask_server is None or self.message_server is None:
+        if client is None or self.ask_server is None:
             return False
         if (self._turn_active or self._turn_consumer_active or self._autonomous_steer_root
                 or self._background_callbacks_pending):
             return False
         send = client._query._send_control_request
-        required = {"list_sessions", "send_message", "message_status"}
+        required = {"cc-remote-ask": {"ask_user", "set_mode"}}
 
         def ready(status, name):
             return any(row.get("name") == name and row.get("status") == "connected"
-                       and required <= {tool.get("name") for tool in row.get("tools", [])}
+                       and required[name] <= {tool.get("name") for tool in row.get("tools", [])}
                        for row in status.get("mcpServers", []))
 
         async with self._control_request_lock:
             try:
                 status = await send({"subtype": "mcp_status"}, timeout=10)
                 servers = {row.get("name"): row for row in status.get("mcpServers", [])}
-                name = "cc_remote_messages" if "cc_remote_messages" in servers else "cc-remote-ask"
-                row = servers.get(name)
-                if row is None or (row.get("status") not in {"connected", "failed"}
-                                   and self._message_tools_toggle_started != name):
-                    # Respect pre-existing disabled servers and incomplete
-                    # startup. Only undo a disable we ourselves attempted.
-                    return False
-                from cc_remote.wrapper.ask import add_message_tools
+                if self.message_server is not None:
+                    name = "cc_remote_messages" if "cc_remote_messages" in servers else "cc-remote-ask"
+                    required.setdefault(name, set()).update(
+                        {"list_sessions", "send_message", "message_status"})
+                    if name == "cc-remote-ask":
+                        from cc_remote.wrapper.ask import add_message_tools
 
-                if name == "cc-remote-ask":
-                    add_message_tools(self.ask_server, self.message_server)
-                # reconnect_mcp_server rejects SDK transports in the verified
-                # CLI. Official toggle off/on re-lists the existing SDK proxy.
-                # Always attempt on, even if the off acknowledgment is lost.
-                # The service outlives this controller. Save intent there before
-                # disabling anything, so a replacement can restore an on-request
-                # whose acknowledgment/controller was lost.
+                        add_message_tools(self.ask_server, self.message_server)
+                names = list(required)
+                pending = self._message_tools_toggle_started
+                if pending is not None:
+                    if pending not in required:
+                        return False
+                    # Restore an interrupted toggle before changing another
+                    # route or overwriting the service's recovery marker.
+                    names.remove(pending)
+                    names.insert(0, pending)
                 marker = getattr(client, "mark_message_tools_refresh", None)
-                if marker is not None:
-                    await marker(name)
-                self._message_tools_toggle_started = name
-                try:
-                    await send({"subtype": "mcp_toggle", "serverName": name, "enabled": False}, timeout=10)
-                finally:
-                    await send({"subtype": "mcp_toggle", "serverName": name, "enabled": True}, timeout=10)
-                status = await send({"subtype": "mcp_status"}, timeout=10)
-                if ready(status, name):
+                for name in names:
+                    row = servers.get(name)
+                    if row is None or (row.get("status") not in {"connected", "failed"}
+                                       and self._message_tools_toggle_started != name):
+                        # Never enable a route the user disabled. Only restore
+                        # a disable whose intent we saved in the service.
+                        return False
+                    # reconnect_mcp_server rejects SDK transports. Official
+                    # toggle off/on re-lists the existing SDK proxy. Save the
+                    # intent first, and attempt on even if the off ack is lost.
+                    if marker is not None:
+                        await marker(name)
+                    self._message_tools_toggle_started = name
+                    try:
+                        await send({"subtype": "mcp_toggle", "serverName": name, "enabled": False}, timeout=10)
+                    finally:
+                        await send({"subtype": "mcp_toggle", "serverName": name, "enabled": True}, timeout=10)
+                    status = await send({"subtype": "mcp_status"}, timeout=10)
+                    servers = {row.get("name"): row for row in status.get("mcpServers", [])}
+                    if not ready(status, name):
+                        return False
                     if marker is not None:
                         await marker(None)
                     self._message_tools_toggle_started = None
-                    self.needs_message_tools_refresh = False
+                if not all(ready(status, name) for name in required):
+                    return False
+                self.needs_message_tools_refresh = False
             except Exception as exc:
                 log.warning("Claude message tools refresh deferred", error_type=type(exc).__name__)
                 return False

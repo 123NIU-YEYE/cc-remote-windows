@@ -257,6 +257,45 @@ def test_attached_summary_opt_in_keeps_running_turn_and_native_child(
     asyncio.run(go())
 
 
+def test_reattachment_schedules_ask_refresh_without_session_messaging(monkeypatch):
+    from cc_remote.config import WrapperConfig
+    from cc_remote.wrapper.ask import make_ask_server
+    from cc_remote.wrapper.sdk import SdkHandle
+
+    async def control(*_, **__):
+        return {}
+
+    async def ask(*_):
+        raise AssertionError("attachment must not ask a question")
+
+    monkeypatch.setattr(FakeClient, "_send_control_request", control, raising=False)
+
+    async def go():
+        async with environment() as (service, attach):
+            first = await attach()
+            worker = service.sessions[first.id]
+            native = worker.client
+            await first.detach()
+            await released(worker)
+            handle = SdkHandle(
+                WrapperConfig(claude_service_socket=first.connection.socket_path),
+                make_ask_server(ask, ask, ask_batch=ask),
+            )
+            handle.service_metadata = worker.metadata.copy()
+            handle.service_defer_events = True
+            try:
+                await handle.connect(resume_id="native-session", cwd="/tmp")
+                assert handle.client.description["attached"]
+                assert handle.message_server is None
+                assert handle.needs_message_tools_refresh
+                assert worker.client is native and not native.closed
+                assert native.prompts == [] and native.interrupts == 0
+            finally:
+                await handle.detach_for_shutdown()
+
+    asyncio.run(go())
+
+
 def test_running_query_and_offline_terminal_survive_wrapper_disconnect():
     async def go():
         async with environment() as (service, attach):
