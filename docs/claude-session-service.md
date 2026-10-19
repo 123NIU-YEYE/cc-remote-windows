@@ -16,6 +16,9 @@ separate route. Each refreshed route must still expose its complete owned tool
 set, including `ask_user` and `set_mode`, before recovery is considered complete.
 The ask schema uses a plain object for native compatibility; the handler checks
 that callers supply either a complete single question or a batch, never both.
+If messaging is disabled after an interrupted dedicated-route refresh, recovery
+confirms that route is disabled or absent before clearing its saved intent, so
+ordinary chat can resume without re-enabling messaging or restarting Claude.
 
 The service continues reading native output while the Wrapper is offline. Its
 private SQLite journal retains each unacknowledged turn and its real terminal

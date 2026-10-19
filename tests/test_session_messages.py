@@ -523,7 +523,8 @@ def legacy_handle(*, dedicated=False):
         async def _send_control_request(self, request, **_):
             self.requests.append(request)
             if request['subtype'] == 'mcp_status':
-                rows = [{'name': self.name, 'status': self.state, 'tools': self.tools}]
+                rows = ([] if self.state == 'absent' else
+                        [{'name': self.name, 'status': self.state, 'tools': self.tools}])
                 if dedicated:
                     rows.append({'name': 'cc-remote-ask', 'status': self.ask_state, 'tools': self.ask_tools})
                 return {'mcpServers': rows}
@@ -638,6 +639,75 @@ async def test_restore_pending_message_toggle_before_refreshing_separate_ask():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('state', ['disabled', 'connected', 'failed', 'pending', 'absent'])
+async def test_pending_message_refresh_can_finish_after_messaging_is_disabled(state):
+    handle, control, _ = legacy_handle(dedicated=True)
+    client = handle.client
+    handle.message_server = None
+    handle._message_tools_toggle_started = 'cc_remote_messages'
+    control.state = state
+    markers = []
+    async def mark(name):
+        if name is None:
+            assert control.state in {'disabled', 'absent'}
+        markers.append(name)
+    client.mark_message_tools_refresh = mark
+    assert await handle.refresh_message_tools()
+    assert handle.client is client and not handle.needs_message_tools_refresh
+    assert handle._message_tools_toggle_started is None
+    assert markers == [None, 'cc-remote-ask', None]
+    assert {tool['name'] for tool in control.ask_tools} == {'ask_user', 'set_mode'}
+    assert [request['enabled'] for request in control.requests
+            if request.get('serverName') == 'cc_remote_messages'] == (
+                [] if state in {'disabled', 'absent'} else [False])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['off_ack', 'still_connected', 'missing_status', 'marker_ack'])
+async def test_retiring_pending_message_route_retains_intent_until_confirmed(failure):
+    handle, control, _ = legacy_handle(dedicated=True)
+    handle.message_server = None
+    handle._message_tools_toggle_started = 'cc_remote_messages'
+    markers = []
+    async def mark(name):
+        if failure == 'marker_ack':
+            raise ConnectionError('metadata acknowledgment lost')
+        markers.append(name)
+    handle.client.mark_message_tools_refresh = mark
+    original_send = control._send_control_request
+    async def send(request, **kwargs):
+        if request['subtype'] == 'mcp_status' and failure == 'missing_status':
+            return {}
+        result = await original_send(request, **kwargs)
+        if request.get('serverName') == 'cc_remote_messages' and failure == 'still_connected':
+            control.state = 'connected'
+        return result
+    control._send_control_request = send
+    control.fail_off = failure == 'off_ack'
+    assert not await handle.refresh_message_tools()
+    assert handle.needs_message_tools_refresh
+    assert handle._message_tools_toggle_started == 'cc_remote_messages'
+    assert not markers
+    assert not any(request.get('serverName') == 'cc-remote-ask' for request in control.requests)
+    failure = None
+    assert await handle.refresh_message_tools()
+    assert handle._message_tools_toggle_started is None
+    assert control.state == 'disabled'
+    assert not any(request.get('serverName') == 'cc_remote_messages' and request['enabled']
+                   for request in control.requests)
+
+
+@pytest.mark.asyncio
+async def test_unknown_pending_route_is_not_cleared_or_toggled():
+    handle, control, _ = legacy_handle(dedicated=True)
+    handle.message_server = None
+    handle._message_tools_toggle_started = 'unowned-route'
+    assert not await handle.refresh_message_tools()
+    assert handle._message_tools_toggle_started == 'unowned-route'
+    assert control.requests == [{'subtype': 'mcp_status'}]
+
+
+@pytest.mark.asyncio
 async def test_lost_toggle_off_ack_always_restores_ask_and_remains_retryable():
     handle, control, _ = legacy_handle()
     control.fail_off = True
@@ -745,3 +815,36 @@ async def test_optional_tool_refresh_does_not_block_ordinary_chat_with_backgroun
     assert isinstance(result, Error) and result.code == 'message_tools_pending'
     assert launched == ['ordinary chat'] and not control.requests
     await machine._command_scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_chat_recovers_pending_refresh_after_messaging_opt_out(monkeypatch):
+    from cc_remote.protocol import Query
+    _, machine, target, *_ = backend(monkeypatch)
+    machine._session_messages = None
+    handle, control, _ = legacy_handle(dedicated=True)
+    target.sdk = handle
+    client = handle.client
+    handle.message_server = None
+    handle._message_tools_toggle_started = 'cc_remote_messages'
+    control.state = 'disabled'
+    async def noop(*_, **__): pass
+    async def no_owner(*_): return False
+    monkeypatch.setattr(machine, '_adopt_claude_broker_handle', noop)
+    monkeypatch.setattr(machine, '_prime_claude_ownership', no_owner)
+    monkeypatch.setattr(machine, '_watch_session', lambda *_: None)
+    monkeypatch.setattr(machine, '_prepare_claude_context_before_query', noop)
+    launched = []
+    async def run(*args, **_): launched.append(args[1])
+    monkeypatch.setattr(machine, '_run_turn', run)
+    try:
+        async with target.query_lock:
+            result = await machine._handle_immediate_query(target, Query(
+                sid=target.key, prompt='ordinary chat', msg_id='human'))
+        assert result is None
+        await target.turn_task
+        assert launched == ['ordinary chat']
+        assert handle.client is client and handle._message_tools_toggle_started is None
+        assert control.state == 'disabled'
+    finally:
+        await machine._command_scheduler.close()
