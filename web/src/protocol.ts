@@ -509,7 +509,7 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 export interface ConversationImageRef { image_id: string; media_type: QueryImg["media_type"]; width: number; height: number; byte_size: number }
 export type ProcessDetailState = "none" | "present" | "unknown";
 export type TurnDetailReason = "process" | "prompt_truncated" | "answer_truncated" | "image_deferred";
-export interface SessionMessageReceipt { itemId: string; threadId: string; status: "sending" | "sent" | "failed" }
+export interface SessionMessageReceipt { itemId: string; threadId: string; status: "sending" | "queued" | "sent" | "failed" }
 export interface ConversationTurn { sessionMessages?: SessionMessageReceipt[] | null; id: string; sourceThreadId?: string | null; timedTask?: TimedMessage | null; clientMsgId?: string | null; prompt: string; blocks: unknown[]; done: boolean; forkPointId?: string | null; checkpointId?: string | null; interrupted?: boolean | null; error?: string | null; images?: QueryImg[] | null; imageRefs?: ConversationImageRef[] | null; files?: QueryFile[] | null; ts?: number | null; doneTs?: number | null; durationMs?: number | null; processDetailState?: ProcessDetailState; detailReasons?: TurnDetailReason[]; processStartedTs?: number | null; processDoneTs?: number | null; detailEventCount: number; detailLoaded: boolean; fileChanges?: TurnChangeSummary | null }
 export interface CodexTerminalFence { turn_id: string; status: "completed" | "interrupted" | "failed"; duration_ms?: number | null; completed_at?: number | null }
 export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; continuity_revision?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; turns?: ConversationTurn[]; detail?: "summary" | "full"; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; compaction_continuation_turn_ids?: string[]; terminal_fences?: CodexTerminalFence[]; reset?: boolean }
@@ -554,12 +554,13 @@ export type EngineCapabilityAction = "install" | "uninstall" | "enable" | "disab
 export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null; actions?: EngineCapabilityAction[]; event?: string | null; matcher?: string | null; handler_type?: string | null; detail?: string | null }
 export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean; claude_profile_id?: string | null; codex_profile_id?: string | null }
 export interface AskOption { label: string; ds?: string }
-export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
+export interface AskQuestion { header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
+export interface AskUser extends Base, AskQuestion { type: "ask_user"; ask_id: string; questions?: AskQuestion[] | null }
 /** Authoritative Hello baseline: following AskUser frames are the complete
  * still-open set visible to this client for the same session. */
 export interface AskUserSync extends Base { type: "ask_user_sync" }
 export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
-export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer: string | string[] }
+export interface AnswerQuestion extends Base { type: "answer_question"; ask_id: string; answer?: string | string[] | null; answers?: (string | string[])[] | null }
 export type GoalStatus = "active" | "paused" | "blocked" | "usageLimited" | "budgetLimited" | "complete";
 export interface GetGoal extends Base { type: "get_goal" }
 export interface SetGoal extends Base {
@@ -742,7 +743,7 @@ export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 76;
+export const PROTOCOL_VERSION = 78;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

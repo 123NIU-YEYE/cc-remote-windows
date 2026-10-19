@@ -3,7 +3,7 @@ import {
   requestHarmonyPermission, confirmHarmonyPermission,
 } from "./harmony-push";
 import { RightPanelPresentation, rekeyPanelScope } from "./right-panel-presentation";
-import type { ServerEvent, FilePreview } from "./protocol";
+import type { FilePreview } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
 import {
   lazy,
@@ -43,7 +43,6 @@ import { usePanelWidthPreference } from "./use-panel-width";
 import { SidebarToggle } from "./components/SidebarToggle";
 import { SidebarShell, SidebarState } from "./components/SidebarLayout";
 import { useSidebarController } from "./sidebar-state";
-const SessionMessagePreview = lazy(() => import("./components/SessionMessagePreview").then((m) => ({ default: m.SessionMessagePreview })));
 
 const BackgroundTaskControl = lazy(() => import("./components/BackgroundTaskControl"));
 import type { QueuedQueryEditor } from "./components/QueuedQueryDialog";
@@ -516,10 +515,6 @@ export default function App() {
   const stateRef = useRef(state);
   stateRef.current = state;
   const wsRef = useRef<RelayWs | null>(null);
-  const [sessionMessagePreview, setSessionMessagePreview] = useState<{
-    scope: string; originSid: string; session: SessionInfo; returnLabel: string;
-  } | null>(null);
-  const sessionMessagePreviewEvents = useRef<((event: ServerEvent) => boolean) | null>(null);
   const goalApiRef = useRef<GoalApi | null>(null);
   const getGoalApi = useCallback(async () => {
     const transport = wsRef.current;
@@ -666,6 +661,8 @@ export default function App() {
     useRef<PendingSessionMigration | null>(null);
   const sessionListsBySurfaceRef = useRef<Record<string, SessionInfo[]>>({});
   const historySessionListsRef = useRef<Record<string, SessionInfo[]>>({});
+  const findMessageSession = (id: string) => resolveRelatedSession(id, focusedSid,
+    [...state.sessions, ...Object.values(sessionListsBySurfaceRef.current).flat()]);
   // Cached lists are paint-only during a surface switch. A surface may choose
   // its remembered/latest focus only after a fresh wrapper list is accepted.
   const authoritativeSurfaceListsRef = useRef<Set<string>>(new Set());
@@ -1123,6 +1120,18 @@ export default function App() {
     (session) => session.session_id === focusedSid);
   const archivedBrowse = focusedSession?.tag === "archived";
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  useEffect(() => {
+    if (space !== "code" || state.connState !== "connected" || !state.wrapperOnline) return;
+    if (!historyView.turns.some((turn) => turn.sourceThreadId?.startsWith("ccr:")
+      || turn.sessionMessages?.some((receipt) => receipt.threadId.startsWith("ccr:"))
+      || turn.blocks.some((block) => block.kind === "tool" && (block.tool.includes("cc_remote_messages")
+        || block.tool === "mcp__cc-remote-ask__send_message")))) return;
+    const other = focusedEngine === "codex" ? "claude" : "codex";
+    const key = `code:${other}`;
+    if (!prefetchedSurfacesRef.current.has(key) && wsRef.current?.sendListSessions(other, "code")) {
+      prefetchedSurfacesRef.current.add(key);
+    }
+  }, [space, focusedEngine, historyView.turns, state.connState, state.wrapperOnline]);
   useEffect(() => {
     if (!focusedSid || state.newChat) {
       archivedBrowseRef.current = null;
@@ -2274,7 +2283,6 @@ export default function App() {
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
           if (!acceptsLifecycle()) return;
-          if (sessionMessagePreviewEvents.current?.(msg)) return;
           if (turnFileRequestsRef.current.accept(msg)) return;
           if (goalApiRef.current?.accept(msg)) return;
           const settlesContextRequest = !!(
@@ -5974,28 +5982,27 @@ export default function App() {
             onSend={sendFirstMessage} /></Suspense>
         ) : (
           <>
-            {sessionMessagePreview?.scope === activeScopeKey
-              && sessionMessagePreview.originSid === focusedSid
-              && state.sessions.some((s) => s.session_id === sessionMessagePreview.session.session_id)
-              && <Suspense fallback={null}><SessionMessagePreview key={`${activeScopeKey}:${sessionMessagePreview.session.session_id}`}
-                session={sessionMessagePreview.session} returnLabel={sessionMessagePreview.returnLabel}
-                returnSid={sessionMessagePreview.originSid}
-                onClose={() => setSessionMessagePreview(null)}
-                api={{ receive: sessionMessagePreviewEvents,
-                  history: (sid, before, cwd) => wsRef.current?.sendGetHistory(sid, before, 12, cwd) ?? false,
-                  detail: (sid, turnId, revision, before) => wsRef.current?.sendGetTurnDetail(sid, turnId, revision, before) ?? false,
-                }} /></Suspense>}
             <ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
               sid={focusedSid} turns={historyView.turns}
               sessionLink={(nativeId) => {
-                const session = resolveRelatedSession(nativeId, focusedSid, state.sessions);
+                const session = findMessageSession(nativeId);
                 return { title: relatedSessionTitle(session, nativeId), available: !!session };
               }}
-              onOpenSession={focusedEngine === "codex" && space === "code" ? (nativeId) => {
-                const session = resolveRelatedSession(nativeId, focusedSid, state.sessions);
-                if (!session || !focusedSid) return;
-                setSessionMessagePreview({ scope: activeScopeKey, originSid: focusedSid,
-                  session, returnLabel: relatedSessionTitle(focusedSession, focusedSid) });
+              onOpenSession={space === "code" ? (nativeId) => {
+                const session = findMessageSession(nativeId);
+                if (!session || !confirmArtifactDiscard()) return;
+                cancelPendingNotificationTarget();
+                const targetEngine = session.engine === "codex" ? "codex" : "claude";
+                if (targetEngine !== engine) {
+                  // Select the exact linked session, not the other engine's
+                  // remembered/latest chat. Use the normal navigation path.
+                  prepareSurfaceSwitch(targetEngine, "code", true);
+                  engineRef.current = targetEngine;
+                  spaceRef.current = "code";
+                  setEngine(targetEngine);
+                  setSpace("code");
+                }
+                focusListedSession(session);
               } : undefined}
               loading={!!rt.loading || historyView.recovering}
               surface={space}
@@ -6439,10 +6446,11 @@ export default function App() {
             imageAssets={btwInlineImageAssets}
             onLoadImage={loadBtwMessageImage}
             onAuthorizeImage={authorizeMessageImage}
-            onAnswerQuestion={(askId, answer) => {
+            onAnswerQuestion={(askId, answer, answers) => {
               if (!activeBtwSid) return false;
               if (!wsRef.current?.sendAnswerQuestion(
-                activeBtwSid, askId, answer)) return false;
+                activeBtwSid, askId, answer, answers)) return false;
+              if (answers) return true; // Batch remains visible until authoritative close.
               dispatch({
                 type: "answer_question",
                 sid: activeBtwSid,
@@ -6479,6 +6487,13 @@ export default function App() {
           allowText={rt.pendingQuestion.allow_text}
           secret={rt.pendingQuestion.secret}
           multiSelect={rt.pendingQuestion.multi_select}
+          questions={rt.pendingQuestion.questions}
+          onAnswers={(answers) => {
+            const question = rt.pendingQuestion;
+            if (!focusedSid || !question) return false;
+            return wsRef.current?.sendAnswerQuestion(
+              focusedSid, question.ask_id, undefined, answers) ?? false;
+          }}
           onAnswer={(answer) => {
             const question = rt.pendingQuestion;
             if (!focusedSid || !question) return false;

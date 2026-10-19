@@ -4,6 +4,8 @@ Tools:
 - `ask_user(question, options)`: ask the user a clarifying question with
   suggested choices and a custom-text fallback. Blocks until the user answers
   (client renders a question card).
+- `ask_user(questions=[...])`: collect 1-4 related questions in one paginated
+  form, returning all answers together after the user's final submission.
 - `set_mode(mode)`: switch cc's permission mode yourself (e.g. "plan" when the
   user wants to plan, "bypassPermissions" to go back to normal). The mode
   change takes effect immediately for the rest of the turn.
@@ -14,6 +16,7 @@ Handlers delegate to callbacks provided by WrapperMachine.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Awaitable, Callable
 
 from mcp import types
@@ -25,7 +28,9 @@ from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT,
     ASK_OPTION_MIN_COUNT,
     ASK_QUESTION_MAX_CHARS,
+    AskQuestion,
 )
+from cc_remote.wrapper.claude_questions import normalize_claude_questions
 
 ASK_USER_TOOL = "ask_user"
 SET_MODE_TOOL = "set_mode"
@@ -35,6 +40,34 @@ MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
 AskCallback = Callable[[str, list[dict[str, str]]], Awaitable[str]]
 # async (mode) -> None  (machine: sdk.set_permission_mode + emit Perm)
 SetModeCallback = Callable[[str], Awaitable[None]]
+AskBatchCallback = Callable[[list[AskQuestion]], Awaitable[str]]
+
+
+def add_message_tools(server: Server, messages: Server) -> None:
+    """Expose the same caller-bound tools on an old worker's existing MCP route.
+
+    Old persistent services cannot acquire a new SDK server without restarting
+    their native child. Their existing ask proxy can still relay tools/list and
+    tools/call to this controller, including after an official MCP toggle.
+    """
+    if getattr(server, "_cc_remote_messages_added", False):
+        return
+    original_list = server.request_handlers[types.ListToolsRequest]
+    original_call = server.request_handlers[types.CallToolRequest]
+
+    async def list_tools(request):
+        original = (await original_list(request)).root
+        extra = (await messages.request_handlers[types.ListToolsRequest](request)).root
+        return types.ServerResult(types.ListToolsResult(tools=[*original.tools, *extra.tools]))
+
+    async def call_tool(request):
+        if request.params.name in {"list_sessions", "send_message", "message_status"}:
+            return await messages.request_handlers[types.CallToolRequest](request)
+        return await original_call(request)
+
+    server.request_handlers[types.ListToolsRequest] = list_tools
+    server.request_handlers[types.CallToolRequest] = call_tool
+    server._cc_remote_messages_added = True
 
 
 def _normalize_ask_arguments(
@@ -73,13 +106,15 @@ def _normalize_ask_arguments(
     return question, options, None
 
 
-def make_ask_server(ask: AskCallback, set_mode: SetModeCallback) -> Server:
+def make_ask_server(
+    ask: AskCallback, set_mode: SetModeCallback, *, ask_batch: AskBatchCallback | None = None,
+) -> Server:
     """Build an in-process MCP server exposing the ask_user + set_mode tools."""
     server: Server = Server("cc-remote-ask")
 
     @server.list_tools()
     async def _list_tools() -> list[types.Tool]:
-        return [
+        tools = [
             types.Tool(
                 name=ASK_USER_TOOL,
                 description=(
@@ -145,10 +180,58 @@ def make_ask_server(ask: AskCallback, set_mode: SetModeCallback) -> Server:
                 },
             ),
         ]
+        if ask_batch is not None:
+            schema = tools[0].inputSchema
+            options = deepcopy(schema["properties"]["options"])
+            options["maxItems"] = 4
+            options["description"] = "2-4 selectable options."
+            properties = options["items"]["properties"]
+            properties["description"] = properties.pop("ds")
+            schema["properties"]["questions"] = {
+                "type": "array", "minItems": 1, "maxItems": 4,
+                "description": "Ask 1-4 related questions together; answers are submitted together.",
+                "items": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "question": deepcopy(schema["properties"]["question"]),
+                        "header": {"type": "string", "maxLength": 512},
+                        "options": options,
+                        "multiSelect": {"type": "boolean", "default": False},
+                    },
+                    "required": ["question", "options"],
+                },
+            }
+            schema.pop("required")
+            schema["oneOf"] = [
+                {"required": ["question", "options"], "not": {"required": ["questions"]}},
+                {"required": ["questions"], "not": {"anyOf": [
+                    {"required": ["question"]}, {"required": ["options"]},
+                ]}},
+            ]
+            schema["additionalProperties"] = False
+            tools[0].description += (
+                " Use questions for a batch of 1-4 related questions, with optional "
+                "header and multiSelect. Users can go back and edit before one final "
+                "submission. Batch results contain an answers array of question/answer pairs. "
+                "Do not combine questions with the legacy question/options fields."
+            )
+        return tools
 
     @server.call_tool()
     async def _call_tool(name: str, arguments: dict[str, Any]):
         if name == ASK_USER_TOOL:
+            if "questions" in arguments:
+                if ask_batch is None or set(arguments) != {"questions"}:
+                    return [types.TextContent(type="text", text="ask_user rejected: invalid batch")]
+                try:
+                    questions = normalize_claude_questions(arguments)
+                except ValueError as exc:
+                    return [types.TextContent(type="text", text=f"ask_user rejected: {exc}")]
+                answer = await ask_batch([AskQuestion(
+                    question=q.question, header=q.header, options=list(q.options),
+                    allow_text=True, multi_select=q.multi_select,
+                ) for q in questions])
+                return [types.TextContent(type="text", text=answer)]
             question, options, error = _normalize_ask_arguments(arguments)
             if error is not None:
                 return [types.TextContent(type="text", text=error)]

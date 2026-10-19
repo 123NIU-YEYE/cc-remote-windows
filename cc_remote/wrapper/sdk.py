@@ -229,6 +229,9 @@ class SdkHandle:
     ):
         self.cfg = cfg
         self.ask_server = ask_server  # in-process MCP server exposing ask_user
+        self.message_server = None
+        self.needs_message_tools_refresh = False
+        self._message_tools_toggle_started: str | None = None
         self.claude_config_dir = claude_config_dir
         self.isolate_account_env = isolate_account_env
         self.client: ClaudeSDKClient | None = None
@@ -558,8 +561,10 @@ class SdkHandle:
             # configured outside this explicit SDK invocation from leaking in.
             mcp_servers=(
                 {} if self.work_mode else
-                ({"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}
-                 if self.ask_server is not None else {})
+                {**({"cc-remote-ask": {"type": "sdk", "name": "cc-remote-ask", "instance": self.ask_server}}
+                    if self.ask_server is not None else {}),
+                 **({"cc_remote_messages": {"type": "sdk", "name": "cc_remote_messages", "instance": self.message_server}}
+                    if self.message_server is not None else {})}
             ),
             strict_mcp_config=self.work_mode,
             # Empty custom agents plus safe mode keeps installed/global agent
@@ -640,6 +645,10 @@ class SdkHandle:
             self._service_owner_identity = self.client.owner_identity
         self.service_recovery = getattr(self.client, "recovery", None)
         description = getattr(self.client, "description", {})
+        self.needs_message_tools_refresh = bool(
+            description.get("attached") and self.message_server is not None
+            and not self.work_mode)
+        self._message_tools_toggle_started = description.get("metadata", {}).get("message_tools_refresh")
         if description.get("attached"):
             controls = description["controls"]
             self.model = controls.get("model")
@@ -825,6 +834,68 @@ class SdkHandle:
             if not isinstance(usage, dict):
                 return {}
             return usage
+
+    async def refresh_message_tools(self) -> bool:
+        """Refresh MCP registration without replacing the native child.
+
+        The caller owns query_lock and checks idle/background/permission state.
+        MCP callbacks use their own bridge, not the conversation reader.
+        """
+        if not self.needs_message_tools_refresh:
+            return True
+        client = self.client
+        if client is None or self.ask_server is None or self.message_server is None:
+            return False
+        if (self._turn_active or self._turn_consumer_active or self._autonomous_steer_root
+                or self._background_callbacks_pending):
+            return False
+        send = client._query._send_control_request
+        required = {"list_sessions", "send_message", "message_status"}
+
+        def ready(status, name):
+            return any(row.get("name") == name and row.get("status") == "connected"
+                       and required <= {tool.get("name") for tool in row.get("tools", [])}
+                       for row in status.get("mcpServers", []))
+
+        async with self._control_request_lock:
+            try:
+                status = await send({"subtype": "mcp_status"}, timeout=10)
+                servers = {row.get("name"): row for row in status.get("mcpServers", [])}
+                name = "cc_remote_messages" if "cc_remote_messages" in servers else "cc-remote-ask"
+                row = servers.get(name)
+                if row is None or (row.get("status") not in {"connected", "failed"}
+                                   and self._message_tools_toggle_started != name):
+                    # Respect pre-existing disabled servers and incomplete
+                    # startup. Only undo a disable we ourselves attempted.
+                    return False
+                from cc_remote.wrapper.ask import add_message_tools
+
+                if name == "cc-remote-ask":
+                    add_message_tools(self.ask_server, self.message_server)
+                # reconnect_mcp_server rejects SDK transports in the verified
+                # CLI. Official toggle off/on re-lists the existing SDK proxy.
+                # Always attempt on, even if the off acknowledgment is lost.
+                # The service outlives this controller. Save intent there before
+                # disabling anything, so a replacement can restore an on-request
+                # whose acknowledgment/controller was lost.
+                marker = getattr(client, "mark_message_tools_refresh", None)
+                if marker is not None:
+                    await marker(name)
+                self._message_tools_toggle_started = name
+                try:
+                    await send({"subtype": "mcp_toggle", "serverName": name, "enabled": False}, timeout=10)
+                finally:
+                    await send({"subtype": "mcp_toggle", "serverName": name, "enabled": True}, timeout=10)
+                status = await send({"subtype": "mcp_status"}, timeout=10)
+                if ready(status, name):
+                    if marker is not None:
+                        await marker(None)
+                    self._message_tools_toggle_started = None
+                    self.needs_message_tools_refresh = False
+            except Exception as exc:
+                log.warning("Claude message tools refresh deferred", error_type=type(exc).__name__)
+                return False
+        return not self.needs_message_tools_refresh
 
     @asynccontextmanager
     async def context_recovery_barrier(self):

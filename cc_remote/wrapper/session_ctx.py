@@ -82,7 +82,7 @@ class PendingAskResolution:
     """
 
     reason: str
-    answer: str | list[str] | None = None
+    answer: str | list[str] | list[str | list[str]] | None = None
 
 
 @dataclass

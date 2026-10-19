@@ -2988,7 +2988,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
             {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
                 {t.prompt && <div className="ubub">
-                  {engine === "codex" && t.sourceThreadId && <Suspense fallback={null}>
+                  {t.sourceThreadId && <Suspense fallback={null}>
                     <SessionMessageLinks turn={t} source resolve={sessionLink}
                       onOpen={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined} />
                   </Suspense>}
@@ -3066,8 +3066,9 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
               </div>
             )}
             {showProcessTimeline && renderProcess()}
-            {engine === "codex" && (!!t.sessionMessages?.length || t.blocks.some((b) =>
-              b.kind === "tool" && b.tool.endsWith("send_message_to_thread"))) && <Suspense fallback={null}>
+            {(!!t.sessionMessages?.length || t.blocks.some((b) =>
+              b.kind === "tool" && (b.tool.endsWith("send_message_to_thread")
+                || b.tool.endsWith("send_message")))) && <Suspense fallback={null}>
               <SessionMessageLinks turn={t} resolve={sessionLink}
                 onOpen={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined} />
             </Suspense>}

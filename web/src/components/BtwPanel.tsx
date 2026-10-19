@@ -126,7 +126,8 @@ interface Props {
     authorization: PreviewAuthorizationState,
     decision: "allow" | "deny",
   ) => boolean;
-  onAnswerQuestion: (askId: string, answer: string | string[]) => boolean | void;
+  onAnswerQuestion: (askId: string, answer: string | string[] | undefined,
+    answers?: (string | string[])[]) => boolean | void;
   onCollapse: () => void;
   onDismissNotice: (noticeId: string) => void;
 }
@@ -759,6 +760,11 @@ export function BtwPanel(p: Props) {
           allowText={p.rt.pendingQuestion.allow_text}
           secret={p.rt.pendingQuestion.secret}
           multiSelect={p.rt.pendingQuestion.multi_select}
+          questions={p.rt.pendingQuestion.questions}
+          onAnswers={(answers) => {
+            const question = p.rt?.pendingQuestion;
+            return question ? p.onAnswerQuestion(question.ask_id, undefined, answers) : false;
+          }}
           onAnswer={(answer) => {
             const question = p.rt?.pendingQuestion;
             return question ? p.onAnswerQuestion(question.ask_id, answer) : false;

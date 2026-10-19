@@ -2,6 +2,15 @@
 
 [English](CHANGELOG.md)
 
+## 未发布
+
+- 新增可选的设备本地消息 MCP，供 Claude 与 Codex 跨会话通信，保留账号隔离、发送回执和重试去重。
+- 点击消息来源或发送回执，直接打开对应引擎、账号的实际会话，并保留各会话草稿。
+- Claude 原生 `AskUserQuestion` 与 cc-remote MCP `ask_user` 共用居中分页询问，翻页保留修改，最后统一提交整组答案。
+- 选项仅通过主题配色表示选中，移除选择图标，上一题／下一题使用圆角按钮。
+- 旧 Claude 会话在空闲边界刷新消息工具，无需重启原生进程；忙碌目标的消息持久排队，并防止重试导致重复执行。
+- Wire protocol v78：Web、Relay 和 Wrapper 需要一同升级，详见[交互询问说明](docs/user-questions.md)及[会话消息说明](docs/session-messages.md)。
+
 ## v4.0.22
 
 修复 Linux Wrapper 重启影响共享 Codex daemon 的问题，并支持预览扩展名与实际内容不一致的图片。
