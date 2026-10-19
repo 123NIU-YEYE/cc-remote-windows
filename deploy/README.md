@@ -588,7 +588,11 @@ This does not apply to Work's deliberately private app-server.
    Existing reachable daemons are reused without relocation or restart.
 
    The installer refuses to stop an older Wrapper whose cgroup still owns a
-   native Codex listener or daemon supervisor. For that one-time migration,
+   native Codex listener, daemon supervisor, or mutating lifecycle command
+   (including its Python resource-limit helper before exec). Read-only daemon
+   queries and private proxy/stdio children do not block this check. If a
+   lifecycle command is still running, let it finish before retrying. For the
+   one-time migration of a daemon that remains inside the Wrapper cgroup,
    wait for the affected account's tasks to finish, then run the official
    `CODEX_HOME="<account-home>" <daily-codex-bin> app-server daemon restart`
    from an independent login terminal. Verify its PID/cgroup is outside the

@@ -133,6 +133,68 @@ def test_guard_blocks_old_listeners_but_not_proxies_private_stdio_or_other_units
     assert check_codex_lifetime.inherited_daemons(group, os.getuid() + 1, tmp_path) == []
 
 
+@pytest.mark.parametrize("operation", [
+    "bootstrap", "enable-remote-control", "restart", "start", "stop",
+    "disable-remote-control", "future-mutating-operation",
+])
+@pytest.mark.parametrize("pre_exec", [False, True], ids=["native", "rlimit-helper"])
+def test_guard_blocks_lifecycle_before_listener_exists(tmp_path, operation, pre_exec):
+    group = "/system.slice/wrapper.service"
+    argv = ["/bin/codex", "app-server", "daemon", operation]
+    if pre_exec:
+        argv = [sys.executable, codex_daemon._RLIMIT_EXEC, "4096", *argv]
+    _process(tmp_path, 10, group, argv)
+    assert check_codex_lifetime.inherited_daemons(group, os.getuid(), tmp_path) == [10]
+
+
+@pytest.mark.parametrize("command", [
+    ["app-server", "daemon", "version"],
+    ["app-server", "daemon", "status"],
+    ["app-server", "daemon", "--help"],
+    ["app-server", "proxy", "--sock", "/account.sock"],
+    ["app-server"],
+])
+def test_guard_allows_read_only_and_private_children_before_exec(tmp_path, command):
+    group = "/system.slice/wrapper.service"
+    _process(tmp_path, 10, group, [
+        sys.executable, codex_daemon._RLIMIT_EXEC, "4096", "/bin/codex", *command,
+    ])
+    assert check_codex_lifetime.inherited_daemons(group, os.getuid(), tmp_path) == []
+
+
+def test_guard_does_not_parse_unrelated_python_arguments_as_a_launcher(tmp_path):
+    group = "/system.slice/wrapper.service"
+    _process(tmp_path, 10, group, [
+        sys.executable, "-c", "pass", codex_daemon._RLIMIT_EXEC, "4096",
+        "/bin/codex", "app-server", "daemon", "start",
+    ])
+    assert check_codex_lifetime.inherited_daemons(group, os.getuid(), tmp_path) == []
+
+
+def test_guard_cli_refuses_pre_exec_launch_without_changing_the_service(monkeypatch, tmp_path):
+    group = "/system.slice/wrapper.service"
+    _process(tmp_path, 10, group, [
+        sys.executable, codex_daemon._RLIMIT_EXEC, "4096", "/bin/codex",
+        "app-server", "daemon", "start",
+    ])
+    scan = check_codex_lifetime.inherited_daemons
+    monkeypatch.setattr(check_codex_lifetime, "inherited_daemons",
+                        lambda group, uid: scan(group, uid, tmp_path))
+    monkeypatch.setattr(sys, "argv", [
+        "check_codex_lifetime.py", "--unit", "wrapper.service", "--uid", str(os.getuid()),
+    ])
+    commands = []
+
+    def read_group(argv, **kwargs):
+        commands.append(argv)
+        return group + "\n"
+
+    monkeypatch.setattr(check_codex_lifetime.subprocess, "check_output", read_group)
+    with pytest.raises(SystemExit, match="lifecycle commands.*PIDs: 10.*remains running"):
+        check_codex_lifetime.main()
+    assert commands == [["systemctl", "show", "wrapper.service", "--property=ControlGroup", "--value"]]
+
+
 def test_guard_refuses_incomplete_inspection(tmp_path):
     group = "/system.slice/wrapper.service"
     _process(tmp_path, 10, group, ["/bin/codex", "app-server"])
