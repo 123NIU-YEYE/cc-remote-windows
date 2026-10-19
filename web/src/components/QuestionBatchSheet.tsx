@@ -179,7 +179,7 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
           value={current.text} disabled={pending} maxLength={4096}
           aria-label={question.secret ? "输入敏感内容" : "输入回答"}
           placeholder={question.secret ? "输入敏感内容" : question.multi_select ? "补充其他回答…" : "或输入其他回答…"}
-          onFocus={() => {
+          onClick={() => {
             if (!question.multi_select && pagesRef.current[page].selected.length) update({ selected: [] });
           }}
           onChange={event => updateText(event.target.value)}
