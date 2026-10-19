@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.25
+
+Render Graphviz SVG exports correctly and open HarmonyOS external links in the system browser. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.25.md).
+
+- Accept complete SVG prolog comments around a DOCTYPE and self-closing SVG roots without relaxing file-access or size limits.
+- Serialize sanitized SVG as XML so non-breaking spaces remain valid in file previews, Markdown and Mermaid images.
+- Route user-initiated external HTTP(S) links and popup destinations from the HarmonyOS client to the system browser, preserving the mounted chat and drafts.
+- Keep same-origin authenticated navigation in the app, settle popup handlers, and prevent duplicate browser launches with failure feedback.
+- Include updated unsigned HarmonyOS preview.5 and the unchanged signed Android preview.2 shell; iOS, Android and shared Web link routing are unchanged.
+
 ## v4.0.24
 
 Restore Claude MCP question tools and let users read the conversation before answering. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.24.md).
