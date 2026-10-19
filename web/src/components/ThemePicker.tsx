@@ -1,54 +1,66 @@
-import type { RefObject } from "react";
-import { Icon } from "../icons";
-import { THEME_PALETTES, themeLabel, type ThemeChoice, type ThemeEngine } from "../themes";
+import { type RefObject } from "react";
+import { EngineIcon } from "../icons";
+import type { ThemeEngine } from "../themes";
+import { appearanceColors, colorContrast, isCustomPalette, type AppearanceColors } from "../appearance";
+import type { AppearanceController } from "../use-theme";
 import { CenteredSheet } from "./CenteredSheet";
+import { AppearanceColor } from "./AppearanceColor";
+import { AppearanceFont } from "./AppearanceFont";
+import { AppearancePalette } from "./AppearancePalette";
 import "./ThemePicker.css";
 
-export default function ThemePicker({ engine, choice, onSelect, onClose, returnFocusRef }: {
+export default function ThemePicker({ engine, appearance, onClose, returnFocusRef }: {
   engine: ThemeEngine;
-  choice: ThemeChoice;
-  onSelect: (choice: ThemeChoice) => void;
+  appearance: AppearanceController;
   onClose: () => void;
   returnFocusRef?: RefObject<HTMLElement | null>;
 }) {
-  return <CenteredSheet open label="主题" onClose={onClose} maxWidth={660} maxHeight={760} minimumHeight={660}
+  const { choice, mode, look, colors, selectTheme, updateLook, replaceLook } = appearance;
+  const custom = isCustomPalette(engine, mode, look);
+  const baseColors = appearanceColors(engine, mode, { preset: look.preset });
+  const lowContrast = colorContrast(colors.background, colors.foreground) < 4.5;
+  const modeLabel = mode === "light" ? "浅色" : "深色";
+  return <CenteredSheet open label="外观" onClose={onClose} maxWidth={620} maxHeight={740} minimumHeight={600}
     className="theme-picker" returnFocusRef={returnFocusRef}>
     <div className="theme-picker-intro">
-      <span>{({ claude: "Claude", codex: "Codex", dsh: "DSH" })[engine]}</span>
-      <p>点击即切换，为当前引擎单独记住。</p>
+      <span>{engine !== "dsh" && <EngineIcon engine={engine} size={17} />}{({ claude: "Claude", codex: "Codex", dsh: "DSH" })[engine]}</span>
+      <p>仅影响当前引擎，自动保存</p>
     </div>
     <div className="sheet-scroll theme-picker-scroll">
-      <div className="theme-basics" aria-label="基础主题">
-        {(["system", "light", "dark"] as const).map(id => <button type="button" key={id}
-          aria-pressed={choice === id} onClick={() => onSelect(id)}>
-          <Icon name={id === "system" ? "devices" : id === "light" ? "sun" : "moon"} size={18} />
-          <span>{themeLabel(id)}</span>
-          {choice === id && <Icon name="check" size={14} />}
-        </button>)}
-      </div>
-      <div className="theme-section-label">柔和配色 <span>低饱和 · 轻灰调</span></div>
-      <div className="theme-grid" aria-label="柔和配色">
-        {THEME_PALETTES.map(palette => <button type="button" key={palette.id}
-          className="theme-card" aria-label={palette.name} aria-pressed={choice === palette.id}
-          onClick={() => onSelect(palette.id)}>
-          <span className="theme-miniature" aria-hidden="true" data-preview-palette={palette.id}>
-            <span className="theme-mini-sidebar"><i /><b /><i /><i /></span>
-            <span className="theme-mini-chat">
-              <span className="theme-mini-head"><i /><b /></span>
-              <span className="theme-mini-bubble" />
-              <span className="theme-mini-lines"><i /><i /><i /></span>
-              <span className="theme-mini-input"><i /><b /></span>
+      <div className="appearance-mode-section">
+        <span className="appearance-label">模式</span>
+        <div className="theme-basics" aria-label="外观模式">
+          {(["system", "light", "dark"] as const).map(id => <button type="button" key={id}
+            aria-label={id === "system" ? "跟随系统" : id === "light" ? "浅色" : "深色"}
+            aria-pressed={choice === id} onClick={() => selectTheme(id)}>
+            <span className={`appearance-miniature ${id}`} aria-hidden="true">
+              <span className="appearance-mini-sidebar"><i /><i /><i /></span>
+              <span className="appearance-mini-chat"><b /><i /><i /><span><b /></span></span>
             </span>
-            {choice === palette.id && <span className="theme-selected"><Icon name="check" size={13} /></span>}
-          </span>
-          <span className="theme-card-name">{palette.name}<span>{palette.mode === "light" ? "浅" : "深"}</span></span>
-          <span className="theme-card-description">{palette.description}</span>
-        </button>)}
+            <span>{id === "system" ? "跟随系统" : id === "light" ? "浅色" : "深色"}</span>
+          </button>)}
+        </div>
       </div>
+      <p className="appearance-mode-help">正在调整{modeLabel}外观 · 浅色与深色分别记住配色</p>
+      <div className="appearance-fields">
+        <AppearancePalette key={`palette:${engine}:${mode}`} engine={engine} mode={mode} look={look}
+          onChange={preset => updateLook({ preset, accent: undefined, background: undefined, foreground: undefined })} />
+        {([['accent', '强调色'], ['background', '背景色'], ['foreground', '文字色']] as const).map(([key, label]) =>
+          <AppearanceColor key={`${engine}:${mode}:${look.preset ?? "classic"}:${key}`} label={label} value={colors[key]}
+            onChange={value => {
+              if (value !== colors[key]) updateLook({ [key]: value === baseColors[key] ? undefined : value } as Partial<AppearanceColors>);
+            }} onReset={() => updateLook({ [key]: undefined })} />)}
+        <AppearanceFont key={`font:${engine}:${mode}`} value={look.font ?? "system"}
+          onChange={font => updateLook({ font })} />
+      </div>
+      <p className="appearance-help">{custom ? "手动调色后，自动标记为自定义。" : "点击色块选色，也可输入 HEX 色值。调整即时预览。"}</p>
+      {lowContrast && <p className="appearance-contrast" role="status">文字与背景较接近，建议拉开明暗差距，便于阅读。</p>}
     </div>
     <footer className="theme-picker-footer">
-      <span role="status">已选：{themeLabel(choice)}</span>
-      <button type="button" onClick={onClose}>完成</button>
+      <button type="button" className="appearance-reset" onClick={() => replaceLook({})}
+        title={`恢复当前引擎的${modeLabel}默认颜色和字体`}>恢复默认</button>
+      <span>仅重置当前{modeLabel}</span>
+      <button type="button" className="appearance-done" onClick={onClose}>完成</button>
     </footer>
   </CenteredSheet>;
 }

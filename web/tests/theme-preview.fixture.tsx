@@ -34,7 +34,7 @@ function demoState(engine: Engine) {
       turn_id: "theme-preview", title: "读取主题配置", tool_name: "Read", command: "web/src/themes.ts" },
     { type: "assistant_msg_start", message_id: "answer", turn_id: "theme-preview", channel: "final" },
     { type: "delta", message_id: "answer", turn_id: "theme-preview", channel: "final", text:
-      "六款主题已经准备好了，页面保留了原来的布局。\n\n### 更柔和，也更清楚\n\n背景、消息气泡、边框和按钮使用同一套配色，正文保留清晰的对比。\n\n- `frontend.cpp:68` 使用 `std::max_element`，需要补上 `<algorithm>`。\n- `package.xml`、`test.yaml` 和 `workdir: sdk` 符合当前规范。\n\n完整记录：[查看审查报告](https://github.com/muggle-stack/cc-remote)，项目说明：[`README.md`](https://github.com/muggle-stack/cc-remote/blob/master/README.md)。\n\n```ts\nconst appearance = {\n  palette: 'moss',\n  rememberPerEngine: true,\n};\n```\n\n从右上角 **更多设置 → 主题** 打开配色卡，点击就能看到整页效果。每个引擎的选择会在当前浏览器单独保存。" },
+      "外观设置已经准备好了，页面保留了原来的布局。\n\n### 更柔和，也更清楚\n\n背景和控件保持柔和，**关键结论更醒目**。链接与行内代码单独着色，方便快速找到重点。\n\n- `frontend.cpp:68` 使用 `std::max_element`，需要补上 `<algorithm>`。\n- `package.xml`、`test.yaml` 和 `workdir: sdk` 符合当前规范。\n\n完整记录：[查看审查报告](https://github.com/muggle-stack/cc-remote)，项目说明：**[`README.md`](https://github.com/muggle-stack/cc-remote/blob/master/README.md)**。\n\n```ts\nconst appearance = {\n  palette: 'moss',\n  rememberPerEngine: true,\n};\n```\n\n从右上角 **更多设置 → 外观** 调整颜色和字体，立即看到整页效果。每个引擎的选择会在当前浏览器单独保存。" },
     { type: "assistant_msg_end", message_id: "answer", turn_id: "theme-preview", channel: "final" },
     { type: "turn_end", turn_id: "theme-preview", result: { subtype: "success", duration_ms: 74000, is_error: false } },
     { type: "state", state: "idle" },
@@ -50,7 +50,8 @@ function demoState(engine: Engine) {
 export function ThemePreview() {
   useMobileViewport();
   const [engine, setEngine] = useState<Engine>(() => normalizeEngine(params.get("engine") ?? "codex"));
-  const { mode, choice, selectTheme } = useTheme(engine);
+  const appearance = useTheme(engine);
+  const { selectTheme } = appearance;
   const { boldText, setBoldText } = useBoldText();
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 980);
   const [active, setActive] = useState("preview");
@@ -95,7 +96,7 @@ export function ThemePreview() {
         <div className="titlewrap"><div className="ttl">Code</div><div className="sub">主题预览 · 示例会话</div></div>
         <span className="hstat idle"><span className="sd" />idle</span>
         <EngineSelector engine={engine} onChange={setEngine} />
-        <HeaderMenu engine={engine} theme={mode} themeChoice={choice} onSelectTheme={selectTheme}
+        <HeaderMenu engine={engine} appearance={appearance}
           boldText={boldText} onBoldText={setBoldText}
           notificationMode="off" notificationBinding="off" notificationAvailable={false}
           onNotificationMode={async () => false} onOpenUsageActivity={noop} onLogout={noop} />
