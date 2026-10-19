@@ -205,7 +205,8 @@ def test_guard_refuses_incomplete_inspection(tmp_path):
 
 def test_install_guard_runs_before_stop_or_rollback_restart_is_armed():
     installer = (Path(__file__).parents[1] / "deploy/install-wrapper.sh").read_text()
-    body = installer.split('if [ "$service_was_running" -eq 1 ]; then\n', 1)[1]
+    body = installer.split("# Check existing units even when is-active was false:", 1)[1]
+    assert '--stop-receipt "$codex_stop_receipt"' in body
     assert body.index("check_codex_lifetime.py") < body.index("service_stopped=1") < body.index("stop_wrapper_service")
 
 

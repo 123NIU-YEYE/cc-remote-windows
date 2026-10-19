@@ -316,6 +316,7 @@ unit_verify_dir=""
 rollback_snapshot=""
 snapshot_created=0
 service_stopped=0
+codex_stop_receipt=""
 service_was_running=0
 activation_committed=0
 retention_generation=""
@@ -424,6 +425,10 @@ wrapper_service_active() {
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
+  if [ -n "${codex_stop_receipt:-}" ] && [ -f "$codex_stop_receipt" ]; then
+    service_stopped=1
+    service_was_running=1
+  fi
   if [ "$status" -ne 0 ] && [ "$activation_committed" -eq 0 ]; then
     rollback_ready=1
     if [ "$snapshot_created" -eq 1 ]; then
@@ -695,13 +700,19 @@ if [ "$service_had_file" -eq 1 ]; then
     service_was_running=1
   fi
 fi
-if [ "$service_was_running" -eq 1 ]; then
-  if [ "$system" = linux ] && [ "$service_manager" = systemd ]; then
-    # Old detached Codex daemons may still inherit this unit's KillMode.
-    # Abort before marking the service stopped: rollback must not restart it.
-    "$target/.venv/bin/python" "$target/deploy/check_codex_lifetime.py" \
-      --unit "$service_label" --uid "$(id -u "$target_user")"
+if [ "$system" = linux ] && [ "$service_manager" = systemd ] && [ "$service_had_file" -eq 1 ]; then
+  # Check existing units even when is-active was false: an activating/restarting
+  # legacy service must not bypass the barrier. A stopped unit is a no-op.
+  codex_stop_dir="$(mktemp -d "$rollback_root/codex-stop-$release_name.XXXXXX")"
+  codex_stop_receipt="$codex_stop_dir/attempted.json"
+  "$target/.venv/bin/python" "$target/deploy/check_codex_lifetime.py" \
+    --unit "$service_label" --uid "$(id -u "$target_user")" \
+    --stop-receipt "$codex_stop_receipt"
+  if [ -f "$codex_stop_receipt" ]; then
+    service_stopped=1
+    service_was_running=1
   fi
+elif [ "$service_was_running" -eq 1 ]; then
   # A lost stop response may still mean the original process stopped.
   # Include it in rollback recovery even when the stop call reports failure.
   service_stopped=1
