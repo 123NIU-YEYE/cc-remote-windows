@@ -587,7 +587,25 @@ This does not apply to Work's deliberately private app-server.
    fails rather than creating a daemon that the next Wrapper upgrade would kill.
    Existing reachable daemons are reused without relocation or restart.
 
-   The installer refuses to stop an older Wrapper whose cgroup still owns a
+   Before a systemd upgrade, the running Wrapper must acknowledge a launch
+   barrier over its process-bound local Unix socket. This excludes new mutating
+   Codex commands across the entire inspect/stop interval. An in-flight launch
+   rejects quiescence; wait for it to finish and retry. The installer verifies
+   the socket peer, process generation and unit invocation before stopping.
+   A rejected check reopens launches without restarting the service. Once stop
+   intent is recorded, quiescence survives lost replies until the Wrapper exits;
+   retrying the installer can reacquire it. Stop intent is retained under the
+   private rollback directory so recovery distinguishes a rejected check from
+   an uncertain stop.
+
+   Older running Wrappers cannot acknowledge this barrier. Their first upgrade
+   is deliberately refused without stopping anything, even if a process scan
+   looks clear. Wait for native tasks to finish and stop the old Wrapper in a
+   maintenance window, then retry the installer. Do not bypass the check on a
+   live legacy service. New installations and already-stopped services do not
+   need this one-time step.
+
+   The installer also refuses to stop a Wrapper whose cgroup still owns a
    native Codex listener, daemon supervisor, or mutating lifecycle command
    (including its Python resource-limit helper before exec). Read-only daemon
    queries and private proxy/stdio children do not block this check. If a

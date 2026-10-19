@@ -8,6 +8,7 @@ process, so disconnecting one remote session cannot stop other Codex clients.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ from typing import Any, Mapping, Optional
 
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
+from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
     ProcessIdentity,
@@ -128,19 +130,20 @@ def _run_command(
             *argv,
         )
     try:
-        if lifecycle_command and needs_isolation():
-            result = run_isolated(command_argv, env, home, timeout)
-        else:
-            result = subprocess.run(
-                command_argv,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=dict(env),
-                cwd=home,
-                timeout=timeout,
-                check=False,
-            )
+        with barrier.launch() if mutates_daemon(argv) else nullcontext():
+            if lifecycle_command and needs_isolation():
+                result = run_isolated(command_argv, env, home, timeout)
+            else:
+                result = subprocess.run(
+                    command_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(env),
+                    cwd=home,
+                    timeout=timeout,
+                    check=False,
+                )
     except (OSError, subprocess.SubprocessError) as exc:
         # Exception text can contain paths or command details.  The manager's
         # caller needs only a bounded failure class to select stdio fallback.
