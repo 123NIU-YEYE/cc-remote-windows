@@ -8,6 +8,7 @@ from cc_remote.log import logger
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.transport import WrapperTransport
 from cc_remote.wrapper.child_env import scrub_parent_control_secrets
+from cc_remote.wrapper.codex_launch_barrier import serve as serve_launch_barrier
 from cc_remote.viewer import registry_path
 from cc_remote.viewer_home import HomePages
 from cc_remote.wrapper.viewer_transport import ViewerTransport
@@ -16,6 +17,12 @@ log = logger("cc_remote.wrapper")
 
 
 async def main() -> None:
+    # Advertise and enforce launch exclusion before any native daemon prewarm.
+    with serve_launch_barrier():
+        await run_wrapper()
+
+
+async def run_wrapper() -> None:
     cfg = wrapper_config()
     validate_wrapper_config(cfg)
     # cfg now owns the one token transport needs. Remove control credentials from

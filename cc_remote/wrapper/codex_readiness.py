@@ -25,6 +25,7 @@ from websockets.uri import parse_uri
 
 from cc_remote import __version__
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager, socket_identity
+from cc_remote.wrapper.codex_service import DaemonIsolationError
 from cc_remote.wrapper.process_scan import process_identity
 
 REPORT_NAME = "codex-readiness.json"
@@ -195,6 +196,8 @@ async def check_profile(
             row["reason"] = "daemon_changed"
             return row
         row.update(status="ready", socket=expected, socket_identity=list(before), version=versions[0])
+    except DaemonIsolationError:
+        row.update(reason="isolation_unavailable")
     except Exception as exc:
         # A CLI may include credentials or prompts in stderr/errors. Publish
         # only a closed reason and exception class, never its raw message.
