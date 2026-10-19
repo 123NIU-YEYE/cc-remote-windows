@@ -74,6 +74,8 @@ def _normalize_ask_arguments(
     arguments: dict[str, Any],
 ) -> tuple[str | None, list[dict[str, str]] | None, str | None]:
     """Validate model-originated ask payloads before they reach the wire."""
+    if set(arguments) != {"question", "options"}:
+        return None, None, "ask_user rejected: expected question and options"
     question = arguments.get("question")
     opts = arguments.get("options")
     if not isinstance(question, str) or not (
@@ -201,18 +203,16 @@ def make_ask_server(
                     "required": ["question", "options"],
                 },
             }
+            # Claude Code may filter out tools with root combinators instead
+            # of normalizing them. Keep both input forms in a plain object;
+            # the handler enforces that exactly one complete form is supplied.
             schema.pop("required")
-            schema["oneOf"] = [
-                {"required": ["question", "options"], "not": {"required": ["questions"]}},
-                {"required": ["questions"], "not": {"anyOf": [
-                    {"required": ["question"]}, {"required": ["options"]},
-                ]}},
-            ]
             schema["additionalProperties"] = False
             tools[0].description += (
                 " Use questions for a batch of 1-4 related questions, with optional "
                 "header and multiSelect. Users can go back and edit before one final "
                 "submission. Batch results contain an answers array of question/answer pairs. "
+                "Supply exactly one form: questions, or both question and options. "
                 "Do not combine questions with the legacy question/options fields."
             )
         return tools

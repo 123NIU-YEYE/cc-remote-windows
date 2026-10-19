@@ -4549,7 +4549,11 @@ async function coverBtwPanel(
 }
 
 test("native question centers long Claude prompts and retains answers above the keyboard", async ({ page }, testInfo) => {
-  const relay = await mockRightPanelRelay(page, { engine: "claude" });
+  const relay = await mockRightPanelRelay(page, { engine: "claude", parentState: "running", seedTurns: [{
+    id: "read-before-answer", prompt: "先解释方案，再让我确认。", done: true,
+    blocks: [{ kind: "text", message_id: "proposal", channel: "final", done: true,
+      text: "请先核对原来的指标定义，再决定是否采用以下方案。\n\n".repeat(50) }],
+  }] });
   await page.goto("/");
   await expect(page.locator(".composer textarea")).toBeEnabled();
   const paragraph = "写飞书前对照现有文档，发现 v0.8 端侧决策的指标和文档里已有的定义冲突。\n\n"
@@ -4580,6 +4584,39 @@ test("native question centers long Claude prompts and retains answers above the 
   await expect(dialog.getByRole("button", { name: "修正指标", exact: true })).toHaveAttribute("aria-pressed", "true");
   const input = dialog.getByPlaceholder("输入回答");
   await input.fill("按原定义修正并补充说明");
+  const scrollBeforeCollapse = await body.evaluate(node => node.scrollTop);
+  const beforeCollapse = relay.commands.length;
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  const resume = page.getByRole("button", { name: "等待你回答 继续回答" });
+  await expect(resume).toBeVisible();
+  await expect(resume).toBeFocused();
+  const resumeBox = (await resume.boundingBox())!;
+  const composerBox = (await page.locator(".composer").boundingBox())!;
+  expect(resumeBox.y + resumeBox.height).toBeLessThan(composerBox.y);
+  expect(resumeBox.height).toBeLessThanOrEqual(48);
+  await page.locator(".composer textarea").click(); // The document is no longer inert.
+  const thread = page.locator(".thread");
+  const threadScroll = await thread.evaluate(node => node.scrollTop);
+  const threadBox = (await thread.boundingBox())!;
+  await page.mouse.move(threadBox.x + threadBox.width / 2, threadBox.y + threadBox.height / 2);
+  if (testInfo.project.use.isMobile) {
+    // Playwright cannot synthesize a wheel in mobile WebKit. The real pointer
+    // click above verifies inert is released; verify the reading viewport too.
+    await thread.evaluate(node => node.scrollBy({ top: -400 }));
+  } else {
+    await page.mouse.wheel(0, -400);
+  }
+  await expect.poll(() => thread.evaluate(node => node.scrollTop)).toBeLessThan(threadScroll - 50);
+  await page.screenshot({ path: testInfo.outputPath("claude-question-collapsed-dark.png") });
+  // Collapsing, reading and reopening are entirely local; no answer/cancel/turn command.
+  expect(relay.commands.slice(beforeCollapse).filter(command => command.type !== "ping")).toEqual([]);
+  await resume.click();
+  await expect(dialog).toBeVisible();
+  await expect(input).toHaveValue("按原定义修正并补充说明");
+  await expect(dialog.getByRole("button", { name: "修正指标", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect.poll(() => body.evaluate(node => node.scrollTop)).toBe(scrollBeforeCollapse);
+  await input.click();
   await page.evaluate(() => {
     Object.defineProperties(window.visualViewport!, {
       height: { configurable: true, value: 340 },
@@ -4625,6 +4662,17 @@ test("native question batch keeps choices across pages and reconnects until atom
   const choice = dialog.getByRole("button", { name: "最近更新优先" });
   await choice.click();
   await expect(choice).toHaveAttribute("aria-pressed", "true");
+  const customAnswer = dialog.getByRole("textbox", { name: "输入回答" });
+  // Traversing the form is not a decision to replace a valid answer.
+  await dialog.getByRole("button", { name: "按文件类型分组", exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(customAnswer).toBeFocused();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeEnabled();
+  await dialog.getByRole("button", { name: "下一题" }).focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(customAnswer).toBeFocused();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
   await expect(choice).toHaveCSS("background-color", "rgb(242, 231, 223)");
   expect(await choice.locator("svg, input, .checkbox, .radio").count()).toBe(0);
   const radius = await dialog.locator(".qa-next").evaluate(node => parseFloat(getComputedStyle(node).borderRadius));
@@ -4639,7 +4687,26 @@ test("native question batch keeps choices across pages and reconnects until atom
   await dialog.getByRole("textbox", { name: "输入回答" }).fill("包含音频");
   await dialog.getByRole("button", { name: "上一题" }).click();
   await expect(choice).toHaveAttribute("aria-pressed", "true");
-  await dialog.getByRole("textbox", { name: "输入回答" }).fill("按名称排序");
+  await customAnswer.focus();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  // Keyboard edits still select the custom-answer mode without a pointer click.
+  await customAnswer.fill("键盘输入的答案");
+  await expect(choice).toHaveAttribute("aria-pressed", "false");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeEnabled();
+  await customAnswer.fill("");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeDisabled();
+  await choice.click();
+  await customAnswer.click();
+  await expect(choice).toHaveAttribute("aria-pressed", "false");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeDisabled();
+  await customAnswer.fill("临时自填答案");
+  await choice.click();
+  await expect(customAnswer).toHaveValue("");
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  await customAnswer.click();
+  await expect(choice).toHaveAttribute("aria-pressed", "false");
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeDisabled();
+  await customAnswer.fill("按名称排序");
   await expect(choice).toHaveAttribute("aria-pressed", "false");
   await dialog.getByRole("button", { name: "下一题" }).click();
   await expect(dialog.getByRole("button", { name: "上传的附件", exact: true })).toHaveAttribute("aria-pressed", "true");
@@ -4649,16 +4716,30 @@ test("native question batch keeps choices across pages and reconnects until atom
     .toHaveCSS("background-color", "rgb(53, 37, 32)");
   await page.screenshot({ path: testInfo.outputPath("question-batch-multi-dark.png") });
   expect(relay.commands.filter(command => command.type === "answer_question")).toHaveLength(0);
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
+  const resume = page.getByRole("button", { name: "等待你回答 2 / 3 继续回答" });
+  await expect(resume).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("question-batch-collapsed-dark.png") });
   await page.keyboard.press("Meta+2");
   await expect(page.getByRole("button", { name: "切换新会话引擎" })).toContainText("Codex");
   await expect(dialog).toHaveCount(0);
+  await expect(resume).toHaveCount(0);
   await page.keyboard.press("Meta+1");
+  await expect(resume).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await resume.click();
   await expect(dialog.locator(".qa-progress")).toHaveText("2 / 3");
   await expect(dialog.getByRole("button", { name: "上传的附件", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(dialog.getByRole("textbox", { name: "输入回答" })).toHaveValue("包含音频");
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
   relay.emit({ type: "ask_user_sync", sid: "layout-parent" });
   await expect(dialog).toHaveCount(0);
+  await expect(resume).toHaveCount(0);
   relay.emit({ ...event, seq: 2 });
+  await expect(resume).toBeVisible();
+  await expect(dialog).toHaveCount(0);
+  await resume.click();
   await expect(dialog.locator(".qa-progress")).toHaveText("2 / 3");
   await expect(dialog.getByRole("textbox", { name: "输入回答" })).toHaveValue("包含音频");
   await dialog.getByRole("button", { name: "下一题" }).click();
@@ -4672,8 +4753,16 @@ test("native question batch keeps choices across pages and reconnects until atom
     ]);
   await expect(dialog).toBeVisible(); // Sending is not acknowledgement.
   await expect(dialog.getByRole("button", { name: "提交中…", exact: true })).toBeDisabled();
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
+  const pendingResume = page.getByRole("button", { name: "回答提交中… 3 / 3 查看回答" });
+  await expect(pendingResume).toBeVisible();
+  await pendingResume.click();
+  await expect(dialog.getByRole("button", { name: "提交中…", exact: true })).toBeDisabled();
+  expect(relay.commands.filter(command => command.type === "answer_question")).toHaveLength(1);
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
   relay.emit({ type: "ask_user_closed", sid: "layout-parent", seq: 3, ask_id: "batch-ask", reason: "answered" });
   await expect(dialog).toHaveCount(0);
+  await expect(pendingResume).toHaveCount(0);
 });
 
 test("native question batch scrolls long text with fixed navigation and routes side chat answers", async ({ page }, testInfo) => {
@@ -4691,6 +4780,23 @@ test("native question batch scrolls long text with fixed navigation and routes s
   const input = dialog.getByRole("textbox", { name: "输入回答" });
   await input.fill("补充验收标准");
   expect((await dialog.locator(".qa-footer").boundingBox())!.y).toBe(footer.y);
+  const body = dialog.locator(".sheet-scroll");
+  const scrollBeforeCollapse = await body.evaluate(node => node.scrollTop);
+  const beforeCollapse = relay.commands.length;
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  const resume = page.locator(".btw-panel").getByRole("button", { name: "等待你回答 继续回答" });
+  await expect(resume).toBeVisible();
+  const barBox = (await resume.boundingBox())!;
+  const composerBox = (await page.locator(".btw-composer").boundingBox())!;
+  expect(barBox.y + barBox.height).toBeLessThan(composerBox.y);
+  await page.locator(".btw-composer textarea").click();
+  await page.screenshot({ path: testInfo.outputPath("question-batch-side-collapsed.png") });
+  expect(relay.commands.slice(beforeCollapse).filter(command => command.type !== "ping")).toEqual([]);
+  await resume.click();
+  await expect(input).toHaveValue("补充验收标准");
+  await expect.poll(() => body.evaluate(node => node.scrollTop)).toBe(scrollBeforeCollapse);
+  await input.click();
   await page.evaluate(() => {
     Object.defineProperties(window.visualViewport!, {
       height: { configurable: true, value: 340 }, offsetTop: { configurable: true, value: 40 },
@@ -4714,6 +4820,32 @@ test("native question batch scrolls long text with fixed navigation and routes s
     ]);
   relay.emit({ type: "ask_user_closed", sid: "btw-layout-child", seq: 2, ask_id: "batch-child", reason: "answered" });
   await expect(dialog).toHaveCount(0);
+});
+
+test("native question collapse retires only the exact server question and new asks still open", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", parentState: "running" });
+  await page.goto("/");
+  await expect(page.locator(".composer textarea")).toBeEnabled();
+  const ask = { type: "ask_user" as const, sid: "layout-parent", question: "是否继续？",
+    options: [{ label: "继续" }, { label: "调整方案" }] };
+  relay.emit({ ...ask, seq: 1, ask_id: "old-ask" });
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
+  const resume = page.getByRole("button", { name: "等待你回答 继续回答" });
+  await expect(resume).toBeVisible();
+  relay.emit({ ...ask, seq: 2, ask_id: "new-ask" });
+  await expect(dialog).toBeVisible();
+  await expect(resume).toHaveCount(0);
+  relay.emit({ type: "ask_user_closed", sid: "layout-parent", seq: 3,
+    ask_id: "old-ask", reason: "superseded" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "收起问题", exact: true }).click();
+  await expect(resume).toBeVisible();
+  relay.emit({ type: "ask_user_closed", sid: "layout-parent", seq: 4,
+    ask_id: "new-ask", reason: "timeout" });
+  await expect(resume).toHaveCount(0);
+  await expect(dialog).toHaveCount(0);
+  expect(relay.commands.filter(command => ["answer_question", "interrupt", "query"].includes(String(command.type)))).toEqual([]);
 });
 
 test("native question keeps custom headings and text-only Codex answers", async ({ page }) => {

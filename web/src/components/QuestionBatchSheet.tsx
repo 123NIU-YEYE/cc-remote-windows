@@ -4,6 +4,7 @@ import type { AskQuestion, Engine } from "../protocol";
 import { EngineIcon } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
 import type { QuestionDraft } from "./QuestionSheet";
+import { QuestionCollapseButton, QuestionResume } from "./QuestionPresentation";
 
 type PageDraft = { text: string; selected: string[]; scrollTop: number };
 const emptyPage = (): PageDraft => ({ text: "", selected: [], scrollTop: 0 });
@@ -29,6 +30,9 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
     return saved?.signature === JSON.stringify(questions) ? saved : undefined;
   });
   const [page, setPage] = useState(Math.min(initial?.page ?? 0, questions.length - 1));
+  const [collapsed, setCollapsed] = useState(initial?.collapsed ?? false);
+  const resumeRef = useRef<HTMLButtonElement>(null);
+  const focusResume = useRef(false);
   const [pages, setPages] = useState<PageDraft[]>(initial?.pages ?? questions.map(emptyPage));
   const pagesRef = useRef(pages);
   const [pending, setPending] = useState(false);
@@ -43,13 +47,13 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
   const current = pages[page];
   const last = page === questions.length - 1;
 
-  const save = (next: PageDraft[], index = page) => {
+  const save = (next: PageDraft[], index = page, minimized = collapsed) => {
     pagesRef.current = next;
     setPages(next);
     if (!draft) return;
     draft.store.delete(draft.key);
     draft.store.set(draft.key, { ...next[index], page: index, pages: next,
-      signature: JSON.stringify(questions) });
+      signature: JSON.stringify(questions), collapsed: minimized });
     // Answers stay in bounded in-memory UI state, never browser storage.
     while (draft.store.size > 64) draft.store.delete(draft.store.keys().next().value!);
   };
@@ -58,6 +62,8 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
     save(next);
     setError("");
   };
+  const updateText = (text: string) => update({ text,
+    ...(!question.multi_select ? { selected: [] } : {}) });
   const navigate = (value: string) => {
     if (pendingRef.current) return;
     const next = pagesRef.current.map((entry, index) => index === page
@@ -94,20 +100,27 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
   useLayoutEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
+    if (collapsed) {
+      if (focusResume.current) resumeRef.current?.focus({ preventScroll: true });
+      focusResume.current = false;
+      return;
+    }
     dialog.showModal();
     return () => dialog.close();
-  }, []);
+  }, [collapsed]);
   useLayoutEffect(() => {
+    if (collapsed) return;
     if (scrollRef.current) scrollRef.current.scrollTop = pagesRef.current[page].scrollTop;
     // Choice pages do not summon a keyboard. Keep free-text-only accessibility.
     const target = question.allow_text && question.options.length === 0
       ? ime.inputRef.current : headingRef.current;
     target?.focus({ preventScroll: true });
-  }, [page, question, ime.inputRef]);
+  }, [page, question, ime.inputRef, collapsed]);
   useLayoutEffect(() => {
     const body = scrollRef.current;
     if (!body) return;
     const observer = new ResizeObserver(() => {
+      if (!dialogRef.current?.open) return;
       const input = ime.inputRef.current;
       if (!input || document.activeElement !== input) return;
       const viewport = body.getBoundingClientRect();
@@ -121,15 +134,26 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
     return () => observer.disconnect();
   }, [ime.inputRef]);
   const content = <dialog ref={dialogRef} className="question-dialog question-batch"
-    aria-label="操作确认" aria-modal="true" data-lock-horizontal-swipe
+    aria-label="操作确认" aria-modal={!collapsed || undefined} data-lock-horizontal-swipe
     onCancel={event => event.preventDefault()} onKeyDown={event => event.stopPropagation()}>
     <div ref={headingRef} tabIndex={-1} className="question-dialog-title">
       <EngineIcon engine={engine} size={26} />
       <span>{engine === "claude" ? "Claude" : "Codex"} 想确认一下</span>
       {questions.length > 1 && <span className="qa-progress" aria-live="polite"
         aria-label={`第 ${page + 1} 题，共 ${questions.length} 题`}>{page + 1} / {questions.length}</span>}
+      <QuestionCollapseButton onPointerDown={ime.commitCompositionBeforePointerSubmit}
+        onCollapse={() => {
+          const next = pagesRef.current.map((value, index) => index === page ? {
+            ...value, text: ime.inputRef.current?.value ?? value.text,
+            scrollTop: scrollRef.current?.scrollTop ?? value.scrollTop,
+          } : value);
+          save(next, page, true);
+          focusResume.current = true;
+          setCollapsed(true);
+        }} />
     </div>
     <div ref={scrollRef} className="sheet-scroll" onScroll={() => {
+      if (!dialogRef.current?.open) return;
       const scrollTop = scrollRef.current?.scrollTop ?? 0;
       if (scrollTop !== pagesRef.current[page].scrollTop) update({ scrollTop });
     }}>
@@ -155,10 +179,12 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
           value={current.text} disabled={pending} maxLength={4096}
           aria-label={question.secret ? "输入敏感内容" : "输入回答"}
           placeholder={question.secret ? "输入敏感内容" : question.multi_select ? "补充其他回答…" : "或输入其他回答…"}
-          onChange={event => update({ text: event.target.value,
-            ...(!question.multi_select ? { selected: [] } : {}) })}
+          onClick={() => {
+            if (!question.multi_select && pagesRef.current[page].selected.length) update({ selected: [] });
+          }}
+          onChange={event => updateText(event.target.value)}
           onCompositionStart={ime.startComposition}
-          onCompositionEnd={event => { ime.endComposition(); update({ text: event.currentTarget.value }); }}
+          onCompositionEnd={event => { ime.endComposition(); updateText(event.currentTarget.value); }}
           onKeyDown={event => {
             if (!ime.shouldSubmitKey({ key: event.key, shiftKey: event.shiftKey,
               isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode })) return;
@@ -181,5 +207,11 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
       </button>
     </div>
   </dialog>;
-  return typeof document === "undefined" ? content : createPortal(content, document.body);
+  return <>
+    {collapsed && <QuestionResume engine={engine} buttonRef={resumeRef}
+      page={page + 1} total={questions.length} pending={pending} onResume={() => {
+        save(pagesRef.current, page, false); setCollapsed(false);
+      }} />}
+    {typeof document === "undefined" ? content : createPortal(content, document.body)}
+  </>;
 }

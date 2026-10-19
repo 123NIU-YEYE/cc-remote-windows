@@ -4,6 +4,7 @@ import type { AskOption, AskQuestion, Engine } from "../protocol";
 import { EngineIcon } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
 import { QuestionBatchSheet } from "./QuestionBatchSheet";
+import { QuestionCollapseButton, QuestionResume } from "./QuestionPresentation";
 import "./QuestionSheet.css";
 
 export interface QuestionDraft {
@@ -13,6 +14,7 @@ export interface QuestionDraft {
   page?: number;
   pages?: { text: string; selected: string[]; scrollTop: number }[];
   signature?: string;
+  collapsed?: boolean;
 }
 
 interface Props {
@@ -42,13 +44,17 @@ function SingleQuestionSheet({
   const headingRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [initialDraft] = useState(() => draft?.store.get(draft.key));
+  const [collapsed, setCollapsed] = useState(initialDraft?.collapsed ?? false);
+  const resumeRef = useRef<HTMLButtonElement>(null);
+  const focusResume = useRef(false);
+  const savedScroll = useRef(initialDraft?.scrollTop ?? 0);
   const focusTextOnOpen = useRef(!initialDraft && allowText && options.length === 0);
   const [text, setText] = useState(initialDraft?.text ?? "");
   const [selected, setSelected] = useState<string[]>(initialDraft?.selected ?? []);
   const saveDraft = (next: Partial<QuestionDraft>) => {
     if (!draft) return;
     const value: QuestionDraft = { text, selected,
-      scrollTop: scrollRef.current?.scrollTop ?? 0, ...next };
+      scrollTop: savedScroll.current, collapsed, ...next };
     draft.store.delete(draft.key);
     draft.store.set(draft.key, value);
     // Only in-memory UI state; never persist answers (including secrets).
@@ -71,17 +77,24 @@ function SingleQuestionSheet({
   useLayoutEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
+    if (collapsed) {
+      if (focusResume.current) resumeRef.current?.focus({ preventScroll: true });
+      focusResume.current = false;
+      return;
+    }
     dialog.showModal();
     // Keep the original text-only autofocus; choice questions open without a keyboard.
     const target = focusTextOnOpen.current ? imeSubmit.inputRef.current : headingRef.current;
     target?.focus({ preventScroll: true });
-    if (scrollRef.current && initialDraft) scrollRef.current.scrollTop = initialDraft.scrollTop;
+    focusTextOnOpen.current = false;
+    if (scrollRef.current) scrollRef.current.scrollTop = savedScroll.current;
     return () => { dialog.close(); };
-  }, [imeSubmit.inputRef, initialDraft]);
+  }, [imeSubmit.inputRef, collapsed]);
   useLayoutEffect(() => {
     const body = scrollRef.current;
     if (!body) return;
     const observer = new ResizeObserver(() => {
+      if (!dialogRef.current?.open) return;
       const input = imeSubmit.inputRef.current;
       if (!input || document.activeElement !== input) return;
       const viewport = body.getBoundingClientRect();
@@ -98,14 +111,29 @@ function SingleQuestionSheet({
     return () => observer.disconnect();
   }, [imeSubmit.inputRef]);
   const content = (
-      <dialog ref={dialogRef} className="question-dialog" aria-label="操作确认" aria-modal="true"
+      <dialog ref={dialogRef} className="question-dialog" aria-label="操作确认" aria-modal={!collapsed || undefined}
         onCancel={(event) => event.preventDefault()}
         onKeyDown={(event) => event.stopPropagation()} data-lock-horizontal-swipe>
         <div ref={headingRef} tabIndex={-1} className="question-dialog-title">
           <EngineIcon engine={engine} size={26} />
           <span>{engine === "claude" ? "Claude" : "Codex"} 想确认一下</span>
+          <QuestionCollapseButton onPointerDown={imeSubmit.commitCompositionBeforePointerSubmit}
+            onCollapse={() => {
+              // Keep this component mounted: hiding the dialog does not answer,
+              // cancel, or replace the native callback waiting on the server.
+              const value = imeSubmit.inputRef.current?.value ?? text;
+              setText(value);
+              savedScroll.current = scrollRef.current?.scrollTop ?? savedScroll.current;
+              saveDraft({ text: value, collapsed: true });
+              focusResume.current = true;
+              setCollapsed(true);
+            }} />
         </div>
-        <div ref={scrollRef} className="sheet-scroll" onScroll={() => saveDraft({})}>
+        <div ref={scrollRef} className="sheet-scroll" onScroll={() => {
+          if (!dialogRef.current?.open) return;
+          savedScroll.current = scrollRef.current?.scrollTop ?? savedScroll.current;
+          saveDraft({});
+        }}>
           {header && <div className="qa-header">{header}</div>}
           <div className="qa-question">{question}</div>
           <div className="qa-options">
@@ -149,5 +177,10 @@ function SingleQuestionSheet({
         </div>
       </dialog>
   );
-  return typeof document === "undefined" ? content : createPortal(content, document.body);
+  return <>
+    {collapsed && <QuestionResume engine={engine} buttonRef={resumeRef} onResume={() => {
+      saveDraft({ collapsed: false }); setCollapsed(false);
+    }} />}
+    {typeof document === "undefined" ? content : createPortal(content, document.body)}
+  </>;
 }

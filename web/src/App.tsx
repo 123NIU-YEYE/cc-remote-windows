@@ -6133,6 +6133,43 @@ export default function App() {
                 }} />
             </Suspense>
 
+            {rt.pendingQuestion && !activeBtwQuestionVisible && (
+              <Suspense fallback={<div className="scrim show" role="dialog"
+                aria-label="正在加载操作确认" aria-busy="true" />}>
+              <QuestionSheet
+                key={JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id])}
+                draft={{ key: JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id]),
+                  store: questionDraftsRef.current }}
+                engine={focusedEngine}
+                header={rt.pendingQuestion.header}
+                question={rt.pendingQuestion.question}
+                options={rt.pendingQuestion.options}
+                allowText={rt.pendingQuestion.allow_text}
+                secret={rt.pendingQuestion.secret}
+                multiSelect={rt.pendingQuestion.multi_select}
+                questions={rt.pendingQuestion.questions}
+                onAnswers={(answers) => {
+                  const question = rt.pendingQuestion;
+                  if (!focusedSid || !question) return false;
+                  return wsRef.current?.sendAnswerQuestion(
+                    focusedSid, question.ask_id, undefined, answers) ?? false;
+                }}
+                onAnswer={(answer) => {
+                  const question = rt.pendingQuestion;
+                  if (!focusedSid || !question) return false;
+                  if (!wsRef.current?.sendAnswerQuestion(
+                    focusedSid, question.ask_id, answer)) return false;
+                  dispatch({
+                    type: "answer_question",
+                    sid: focusedSid,
+                    ask_id: question.ask_id,
+                  });
+                  return true;
+                }}
+              />
+              </Suspense>
+            )}
+
             <Composer
           draftKey={focusedComposerDraftKey}
           draftStore={composerDraftsRef.current}
@@ -6473,42 +6510,6 @@ export default function App() {
         }}
         onSave={updateQueuedQuery}
         onRetry={retryQueuedQuery} /></Suspense>}
-      {rt.pendingQuestion && !activeBtwQuestionVisible && (
-        <Suspense fallback={<div className="scrim show" role="dialog"
-          aria-label="正在加载操作确认" aria-busy="true" />}>
-        <QuestionSheet
-          key={JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id])}
-          draft={{ key: JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id]),
-            store: questionDraftsRef.current }}
-          engine={focusedEngine}
-          header={rt.pendingQuestion.header}
-          question={rt.pendingQuestion.question}
-          options={rt.pendingQuestion.options}
-          allowText={rt.pendingQuestion.allow_text}
-          secret={rt.pendingQuestion.secret}
-          multiSelect={rt.pendingQuestion.multi_select}
-          questions={rt.pendingQuestion.questions}
-          onAnswers={(answers) => {
-            const question = rt.pendingQuestion;
-            if (!focusedSid || !question) return false;
-            return wsRef.current?.sendAnswerQuestion(
-              focusedSid, question.ask_id, undefined, answers) ?? false;
-          }}
-          onAnswer={(answer) => {
-            const question = rt.pendingQuestion;
-            if (!focusedSid || !question) return false;
-            if (!wsRef.current?.sendAnswerQuestion(
-              focusedSid, question.ask_id, answer)) return false;
-            dispatch({
-              type: "answer_question",
-              sid: focusedSid,
-              ask_id: question.ask_id,
-            });
-            return true;
-          }}
-        />
-        </Suspense>
-      )}
       {shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)
         && <Suspense fallback={null}>
           <StatusSheet open report={rt.statusReport}
