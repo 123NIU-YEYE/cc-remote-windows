@@ -871,8 +871,16 @@ class SdkHandle:
                         from cc_remote.wrapper.ask import add_message_tools
 
                         add_message_tools(self.ask_server, self.message_server)
-                names = list(required)
                 pending = self._message_tools_toggle_started
+                if ("cc_remote_messages" in required
+                        and servers.get("cc-remote-ask", {}).get("status") == "disabled"
+                        and pending != "cc-remote-ask"):
+                    # A user-disabled ask route is independent of a dedicated
+                    # messaging route. Honor that opt-out without blocking
+                    # message delivery; our own unfinished ask toggle still
+                    # has to be restored before either path may proceed.
+                    del required["cc-remote-ask"]
+                names = list(required)
                 marker = getattr(client, "mark_message_tools_refresh", None)
                 if pending == "cc_remote_messages" and self.message_server is None:
                     # Messaging was opted out after an interrupted refresh.
