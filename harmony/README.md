@@ -11,8 +11,9 @@ The conversation UI stays web-based; it is not a rewrite of the UI in ArkUI.
 - No additional address bar or native-only menu entries in chat.
   Server selection and app information remain in **客户端设置** on the login page
   and the native load-error screen.
-- Separate in-app web browsing with **返回聊天**, retaining the mounted chat and
-  its draft. HTTPS links and user-triggered new windows are supported.
+- External HTTPS links open in the system browser, including user-triggered
+  new windows. The chat remains mounted and retains its draft when returning.
+  Same-origin new windows retain **返回聊天** and the app's login cookies.
 - System file selection through ArkWeb's default file-upload handling.
 - System-bar and keyboard avoidance; the page retains its existing sidebar
   gestures, rounding and fading. No additional native horizontal recognizer or
@@ -101,13 +102,14 @@ Official references:
 - [Signing requirements](https://developer.huawei.com/consumer/cn/develop-novice-guide/)
 - [ArkWeb file upload](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/web-file-upload)
 - [ArkWeb new windows](https://developer.huawei.com/consumer/cn/doc/doccenter-capabilities/web-open-in-new-window)
+- [System application redirection](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/deep-linking-startup)
 
 ## Verification
 
 With Node 24 selected and the existing `web/` development dependencies installed:
 
 ```bash
-node --test harmony/tests/url-policy.test.mjs harmony/tests/push-route.test.mjs harmony/tests/push-bridge.test.mjs
+node --test harmony/tests/url-policy.test.mjs harmony/tests/external-browser.test.mjs harmony/tests/push-route.test.mjs harmony/tests/push-bridge.test.mjs
 node web/node_modules/@playwright/test/cli.js test -c harmony/playwright.config.mjs
 ```
 
@@ -129,8 +131,12 @@ on the target phone, and check:
   compare the same session with Huawei Browser. Do not claim a measured frame
   rate without a device capture.
 - Keyboard resize, attachment selection/cancel/reselect, and file previews.
-- Open an HTTPS link and a target-blank preview, navigate back and return to the
-  unchanged draft; cancel a popup while it is attaching.
+- Open external HTTPS links (regular navigation, target-blank and a user-created
+  blank window assigned a destination later) in the system browser; return to the
+  unchanged chat/draft. Automatic redirects must not launch another app. Check a
+  same-origin target-blank preview still uses the app's login and **返回聊天**;
+  cancel a popup while it is attaching. Check browser launch failures show a
+  retryable message without replacing the chat.
 - Client settings, cancelling server change, offline recovery and server change.
 - TLS errors remain rejected, and external/iframe pages cannot open client
   settings or access privileged native methods.
