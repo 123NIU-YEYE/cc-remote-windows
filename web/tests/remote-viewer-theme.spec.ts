@@ -31,16 +31,20 @@ test("exported theme preview loads and switches palettes over Bridge", async ({ 
   const draft = frame.locator(".inrow textarea");
   await draft.fill("手机预览保留草稿");
   await frame.getByRole("button", { name: "更多设置", exact: true }).click();
-  await frame.getByRole("button", { name: /^主题/ }).click();
-  const dialog = frame.getByRole("dialog", { name: "主题", exact: true });
-  await expect(dialog.locator(".theme-card")).toHaveCount(6);
+  await frame.getByRole("button", { name: /^外观/ }).click();
+  const dialog = frame.getByRole("dialog", { name: "外观", exact: true });
+  await expect(dialog.getByRole("combobox", { name: "配色方案" })).toBeVisible();
   for (const [name, id] of [["奶油琥珀", "amber"], ["森林苔绿", "moss"], ["玫瑰雾", "rose"],
     ["深海青", "lagoon"], ["酒红夜色", "bordeaux"], ["复古终端绿", "heritage"]]) {
-    await dialog.getByRole("button", { name, exact: true }).click();
+    await dialog.getByRole("button", { name: ["amber", "moss", "rose"].includes(id) ? "浅色" : "深色", exact: true }).click();
+    await dialog.getByRole("combobox", { name: "配色方案" }).click();
+    await dialog.getByRole("option", { name, exact: true }).click();
     await expect(frame.locator("html")).toHaveAttribute("data-palette", id);
     await expect(draft).toHaveValue("手机预览保留草稿");
   }
-  await dialog.getByRole("button", { name: "森林苔绿", exact: true }).click();
+  await dialog.getByRole("button", { name: "浅色", exact: true }).click();
+  await dialog.getByRole("combobox", { name: "配色方案" }).click();
+  await dialog.getByRole("option", { name: "森林苔绿", exact: true }).click();
   await page.screenshot({ path: info.outputPath("theme-preview-bridge.png"), fullPage: true });
   await dialog.getByRole("button", { name: "完成", exact: true }).click();
   await page.getByRole("button", { name: "刷新预览", exact: true }).click();

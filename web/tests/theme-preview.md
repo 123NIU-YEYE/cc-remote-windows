@@ -1,7 +1,17 @@
 # Theme review preview
 
-The theme fixture uses production UI components with example conversations. It
-does not connect to a model or an existing session.
+The theme fixture uses production UI components with example conversations.
+The **More settings → Appearance** panel edits colors and fonts live,
+keeps each engine’s light/dark appearance separate, and restores only the visible
+mode. Existing theme choices are retained. Preferences stay in the current browser.
+Font choices and color controls use themed, keyboard-accessible popovers. The
+color picker supports touch/drag, HEX input, common swatches, and resetting just
+the edited color. Escape dismisses the popover before the Appearance panel.
+The palette menu shows only presets with aligned color samples. Its label
+automatically reflects color edits; font changes are independent, and selecting
+a preset preserves the font. The panel footer restores the visible mode's default
+colors and font.
+It does not connect to a model or an existing session.
 
 For local development, run `npm run dev` in `web` and open
 `/tests/theme-preview.html?engine=codex`. This entry imports TSX and requires

@@ -53,10 +53,13 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // Question draft UI remains lazy; gzip, entry and request caps stay unchanged.
 // Cross-engine message references and on-demand catalog routing add <1 KiB.
 // Receipt parsing and link UI stay lazy; gzip/request limits are unchanged.
-const MAX_INITIAL_BYTES = 952 * 1024;
+// Per-engine/mode appearance migration and derived colors add <6 KiB at startup
+// so saved colors apply before paint. The editor remains lazy; no new dependency
+// or initial request. Allow <2 KiB gzip for the persistence/color calculations.
+const MAX_INITIAL_BYTES = 958 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
-const MAX_INITIAL_GZIP_BYTES = 286 * 1024;
+const MAX_INITIAL_GZIP_BYTES = 288 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");
