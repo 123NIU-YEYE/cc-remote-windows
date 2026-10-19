@@ -58,6 +58,8 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
     save(next);
     setError("");
   };
+  const updateText = (text: string) => update({ text,
+    ...(!question.multi_select ? { selected: [] } : {}) });
   const navigate = (value: string) => {
     if (pendingRef.current) return;
     const next = pagesRef.current.map((entry, index) => index === page
@@ -155,10 +157,12 @@ export function QuestionBatchSheet({ engine, questions, draft, onSubmit }: {
           value={current.text} disabled={pending} maxLength={4096}
           aria-label={question.secret ? "输入敏感内容" : "输入回答"}
           placeholder={question.secret ? "输入敏感内容" : question.multi_select ? "补充其他回答…" : "或输入其他回答…"}
-          onChange={event => update({ text: event.target.value,
-            ...(!question.multi_select ? { selected: [] } : {}) })}
+          onFocus={() => {
+            if (!question.multi_select && pagesRef.current[page].selected.length) update({ selected: [] });
+          }}
+          onChange={event => updateText(event.target.value)}
           onCompositionStart={ime.startComposition}
-          onCompositionEnd={event => { ime.endComposition(); update({ text: event.currentTarget.value }); }}
+          onCompositionEnd={event => { ime.endComposition(); updateText(event.currentTarget.value); }}
           onKeyDown={event => {
             if (!ime.shouldSubmitKey({ key: event.key, shiftKey: event.shiftKey,
               isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode })) return;
