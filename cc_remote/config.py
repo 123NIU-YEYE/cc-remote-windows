@@ -275,6 +275,9 @@ class RelayConfig:
 
 @dataclass
 class WrapperConfig:
+    # Local agent messaging is opt-in and never changes account MCP settings.
+    session_messages_enabled: bool = field(default_factory=lambda: _bool(
+        "CC_REMOTE_SESSION_MESSAGES", False))
     relay_url: str = field(default_factory=lambda: _wrapper_value(
         "RELAY_URL", "relay_url", "ws://127.0.0.1:8765/ws"))
     # Token the wrapper presents to the relay at WS upgrade (must match the

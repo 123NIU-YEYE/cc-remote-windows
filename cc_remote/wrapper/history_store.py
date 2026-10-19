@@ -79,6 +79,8 @@ from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 # v46 restores native commands, source clocks and closed segment envelopes.
 # v47 preserves native cross-thread provenance and outgoing message receipts.
 # v48 retains Codex async task receipt boundaries in compact summaries.
+# Unified messaging introduces new transcript envelopes/tool names only; old
+# projections stay valid and do not need a cache migration.
 _SCHEMA_VERSION = 48
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
@@ -845,7 +847,9 @@ def materialize_history_turns(
                         "itemId": item_id, "threadId": target, "status": "sending",
                     })
             elif event_type == "tool_result" and event.get("tool_use_id") in session_messages:
-                session_messages[event["tool_use_id"]]["status"] = (
+                receipt = session_messages[event["tool_use_id"]]
+                from cc_remote.session_messages import receipt_status
+                receipt["status"] = receipt_status(event.get("content")) if receipt["threadId"].startswith("ccr:") else (
                     "failed" if event.get("is_error") or event.get("status") in {
                         "failed", "cancelled", "declined", "interrupted",
                     } else "sent")

@@ -5276,26 +5276,19 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         assert first_event.multi_select is False
         assert first_event.allow_text is True
         assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
+        assert len(first_event.questions) == 2
+        assert first_event.questions[1].header == "Checks"
+        assert first_event.questions[1].multi_select is True
+        assert first_event.questions[1].allow_text is True
+        # A stale single-page client must not advance a native batch.
+        partial = await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key, ask_id=first_id, answer="Windows", client_id="client-1"))
+        assert partial.code == "bad_prompt"
+        assert not task.done()
         assert await machine._handle_answer_question(AnswerQuestion(
             sid=ctx.key,
             ask_id=first_id,
-            answer="Windows",
-            client_id="client-1",
-        )) is None
-
-        while not ctx.pending_asks or first_id in ctx.pending_asks:
-            await asyncio.sleep(0)
-        second_id = next(iter(ctx.pending_asks))
-        second_event = next(
-            message for message in transport.sent
-            if message.type == "ask_user" and message.ask_id == second_id)
-        assert second_event.header == "Checks"
-        assert second_event.multi_select is True
-        assert second_event.allow_text is True
-        assert await machine._handle_answer_question(AnswerQuestion(
-            sid=ctx.key,
-            ask_id=second_id,
-            answer=["Tests", "Custom audit"],
+            answers=["Windows", ["Tests", "Custom audit"]],
             client_id="client-1",
         )) is None
 

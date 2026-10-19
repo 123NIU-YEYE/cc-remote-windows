@@ -19104,6 +19104,41 @@ assert.equal(scopedObserved.length, beforeReconnectFrame,
   "a delayed frame from an older underlying WebSocket generation is dropped");
 scopedRelay.stop();
 
+// Message links need the other engine's catalog before visiting its surface.
+// A first background read has a real epoch without changing visible focus;
+// visiting that surface later still invalidates its older read ownership.
+function testBackgroundMessageCatalog() {
+  const events: Array<{ event: ServerEvent; ownership?: {
+    scopeKey: string; surfaceEpoch: number;
+  } }> = [];
+  const relay = new RelayWs({
+    onEvent: (event, ownership) => { events.push({ event, ownership }); },
+    onConnState: () => {},
+  }, "message-machine");
+  relay.start();
+  const socket = FakeWebSocket.instances.at(-1)!;
+  socket.onopen?.();
+  relay.setFocusedSid("iris@receiver", "claude", "code");
+  assert.equal(relay.sendListSessions("codex", "code"), true);
+  const request = JSON.parse(socket.sent.at(-1)!);
+  const response = {
+    type: "session_list", engine: "codex", space: "code",
+    request_id: request.cmd_id,
+    sessions: [{ session_id: "stack@source", engine: "codex", space: "code" }],
+  };
+  socket.receive(response);
+  assert.equal(events.at(-1)?.ownership?.scopeKey, "message-machine:code:codex",
+    "an unvisited engine's catalog must resolve cross-engine message links");
+  assert.ok(!socket.sent.some(raw => JSON.parse(raw).type === "switch_session"),
+    "catalog discovery does not navigate or resume a session");
+  relay.setSurface("codex", "code");
+  socket.receive(response);
+  assert.equal(events.at(-1)?.ownership, undefined,
+    "a background response from before the surface switch remains stale");
+  relay.stop();
+}
+testBackgroundMessageCatalog();
+
 // Codex account ownership is frozen together with the normal surface epoch.
 // Identical native UUIDs must remain routed by their profile-prefixed sid
 // through list -> switch and temp focus -> rekey lifecycles.

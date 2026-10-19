@@ -277,6 +277,36 @@ async def test_blank_blocking_answer_keeps_question_pending(text):
 
 
 @pytest.mark.asyncio
+async def test_blocking_batch_dialog_keeps_previous_page_and_submits_once():
+    from tests.test_tui_workspace import emit
+    from cc_remote.tui_panels import QuestionDialog
+
+    c, _ = setup()
+    questions = [
+        dict(question="Where?", options=[dict(label="Mac"), dict(label="Linux")], allow_text=True),
+        dict(question="Checks?", options=[dict(label="Tests"), dict(label="Lint")], multi_select=True),
+    ]
+    emit(c, "ask_user", ask_id="batch", **questions[0], questions=questions)
+    app = WorkspaceApp(c, connect=False)
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+t")
+        dialog = app.screen
+        assert isinstance(dialog, QuestionDialog)
+        dialog.query_one("#answer", ModalEditor).load_text("1")
+        await dialog.send()
+        assert dialog.index == 1 and not frames(c)
+        dialog.query_one("#answer", ModalEditor).load_text("1,2")
+        dialog.action_question(-1)
+        assert dialog.query_one("#answer", ModalEditor).text == "1"
+        dialog.query_one("#answer", ModalEditor).load_text("Custom machine")
+        await dialog.send()
+        assert dialog.query_one("#answer", ModalEditor).text == "1,2"
+        await dialog.send()
+        assert len(frames(c)) == 1
+        assert frames(c)[0]["answers"] == ["Custom machine", ["Tests", "Lint"]]
+
+
+@pytest.mark.asyncio
 async def test_dialog_keeps_one_native_message_per_web_answer_envelope():
     c, v = setup()
     ask(v)

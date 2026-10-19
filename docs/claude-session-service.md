@@ -5,6 +5,13 @@ daily Claude Code CLI processes. The Wrapper remains the controller. Restarting
 the Wrapper detaches the controller; it does not interrupt the native SDK or
 resubmit an accepted prompt.
 
+Attached legacy workers can acquire cc-remote's message tools without replacing
+their native process. At the next idle input boundary the Wrapper refreshes its
+owned SDK MCP route with the official toggle API, then verifies the actual tool
+list. Workers without a dedicated message route reuse the existing ask proxy.
+Active turns, questions and background tasks defer refresh; failed refresh never
+permits a message to claim delivery. See [session messaging](session-messages.md).
+
 The service continues reading native output while the Wrapper is offline. Its
 private SQLite journal retains each unacknowledged turn and its real terminal
 result. On return, the Wrapper reconstructs the translator and restores pending
@@ -12,7 +19,11 @@ tool approvals and MCP questions. Replayed text replaces the existing message
 prefix. The original browser message ID remains the turn's owner. Human and
 autonomous results are separate; a background result cannot acknowledge a human
 turn. Answers are saved in the service before the browser receives acceptance,
-including answers to earlier pages of a multi-question tool call.
+including the complete answer batch of a multi-question tool call. Native
+`AskUserQuestion` and cc-remote's `ask_user` MCP share the paginated form: page
+navigation retains client-side drafts, and only the final submission resolves
+the pending callback. The whole accepted batch is retained before its close
+event, so controller replacement cannot ask an accepted batch again.
 
 If background projection or acknowledgement fails, the controller stops advancing
 acknowledgements and accepting new prompts. Human terminal commits also wait for

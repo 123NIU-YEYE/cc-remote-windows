@@ -1,12 +1,13 @@
-"""Codex App cross-thread input envelopes (not sub-agent collaboration).
+"""Native Codex App and unified cross-session envelopes (not sub-agents).
 
-Only decode the native envelope. A source id is display/navigation metadata,
+Only decode explicit supported envelopes. A source id is display/navigation metadata,
 never authority to change accounts, machines or execute an action.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from cc_remote.session_messages import parse_message, message_target
 
 _NATIVE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ENVELOPE = re.compile(
@@ -24,6 +25,9 @@ class CodexDelegation:
 
 
 def parse_codex_delegation(text: object) -> CodexDelegation | None:
+    unified = parse_message(text)
+    if unified is not None:
+        return CodexDelegation(unified.source_thread_id, unified.prompt)
     if not isinstance(text, str) or len(text) > 1024 * 1024:
         return None
     match = _ENVELOPE.fullmatch(text.strip())
@@ -58,6 +62,9 @@ def normalize_codex_delegation_item(item: dict) -> dict:
 
 
 def codex_message_target(tool: object, arguments: object, server: object = None) -> str | None:
+    unified = message_target(tool, arguments, server)
+    if unified is not None:
+        return unified
     if not isinstance(tool, str) or not isinstance(arguments, dict):
         return None
     native_tool = tool in {"send_message_to_thread", "codex_app.send_message_to_thread"}

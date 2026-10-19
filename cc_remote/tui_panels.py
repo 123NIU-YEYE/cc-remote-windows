@@ -528,20 +528,28 @@ class QuestionDialog(QuestionLayout):
     def __init__(self, client, ask: dict):
         super().__init__()
         self.client, self.ask = client, dict(ask)
+        self.questions = ask.get("questions") or [ask]
+        self.drafts = [""] * len(self.questions)
+        self.index = 0
+        if ask.get("questions"):
+            self.key_layer = "question"
+            self.local_actions = {"cancel", "submit", "question"}
+
+    def body(self):
+        question = self.questions[self.index]
+        labels = [question.get("question", ""), ""]
+        for index, option in enumerate(question.get("options", []), 1):
+            labels.append(f"{index}. {option['label']}\n   {option.get('ds', '')}")
+        if question.get("multi_select"):
+            labels.append("Select multiple options using comma-separated numbers.")
+        return _safe_remote_text("\n".join(labels))
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="tui-panel"):
-            yield Label("Answer question", markup=False)
-            labels = [self.ask.get("question", ""), ""]
-            for index, option in enumerate(self.ask.get("options", []), 1):
-                labels.append(
-                    f"{index}. {option['label']}\n   {option.get('ds', '')}"
-                )
-            yield PanelReader(
-                _safe_remote_text("\n".join(labels)), id="question-body"
-            )
+            yield Label(f"Answer question 1/{len(self.questions)}", id="question-title", markup=False)
+            yield PanelReader(self.body(), id="question-body")
             yield Static("", id="reading-position", markup=False)
-            if self.ask.get("secret"):
+            if any(q.get("secret") for q in self.questions):
                 yield ModalInput(
                     placeholder="i: enter secret answer",
                     password=True,
@@ -570,6 +578,22 @@ class QuestionDialog(QuestionLayout):
     async def send(self) -> None:
         editor = self.query_one("#answer")
         value = editor.value if isinstance(editor, Input) else editor.text
+        if self.ask.get("questions"):
+            from cc_remote.tui_questions import parse_blocking_answer
+
+            try:
+                parse_blocking_answer(self.questions[self.index], value)
+            except ValueError as exc:
+                self.query_one("#answer-result", Static).update(str(exc))
+                return
+            self.drafts[self.index] = value
+            if self.index < len(self.questions) - 1:
+                self.action_question(1)
+                return
+            if any(not text.strip() for text in self.drafts):
+                self.query_one("#answer-result", Static).update("Answer all pages before submitting.")
+                return
+            value = self.drafts
         if await self.client.answer_for(self.ask, value):
             if isinstance(editor, Input):
                 editor.value = ""
@@ -578,6 +602,22 @@ class QuestionDialog(QuestionLayout):
             self.dismiss(None)
         else:
             self.query_one("#answer-result", Static).update(self.client.notice)
+
+    def action_question(self, direction):
+        if not self.ask.get("questions"):
+            return
+        editor = self.query_one("#answer")
+        self.drafts[self.index] = editor.value if isinstance(editor, Input) else editor.text
+        self.index = max(0, min(self.index + direction, len(self.questions) - 1))
+        self.query_one("#question-title", Label).update(f"Answer question {self.index + 1}/{len(self.questions)}")
+        self.query_one("#question-body", PanelReader).load_text(self.body())
+        if isinstance(editor, Input):
+            editor.value = self.drafts[self.index]
+            editor.password = bool(self.questions[self.index].get("secret"))
+        else:
+            editor.load_text(self.drafts[self.index])
+        self.query_one("#answer-result", Static).update("")
+        editor.focus()
 
 
 class AsyncQuestionDialog(QuestionLayout):
