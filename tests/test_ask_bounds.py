@@ -87,6 +87,8 @@ def test_protocol_bounds_question_options_and_answer():
 @pytest.mark.parametrize(
     "arguments,error_fragment",
     [
+        ({"question": "q", "options": [{"label": "a"}, {"label": "b"}],
+          "extra": True}, "expected question and options"),
         ({"question": "", "options": [{"label": "a"}, {"label": "b"}]},
          "question"),
         ({"question": "q", "options": [{"label": "a"}]}, "2-5 options"),

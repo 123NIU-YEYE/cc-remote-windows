@@ -98,7 +98,12 @@ async def test_real_mcp_handler_accepts_legacy_and_batch_and_rejects_mixed_input
 
     server = make_ask_server(single, mode, ask_batch=batch)
     listed = (await server.request_handlers[ListToolsRequest](ListToolsRequest())).root
-    assert "questions" in listed.tools[0].inputSchema["properties"]
+    schema = listed.tools[0].inputSchema
+    assert "questions" in schema["properties"]
+    # Native Claude may drop a tool with root combinators, while keeping its
+    # MCP server connected. Do not depend on its optional schema normalizer.
+    assert schema["type"] == "object"
+    assert not {"oneOf", "anyOf", "allOf"} & schema.keys()
 
     async def call(arguments):
         request = CallToolRequest(params=CallToolRequestParams(name="ask_user", arguments=arguments))
@@ -112,7 +117,9 @@ async def test_real_mcp_handler_accepts_legacy_and_batch_and_rejects_mixed_input
     assert json.loads(result.content[0].text)["answers"][0]["question"] == "Target?"
     assert called[-1][0].multi_select and called[-1][0].allow_text
     count = len(called)
-    for args in ({**legacy, **group}, {"questions": []}, {"questions": group["questions"] * 5},
+    for args in ({}, {"question": "Target?"}, {"options": legacy["options"]},
+                 {**legacy, "extra": True}, {**group, "extra": True},
+                 {**legacy, **group}, {"questions": []}, {"questions": group["questions"] * 5},
                  {"questions": [{**legacy, "multiSelect": "yes"}]}):
         result = await call(args)
         assert result.isError or "rejected" in result.content[0].text

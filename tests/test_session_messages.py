@@ -506,7 +506,7 @@ def legacy_handle(*, dedicated=False):
     async def message(name, args, meta):
         calls.append((name, args))
         return {'sessions': []}
-    handle = SdkHandle(WrapperConfig(), make_ask_server(ask, ask))
+    handle = SdkHandle(WrapperConfig(), make_ask_server(ask, ask, ask_batch=ask))
     handle.message_server = make_server(message)
     handle.needs_message_tools_refresh = True
 
@@ -516,18 +516,34 @@ def legacy_handle(*, dedicated=False):
         tools = []
         requests = []
         state = 'connected'
+        ask_state = 'connected'
+        ask_tools = []
+        dropped_tools = set()
         fail_off = False
         async def _send_control_request(self, request, **_):
             self.requests.append(request)
             if request['subtype'] == 'mcp_status':
-                return {'mcpServers': [{'name': self.name, 'status': self.state, 'tools': self.tools}]}
-            assert request == {'subtype': 'mcp_toggle', 'serverName': self.name, 'enabled': request['enabled']}
+                rows = [{'name': self.name, 'status': self.state, 'tools': self.tools}]
+                if dedicated:
+                    rows.append({'name': 'cc-remote-ask', 'status': self.ask_state, 'tools': self.ask_tools})
+                return {'mcpServers': rows}
+            name = request['serverName']
+            assert name in ({'cc-remote-ask', self.name} if dedicated else {self.name})
+            assert request == {'subtype': 'mcp_toggle', 'serverName': name, 'enabled': request['enabled']}
+            separate_ask = dedicated and name == 'cc-remote-ask'
             if request['enabled']:
-                result = await self.server.request_handlers[types.ListToolsRequest](types.ListToolsRequest())
-                self.tools = [{'name': tool.name} for tool in result.root.tools]
-                self.state = 'connected'
+                server = handle.ask_server if separate_ask else self.server
+                result = await server.request_handlers[types.ListToolsRequest](types.ListToolsRequest())
+                tools = [{'name': tool.name} for tool in result.root.tools if tool.name not in self.dropped_tools]
+                if separate_ask:
+                    self.ask_tools, self.ask_state = tools, 'connected'
+                else:
+                    self.tools, self.state = tools, 'connected'
             else:
-                self.state = 'disabled'
+                if separate_ask:
+                    self.ask_state = 'disabled'
+                else:
+                    self.state = 'disabled'
                 if self.fail_off:
                     self.fail_off = False
                     raise TimeoutError('off acknowledgment lost')
@@ -548,7 +564,10 @@ async def test_attached_claude_refreshes_actual_tool_list_and_preserves_ask(dedi
     assert handle.client is client and not handle.needs_message_tools_refresh
     assert {t['name'] for t in control.tools} == ({'list_sessions', 'send_message', 'message_status'}
         | (set() if dedicated else {'ask_user', 'set_mode'}))
-    assert [r['enabled'] for r in control.requests if r['subtype'] == 'mcp_toggle'] == [False, True]
+    if dedicated:
+        assert {t['name'] for t in control.ask_tools} == {'ask_user', 'set_mode'}
+    assert [r['enabled'] for r in control.requests if r['subtype'] == 'mcp_toggle'] == (
+        [False, True] * (2 if dedicated else 1))
     before = len(control.requests)
     assert await handle.refresh_message_tools()
     assert len(control.requests) == before
@@ -564,6 +583,58 @@ async def test_attached_claude_refreshes_actual_tool_list_and_preserves_ask(dedi
             assert result.content[0].text == 'answer'
     finally:
         request_ctx.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dedicated', [False, True])
+@pytest.mark.parametrize('missing', ['ask_user', 'set_mode'])
+async def test_connected_message_tools_do_not_hide_a_missing_ask_tool(dedicated, missing):
+    handle, control, _ = legacy_handle(dedicated=dedicated)
+    control.dropped_tools = {missing}
+    markers = []
+    async def mark(name): markers.append(name)
+    handle.client.mark_message_tools_refresh = mark
+    assert not await handle.refresh_message_tools()
+    assert handle.needs_message_tools_refresh
+    assert handle._message_tools_toggle_started == 'cc-remote-ask'
+    assert markers == ['cc-remote-ask']
+    assert control.ask_state == 'connected' and control.state == 'connected'
+    control.dropped_tools = set()
+    assert await handle.refresh_message_tools()
+    assert not handle.needs_message_tools_refresh
+    assert handle._message_tools_toggle_started is None
+    assert markers[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_ask_schema_refresh_does_not_require_session_messaging():
+    handle, control, _ = legacy_handle()
+    handle.message_server = None
+    assert await handle.refresh_message_tools()
+    assert {t['name'] for t in control.tools} == {'ask_user', 'set_mode'}
+    assert not handle.needs_message_tools_refresh
+
+
+@pytest.mark.asyncio
+async def test_separate_ask_server_disabled_by_user_is_not_enabled():
+    handle, control, _ = legacy_handle(dedicated=True)
+    control.ask_state = 'disabled'
+    assert not await handle.refresh_message_tools()
+    assert control.requests == [{'subtype': 'mcp_status'}]
+
+
+@pytest.mark.asyncio
+async def test_restore_pending_message_toggle_before_refreshing_separate_ask():
+    handle, control, _ = legacy_handle(dedicated=True)
+    control.state = 'disabled'
+    handle._message_tools_toggle_started = 'cc_remote_messages'
+    markers = []
+    async def mark(name): markers.append(name)
+    handle.client.mark_message_tools_refresh = mark
+    assert await handle.refresh_message_tools()
+    assert markers == ['cc_remote_messages', None, 'cc-remote-ask', None]
+    assert [r['serverName'] for r in control.requests if r['subtype'] == 'mcp_toggle'] == [
+        'cc_remote_messages', 'cc_remote_messages', 'cc-remote-ask', 'cc-remote-ask']
 
 
 @pytest.mark.asyncio
