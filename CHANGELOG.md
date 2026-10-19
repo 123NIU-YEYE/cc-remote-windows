@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.24
+
+Restore Claude MCP question tools and let users read the conversation before answering. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.24.md).
+
+- Advertise single and batched `ask_user` inputs with a compatible object schema, validating exclusive forms in the handler.
+- Recover interrupted ask/message tool refreshes without replacing the native process; respect disabled routes and retain recovery intent until tool discovery succeeds.
+- Collapse pending questions into a resume bar above the composer divider in main and side chats. Keep Claude waiting and preserve the question page, answers and scroll position.
+- Clear a single-choice selection when the user clicks or edits a custom answer, while preserving choices during Tab traversal and programmatic focus. Multi-select supplemental answers remain supported.
+- Include the unchanged signed Android preview.2 and unsigned HarmonyOS preview.4 shells; existing users need no phone reinstall for this release.
+
 ## v4.0.23
 
 Add account-scoped Claude/Codex session messaging, durable delivery to busy recipients, and paginated user questions. Wire protocol advances to v78. See the bilingual [release notes](docs/releases/v4.0.23.md).
