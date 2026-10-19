@@ -62,6 +62,7 @@ import {
 } from "../src/components/QueuedQueryDialog";
 import { DirPicker } from "../src/components/DirPicker";
 import { HeaderMenu } from "../src/components/HeaderMenu";
+import { useTheme } from "../src/use-theme";
 import { useBoldText } from "../src/use-bold-text";
 import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
 import { displayHistoryProjection } from "../src/history-recovery";
@@ -542,23 +543,22 @@ function UsageActivityBrowserFixture({
   const [activityOpen, setActivityOpen] = useState(false);
   const { boldText, setBoldText } = useBoldText();
   const report = useMemo(fixtureUsageReport, []);
+  const appearance = useTheme(engine);
+  const { selectTheme } = appearance;
   useEffect(() => {
-    document.documentElement.dataset.engine = engine;
-    document.documentElement.dataset.theme = "dark";
-  }, [engine]);
+    selectTheme("dark");
+  }, [selectTheme]);
   return <main style={{ minHeight: "100dvh", background: "var(--bg)" }}>
     <header className="c-head" style={{ justifyContent: "flex-end" }}>
       <HeaderMenu
         engine={engine}
-        theme="dark"
-        themeChoice="dark"
+        appearance={appearance}
         boldText={boldText} onBoldText={setBoldText}
         notificationMode="off"
         notificationBinding="off"
         notificationAvailable
         onNotificationMode={async () => true}
         onOpenUsageActivity={() => setActivityOpen(true)}
-        onSelectTheme={() => {}}
         onLogout={() => {}}
       />
     </header>

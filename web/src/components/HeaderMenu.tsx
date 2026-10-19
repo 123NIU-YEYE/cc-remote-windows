@@ -4,14 +4,15 @@ import { Icon } from "../icons";
 import { SideChatIcon } from "./SideChatIcon";
 import type { NotificationMode } from "../notification-mode";
 import type { PushBindingState } from "../push";
-import { themeLabel, type ThemeChoice } from "../themes";
+import { themeLabel } from "../themes";
+import { appearancePaletteLabel } from "../appearance";
+import type { AppearanceController } from "../use-theme";
 
 const ThemePicker = lazy(() => import("./ThemePicker"));
 
 interface Props {
   engine: "claude" | "codex";
-  theme: "light" | "dark";
-  themeChoice: ThemeChoice;
+  appearance: AppearanceController;
   boldText: boolean;
   onBoldText: (enabled: boolean) => void;
   notificationMode: NotificationMode;
@@ -25,7 +26,6 @@ interface Props {
   onOpenViewer?: () => void;
   onOpenArtifacts?: () => void;
   onOpenFiles?: () => void;
-  onSelectTheme: (choice: ThemeChoice) => void;
   onLogout: () => void;
 }
 
@@ -42,8 +42,7 @@ const MODE_LABELS: Record<NotificationMode, string> = {
 
 export function HeaderMenu({
   engine,
-  theme,
-  themeChoice,
+  appearance,
   boldText,
   onBoldText,
   notificationMode,
@@ -57,7 +56,6 @@ export function HeaderMenu({
   onOpenViewer,
   onOpenFiles,
   onOpenArtifacts,
-  onSelectTheme,
   onLogout,
 }: Props) {
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -216,8 +214,8 @@ export function HeaderMenu({
                 </button>
                 <button type="button" className="header-menu-item"
                   onClick={() => { close(); setThemeOpen(true); }}>
-                  <Icon name={theme === "dark" ? "sun" : "moon"} size={18} />
-                  <span><b>主题</b><small>{themeLabel(themeChoice)}</small></span>
+                  <Icon name={appearance.mode === "dark" ? "sun" : "moon"} size={18} />
+                  <span><b>外观</b><small>{themeLabel(appearance.choice)} · {appearancePaletteLabel(engine, appearance.mode, appearance.look)}</small></span>
                   <Icon name="chevron-right" size={16} />
                 </button>
                 <button type="button" className="header-menu-item" role="switch"
@@ -277,7 +275,7 @@ export function HeaderMenu({
         document.body,
       )}
       {themeOpen && <Suspense fallback={null}>
-        <ThemePicker engine={engine} choice={themeChoice} onSelect={onSelectTheme}
+        <ThemePicker key={engine} engine={engine} appearance={appearance}
           onClose={() => setThemeOpen(false)} returnFocusRef={triggerRef} />
       </Suspense>}
     </>

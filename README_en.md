@@ -44,6 +44,9 @@ features or wire protocol across different commits.
 - **Connect machines and accounts.** Pair, switch and revoke devices in Device
   Center. Built-in Claude/Codex multi-account support lets you use OAuth accounts
   and third-party API gateway accounts in one interface.
+- **Customize appearance.** More settings → Appearance adjusts accent, background,
+  text and fonts. Each engine’s light/dark styles are saved separately in the
+  current browser; reset restores only the visible style.
 - **Work from a phone.** Compact engine menus, light/dark themes, image zoom, PWA
   installation and optional background notifications. Notifications default to
   generic status; showing a session name requires an explicit opt-in.
