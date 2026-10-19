@@ -17,6 +17,13 @@
   --accent-weak:#EBE2D4;
   --accent-line:#CEBEA8;
   --on-accent:#29241E;
+  --emphasis-ink:#65380F;
+  --link-ink:#8B4E16;
+  --inline-code-ink:#8A4616;
+  --inline-code-bg:#F3E5D4;
+  --inline-code-line:#DCC3A4;
+  --selection-bg:#DCC3A4;
+  --selection-ink:#1C1712;
 }
 
 :root[data-engine][data-theme][data-palette="moss"],
@@ -36,6 +43,13 @@
   --accent-weak:#E0E7D9;
   --accent-line:#BCC9B1;
   --on-accent:#232C1F;
+  --emphasis-ink:#1D522C;
+  --link-ink:#276241;
+  --inline-code-ink:#315D2B;
+  --inline-code-bg:#E2EBDC;
+  --inline-code-line:#B8CCAB;
+  --selection-bg:#B8CCAB;
+  --selection-ink:#172418;
 }
 
 :root[data-engine][data-theme][data-palette="rose"],
@@ -55,6 +69,13 @@
   --accent-weak:#EBDDE1;
   --accent-line:#D3B8C2;
   --on-accent:#30222A;
+  --emphasis-ink:#6C294C;
+  --link-ink:#913A63;
+  --inline-code-ink:#90375B;
+  --inline-code-bg:#F4DFE8;
+  --inline-code-line:#DEB9CA;
+  --selection-bg:#DEB9CA;
+  --selection-ink:#291923;
 }
 
 :root[data-engine][data-theme][data-palette="lagoon"],
@@ -74,6 +95,13 @@
   --accent-weak:#364447;
   --accent-line:#5C7377;
   --on-accent:#202729;
+  --emphasis-ink:#9DEAE5;
+  --link-ink:#72D6E4;
+  --inline-code-ink:#99E4DA;
+  --inline-code-bg:#1D393C;
+  --inline-code-line:#3B696E;
+  --selection-bg:#8CDDE3;
+  --selection-ink:#152E31;
 }
 
 :root[data-engine][data-theme][data-palette="bordeaux"],
@@ -93,6 +121,13 @@
   --accent-weak:#463B42;
   --accent-line:#7A606E;
   --on-accent:#292126;
+  --emphasis-ink:#FBC1D9;
+  --link-ink:#F1A0C1;
+  --inline-code-ink:#F4B9D3;
+  --inline-code-bg:#412B3B;
+  --inline-code-line:#775267;
+  --selection-bg:#E6A5C1;
+  --selection-ink:#36202C;
 }
 
 :root[data-engine][data-theme][data-palette="heritage"],
@@ -112,10 +147,24 @@
   --accent-weak:#404A40;
   --accent-line:#697961;
   --on-accent:#222824;
+  --emphasis-ink:#D4EFA7;
+  --link-ink:#ABD989;
+  --inline-code-ink:#C3E7A5;
+  --inline-code-bg:#2A3D2C;
+  --inline-code-line:#5D7750;
+  --selection-bg:#B4D59A;
+  --selection-ink:#23301D;
 }
 
+/* Quiet surfaces do not require quiet content. Give emphasis, links and code
+   their own inks instead of reusing the muted control accent everywhere. */
 :root[data-engine][data-theme][data-palette]:not([data-palette="classic"]) {
   --accent-text:var(--accent-ink);
+  --inline-code-padding:.08em .32em;
+}
+:root[data-palette]:not([data-palette="classic"]) .prose ::selection {
+  color:var(--selection-ink);
+  background:var(--selection-bg);
 }
 :root[data-palette]:not([data-palette="classic"])[data-theme="light"] {
   --ok:#4A7158; --ok-weak:#E4EBE4; --warn:#856623; --warn-weak:#EDE6D8;

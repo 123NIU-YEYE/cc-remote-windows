@@ -40,7 +40,7 @@ export function CenteredSheet({ open, label, onClose, children, className = "",
         closeRef.current();
       } else if (event.key === "Tab") {
         const nodes = [...(ref.current?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex="0"]',
+          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary, a[href], [tabindex="0"]',
         ) ?? [])].filter(node => node.getClientRects().length > 0);
         const current = nodes.indexOf(document.activeElement as HTMLElement);
         event.preventDefault();

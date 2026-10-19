@@ -350,7 +350,8 @@ export default function App() {
   const initialEngineRef = useRef(normalizeEngine(localStorage.getItem(ENGINE_KEY)));
   const initialSpacesRef = useRef(readEngineSpaces(localStorage, initialEngineRef.current));
   const [engine, setEngine] = useState<Engine>(initialEngineRef.current);
-  const { mode: theme, choice: themeChoice, selectTheme } = useTheme(engine);
+  const appearance = useTheme(engine);
+  const { mode: theme, selectTheme } = appearance;
   const { boldText, setBoldText } = useBoldText();
   const [space, setSpace] = useState<Space>(initialSpacesRef.current[initialEngineRef.current]);
   const spacesByEngineRef = useRef<Record<Engine, Space>>(initialSpacesRef.current);
@@ -5893,8 +5894,7 @@ export default function App() {
           <EngineSelector engine={engine} onChange={toggleEngine} />
           <Suspense fallback={<span className="iconbtn" aria-hidden="true"><Icon name="dots" /></span>}><HeaderMenu
             engine={engine}
-            theme={theme}
-            themeChoice={themeChoice}
+            appearance={appearance}
             boldText={boldText} onBoldText={setBoldText}
             notificationMode={notificationMode}
             notificationBinding={pushBinding.state}
@@ -5907,7 +5907,6 @@ export default function App() {
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
             onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
-            onSelectTheme={selectTheme}
             onLogout={() => void logout()}
           /></Suspense>
         </header>
