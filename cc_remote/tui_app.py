@@ -1075,36 +1075,29 @@ class WorkspaceClient(Tui):
         ).presentation.questions
         return next(iter(questions.values()), None)
 
-    async def answer_for(self, ask: dict, text: str) -> bool:
+    async def answer_for(self, ask: dict, text: str | list[str]) -> bool:
         sid = self.workspace.rekeys.get(ask["sid"], ask["sid"])
         pending = self.workspace.view(sid).presentation.questions
         if ask["ask_id"] not in pending:
             self.notice = "This question is no longer pending"
             return False
-        options = ask.get("options", [])
-        picks = [p.strip() for p in text.split(",")]
-        if picks and all(p.isdigit() for p in picks) and options:
-            indices = [int(p) - 1 for p in picks]
-            if (
-                any(i < 0 or i >= len(options) for i in indices)
-                or len(set(indices)) != len(indices)
-                or (len(indices) > 1 and not ask.get("multi_select"))
-            ):
-                self.notice = "Invalid option selection"
-                return False
-            labels = [options[i]["label"] for i in indices]
-            answer = labels if ask.get("multi_select") else labels[0]
-        elif ask.get("allow_text"):
-            if not text.strip():
-                self.notice = "Enter a non-empty answer; nothing was sent"
-                return False
-            answer = text
-        else:
-            self.notice = "Enter option number(s), separated by commas"
+        from cc_remote.tui_questions import parse_blocking_answer
+
+        try:
+            questions = ask.get("questions")
+            if questions:
+                if not isinstance(text, list) or len(text) != len(questions):
+                    raise ValueError("Open the question form to answer all pages together")
+                answers = [parse_blocking_answer(q, value)
+                           for q, value in zip(questions, text, strict=True)]
+                command = AnswerQuestion(ask_id=ask["ask_id"], answers=answers, sid=sid)
+            else:
+                command = AnswerQuestion(ask_id=ask["ask_id"],
+                                         answer=parse_blocking_answer(ask, text), sid=sid)
+        except ValueError as exc:
+            self.notice = str(exc)
             return False
-        accepted = await self._send(
-            AnswerQuestion(ask_id=ask["ask_id"], answer=answer, sid=ask["sid"])
-        )
+        accepted = await self._send(command)
         if accepted:
             if (self.pending_asks.get(sid) or {}).get("ask_id") == ask["ask_id"]:
                 self.pending_asks.pop(sid, None)

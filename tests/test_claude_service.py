@@ -390,16 +390,22 @@ def test_duplicate_query_request_and_competing_controller_do_not_write_twice():
     asyncio.run(go())
 
 
-def test_answered_question_page_is_not_asked_again_after_restart():
+@pytest.mark.parametrize("batched", [False, True])
+def test_answered_question_page_is_not_asked_again_after_restart(batched):
     from types import SimpleNamespace
 
     from cc_remote.claude_service.client import callback_identity
-    from cc_remote.protocol import AnswerQuestion, AskUser
+    from cc_remote.protocol import AnswerQuestion, AskQuestion, AskUser
     from tests.test_claude_autocompact import _machine_with_sdk
 
     async def question(machine, ctx, text):
         token = callback_identity.set("same-native-tool-call")
         try:
+            if batched:
+                return await machine._on_ask_batch(ctx, [AskQuestion(
+                    question=label, options=[{"label": "Yes"}, {"label": "No"}],
+                    multi_select=index == 1,
+                ) for index, label in enumerate([text, "Second page?"])])
             return await machine._on_ask(ctx, text, [
                 {"label": "Yes"}, {"label": "No"},
             ])
@@ -415,16 +421,18 @@ def test_answered_question_page_is_not_asked_again_after_restart():
                 while not any(isinstance(event, AskUser) for event in transport.sent):
                     await asyncio.sleep(0.001)
             event = next(event for event in transport.sent if isinstance(event, AskUser))
+            expected = ["Yes", ["No"]] if batched else "Yes"
             result = await machine._handle_answer_question(AnswerQuestion(
-                sid=ctx.key, ask_id=event.ask_id, answer="Yes"))
+                sid=ctx.key, ask_id=event.ask_id,
+                **({"answers": expected} if batched else {"answer": expected})))
             assert result is None
-            assert await task == "Yes"
-            assert service.sessions[first.id].question_answers[event.ask_id] == "Yes"
+            assert await task == expected
+            assert service.sessions[first.id].question_answers[event.ask_id] == expected
             await first.detach()
             await released(service.sessions[first.id])
             second = await attach()
             machine2, transport2, ctx2 = _machine_with_sdk(SimpleNamespace(client=second, ask_server=None))
-            assert await asyncio.wait_for(question(machine2, ctx2, "First page?"), 2) == "Yes"
+            assert await asyncio.wait_for(question(machine2, ctx2, "First page?"), 2) == expected
             assert not any(isinstance(event, AskUser) for event in transport2.sent)
     asyncio.run(go())
 
@@ -743,4 +751,21 @@ asyncio.run(run())
                 if service.returncode is None:
                     service.terminate()
                     await service.wait()
+    asyncio.run(go())
+
+
+def test_message_tool_refresh_marker_survives_controller_replacement():
+    async def go():
+        async with environment() as (service, attach):
+            first = await attach()
+            worker = service.sessions[first.id]
+            await first.mark_message_tools_refresh('cc-remote-ask')
+            await first.detach()
+            await released(worker)
+            second = await attach()
+            assert second.id == first.id
+            assert second.description['metadata']['message_tools_refresh'] == 'cc-remote-ask'
+            assert not worker.client.closed and not worker.client.prompts
+            await second.mark_message_tools_refresh(None)
+            assert worker.metadata['message_tools_refresh'] is None
     asyncio.run(go())

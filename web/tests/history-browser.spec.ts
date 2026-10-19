@@ -183,11 +183,12 @@ type PanelRelayEvent<T = ServerEvent> = T extends ServerEvent
 // traffic terminates in this in-memory relay; no real session is touched.
 async function mockRightPanelRelay(
   page: import("@playwright/test").Page,
-  { visible = false, retained = true, engine = "codex", seedTurns = [],
+  { visible = false, retained = true, engine = "codex", seedTurns = [], parentSid = "layout-parent",
     secondParent = false, parentState = "idle", btwReadOnly = false, imageAssets = false, imageData, externalPreview, historyReply, listReply }: {
     visible?: boolean;
     retained?: boolean;
     engine?: "codex" | "claude";
+    parentSid?: string;
     seedTurns?: NonNullable<Extract<ServerEvent, { type: "history" }>["turns"]>;
     secondParent?: boolean;
     parentState?: "idle" | "running";
@@ -199,14 +200,13 @@ async function mockRightPanelRelay(
     listReply?: (command: Record<string, unknown>) => PanelRelayEvent | undefined;
   } = {},
 ) {
-  const parentSid = "layout-parent";
   const btwSid = "btw-layout-child";
   const commands: Record<string, unknown>[] = [];
   const allowedReads = new Set<string>();
   let emit: (message: PanelRelayEvent) => void = () => {
     throw new Error("layout relay has not connected");
   };
-  await page.addInitScript(({ visible, engine }) => {
+  await page.addInitScript(({ visible, engine, parentSid }) => {
     localStorage.setItem("cc_remote_engine", engine);
     localStorage.setItem("cc_remote_machine", "layout-machine");
     // Preserve a user's resize preference while opening/closing the slot.
@@ -215,9 +215,9 @@ async function mockRightPanelRelay(
     }
     if (sessionStorage.getItem("cc-remote:btw-panel-scopes-v1") === null) {
       sessionStorage.setItem("cc-remote:btw-panel-scopes-v1", JSON.stringify(visible
-        ? [JSON.stringify(["layout-machine", "code", engine, "layout-parent"])] : []));
+        ? [JSON.stringify(["layout-machine", "code", engine, parentSid])] : []));
     }
-  }, { visible, engine });
+  }, { visible, engine, parentSid });
   await page.route("**/api/**", (route) => route.fulfill({ status: 404 }));
   await page.route("**/api/session", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/viewers/pages", (route) => route.fulfill({ json: { pages: [] } }));
@@ -4602,6 +4602,118 @@ test("native question centers long Claude prompts and retains answers above the 
     .map(({ sid, ask_id, answer }) => ({ sid, ask_id, answer }))).toEqual([
       { sid: "layout-parent", ask_id: "long-ask", answer: ["修正指标", "按原定义修正并补充说明"] },
     ]);
+});
+
+test("native question batch keeps choices across pages and reconnects until atomic submission", async ({ page }, testInfo) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", listReply: otherHarnessList });
+  await page.goto("/");
+  await expect(page.locator(".composer textarea")).toBeEnabled();
+  const questions = [
+    { question: "文件列表按什么顺序展示？", header: "展示顺序", allow_text: true,
+      options: [{ label: "最近更新优先", ds: "新上传或新生成的文件排在前面" }, { label: "按文件类型分组" }] },
+    { question: "哪些文件放进 Artifacts？", header: "收录范围", multi_select: true, allow_text: true,
+      options: [{ label: "上传的附件" }, { label: "AI 生成的文档" }, { label: "AI 生成的图片" }] },
+    { question: "补充要求？", header: "其他", allow_text: true,
+      options: [{ label: "保持现状" }, { label: "调整显示" }] },
+  ];
+  const event = { type: "ask_user", sid: "layout-parent", ask_id: "batch-ask", ...questions[0], questions };
+  relay.emit({ ...event, seq: 1 });
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  await expect(dialog.locator(".qa-progress")).toHaveText("1 / 3");
+  await expect(dialog.getByRole("button", { name: "上一题" })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "下一题" })).toBeDisabled();
+  const choice = dialog.getByRole("button", { name: "最近更新优先" });
+  await choice.click();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  await expect(choice).toHaveCSS("background-color", "rgb(242, 231, 223)");
+  expect(await choice.locator("svg, input, .checkbox, .radio").count()).toBe(0);
+  const radius = await dialog.locator(".qa-next").evaluate(node => parseFloat(getComputedStyle(node).borderRadius));
+  expect(radius).toBeGreaterThanOrEqual(18);
+  const box = (await dialog.boundingBox())!;
+  expect(Math.abs(box.y + box.height / 2 - page.viewportSize()!.height / 2)).toBeLessThan(2);
+  await page.screenshot({ path: testInfo.outputPath("question-batch-single.png") });
+  await dialog.getByRole("button", { name: "下一题" }).click();
+  await expect(dialog.locator(".qa-progress")).toHaveText("2 / 3");
+  await dialog.getByRole("button", { name: "上传的附件", exact: true }).click();
+  await dialog.getByRole("button", { name: "AI 生成的文档", exact: true }).click();
+  await dialog.getByRole("textbox", { name: "输入回答" }).fill("包含音频");
+  await dialog.getByRole("button", { name: "上一题" }).click();
+  await expect(choice).toHaveAttribute("aria-pressed", "true");
+  await dialog.getByRole("textbox", { name: "输入回答" }).fill("按名称排序");
+  await expect(choice).toHaveAttribute("aria-pressed", "false");
+  await dialog.getByRole("button", { name: "下一题" }).click();
+  await expect(dialog.getByRole("button", { name: "上传的附件", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(dialog.getByRole("textbox", { name: "输入回答" })).toHaveValue("包含音频");
+  await page.evaluate(() => document.documentElement.dataset.theme = "dark");
+  await expect(dialog.getByRole("button", { name: "上传的附件", exact: true }))
+    .toHaveCSS("background-color", "rgb(53, 37, 32)");
+  await page.screenshot({ path: testInfo.outputPath("question-batch-multi-dark.png") });
+  expect(relay.commands.filter(command => command.type === "answer_question")).toHaveLength(0);
+  await page.keyboard.press("Meta+2");
+  await expect(page.getByRole("button", { name: "切换新会话引擎" })).toContainText("Codex");
+  await expect(dialog).toHaveCount(0);
+  await page.keyboard.press("Meta+1");
+  await expect(dialog.locator(".qa-progress")).toHaveText("2 / 3");
+  await expect(dialog.getByRole("button", { name: "上传的附件", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(dialog.getByRole("textbox", { name: "输入回答" })).toHaveValue("包含音频");
+  relay.emit({ type: "ask_user_sync", sid: "layout-parent" });
+  await expect(dialog).toHaveCount(0);
+  relay.emit({ ...event, seq: 2 });
+  await expect(dialog.locator(".qa-progress")).toHaveText("2 / 3");
+  await expect(dialog.getByRole("textbox", { name: "输入回答" })).toHaveValue("包含音频");
+  await dialog.getByRole("button", { name: "下一题" }).click();
+  await dialog.getByRole("button", { name: "保持现状", exact: true }).click();
+  await page.screenshot({ path: testInfo.outputPath("question-batch-final.png") });
+  await dialog.getByRole("button", { name: "提交回答", exact: true }).click();
+  await expect.poll(() => relay.commands.filter(command => command.type === "answer_question")
+    .map(({ sid, ask_id, answer, answers }) => ({ sid, ask_id, answer, answers }))).toEqual([
+      { sid: "layout-parent", ask_id: "batch-ask", answer: undefined,
+        answers: ["按名称排序", ["上传的附件", "AI 生成的文档", "包含音频"], "保持现状"] },
+    ]);
+  await expect(dialog).toBeVisible(); // Sending is not acknowledgement.
+  await expect(dialog.getByRole("button", { name: "提交中…", exact: true })).toBeDisabled();
+  relay.emit({ type: "ask_user_closed", sid: "layout-parent", seq: 3, ask_id: "batch-ask", reason: "answered" });
+  await expect(dialog).toHaveCount(0);
+});
+
+test("native question batch scrolls long text with fixed navigation and routes side chat answers", async ({ page }, testInfo) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", visible: true });
+  await page.goto("/");
+  await expect(page.locator(".btw-panel")).toBeVisible();
+  const questions = [{ question: "请确认这组要求。\n".repeat(60), header: "需求", allow_text: true,
+    options: [{ label: "同意" }, { label: "需要调整" }] }];
+  relay.emit({ type: "ask_user", sid: "btw-layout-child", seq: 1, ask_id: "batch-child", ...questions[0], questions });
+  const dialog = page.getByRole("dialog", { name: "操作确认" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator(".qa-progress")).toHaveCount(0);
+  expect(await dialog.locator(".sheet-scroll").evaluate(node => node.scrollHeight > node.clientHeight)).toBe(true);
+  const footer = (await dialog.locator(".qa-footer").boundingBox())!;
+  const input = dialog.getByRole("textbox", { name: "输入回答" });
+  await input.fill("补充验收标准");
+  expect((await dialog.locator(".qa-footer").boundingBox())!.y).toBe(footer.y);
+  await page.evaluate(() => {
+    Object.defineProperties(window.visualViewport!, {
+      height: { configurable: true, value: 340 }, offsetTop: { configurable: true, value: 40 },
+    });
+    window.visualViewport!.dispatchEvent(new Event("resize"));
+  });
+  await expect.poll(async () => {
+    const rect = await dialog.boundingBox();
+    return !!rect && rect.y >= 40 && rect.y + rect.height <= 380;
+  }).toBe(true);
+  await expect(input).toBeInViewport({ ratio: 1 });
+  await page.screenshot({ path: testInfo.outputPath("question-batch-keyboard.png") });
+  await input.dispatchEvent("compositionstart");
+  await input.press("Enter");
+  expect(relay.commands.filter(command => command.type === "answer_question")).toHaveLength(0);
+  await input.dispatchEvent("compositionend");
+  await dialog.getByRole("button", { name: "提交回答", exact: true }).click();
+  await expect.poll(() => relay.commands.filter(command => command.type === "answer_question")
+    .map(({ sid, answers }) => ({ sid, answers }))).toEqual([
+      { sid: "btw-layout-child", answers: ["补充验收标准"] },
+    ]);
+  relay.emit({ type: "ask_user_closed", sid: "btw-layout-child", seq: 2, ask_id: "batch-child", reason: "answered" });
+  await expect(dialog).toHaveCount(0);
 });
 
 test("native question keeps custom headings and text-only Codex answers", async ({ page }) => {
@@ -12371,38 +12483,75 @@ test("live token usage updates immediately and supports explicit keyboard activa
 });
 
 
-test("session message source preview returns to the same reading position", async ({ page }, testInfo) => {
-  await page.goto("/tests/history-browser.html?session-messages=1");
-  const thread = page.locator(".thread").first();
-  await expect(page.getByRole("button", { name: /来自会话/ }).last()).toBeVisible();
-  const source = page.getByRole("button", { name: /来自会话/ }).last();
-  await source.scrollIntoViewIfNeeded();
-  const before = await thread.evaluate((node) => node.scrollTop);
-  await source.click();
-  const preview = page.getByRole("dialog", { name: "关联会话历史" });
-  await expect(preview).toBeVisible();
-  await expect(preview.getByText("让代码审查会话帮忙检查这次改动。")).toBeVisible();
-  await expect(preview.getByRole("button", { name: /已发送给/ })).toBeVisible();
-  await page.screenshot({ path: testInfo.outputPath("session-source.png") });
-  await preview.getByRole("button", { name: "更早记录", exact: true }).click();
-  await expect(preview.getByText("更早的开发记录")).toBeVisible();
-  await preview.getByRole("button", { name: "较新记录", exact: true }).click();
-  await expect(preview.getByText("让代码审查会话帮忙检查这次改动。")).toBeVisible();
-  await preview.getByRole("button", { name: "返回代码审查" }).click();
-  await expect(preview).toHaveCount(0);
-  expect(Math.abs(await thread.evaluate((node) => node.scrollTop) - before)).toBeLessThan(3);
-  await source.click();
-  await preview.getByRole("button", { name: /已发送给 代码审查/ }).click();
-  await expect(preview).toHaveCount(0);
-  await source.click();
-  await expect(preview).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(preview).toHaveCount(0);
-  expect(Math.abs(await thread.evaluate((node) => node.scrollTop) - before)).toBeLessThan(3);
-  // StrictMode reattaches effects on each open; every command remains read-only.
-  expect(JSON.parse(await page.getByTestId("session-read-commands").textContent() ?? "[]"))
-    .toEqual(Array(8).fill("get_history"));
-});
+for (const scenario of [
+  { name: "native", engine: "codex", targetEngine: "codex", account: "iris", native: true },
+  { name: "same-account", engine: "claude", targetEngine: "claude", account: "iris" },
+  { name: "cross-account", engine: "claude", targetEngine: "claude", account: "stack" },
+  { name: "claude-to-codex", engine: "claude", targetEngine: "codex", account: "stack" },
+  { name: "codex-to-claude", engine: "codex", targetEngine: "claude", account: "stack" },
+] as const) {
+  test(`session message ${scenario.name} links navigate the real conversation`, async ({ page }, testInfo) => {
+    const originSid = "iris@receiver";
+    const targetSid = `${scenario.account}@source`;
+    const native = "native" in scenario;
+    const sourceRef = native ? "source" : `ccr:${scenario.targetEngine}:${targetSid}`;
+    const returnRef = native ? "receiver" : `ccr:${scenario.engine}:${originSid}`;
+    const origin = { session_id: originSid, engine: scenario.engine, space: "code" as const,
+      summary: "代码审查", cwd: "/tmp/layout", state: "idle" as const, last_modified: "100" };
+    const target = { session_id: targetSid, engine: scenario.targetEngine, space: "code" as const,
+      summary: "消息来源会话", cwd: "/tmp/source", state: "idle" as const, last_modified: "50" };
+    const relay = await mockRightPanelRelay(page, {
+      engine: scenario.engine, parentSid: originSid, retained: false,
+      listReply: command => ({ type: "session_list", engine: command.engine as "claude" | "codex",
+        space: command.space as "code" | "work", request_id: String(command.cmd_id),
+        sessions: command.space === "code" ? [origin, target].filter(s => s.engine === command.engine) : [] }),
+      historyReply: command => {
+        const sid = String(command.session_id);
+        return { type: "history", session_id: sid, sid, revision: `history-${sid}`,
+          generation: "layout-generation", detail: "summary", events: [], has_more: false,
+          turns: [{ id: `turn-${sid}`, prompt: sid === originSid ? "请审查消息来源" : "目标会话的完整历史",
+            sourceThreadId: sid === originSid ? sourceRef : undefined,
+            sessionMessages: sid === targetSid ? [{ itemId: "sent", threadId: returnRef, status: "sent" }] : [],
+            done: true, blocks: [{ kind: "text", message_id: `answer-${sid}`, done: true,
+              text: sid === originSid ? "原会话回答" : "这里是可继续交流的目标会话" }] }] };
+      },
+    });
+    await page.goto("/");
+    const composer = page.locator(".composer textarea");
+    const source = page.getByRole("button", { name: /来自会话 · 消息来源会话/ });
+    await expect(source).toBeEnabled();
+    await composer.fill("原会话未发送的草稿");
+    const before = relay.commands.length;
+    await source.click();
+    await expect.poll(() => relay.commands.slice(before).filter(c => c.type === "switch_session")
+      .map(c => [c.session_id, c.engine ?? "claude", c.space ?? "code"]))
+      .toEqual([[targetSid, scenario.targetEngine, "code"]]);
+    await expect(page.getByText("目标会话的完整历史", { exact: true })).toBeVisible();
+    await expect(page.getByRole("dialog", { name: "关联会话历史" })).toHaveCount(0);
+    await expect(page.getByText("只读查看", { exact: true })).toHaveCount(0);
+    await expect(page.locator("html")).toHaveAttribute("data-engine", scenario.targetEngine);
+    await expect(composer).toBeEditable();
+    await expect(composer).toHaveValue("");
+    await composer.fill("目标会话自己的草稿");
+    await page.screenshot({ path: testInfo.outputPath("session-direct-navigation.png") });
+    await page.getByRole("button", { name: /已发送给 代码审查/ }).click();
+    await expect(page.getByText("原会话回答", { exact: true })).toBeVisible();
+    await expect(composer).toHaveValue("原会话未发送的草稿");
+    await expect(page.locator("html")).toHaveAttribute("data-engine", scenario.engine);
+    expect(relay.commands.slice(before).filter(c => c.type === "switch_session")
+      .map(c => [c.session_id, c.engine ?? "claude", c.space ?? "code"]))
+      .toEqual([[targetSid, scenario.targetEngine, "code"], [originSid, scenario.engine, "code"]]);
+    expect(relay.commands.slice(before).filter(c => ["query", "create_session", "interrupt", "takeover_session"]
+      .includes(String(c.type)))).toEqual([]);
+    // A removed target stays labelled, but cannot navigate using a stale cache.
+    const listRequest = relay.commands.findLast(c => c.type === "list_sessions"
+      && c.engine === scenario.targetEngine && c.space === "code")!;
+    relay.emit({ type: "session_list", engine: scenario.targetEngine, space: "code",
+      request_id: String(listRequest.cmd_id),
+      sessions: scenario.targetEngine === scenario.engine ? [origin] : [] });
+    await expect(page.getByRole("button", { name: /来自会话/ })).toBeDisabled();
+  });
+}
 
 for (const centered of [false, true]) {
   test(`right panel layout centered side chat overlays ${centered ? "centered" : "docked"} editor without replacing it`, async ({ page }, info) => {

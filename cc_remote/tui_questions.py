@@ -3,6 +3,24 @@
 from cc_remote.tui import _safe_remote_text
 
 
+def parse_blocking_answer(question: dict, text: str):
+    options = question.get("options", [])
+    picks = [p.strip() for p in text.split(",")]
+    if picks and all(p.isdigit() for p in picks) and options:
+        indices = [int(p) - 1 for p in picks]
+        if (any(i < 0 or i >= len(options) for i in indices)
+                or len(set(indices)) != len(indices)
+                or (len(indices) > 1 and not question.get("multi_select"))):
+            raise ValueError("Invalid option selection")
+        labels = [options[i]["label"] for i in indices]
+        return labels if question.get("multi_select") else labels[0]
+    if not question.get("allow_text"):
+        raise ValueError("Enter option number(s), separated by commas")
+    if not text.strip():
+        raise ValueError("Enter a non-empty answer; nothing was sent")
+    return text
+
+
 def supplemental_answer_prompt(answers):
     """Match Web's async-question-presentation.ts envelope exactly."""
     return "补充回答：\n\n" + "\n\n".join(

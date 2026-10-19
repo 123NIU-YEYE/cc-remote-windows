@@ -4,7 +4,7 @@
 
 Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
 
-**Product version: v4.0.22** · Wire protocol v76
+**Product version: v4.0.22** · Wire protocol v78
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
 [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
@@ -376,6 +376,7 @@ policy is not a replacement for separate OS users, containers or virtual machine
 | Codex App: [macOS](docs/codex-desktop-launcher.md) / [Linux](docs/codex-desktop-linux.md) | Optional App, daily CLI and Wrapper on one daemon |
 | [Codex App tools](docs/codex-app-tools.md) | Optional App-control MCP |
 | [Generic async task MCP](docs/async-tasks.md) | Run scripts/external agents in the background and return results to the originating Codex thread |
+| [Cross-session messaging MCP](docs/session-messages.md) | Unified Claude/Codex delivery alongside native Codex App messages, source labels and receipts |
 | [Timed messages](docs/timed-messages.md) | Scheduled queue receipts, message tags and countdown UI |
 | [Terminal workspace](docs/tui.md) | TUI setup, connections, Vim controls, session tree, previews and terminal limits |
 | [Changelog](CHANGELOG.md) | Version changes and migrations |

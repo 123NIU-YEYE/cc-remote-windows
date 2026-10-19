@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 76
+PROTOCOL_VERSION = 78
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -114,6 +114,7 @@ ASK_OPTION_DESCRIPTION_MAX_CHARS = 2 * 1024
 ASK_ANSWER_MAX_CHARS = 4 * 1024
 ASK_OPTION_MIN_COUNT = 2
 ASK_OPTION_MAX_COUNT = 5
+ASK_QUESTION_MAX_COUNT = 4
 FILE_PREVIEW_MAX_BYTES = 512 * 1024
 PREVIEW_ASSET_MAX_BYTES = 4 * 1024 * 1024
 MAX_ENCODED_PREVIEW_ASSET_CHARS = ((PREVIEW_ASSET_MAX_BYTES + 2) // 3) * 4
@@ -2522,7 +2523,7 @@ class SessionMessageReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid")
     itemId: WireId
     threadId: WireId
-    status: Literal["sending", "sent", "failed"]
+    status: Literal["sending", "queued", "sent", "failed"]
 
 
 class ConversationTurn(BaseModel):
@@ -2785,13 +2786,10 @@ class ArtifactInvalidated(_Base):
     reason: Literal["rollback", "session_migration"] = "rollback"
 
 
-class AskUser(_Base):
-    """wrapper -> client: the agent called the `ask_user` MCP tool and is
-    blocked awaiting the user's choice. The client renders a question card;
-    the user's pick is returned via AnswerQuestion. ask_id correlates the two.
-    The wrapper's MCP handler awaits a Future keyed by ask_id."""
-    type: Literal["ask_user"] = "ask_user"
-    ask_id: WireId
+class AskQuestion(BaseModel):
+    """One bounded page of an interactive question batch."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
     question: AskQuestionText
     header: Optional[str] = Field(default=None, max_length=512)
     options: list[AskOption] = Field(default_factory=list, max_length=ASK_OPTION_MAX_COUNT)
@@ -2805,6 +2803,27 @@ class AskUser(_Base):
             raise ValueError("ask_user requires 2-5 options unless text input is enabled")
         if self.multi_select and len(self.options) < ASK_OPTION_MIN_COUNT:
             raise ValueError("multi-select ask_user requires 2-5 options")
+        return self
+
+
+class AskUser(_Base, AskQuestion):
+    """One pending interaction. A batch is answered atomically in page order.
+
+    Top-level fields describe its first question for summary surfaces; they
+    never authorize submitting only that page when ``questions`` is present.
+    """
+
+    type: Literal["ask_user"] = "ask_user"
+    ask_id: WireId
+    questions: Optional[list[AskQuestion]] = Field(
+        default=None, min_length=1, max_length=ASK_QUESTION_MAX_COUNT)
+
+    @model_validator(mode="after")
+    def first_question_matches(self):
+        if self.questions is not None:
+            first = self.questions[0].model_dump()
+            if any(getattr(self, key) != value for key, value in first.items()):
+                raise ValueError("ask_user summary must match its first question")
         return self
 
 
@@ -2831,7 +2850,15 @@ class AnswerQuestion(_Command):
     selected option's label (or free text if the agent allowed it)."""
     type: Literal["answer_question"] = "answer_question"
     ask_id: WireId
-    answer: AskAnswer
+    answer: Optional[AskAnswer] = None
+    answers: Optional[list[AskAnswer]] = Field(
+        default=None, min_length=1, max_length=ASK_QUESTION_MAX_COUNT)
+
+    @model_validator(mode="after")
+    def exactly_one_answer_shape(self):
+        if (self.answer is None) == (self.answers is None):
+            raise ValueError("provide either answer or answers")
+        return self
 
 
 class GetGoal(_Command):

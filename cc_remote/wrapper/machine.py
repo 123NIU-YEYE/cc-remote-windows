@@ -140,7 +140,7 @@ from cc_remote.protocol import (
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, CodexTerminalFence, History, TurnDetail, AgentDetail,
     HistoryImage,
-    HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserSync,
+    HistoryInvalidated, ArtifactInvalidated, AskQuestion, AskUser, AskUserSync,
     AskUserClosed,
     BackgroundProcessItem, BackgroundProcessSync,
     GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
@@ -2067,6 +2067,8 @@ class WrapperMachine:
 
     def __init__(self, cfg: WrapperConfig, transport: WrapperTransport):
         self.cfg = cfg
+        from cc_remote.wrapper.session_messages import SessionMessages
+        self._session_messages = SessionMessages(self) if cfg.session_messages_enabled else None
         self._timed_tasks = TimedTaskStore(cfg.state_dir)
         self._timed_task_catalog = {}
         self.transport = transport
@@ -6476,7 +6478,10 @@ class WrapperMachine:
         sdk.ask_server = make_ask_server(
             lambda q, o: self._on_mcp_ask(ctx, q, o),
             lambda m: self._on_set_mode(ctx, m),
+            ask_batch=lambda qs: self._on_mcp_ask_batch(ctx, qs),
         )
+        if self._session_messages is not None and ctx.space == "code" and not ctx.btw:
+            sdk.message_server = self._session_messages.claude_server(ctx)
         sdk.permission_callback = (
             lambda tool, tool_input, permission_context:
             self._on_claude_tool_permission(
@@ -9297,12 +9302,16 @@ class WrapperMachine:
                 await self._on_transport_connected()
 
             self._watch_task = asyncio.create_task(self._watch_loop())
+            if self._session_messages is not None:
+                await self._session_messages.start()
             self._work_schedule_task = asyncio.create_task(
                 self._work_schedule_loop())
             async for cmd in self.transport.incoming():
                 await self._dispatch_incoming_command(cmd)
             await self._command_scheduler.drain()
         finally:
+            if self._session_messages is not None:
+                await self._session_messages.close()
             await self._command_scheduler.close()
             models_tasks = list(self._models_command_tasks.values())
             for task in models_tasks:
@@ -10515,6 +10524,12 @@ class WrapperMachine:
         return list(snapshot)
 
     async def _emit_locked(self, ctx: SessionContext, msg) -> None:
+        if isinstance(msg, (UserMsg, TurnSteered)):
+            from cc_remote.session_messages import parse_message
+            message = parse_message(msg.prompt)
+            if message is not None:
+                msg.prompt = message.prompt
+                msg.source_thread_id = message.source_thread_id
         # Stamp routing before buffering so byte accounting includes the final
         # wire shape.  Every live and replayable /btw frame is owner-only; relay
         # treats an absent ``to`` as broadcast, so fail closed for an impossible
@@ -11769,6 +11784,9 @@ class WrapperMachine:
     async def _process_command_safely(self, cmd) -> None:
         """Run one command without letting a handler failure stop the loop."""
         try:
+            if self._session_messages is not None and id(cmd) in self._session_messages.commands:
+                await self._session_messages.dispatch(cmd)
+                return
             await self._process_command(cmd)
         except Exception:
             log.exception("command handling failed", type=cmd.type)
@@ -18457,6 +18475,13 @@ class WrapperMachine:
                 )
                 return await self._reject_query(ctx, cmd, error)
         is_claude_broker = bool(getattr(ctx.sdk, "is_claude_broker", False))
+        if (is_claude_broker and self._session_messages is not None
+                and self._session_messages.owns(cmd.msg_id)):
+            # The native CLI may acquire ownership after message dispatch's
+            # first check. Keep MCP sends out of that newly adopted terminal.
+            return await self._reject_query(ctx, cmd, Error(
+                code=ERR_BUSY, message="目标会话已由本机终端接管，本次消息未发送",
+                msg_id=cmd.msg_id))
         is_codex_shared = self._codex_shared_affinity(ctx)
         if (
             is_codex_shared
@@ -18572,6 +18597,22 @@ class WrapperMachine:
             )
             return await self._reject_query(ctx, cmd, error)
         if ctx.engine == "claude" and not is_claude_broker:
+            if getattr(ctx.sdk, "needs_message_tools_refresh", False):
+                ready = False
+                async with ctx.sdk.context_recovery_barrier() as quiescent:
+                    if quiescent and not self._claude_has_background_work(ctx):
+                        ready = await ctx.sdk.refresh_message_tools()
+                if not ready and (
+                    (self._session_messages is not None and self._session_messages.owns(cmd.msg_id))
+                    or getattr(ctx.sdk, "_message_tools_toggle_started", None)
+                ):
+                    # Keep cross-session delivery pending until replies are
+                    # possible. Ordinary chat may keep using an unchanged old
+                    # tool set while background work defers this optional refresh.
+                    # An unfinished toggle must be repaired before either path.
+                    return await self._reject_query(ctx, cmd, Error(
+                        code="message_tools_pending", message="Claude 消息工具尚未就绪，正在等待安全刷新；本次尚未发送。",
+                        msg_id=getattr(cmd, "msg_id", None)))
             context_error = await self._prepare_claude_context_before_query(
                 ctx, msg_id=getattr(cmd, "msg_id", None))
             if context_error is not None:
@@ -25313,7 +25354,7 @@ class WrapperMachine:
         ask_id: str,
         *,
         reason: str,
-        answer: str | list[str] | None = None,
+        answer: str | list[str] | list[str | list[str]] | None = None,
     ) -> PendingAskState | None:
         """Close one question while ``ctx.emit_lock`` is held.
 
@@ -25358,7 +25399,7 @@ class WrapperMachine:
         ask_id: str,
         *,
         reason: str,
-        answer: str | list[str] | None = None,
+        answer: str | list[str] | list[str | list[str]] | None = None,
     ) -> PendingAskState | None:
         async with ctx.emit_lock:
             return await self._close_pending_ask_locked(
@@ -25394,17 +25435,39 @@ class WrapperMachine:
     ) -> str:
         """Keep the MCP tool's textual result and allow a custom answer."""
         try:
-            answer = await self._on_ask(
-                ctx,
-                question,
-                options,
-                allow_text=True,
-            )
+            answers = await self._on_ask_batch(ctx, [AskQuestion(
+                question=question, options=options, allow_text=True)])
+            answer = answers[0]
         except AskTimeout:
             return "(用户未回答，已超时)"
         except (AskCancelled, AskSuperseded):
             return "(用户未回答，问题已取消)"
         return answer if isinstance(answer, str) else ", ".join(answer)
+
+    async def _on_mcp_ask_batch(
+        self, ctx: SessionContext, questions: list[AskQuestion],
+    ) -> str:
+        try:
+            answers = await self._on_ask_batch(ctx, questions)
+        except AskTimeout:
+            return "(用户未回答，已超时)"
+        except (AskCancelled, AskSuperseded):
+            return "(用户未回答，问题已取消)"
+        return json.dumps({"answers": [
+            {"question": question.question, "answer": answer}
+            for question, answer in zip(questions, answers, strict=True)
+        ]}, ensure_ascii=False)
+
+    async def _on_ask_batch(
+        self, ctx: SessionContext, questions: list[AskQuestion], **kwargs,
+    ) -> list[str | list[str]]:
+        if not questions:
+            raise ValueError("a question batch cannot be empty")
+        async with ctx.ask_lock:
+            result = await self._on_ask_locked(
+                ctx, **questions[0].model_dump(), questions=questions, **kwargs)
+        assert isinstance(result, list)
+        return result
 
     async def _on_ask(
         self,
@@ -25451,7 +25514,8 @@ class WrapperMachine:
         timeout: float = 30 * 60,
         ask_id: str | None = None,
         to: str | None = None,
-    ) -> str | list[str]:
+        questions: list[AskQuestion] | None = None,
+    ) -> str | list[str] | list[str | list[str]]:
         """Run one question while the caller owns ``ctx.ask_lock``."""
         service_client = getattr(ctx.sdk, "client", None)
         if ask_id is None and hasattr(service_client, "description"):
@@ -25465,6 +25529,9 @@ class WrapperMachine:
             if origin is not None:
                 stable = json.dumps([service_client.id, origin, question, options, header],
                                     ensure_ascii=False, sort_keys=True)
+                if questions is not None:
+                    stable += json.dumps([q.model_dump() for q in questions],
+                                         ensure_ascii=False, sort_keys=True)
                 ask_id = "ask-" + hashlib.sha256(stable.encode()).hexdigest()[:32]
                 cached = await service_client.call("question_answer", {"ask_id": ask_id})
                 if cached["found"]:
@@ -25484,6 +25551,7 @@ class WrapperMachine:
             allow_text=allow_text,
             secret=secret,
             multi_select=multi_select,
+            questions=questions,
             to=to,
         )
         loop = asyncio.get_running_loop()
@@ -25571,6 +25639,23 @@ class WrapperMachine:
             return await self._on_ask(*args, **kwargs)
         except AskUnavailable:
             return None
+
+    @staticmethod
+    def _normalize_question_answer(question: AskQuestion, answer) -> str | list[str]:
+        if isinstance(answer, list):
+            if not question.multi_select:
+                raise ValueError("该问题不支持多选")
+            values = answer
+            if len(set(values)) != len(values):
+                raise ValueError("多选答案不能包含重复选项")
+        else:
+            values = [answer]
+        if not values or any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError("回答不能为空")
+        labels = {option["label"] for option in question.options}
+        if not question.allow_text and any(value not in labels for value in values):
+            raise ValueError("回答不属于该问题的可选项")
+        return values if question.multi_select else values[0]
 
     async def _on_codex_approval(self, ctx: SessionContext, method: str,
                                  params: dict) -> str:
@@ -25768,21 +25853,13 @@ class WrapperMachine:
             return PermissionResultDeny(
                 message="Claude 的确认问题格式无效，已安全取消")
 
-        answers: dict[str, str | list[str]] = {}
         try:
-            # Hold the session-wide slot for the whole batch so a concurrent
-            # approval/subagent question cannot interleave between its pages.
-            async with ctx.ask_lock:
-                for question in questions:
-                    answer = await self._on_ask_locked(
-                        ctx,
-                        question.question,
-                        list(question.options),
-                        header=question.header,
-                        allow_text=True,
-                        multi_select=question.multi_select,
-                    )
-                    answers[question.question] = answer
+            # One native callback, one pending identity, one atomic submission.
+            values = await self._on_ask_batch(ctx, [AskQuestion(
+                question=q.question, options=list(q.options), header=q.header,
+                allow_text=True, multi_select=q.multi_select,
+            ) for q in questions])
+            answers = {q.question: value for q, value in zip(questions, values, strict=True)}
         except AskUnavailable:
             return PermissionResultDeny(
                 message="用户未完成 Claude 的确认问题")
@@ -25872,27 +25949,21 @@ class WrapperMachine:
                 return await reject_locked(
                     ERR_NOT_RUNNING, "该交互问题已经超时")
 
-            answer = cmd.answer
-            if isinstance(answer, list):
-                if not state.multi_select:
-                    return await reject_locked(
-                        ERR_BAD_PROMPT, "该问题不支持多选")
-                if len(set(answer)) != len(answer):
-                    return await reject_locked(
-                        ERR_BAD_PROMPT, "多选答案不能包含重复选项")
-                normalized: str | list[str] = answer
-                values = answer
-            else:
-                if not answer.strip():
-                    return await reject_locked(
-                        ERR_BAD_PROMPT, "回答不能为空")
-                normalized = [answer] if state.multi_select else answer
-                values = [answer]
-            if not state.allow_text and any(
-                value not in state.labels for value in values
-            ):
-                return await reject_locked(
-                    ERR_BAD_PROMPT, "回答不属于该问题的可选项")
+            try:
+                batch = state.event.questions
+                submitted = getattr(cmd, "answers", None)
+                if batch is not None:
+                    if (not isinstance(submitted, list) or len(submitted) != len(batch)
+                            or getattr(cmd, "answer", None) is not None):
+                        raise ValueError("请完整提交这一组问题的回答")
+                    normalized = [self._normalize_question_answer(question, answer)
+                                  for question, answer in zip(batch, submitted, strict=True)]
+                else:
+                    if submitted is not None:
+                        raise ValueError("该问题需要单题回答")
+                    normalized = self._normalize_question_answer(state.event, cmd.answer)
+            except ValueError as exc:
+                return await reject_locked(ERR_BAD_PROMPT, str(exc))
 
             service_client = getattr(ctx.sdk, "client", None)
             if hasattr(service_client, "description"):
@@ -39128,6 +39199,8 @@ class WrapperMachine:
                             images=img_paths,
                             client_user_message_id=ctx.active_msg_id,
                         )
+                        if self._session_messages is not None:
+                            self._session_messages.accepted(ctx.active_msg_id)
                         # Publish only after the native acceptance boundary. A
                         # Claude autonomous guard (and every earlier preflight)
                         # must not turn an unsent queued prompt into conversation
@@ -39195,6 +39268,8 @@ class WrapperMachine:
                         ctx.claude_write_active = True
                         await ctx.sdk.query(prompt)
                     if not is_codex:
+                        if self._session_messages is not None:
+                            self._session_messages.accepted(ctx.active_msg_id)
                         await self._emit(ctx, UserMsg(
                             msg_id=ctx.active_msg_id or uuid4().hex,
                             prompt=display_prompt,

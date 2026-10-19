@@ -198,7 +198,7 @@ def test_mcp_ask_accepts_custom_text_without_relaxing_other_asks():
         result = await machine._handle_answer_question(AnswerQuestion(
             sid=ctx.key,
             ask_id=ask.ask_id,
-            answer="Custom direction",
+            answers=["Custom direction"],
         ))
         assert result is None
         assert await task == "Custom direction"

@@ -51,7 +51,9 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // markup adds <1 KiB JS / 0.3 KiB gzip; retain entry and initial request caps.
 // Global harness navigation and scoped modal/side-chat restoration add <1 KiB.
 // Question draft UI remains lazy; gzip, entry and request caps stay unchanged.
-const MAX_INITIAL_BYTES = 951 * 1024;
+// Cross-engine message references and on-demand catalog routing add <1 KiB.
+// Receipt parsing and link UI stay lazy; gzip/request limits are unchanged.
+const MAX_INITIAL_BYTES = 952 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
 const MAX_INITIAL_GZIP_BYTES = 286 * 1024;
