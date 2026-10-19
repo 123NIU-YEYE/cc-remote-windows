@@ -2,6 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.26
+
+Customize colors and fonts independently for each engine and appearance mode, with clearer preset content colors. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.26.md).
+
+- Add an Appearance panel with live accent, background, text and font editing; preserve legacy themes and sync edits across browser tabs.
+- Save light/dark styles separately for each engine, follow the system mode, and reset only the visible style.
+- Use themed palette/font menus with aligned samples and a touch/keyboard color picker with HEX input; derive custom status from actual color edits.
+- Coordinate the Codex light default with its purple identity, and distinguish bold text, links, inline code and selections across all six presets.
+- Keep settings controls readable for low-contrast custom colors and retain code's monospace font.
+- Include unchanged signed Android preview.2 and unsigned HarmonyOS preview.5 shells; existing mobile users need no native reinstall.
+
 ## v4.0.25
 
 Render Graphviz SVG exports correctly and open HarmonyOS external links in the system browser. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.25.md).
