@@ -11,7 +11,7 @@
 // session_focus, wrapper_reconnected, diff_report, ...) are global.
 import type { ConnState, EventOwnership } from "./ws";
 import type {
-  ServerEvent, SessionInfo, State, ContextReport, StatusReport,
+  ServerEvent, SessionInfo, State, ContextReport, StatusReport, AskQuestion,
   RateLimitResetResult, ThreadGoal,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
@@ -340,7 +340,7 @@ export interface SessionRuntime {
   takeoverPending: boolean;
   takeoverMessage: string | null;
   ccSessionId?: string;
-  pendingQuestion: { ask_id: string; header?: string | null; question: string; options: { label: string; ds?: string }[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean } | null;
+  pendingQuestion: (AskQuestion & { ask_id: string; questions?: AskQuestion[] | null }) | null;
   contextReport: ContextReport | null;
   // Last usable native reading, or the latest billing reading until native
   // context has arrived. Transient refresh failures must not clear the ring.
@@ -5658,7 +5658,7 @@ function reduceEvent(
     case "ask_user_sync":
       return patch(state, e.sid, (rt) => { rt.pendingQuestion = null; });
     case "ask_user":
-      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select }; });
+      return patch(state, e.sid, (rt) => { rt.pendingQuestion = { ask_id: e.ask_id, header: e.header, question: e.question, options: e.options, allow_text: e.allow_text, secret: e.secret, multi_select: e.multi_select, questions: e.questions }; });
     case "ask_user_closed":
       return patch(state, e.sid, (rt) => {
         if (rt.pendingQuestion?.ask_id === e.ask_id) {

@@ -3074,6 +3074,8 @@ def translate_history(
 
     def _um(uid, prompt):
         nonlocal pending_interrupted_alias
+        from cc_remote.session_messages import parse_message
+        source = parse_message(prompt)
         client_msg_id = client_message_ids.get(uid)
         if (
             client_msg_id is None
@@ -3085,7 +3087,8 @@ def translate_history(
         um = UserMsg(
             msg_id=uid,
             client_msg_id=client_msg_id,
-            prompt=prompt,
+            prompt=source.prompt if source else prompt,
+            source_thread_id=source.source_thread_id if source else None,
         )
         t = _ts(uid)
         if t is not None:

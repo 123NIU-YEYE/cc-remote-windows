@@ -1,14 +1,23 @@
-import type { SessionInfo, SessionMessageReceipt } from "./protocol";
-import type { Turn } from "./domain/conversation";
+import type { SessionInfo } from "./protocol";
 
 const NATIVE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const LOCAL_REF = /^ccr:(claude|codex):([A-Za-z0-9][A-Za-z0-9._@-]{0,110})$/;
 
-/** An envelope cannot nominate another machine/account. Resolve only against
- * the current device catalog in the current routing namespace. */
+export function localSessionReference(value: string): { engine: string; sid: string } | null {
+  const match = LOCAL_REF.exec(value);
+  return match && value.length <= 128 ? { engine: match[1], sid: match[2] } : null;
+}
+
+/** Native IDs stay within their account; explicit unified refs can identify
+ * another engine/account in this device's catalog. Never a different device. */
 export function resolveRelatedSession(
   nativeId: string, currentSid: string | null, sessions: readonly SessionInfo[],
 ): SessionInfo | undefined {
-  if (!currentSid || !NATIVE_ID.test(nativeId)) return undefined;
+  if (!currentSid) return undefined;
+  const local = localSessionReference(nativeId);
+  if (local) return sessions.find((session) => session.session_id === local.sid
+    && session.engine === local.engine && session.space !== "work" && session.session_id !== currentSid);
+  if (!NATIVE_ID.test(nativeId)) return undefined;
   const separator = currentSid.indexOf("@");
   const target = separator < 0 ? nativeId : `${currentSid.slice(0, separator)}@${nativeId}`;
   if (target === currentSid) return undefined;
@@ -17,27 +26,7 @@ export function resolveRelatedSession(
 }
 
 export function relatedSessionTitle(session: SessionInfo | undefined, nativeId: string): string {
-  return session?.summary || session?.first_prompt || nativeId.slice(0, 8);
-}
-
-/** Only the native send tool carries an outgoing link, never arbitrary prose. */
-export function outgoingSessionMessages(turn: Turn): SessionMessageReceipt[] {
-  const receipts = new Map((turn.sessionMessages ?? []).map((r) => [r.itemId, r]));
-  for (const block of turn.blocks) {
-    if (block.kind !== "tool") continue;
-    const native = (block.tool === "send_message_to_thread"
-        || block.tool === "codex_app.send_message_to_thread")
-      && (block.server === "codex_app" || block.input.namespace === "codex_app");
-    if (!native && block.tool !== "mcp__codex_app__send_message_to_thread") continue;
-    const target = block.input.threadId;
-    if (typeof target !== "string" || !NATIVE_ID.test(target)) continue;
-    const result = block.result;
-    receipts.set(block.tool_use_id, {
-      itemId: block.tool_use_id, threadId: target,
-      status: !result ? receipts.get(block.tool_use_id)?.status ?? "sending"
-        : result.is_error || ["failed", "cancelled", "declined", "interrupted"].includes(result.status ?? "")
-          ? "failed" : "sent",
-    });
-  }
-  return [...receipts.values()].slice(0, 16);
+  const local = localSessionReference(nativeId);
+  return session?.summary || session?.first_prompt
+    || (local ? `${local.engine === "claude" ? "Claude" : "Codex"} · ${local.sid.split("@").at(-1)!.slice(0, 8)}` : nativeId.slice(0, 8));
 }

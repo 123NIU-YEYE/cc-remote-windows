@@ -544,7 +544,9 @@ export class RelayWs {
       space,
       claudeProfileId: engine === "claude" ? (claudeProfileId ?? null) : null,
       codexProfileId: engine === "codex" ? (codexProfileId ?? null) : null,
-      surfaceEpoch: this.surfaceEpochByScope[scopeKey] ?? 0,
+      // Background catalog reads may target an engine not yet visited. Record
+      // its initial epoch so its correlated response passes the same guard.
+      surfaceEpoch: this.surfaceEpochByScope[scopeKey] ??= 0,
       connectionGeneration: this.connectionGeneration,
     };
   }
@@ -1187,11 +1189,12 @@ export class RelayWs {
   }
 
   sendAnswerQuestion(
-    sid: string, askId: string, answer: string | string[],
+    sid: string, askId: string, answer: string | string[] | undefined,
+    answers?: (string | string[])[],
   ): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "answer_question",
-      ask_id: askId, answer, sid, ts: nowTs(),
+      ask_id: askId, answer, answers, sid, ts: nowTs(),
     });
   }
 

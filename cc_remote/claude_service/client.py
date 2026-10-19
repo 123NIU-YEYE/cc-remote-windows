@@ -335,6 +335,11 @@ class RemoteClient:
     async def _send_control_request(self, request, timeout=60):
         return await self.call("control", {"request": request, "timeout": timeout}, timeout=timeout + 10)
 
+    async def mark_message_tools_refresh(self, name):
+        # Uses the original service's metadata operation; no owner restart or
+        # new service protocol is required to recover a lost toggle callback.
+        await self.call("metadata", {"value": {"message_tools_refresh": name}}, timeout=10)
+
     async def interrupt(self):
         return await self.call("interrupt")
 

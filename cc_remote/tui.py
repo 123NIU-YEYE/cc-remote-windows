@@ -747,12 +747,15 @@ class Tui:
             return
         if isinstance(picks, int):
             picks = [picks]
-        opts = ask.get("options") or []
+        questions = ask.get("questions")
+        collected = ask.get("_answers", [])
+        question = questions[len(collected)] if questions else ask
+        opts = question.get("options") or []
         if (not picks or any(not 1 <= pick <= len(opts) for pick in picks)
                 or len(set(picks)) != len(picks)):
             self._line(YELLOW(f"[pick 1..{len(opts)}]"))
             return
-        multi_select = bool(ask.get("multi_select"))
+        multi_select = bool(question.get("multi_select"))
         if not multi_select and len(picks) != 1:
             self._line(YELLOW("[this question accepts one choice]"))
             return
@@ -761,8 +764,16 @@ class Tui:
             for pick in picks
         ]
         answer = labels if multi_select else labels[0]
+        payload = {"answer": answer}
+        if questions:
+            answers = [*collected, answer]
+            if len(answers) < len(questions):
+                ask["_answers"] = answers
+                self._render_ask(ask)
+                return
+            payload = {"answers": answers}
         if await self._send(AnswerQuestion(
-                ask_id=ask["ask_id"], answer=answer, sid=ask["sid"])):
+                ask_id=ask["ask_id"], sid=ask["sid"], **payload)):
             display = ", ".join(labels)
             self._line(CYAN(f"[answered: {_safe_remote_text(display)}]"))
             self.pending_asks.pop(ask["sid"], None)
@@ -1015,8 +1026,11 @@ class Tui:
                     "question": d.get("question", ""),
                     "options": d.get("options") or [],
                     "multi_select": bool(d.get("multi_select")),
+                    "questions": d.get("questions"),
                 }
                 previous = self.pending_asks.get(sid)
+                if previous and previous.get("ask_id") == ask["ask_id"] and previous.get("_answers"):
+                    ask["_answers"] = previous["_answers"]
                 self.pending_asks[sid] = ask
                 if self._for_me(d) and previous != ask:
                     self._render_ask(ask)
@@ -1100,6 +1114,10 @@ class Tui:
             self._render_ask(ask)
 
     def _render_ask(self, ask: dict) -> None:
+        if ask.get("questions"):
+            index = len(ask.get("_answers", []))
+            self._line(DIM(f"[question {index + 1}/{len(ask['questions'])} · submit together]"))
+            ask = ask["questions"][index]
         self._line(YELLOW("? ") + BOLD(
             _safe_remote_text(ask.get("question", ""))))
         for i, o in enumerate(ask.get("options") or [], 1):

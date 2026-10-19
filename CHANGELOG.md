@@ -2,6 +2,15 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Add an opt-in, device-local messaging MCP for Claude and Codex, with account-scoped caller identity, delivery receipts and retry deduplication.
+- Open the exact source or destination conversation from message links, including across engines and accounts, while preserving session drafts.
+- Present Claude native `AskUserQuestion` and cc-remote MCP `ask_user` batches in the same centered, paginated form, preserving edits between pages and submitting all answers together.
+- Indicate selected options with themed card colors and use rounded Previous/Next controls without selection icons.
+- Refresh old persistent Claude workers' message tools at an idle boundary without restarting the native process; retain messages for busy targets in a durable, deduplicated inbox.
+- Wire protocol v78 requires Web, Relay and Wrapper to upgrade together; see [interactive questions](docs/user-questions.md) and [session messaging](docs/session-messages.md).
+
 ## v4.0.22
 
 Preserve shared Codex daemons across Linux Wrapper restarts and preview raster

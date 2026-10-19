@@ -1,14 +1,18 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import type { AskOption, Engine } from "../protocol";
+import type { AskOption, AskQuestion, Engine } from "../protocol";
 import { EngineIcon } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
+import { QuestionBatchSheet } from "./QuestionBatchSheet";
 import "./QuestionSheet.css";
 
 export interface QuestionDraft {
   text: string;
   selected: string[];
   scrollTop: number;
+  page?: number;
+  pages?: { text: string; selected: string[]; scrollTop: number }[];
+  signature?: string;
 }
 
 interface Props {
@@ -19,11 +23,19 @@ interface Props {
   allowText?: boolean;
   secret?: boolean;
   multiSelect?: boolean;
+  questions?: AskQuestion[] | null;
   draft?: { key: string; store: Map<string, QuestionDraft> };
   onAnswer: (answer: string | string[]) => boolean | void;
+  onAnswers?: (answers: (string | string[])[]) => boolean | void;
 }
 
-export function QuestionSheet({
+export function QuestionSheet(props: Props) {
+  return props.questions?.length ? <QuestionBatchSheet key={JSON.stringify(props.questions)}
+    engine={props.engine} questions={props.questions} draft={props.draft}
+    onSubmit={props.onAnswers ?? (() => false)} /> : <SingleQuestionSheet {...props} />;
+}
+
+function SingleQuestionSheet({
   engine, question, header, options, allowText, secret, multiSelect, onAnswer, draft,
 }: Props) {
   const dialogRef = useRef<HTMLDialogElement>(null);
