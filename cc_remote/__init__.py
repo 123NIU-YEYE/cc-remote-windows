@@ -5,4 +5,4 @@ Two independent links:
   - control link: client <-> relay(WS) <-> wrapper <-> ClaudeSDKClient <-> cc
 """
 
-__version__ = "4.0.21"
+__version__ = "4.0.22"

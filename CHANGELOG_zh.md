@@ -2,6 +2,17 @@
 
 [English](CHANGELOG.md)
 
+## v4.0.22
+
+修复 Linux Wrapper 重启影响共享 Codex daemon 的问题，并支持预览扩展名与实际内容不一致的图片。
+通信协议保持 v76。详见[双语发布说明](docs/releases/v4.0.22.md)。
+
+- 通过隔离的 systemd 用户服务执行 Codex 原生命令，保留独立账号环境和资源限制。
+- 升级检查至停止期间阻止新的 Codex 生命周期命令；遇到忙碌、进程变化或无法核实的状态时安全拒绝升级。
+- 旧 Linux systemd Wrapper 首次升级需在任务结束后安排维护停机；不支持新检查协议的运行实例不会被强行停止。
+- 文件预览、Artifacts 和 Markdown 图片按实际文件内容识别受支持的位图格式，保留访问与大小限制。
+- 附带已签名 Android preview.2 和未签名鸿蒙 preview.4 安装包；原生外壳代码未变化。
+
 ## v4.0.21
 
 新增会话专属 Artifacts，并在 Claude/Codex 切换时保留未完成的聊天状态。

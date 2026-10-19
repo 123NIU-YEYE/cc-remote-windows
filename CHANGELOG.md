@@ -2,6 +2,18 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.22
+
+Preserve shared Codex daemons across Linux Wrapper restarts and preview raster
+images whose file extension does not match their content. Wire protocol v76 is
+unchanged. See the bilingual [release notes](docs/releases/v4.0.22.md).
+
+- Launch native Codex lifecycle commands through an isolated systemd user service, preserving account environment and resource limits.
+- Hold a process-bound launch barrier across upgrade inspection and stop, rejecting busy, changed or unverifiable service state without forcing a stop.
+- Require a one-time maintenance stop before upgrading a running legacy Linux systemd Wrapper that cannot acknowledge the barrier.
+- Detect supported raster formats from file contents in previews, Artifacts and Markdown images while retaining file-access and size boundaries.
+- Include signed Android preview.2 and unsigned HarmonyOS preview.4 packages; native shell code is unchanged.
+
 ## v4.0.21
 
 Add per-session Artifacts and preserve unfinished chat state across Claude/Codex
