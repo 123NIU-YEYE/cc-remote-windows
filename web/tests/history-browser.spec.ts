@@ -5300,8 +5300,45 @@ for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
     expect(sanitized.text).not.toMatch(
       /<script|foreignObject|example\.com|<image/i,
     );
+    const parsed = await page.evaluate((svg) => {
+      const document = new DOMParser().parseFromString(svg, "image/svg+xml");
+      return {
+        error: !!document.querySelector("parsererror"),
+        text: document.querySelector("text")?.textContent,
+      };
+    }, sanitized.text);
+    expect(parsed).toEqual({ error: false, text: "A\u00a0B & <C>" });
     await applyProductionCsp(page);
     await expect(image).toBeVisible();
+    await expect.poll(() => image.evaluate((node) =>
+      (node as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  });
+
+  test(`${fixture} renders an optional operator SVG without external requests`, async ({
+    page,
+  }, testInfo) => {
+    const path = process.env.CC_REMOTE_SVG_TEST_FILE;
+    test.skip(!path, "No operator SVG sample selected");
+    const bytes = readFileSync(path!);
+    const externalRequests: string[] = [];
+    await page.route(/^https?:\/\/(?!127\.0\.0\.1(?::|\/))/, (route) => {
+      externalRequests.push(route.request().url());
+      return route.abort();
+    });
+    await page.addInitScript((data) => {
+      (window as unknown as { svgFixture: string }).svgFixture = data;
+    }, bytes.toString("base64"));
+    await gotoWithProductionCsp(page, `/tests/history-browser.html?${fixture}=1`);
+    const image = page.getByRole("img", { name: fixture === "artifact-svg"
+      ? "diagram.svg" : "diagram" });
+    await expect(image).toBeVisible();
+    await expect.poll(() => image.evaluate((node) => {
+      const img = node as HTMLImageElement;
+      return img.complete && img.naturalWidth > 0 && img.naturalHeight > 0;
+    })).toBe(true);
+    await expect(page.locator(".preview-error")).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath("operator-svg-preview.png") });
+    expect(externalRequests).toEqual([]);
   });
 }
 
