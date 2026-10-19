@@ -47,6 +47,7 @@ export function sanitizeSvgMarkup(
     throw new Error("SVG 超过 4 MiB 安全限制");
   }
   const clean = DOMPurify.sanitize(svg, {
+    RETURN_DOM_FRAGMENT: true,
     USE_PROFILES: { svg: true, svgFilters: true },
     FORBID_TAGS: [
       "script",
@@ -58,7 +59,10 @@ export function sanitizeSvgMarkup(
     ],
     FORBID_ATTR: ["src", "target"],
   });
-  const sanitized = String(clean);
+  // DOMPurify's HTML string serialization can turn a numeric SVG entity into
+  // &nbsp;, which is undefined in XML. Serialize the sanitized DOM as XML so
+  // text and namespaces survive without allowing DTD/entity resolution.
+  const sanitized = new XMLSerializer().serializeToString(clean);
   const namespaced = sanitized.includes("xlink:")
     && !/\sxmlns:xlink=/.test(sanitized)
     ? sanitized.replace(

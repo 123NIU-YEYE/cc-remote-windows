@@ -3,8 +3,9 @@ import { preferences } from '@kit.ArkData';
 import { webview } from '@kit.ArkWeb';
 import { util } from '@kit.ArkTS';
 import { PushBridge } from '../model/PushBridge';
+import { ExternalBrowser } from '../model/ExternalBrowser';
 import { PushTarget } from '../model/PushRoute';
-import { httpsOrigin, navigationAction, sameOrigin, serverOrigin } from '../model/UrlPolicy';
+import { httpsOrigin, navigationAction, newWindowAction, sameOrigin, serverOrigin } from '../model/UrlPolicy';
 
 @Entry
 @Component
@@ -25,6 +26,8 @@ struct Index {
   private browserInitialUrl: string = '';
   private popupHandler: ControllerHandler | undefined = undefined;
   private popupTimeout: number = 0;
+  private popupNavigationPending: boolean = false;
+  private externalBrowser: ExternalBrowser = new ExternalBrowser();
   private store: preferences.Preferences | undefined = undefined;
   private shellScript: string = '';
   private settingsOpen: boolean = false;
@@ -134,7 +137,7 @@ struct Index {
       }
       if (result.index === 2) this.getUIContext().getPromptAction().showDialog({
         title: 'cc-remote · 鸿蒙版',
-        message: '0.1.0-preview.2\n直接使用鸿蒙 ArkWeb。聊天与任务仍在你的设备上运行。',
+        message: '0.1.0-preview.5\n直接使用鸿蒙 ArkWeb。聊天与任务仍在你的设备上运行。',
         buttons: [{ text: '知道了', color: '#2962E8' }]
       });
     }).catch(() => {}).finally(() => { this.settingsOpen = false; });
@@ -144,34 +147,41 @@ struct Index {
     const value = request.getRequestUrl();
     const current = isChat ? this.chat.getUrl() : this.browser.getUrl();
     const action = navigationAction(value, this.server, current, isChat,
-      request.isMainFrame(), request.isRequestGesture());
+      request.isMainFrame(), request.isRequestGesture(), this.popupNavigationPending);
     if (action === 'settings') this.clientSettings();
-    if (action === 'browser') this.openBrowser(value);
+    if (action === 'external') {
+      if (!isChat) this.closeBrowser();
+      this.openExternal(value);
+    }
     if (action === 'block' && request.isMainFrame() && request.isRequestGesture()) {
-      this.getUIContext().getPromptAction().showToast({ message: '此预览版仅支持在应用内打开 HTTPS 网页。' });
+      this.getUIContext().getPromptAction().showToast({ message: '此链接无法打开，仅支持 HTTPS 网页。' });
     }
     return action !== 'allow';
   }
 
-  private openBrowser(value: string): void {
-    if (httpsOrigin(value) === '') return;
-    if (this.browserOpen) {
-      this.browser.loadUrl(value);
-      return;
+  private async openExternal(value: string): Promise<void> {
+    try {
+      const context = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+      if (!context) throw new Error('Ability context unavailable');
+      await this.externalBrowser.open(value, context);
+    } catch (_) {
+      this.getUIContext().getPromptAction().showToast({
+        message: '未能打开系统浏览器，请检查默认浏览器设置后再次点击链接。'
+      });
     }
-    this.browser = new webview.WebviewController();
-    this.browserInitialUrl = value;
-    this.browserAddress = httpsOrigin(value);
-    this.browserError = false;
-    this.browserOpen = true;
   }
 
   private newWindow(event: OnWindowNewEvent): void {
-    if (!event.isUserTrigger || this.browserOpen
-      || (event.targetUrl !== '' && event.targetUrl !== 'about:blank' && httpsOrigin(event.targetUrl) === '')) {
+    const action = newWindowAction(event.targetUrl, this.server, event.isUserTrigger);
+    if (action === 'external') {
+      event.handler.setWebController(null);
+      this.openExternal(event.targetUrl);
+      return;
+    }
+    if (action === 'block' || this.browserOpen) {
       // Every path must settle the handler, otherwise ArkWeb blocks its renderer.
       event.handler.setWebController(null);
-      if (event.isUserTrigger && this.browserOpen && httpsOrigin(event.targetUrl) !== '') {
+      if (action === 'browser' && this.browserOpen && sameOrigin(this.server, event.targetUrl)) {
         this.browser.loadUrl(event.targetUrl);
       }
       return;
@@ -181,6 +191,7 @@ struct Index {
     this.browserAddress = httpsOrigin(event.targetUrl);
     this.browserError = false;
     this.popupHandler = event.handler;
+    this.popupNavigationPending = true;
     this.browserOpen = true;
     this.popupTimeout = setTimeout(() => {
       if (this.popupHandler) this.closeBrowser();
@@ -197,6 +208,7 @@ struct Index {
 
   private closeBrowser(): void {
     this.cancelPendingPopup();
+    this.popupNavigationPending = false;
     this.browserOpen = false;
     this.browserError = false;
     this.browserProgress = 0;
@@ -272,6 +284,7 @@ struct Index {
           this.pushAttached = false;
           this.push?.detach();
         } else {
+          if (event && sameOrigin(this.server, event.url)) this.popupNavigationPending = false;
           this.browserError = false;
           this.browserAddress = event ? httpsOrigin(event.url) : '';
         }
