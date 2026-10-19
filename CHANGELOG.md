@@ -2,7 +2,9 @@
 
 [中文](CHANGELOG_zh.md)
 
-## Unreleased
+## v4.0.23
+
+Add account-scoped Claude/Codex session messaging, durable delivery to busy recipients, and paginated user questions. Wire protocol advances to v78. See the bilingual [release notes](docs/releases/v4.0.23.md).
 
 - Add an opt-in, device-local messaging MCP for Claude and Codex, with account-scoped caller identity, delivery receipts and retry deduplication.
 - Open the exact source or destination conversation from message links, including across engines and accounts, while preserving session drafts.
