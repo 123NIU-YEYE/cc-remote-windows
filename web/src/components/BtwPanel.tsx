@@ -580,6 +580,31 @@ export function BtwPanel(p: Props) {
                 ambiguousActiveTurnIds={activeTurnCandidates.length > 1
                   ? activeTurnCandidates : []} />}
       </div>
+      {!inputLocked && p.rt?.pendingQuestion && (
+        <QuestionSheet
+          key={JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id])}
+          draft={p.questionDrafts && p.sid ? {
+            key: JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id]),
+            store: p.questionDrafts,
+          } : undefined}
+          engine={p.engine}
+          header={p.rt.pendingQuestion.header}
+          question={p.rt.pendingQuestion.question}
+          options={p.rt.pendingQuestion.options}
+          allowText={p.rt.pendingQuestion.allow_text}
+          secret={p.rt.pendingQuestion.secret}
+          multiSelect={p.rt.pendingQuestion.multi_select}
+          questions={p.rt.pendingQuestion.questions}
+          onAnswers={(answers) => {
+            const question = p.rt?.pendingQuestion;
+            return question ? p.onAnswerQuestion(question.ask_id, undefined, answers) : false;
+          }}
+          onAnswer={(answer) => {
+            const question = p.rt?.pendingQuestion;
+            return question ? p.onAnswerQuestion(question.ask_id, answer) : false;
+          }}
+        />
+      )}
       <div className="btw-composer">
         {lockReason && <div className="btw-readonly-notice" role="status">{lockReason}</div>}
         {notice && <div className="btw-composer-notice">{notice}</div>}
@@ -746,31 +771,6 @@ export function BtwPanel(p: Props) {
           </div>
         </div>
       </>}
-      {!inputLocked && p.rt?.pendingQuestion && (
-        <QuestionSheet
-          key={JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id])}
-          draft={p.questionDrafts && p.sid ? {
-            key: JSON.stringify([p.draftKey, p.rt.pendingQuestion.ask_id]),
-            store: p.questionDrafts,
-          } : undefined}
-          engine={p.engine}
-          header={p.rt.pendingQuestion.header}
-          question={p.rt.pendingQuestion.question}
-          options={p.rt.pendingQuestion.options}
-          allowText={p.rt.pendingQuestion.allow_text}
-          secret={p.rt.pendingQuestion.secret}
-          multiSelect={p.rt.pendingQuestion.multi_select}
-          questions={p.rt.pendingQuestion.questions}
-          onAnswers={(answers) => {
-            const question = p.rt?.pendingQuestion;
-            return question ? p.onAnswerQuestion(question.ask_id, undefined, answers) : false;
-          }}
-          onAnswer={(answer) => {
-            const question = p.rt?.pendingQuestion;
-            return question ? p.onAnswerQuestion(question.ask_id, answer) : false;
-          }}
-        />
-      )}
     </PanelFrame>
   );
 }
