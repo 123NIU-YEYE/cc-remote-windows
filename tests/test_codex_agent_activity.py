@@ -265,3 +265,51 @@ async def test_bad_mcp_snapshot_does_not_block_native_agent_refresh(tmp_path, mo
     await machine._refresh_codex_background_processes()
     assert ctx.codex_background_processes == {} and ctx.state == "idle"
     assert len(transport.sent) == 1 and transport.sent[0].items == []
+
+
+@pytest.mark.asyncio
+async def test_partial_refresh_retains_other_resident_agent_until_its_terminal(tmp_path, monkeypatch):
+    first, second = str(uuid4()), str(uuid4())
+    catalog(tmp_path, first)
+    catalog(tmp_path, second)
+    catalog(tmp_path, "first-child", first, rows=[boundary("first-child"), task("first-turn")])
+    child = catalog(tmp_path, "second-child", second, rows=[
+        boundary("second-child"), task("second-turn")])
+    machine, transport = _mk_machine()
+    contexts = [_mk_ctx(sid, sid) for sid in (first, second)]
+    for ctx in contexts:
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+    monkeypatch.setattr(machine, "_codex_profile_for_ctx", lambda _: SimpleNamespace(home=tmp_path))
+    await machine._refresh_codex_background_processes()
+    transport.sent.clear()
+
+    # Focus/BTW synchronization refreshes only the first context's public level.
+    await machine._refresh_codex_background_processes([contexts[0]])
+    assert transport.sent == []
+    with sqlite3.connect(tmp_path / "state_5.sqlite") as db:
+        db.execute("DELETE FROM threads WHERE id='second-child'")
+    await machine._refresh_codex_background_processes()
+    retained = contexts[1].codex_background_processes
+    assert set(retained) == {"codex-agent:second-child"}
+    assert retained["codex-agent:second-child"].status == "unknown"
+    assert len(transport.sent) == 1 and transport.sent[0].sid == second
+
+    # A partial refresh must not broadcast changes for the unfocused session.
+    catalog(tmp_path, "second-child", second, rows=[
+        boundary("second-child"), task("second-turn")])
+    append(child, terminal("second-turn"))
+    transport.sent.clear()
+    await machine._refresh_codex_background_processes([contexts[0]])
+    assert transport.sent == [] and contexts[1].codex_background_processes == retained
+    await machine._refresh_codex_background_processes()
+    assert contexts[1].codex_background_processes == {}
+    assert len(transport.sent) == 1 and transport.sent[0].items == []
+    assert all(ctx.state == "idle" for ctx in contexts)
+
+    # Removed residents must not accumulate indefinitely in the account cache.
+    del machine.sessions[second]
+    await machine._refresh_codex_background_processes([contexts[0]])
+    reader = machine._codex_agent_activity[tmp_path]
+    assert second not in reader._previous
+    assert "second-child" not in reader._cursors
