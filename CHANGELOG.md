@@ -2,6 +2,16 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.28
+
+Restore delivered files in Artifacts and show native Codex agents in background tasks. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.28.md).
+
+- Discover explicit local paths and directory-introduced filenames in assistant lists and tables, including Markdown tables with optional outer pipes.
+- Restrict table discovery to the filename/path column; preserve file access boundaries and avoid directory crawling.
+- Track native Codex child agents through their own turn boundaries, including legacy completion markers, and show their activity beside MCP background tasks.
+- Preserve known task state during partial refreshes or source failures, isolate inventory limits per parent, and retain reconnect synchronization.
+- Reuse the unchanged signed Android preview.2 and unsigned HarmonyOS preview.5 shells from v4.0.27 with their original build provenance; existing users need no native reinstall.
+
 ## v4.0.27
 
 Restore link previews for larger site images and keep monochrome site icons readable across themes. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.27.md).
