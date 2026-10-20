@@ -2353,6 +2353,7 @@ class WrapperMachine:
         self._codex_watch_lock = asyncio.Lock()
         self._codex_task_sync_lock = asyncio.Lock()
         self._codex_task_read_errors: set[Path] = set()
+        self._codex_agent_read_errors: set[Path] = set()
         self._codex_agent_activity: dict[Path, object] = {}
         self._codex_probe_warned = False
         self._codex_tui_log_trackers = {
@@ -6880,32 +6881,49 @@ class WrapperMachine:
                 profile = self._codex_profile_for_ctx(ctx)
                 accounts.setdefault(profile.home, []).append((ctx, ctx.session_id))
             for home, residents in accounts.items():
+                activity = agents = None
                 try:
                     activity = await asyncio.to_thread(read_task_activity, home)
-                    reader = self._codex_agent_activity.setdefault(home, CodexAgentActivity())
-                    agents = await asyncio.to_thread(
-                        reader.read, home, {sid for _, sid in residents})
                 except Exception as exc:
-                    # Failure is not an empty level; don't retire real tasks.
+                    # Each source owns only its own membership. A failed read
+                    # retains that source without blocking the other refresh.
                     if home not in self._codex_task_read_errors:
                         log.warning("Codex background task snapshot unavailable",
                                     error_type=type(exc).__name__)
                         self._codex_task_read_errors.add(home)
+                else:
+                    self._codex_task_read_errors.discard(home)
+                try:
+                    reader = self._codex_agent_activity.setdefault(home, CodexAgentActivity())
+                    agents = await asyncio.to_thread(
+                        reader.read, home, {sid for _, sid in residents})
+                except Exception as exc:
+                    if home not in self._codex_agent_read_errors:
+                        log.warning("Codex native agent snapshot unavailable",
+                                    error_type=type(exc).__name__)
+                        self._codex_agent_read_errors.add(home)
+                else:
+                    self._codex_agent_read_errors.discard(home)
+                if activity is None and agents is None:
                     continue
-                self._codex_task_read_errors.discard(home)
                 for ctx, native_sid in residents:
                     if (not self._is_resident_context(ctx) or ctx.session_id != native_sid
                             or self._codex_profile_for_ctx(ctx).home != home):
                         continue
-                    combined = activity.get(native_sid, []) + agents.get(native_sid, [])
+                    previous = ctx.codex_background_processes
+                    retained = (previous or {}).values()
+                    tasks = (activity.get(native_sid, []) if activity is not None else
+                             [item for item in retained if item.item_id.startswith("async-task:")])
+                    native_agents = (agents.get(native_sid, []) if agents is not None else
+                                     [item for item in retained if item.item_id.startswith("codex-agent:")])
+                    combined = tasks + native_agents
                     # Active native agents must not be hidden behind retained
                     # MCP delivery warnings when the public snapshot is full.
                     combined.sort(key=lambda item: item.status not in {"running", "pending"})
                     replacement = {item.item_id: item for item in
                                    combined[:MAX_BACKGROUND_PROCESS_ITEMS]}
-                    if replacement == ctx.codex_background_processes:
+                    if replacement == previous:
                         continue
-                    previous = ctx.codex_background_processes
                     ctx.codex_background_processes = replacement
                     # A first empty read has no live transition to broadcast.
                     # Hello/focus still seed it after their ordered envelope.

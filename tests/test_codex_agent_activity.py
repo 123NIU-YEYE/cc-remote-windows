@@ -182,3 +182,86 @@ async def test_wrapper_merges_native_and_mcp_and_reseeds_after_parent_completion
     store.update(key, state="completed", delivery="delivered")
     await machine._refresh_codex_background_processes()
     assert ctx.codex_background_processes == {} and ctx.state == "idle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warm", [False, True])
+async def test_bad_native_catalog_does_not_block_mcp_refresh(tmp_path, monkeypatch, warm):
+    parent = str(uuid4())
+    catalog(tmp_path, parent)
+    child = catalog(tmp_path, "child", parent, rows=[boundary("child"), task("own")])
+    machine, transport = _mk_machine()
+    ctx = _mk_ctx(parent, parent)
+    ctx.engine = "codex"
+    machine.sessions[ctx.key] = ctx
+    monkeypatch.setattr(machine, "_codex_profile_for_ctx", lambda _: SimpleNamespace(home=tmp_path))
+    if warm:
+        await machine._refresh_codex_background_processes()
+    retained = dict(ctx.codex_background_processes or {})
+    database = tmp_path / "state_5.sqlite"
+    original = database.read_bytes()
+    database.write_bytes(b"corrupt")
+    store, key = detached_task(tmp_path, parent)
+    transport.sent.clear()
+
+    await machine._refresh_codex_background_processes()
+    assert set(ctx.codex_background_processes) == set(retained) | {f"async-task:{key}"}
+    assert all(ctx.codex_background_processes[key] == item for key, item in retained.items())
+    assert len(transport.sent) == 1 and transport.sent[0].sid == parent
+    transport.sent.clear()
+    await machine._refresh_codex_background_processes()
+    assert transport.sent == [], "a persistent catalog error must not rebroadcast unchanged tasks"
+
+    store.update(key, state="completed", delivery="delivered")
+    await machine._refresh_codex_background_processes()
+    assert ctx.codex_background_processes == retained
+    assert len(transport.sent) == 1
+    assert {item.item_id for item in transport.sent[0].items} == set(retained)
+    transport.sent.clear()
+    database.write_bytes(original)
+    append(child, terminal("own"))
+    await machine._refresh_codex_background_processes()
+    assert ctx.codex_background_processes == {} and ctx.state == "idle"
+    assert len(transport.sent) == int(warm)
+
+
+@pytest.mark.asyncio
+async def test_bad_mcp_snapshot_does_not_block_native_agent_refresh(tmp_path, monkeypatch):
+    from cc_remote.wrapper import codex_tasks
+
+    parent = str(uuid4())
+    catalog(tmp_path, parent)
+    store, key = detached_task(tmp_path, parent)
+    machine, transport = _mk_machine()
+    ctx = _mk_ctx(parent, parent)
+    ctx.engine = "codex"
+    machine.sessions[ctx.key] = ctx
+    monkeypatch.setattr(machine, "_codex_profile_for_ctx", lambda _: SimpleNamespace(home=tmp_path))
+    await machine._refresh_codex_background_processes()
+    retained = dict(ctx.codex_background_processes)
+    original = codex_tasks.read_task_activity
+
+    def unavailable(_):
+        raise OSError("task state unavailable")
+
+    monkeypatch.setattr(codex_tasks, "read_task_activity", unavailable)
+    child = catalog(tmp_path, "child", parent, rows=[boundary("child"), task("own")])
+    transport.sent.clear()
+    await machine._refresh_codex_background_processes()
+    assert set(ctx.codex_background_processes) == set(retained) | {"codex-agent:child"}
+    assert ctx.codex_background_processes[f"async-task:{key}"] == retained[f"async-task:{key}"]
+    assert len(transport.sent) == 1 and transport.sent[0].sid == parent
+    transport.sent.clear()
+    await machine._refresh_codex_background_processes()
+    assert transport.sent == []
+
+    append(child, terminal("own"))
+    await machine._refresh_codex_background_processes()
+    assert ctx.codex_background_processes == retained
+    assert len(transport.sent) == 1
+    transport.sent.clear()
+    monkeypatch.setattr(codex_tasks, "read_task_activity", original)
+    store.update(key, state="completed", delivery="delivered")
+    await machine._refresh_codex_background_processes()
+    assert ctx.codex_background_processes == {} and ctx.state == "idle"
+    assert len(transport.sent) == 1 and transport.sent[0].items == []
