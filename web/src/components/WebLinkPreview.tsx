@@ -2,13 +2,18 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { Icon } from "../icons";
 import { getLinkMetadata, subscribeLinkIcon, type LinkMetadata } from "../link-preview";
+import { iconUsesThemeColor } from "../site-icon";
 import type { useLinkPopover } from "../use-link-popover";
 
 function SiteIcon({ src }: { src?: string }) {
-  const [failed, setFailed] = useState(false);
-  useEffect(() => setFailed(false), [src]);
-  return src && !failed ? <img src={src} alt="" width="16" height="16" onError={() => setFailed(true)} />
-    : <Icon name="globe" size={16} />;
+  const [failedSrc, setFailedSrc] = useState<string>();
+  const [monochromeSrc, setMonochromeSrc] = useState<string>();
+  if (!src || failedSrc === src) return <Icon name="globe" size={16} />;
+  if (monochromeSrc === src) return <span aria-hidden="true" className="message-site-icon is-monochrome"
+    style={{ maskImage: `url("${src}")`, WebkitMaskImage: `url("${src}")` }} />;
+  return <img className="message-site-icon" src={src} alt="" width="16" height="16"
+    onLoad={(event) => { if (iconUsesThemeColor(event.currentTarget)) setMonochromeSrc(src); }}
+    onError={() => setFailedSrc(src)} />;
 }
 
 export default function PreviewWebLink({ href, url, children, title, id, pop }: {

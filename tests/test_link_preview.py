@@ -1,6 +1,7 @@
 """Public link metadata never contacts private services or carries credentials."""
 import asyncio
 import io
+import random
 import socket
 import threading
 
@@ -163,6 +164,38 @@ async def test_metadata_inert_images_cache_and_origin_only_icons(monkeypatch):
     for index in range(preview.CACHE_LIMIT + 2):
         await service.get(f"https://example.org/{index}")
     assert len(service.cache) == preview.CACHE_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_source_download_budget_allows_large_icon_and_cover_thumbnails(monkeypatch):
+    icon_output, cover_output = io.BytesIO(), io.BytesIO()
+    with Image.new("RGB", (128, 128), "red") as image:
+        image.save(icon_output, format="ICO", bitmap_format="bmp")
+    with Image.frombytes("RGB", (600, 400), random.Random(1).randbytes(600 * 400 * 3)) as image:
+        image.save(cover_output, format="PNG")
+    icon, cover = icon_output.getvalue(), cover_output.getvalue()
+    assert len(icon) > 64 * 1024 and len(cover) > 256 * 1024
+
+    async def addresses(url):
+        return ["8.8.8.8"]
+
+    def handler(request):
+        if request.url.path == "/favicon.ico":
+            content, kind = icon, "image/x-icon"
+        elif request.url.path == "/cover.png":
+            content, kind = cover, "image/png"
+        else:
+            content, kind = b'<title>Model</title><meta property="og:image" content="/cover.png">', "text/html"
+        return httpx.Response(200, headers={"content-type": kind, "content-length": str(len(content))},
+                              stream=Body(content))
+
+    monkeypatch.setattr(preview, "_addresses", addresses)
+    install_transport(monkeypatch, handler)
+    service = preview.LinkPreviewService()
+    automatic = await service.get("https://example.org/model", icon_only=True)
+    result = await service.get("https://example.org/model")
+    assert automatic["icon"] and result["icon"] == automatic["icon"]
+    assert result["title"] == "Model" and result["image"]
 
 
 @pytest.mark.asyncio

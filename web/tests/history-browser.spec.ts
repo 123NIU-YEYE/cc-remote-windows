@@ -5900,6 +5900,56 @@ for (const top of [24, 200, 400]) {
   });
 }
 
+for (const artwork of ["dark", "white", "colored", "opaque", "details"] as const) {
+  test(`local Markdown file link icons adapt ${artwork} artwork without losing brand colors`, async ({ page }) => {
+    const icon = await page.evaluate(kind => {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 32;
+      const ctx = canvas.getContext("2d")!;
+      if (kind === "opaque") { ctx.fillStyle = "white"; ctx.fillRect(0, 0, 32, 32); }
+      ctx.fillStyle = kind === "white" ? "white" : kind === "colored" ? "#ffd21e" : "#24292f";
+      ctx.beginPath(); ctx.arc(16, 16, 12, 0, Math.PI * 2); ctx.fill();
+      if (kind === "details") { ctx.fillStyle = "white"; ctx.fillRect(12, 12, 8, 8); }
+      return canvas.toDataURL("image/png");
+    }, artwork);
+    await page.route("**/api/link-preview", route => route.fulfill({ json: { icon, title: "Documentation" } }));
+    await page.goto("/tests/history-browser.html?local-file-link=1");
+    const button = page.getByRole("button", { name: "预览 preview.example", exact: true });
+    const monochrome = artwork === "dark" || artwork === "white";
+    await expect(button.locator(monochrome ? ".is-monochrome" : "img")).toBeVisible();
+    await button.click();
+    const header = page.getByRole("dialog", { name: "网页预览 preview.example" }).locator(".message-web-preview-header");
+    await expect(header.locator(monochrome ? ".is-monochrome" : "img")).toBeVisible();
+    for (const [engine, theme, color] of [
+      ["codex", "dark", "rgb(236, 237, 243)"], ["codex", "light", "rgb(37, 35, 52)"],
+      ["claude", "dark", "rgb(236, 233, 223)"], ["claude", "light", "rgb(32, 30, 24)"],
+    ]) {
+      await page.evaluate(({ engine, theme }) => {
+        document.documentElement.dataset.engine = engine;
+        document.documentElement.dataset.theme = theme;
+      }, { engine, theme });
+      for (const parent of [button, header]) {
+        const image = parent.locator(".message-site-icon");
+        await expect(image).toHaveCSS("width", "16px");
+        await expect(image).toHaveCSS("height", "16px");
+        if (monochrome) {
+          await expect(image).toHaveCSS("background-color", color);
+          expect(await image.evaluate(node => getComputedStyle(node).maskImage)).toContain(icon);
+        } else {
+          await expect(image).toHaveAttribute("src", icon);
+          await expect(image).toHaveCSS("filter", "none");
+          await expect(parent.locator(".is-monochrome")).toHaveCount(0);
+        }
+      }
+    }
+    if (monochrome) {
+      await page.evaluate(() => document.documentElement.style.setProperty("--text", "#c2dfd3"));
+      await expect(button.locator(".message-site-icon")).toHaveCSS("background-color", "rgb(194, 223, 211)");
+      await expect(header.locator(".message-site-icon")).toHaveCSS("background-color", "rgb(194, 223, 211)");
+    }
+  });
+}
+
 for (const previewFirst of [false, true]) {
   test(`local Markdown file links share website icons ${previewFirst ? "after preview despite a late automatic miss" : "automatically without opening a preview"}`, async ({ page }) => {
     const icon = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6SAAAAABJRU5ErkJggg==";

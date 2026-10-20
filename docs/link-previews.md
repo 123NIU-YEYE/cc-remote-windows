@@ -22,13 +22,16 @@ and its local static-file publications.
   TLS hostname and Host header. Environment proxies and connection reuse across
   redirects are disabled. HTTPS redirects may not downgrade to HTTP.
 - At most four hops are followed. HTML reads stop after the head or 256 KiB;
-  images are limited to 256 KiB and icons to 64 KiB. Recognized raster images
+  source images are limited to 1 MiB and source icons to 256 KiB. These download
+  budgets allow multi-size ICO files and social covers to be resized instead of
+  rejecting them at the final thumbnail's byte cap. Recognized raster images
   are decoded only within a 4-million-pixel budget (1 million for icons) and a
   4096-pixel edge limit, including embedded ICO images and WebP canvases before
   eager decoder allocation. Only the first frame is decoded and re-encoded as a
   metadata-free static PNG, at most 1024 × 768 (128 × 128 for icons), still within
-  the same byte cap. Decoding uses at most two worker threads, keeping the
-  control-link event loop responsive. Invalid or oversized images are omitted while page text
+  256 KiB (64 KiB for icons). At most four bounded PNG encodes reduce dimensions
+  further when needed to fit that output cap. Decoding uses at most two worker
+  threads, keeping the control-link event loop responsive. Invalid or oversized images are omitted while page text
   remains available. SVG, HTML, scripts, cookies and external image URLs are
   never embedded in the returned card. CSP stays intact.
 - Linked pages are fetched only on preview interaction. Visible inline favicons
@@ -37,6 +40,12 @@ and its local static-file publications.
   raster/touch icons, including after redirects. These background requests never
   fetch cover images. Discovered icons are shared with mounted same-origin links;
   a late failed request cannot replace a successfully discovered icon.
+- Transparent, neutral single-color favicons use their alpha silhouette with the
+  theme's foreground color in both message links and preview headers. This keeps
+  dark logos visible on dark themes, including custom palettes. Colored icons,
+  opaque backgrounds, and icons with internal color/brightness details retain
+  their original pixels. Classification reads only bounded Relay PNGs locally;
+  it makes no extra network request and falls back to the original on failure.
 - The Relay permits four concurrent metadata jobs and 120 requests/minute per
   client IP. Browser requests are deduplicated and limited to three concurrent
   requests. Both sides retain at most 64 cache entries in memory, with bounded
