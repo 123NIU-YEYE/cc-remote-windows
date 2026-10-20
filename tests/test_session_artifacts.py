@@ -189,6 +189,7 @@ def test_artifact_discovery_handles_directory_and_separate_delivery_names():
         "/workspace/output/报告 中文.pdf", "/workspace/output/chart.svg"]
 
 
+@pytest.mark.parametrize("outer_pipes", ["both", "neither", "leading", "trailing", "mixed"])
 @pytest.mark.parametrize("table", [
     "| File | Description |\n|---|---|\n"
     "| `report.pdf` | From `config.yaml`, `API.call` and `./src/input.svg` |",
@@ -203,7 +204,19 @@ def test_artifact_discovery_handles_directory_and_separate_delivery_names():
     "| `report.pdf` | From `config.yaml` |",
     "| File | Description\n|:---|---:\n| `report.pdf` | From `config.yaml`",
 ])
-def test_artifact_directory_table_only_discovers_filename_cell(table):
+def test_artifact_directory_table_only_discovers_filename_cell(table, outer_pipes):
+    lines = table.splitlines()
+    if outer_pipes != "both":
+        for index, line in enumerate(lines):
+            # Keep a leading outer pipe when the first cell is empty, so its
+            # separator cannot be mistaken for the optional outer delimiter.
+            if not line.startswith("| |") and (
+                    outer_pipes in {"neither", "trailing"} or (outer_pipes == "mixed" and index % 2)):
+                line = line.removeprefix("|")
+            if outer_pipes in {"neither", "leading"} or (outer_pipes == "mixed" and index % 2):
+                line = line.removesuffix("|")
+            lines[index] = line.strip()
+        table = "\n".join(lines)
     text = f"Files in `/tmp/output/`:\n\n{table}"
     expected = ["/tmp/output/report.pdf"]
     if "`chart.svg`" in table:
@@ -237,6 +250,34 @@ Files in `/tmp/two/`:
 | `second.pdf` | From `other.yaml` |
 """
     assert local_links(text, "/workspace") == ["/tmp/one/first.pdf", "/tmp/two/second.pdf"]
+
+
+def test_artifact_pipe_separated_prose_does_not_extend_directory_context():
+    text = """Files in `/tmp/output/`:
+- `report.pdf`
+
+Choose debug | release; use `./config.yaml` as input.
+- `not-delivered.pdf`
+"""
+    assert local_links(text, "/workspace") == [
+        "/tmp/output/report.pdf", "/workspace/config.yaml"]
+
+
+def test_artifact_single_column_table_can_omit_body_and_delimiter_pipes():
+    text = "Files in `/tmp/output/`:\n| File |\n---\n`report.pdf`\n`chart.svg`"
+    assert local_links(text, "/workspace") == ["/tmp/output/report.pdf", "/tmp/output/chart.svg"]
+
+
+@pytest.mark.parametrize("boundary", ["", "# Other files", "> Another topic", "- Another list"])
+def test_artifact_table_context_ends_at_blank_lines_and_new_blocks(boundary):
+    text = f"""Files in `/tmp/output/`:
+File | Description
+--- | ---
+`report.pdf` | From `config.yaml`
+{boundary}
+- `not-delivered.pdf`
+"""
+    assert local_links(text, "/workspace") == ["/tmp/output/report.pdf"]
 
 
 @pytest.mark.parametrize("directory,expected", [
@@ -313,7 +354,7 @@ def test_artifact_inline_discovery_is_bounded_and_deduplicated():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", ["claude", "codex"])
 @pytest.mark.parametrize("trailing_slash", ["", "/"])
-@pytest.mark.parametrize("presentation", ["list", "table"])
+@pytest.mark.parametrize("presentation", ["list", "table", "table-no-outer-pipes"])
 async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalog(
         tmp_path, engine, trailing_slash, presentation):
     machine, _ = _mk_machine()
@@ -327,9 +368,11 @@ async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalo
         (output / name).write_bytes(_test_image())
     (output / "config.yaml").write_text("source: input")
     text = f"三张图已生成，文件在 `{output}{trailing_slash}`：\n\n"
-    if presentation == "table":
+    if presentation.startswith("table"):
         text += "| 文件 | 说明 |\n|---|---|\n" + "\n".join(
             f"| `{name}` | 从 `config.yaml` 生成。 |" for name in names)
+        if presentation == "table-no-outer-pipes":
+            text = "\n".join(line.strip("| ") for line in text.splitlines())
     else:
         text += "\n".join(f"- `{name}`：图的说明。" for name in names)
     service = machine._artifacts
