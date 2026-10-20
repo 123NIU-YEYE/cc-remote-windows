@@ -68,6 +68,27 @@ def image_thumbnail(data: bytes) -> bytes:
         return result
 
 
+def _table_cells(line: str) -> list[str]:
+    """Split a pipe-led Markdown row without treating escaped pipes as columns."""
+    cells = []
+    start, escaped = 1, False
+    for index in range(1, len(line)):
+        char = line[index]
+        if char == "|" and not escaped:
+            cells.append(line[start:index].strip())
+            start = index + 1
+        escaped = char == "\\" and not escaped
+    if start < len(line):
+        cells.append(line[start:].strip())
+    return cells
+
+
+_FILE_TABLE_HEADERS = frozenset({
+    "file", "files", "filename", "filenames", "path", "paths", "artifact", "artifacts",
+    "文件", "文件名", "文件路径", "路径", "产物", "输出文件", "交付文件",
+})
+
+
 def _inline_local_paths(text: str, cwd: str):
     """Recognize quoted paths and directory-led file lists, without filesystem I/O.
 
@@ -77,8 +98,14 @@ def _inline_local_paths(text: str, cwd: str):
     """
     directory = None
     fence = None
+    table_started, table_ready = False, False
+    table_column, table_width = None, 0
     for line in text.splitlines():
         stripped = line.strip()
+        is_table = stripped.startswith("|")
+        if not is_table:
+            table_started, table_ready = False, False
+            table_column = None
         marker = re.match(r"^\s*(`{3,}|~{3,})", line)
         if fence:
             if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
@@ -93,6 +120,29 @@ def _inline_local_paths(text: str, cwd: str):
         in_list = bool(re.match(r"^\s*(?:[-+*]\s+|\d+[.)]\s+|\|)", line))
         if not in_list:
             directory = None
+        if directory and is_table:
+            cells = _table_cells(stripped)
+            if not table_started:
+                columns = [index for index, cell in enumerate(cells)
+                           if re.sub(r"\s+", "", cell.strip("*_` ")).lower()
+                           in _FILE_TABLE_HEADERS]
+                table_column = columns[0] if len(columns) == 1 else None
+                table_width, table_started = len(cells), True
+                continue
+            if table_column is None:
+                continue
+            if not table_ready:
+                if (len(cells) != table_width
+                        or not all(re.fullmatch(r":?-+:?", cell) for cell in cells)):
+                    table_column = None
+                else:
+                    table_ready = True
+                continue
+            if table_column >= len(cells):
+                continue
+            # Descriptions may contain source filenames or code identifiers.
+            # Only the explicitly named file column participates in discovery.
+            line = cells[table_column]
         values = []
         for match in re.finditer(r"(?<!`)(`{1,2})([^`\n]+)\1(?!`)", line):
             value = match[2].strip()
@@ -107,7 +157,7 @@ def _inline_local_paths(text: str, cwd: str):
                 if not re.fullmatch(r"[\w.-]+", value.split("/", 1)[0]):
                     continue
             values.append(value)
-        directories = [value for value in values if value.endswith("/")]
+        directories = [value for value in values if value.endswith("/")] if not is_table else []
         if (not directories and len(values) == 1 and not in_list
                 and stripped.endswith((":", "："))):
             # A path-shaped, extensionless introduction is unambiguous.
@@ -130,7 +180,7 @@ def _inline_local_paths(text: str, cwd: str):
                 continue
             if "/" in value:
                 yield os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
-            elif directory and in_list and (index == 0 or stripped.startswith("|")):
+            elif directory and in_list and (index == 0 or is_table):
                 # Only the file label in a bullet, not identifiers in its description.
                 yield os.path.abspath(os.path.join(directory, value))
 

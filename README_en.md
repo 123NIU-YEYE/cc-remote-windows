@@ -128,6 +128,8 @@ side chats have their own Artifacts entry. Discovery also recognizes
 code-formatted local paths and filenames in a list or
 table introduced by an explicit directory. It does not crawl directories or
 automatically treat tool-read files as deliverables.
+Tables use an explicitly labeled filename/path column; code-formatted source
+filenames or identifiers in description columns are not treated as deliverables.
 Opening a file replaces the list with
 its preview; Back returns to the list. New uploads have durable private copies,
 while delivered files reference their original paths. Older sessions are indexed

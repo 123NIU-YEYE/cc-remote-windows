@@ -189,6 +189,56 @@ def test_artifact_discovery_handles_directory_and_separate_delivery_names():
         "/workspace/output/报告 中文.pdf", "/workspace/output/chart.svg"]
 
 
+@pytest.mark.parametrize("table", [
+    "| File | Description |\n|---|---|\n"
+    "| `report.pdf` | From `config.yaml`, `API.call` and `./src/input.svg` |",
+    "| Description | **文件名** | Size |\n|---|---|---|\n"
+    "| From `missing.yaml` |\n"
+    "| From `config.yaml` and `/tmp/source.png` | `report.pdf` | `size.bytes` |",
+    "| Description | File name |\n|---|---|\n"
+    "| Uses `left\\|right`, `config.yaml` and `/tmp/input/` | `report.pdf` |\n"
+    "| From `other.yaml` | `chart.svg` |",
+    "| File | Description |\n|---|---|\n"
+    "| | From `config.yaml` |\n| No output | See `fallback.pdf` |\n"
+    "| `report.pdf` | From `config.yaml` |",
+    "| File | Description\n|:---|---:\n| `report.pdf` | From `config.yaml`",
+])
+def test_artifact_directory_table_only_discovers_filename_cell(table):
+    text = f"Files in `/tmp/output/`:\n\n{table}"
+    expected = ["/tmp/output/report.pdf"]
+    if "`chart.svg`" in table:
+        expected.append("/tmp/output/chart.svg")
+    assert local_links(text, "/workspace") == expected
+
+
+def test_artifact_directory_table_without_unique_filename_column_is_not_delivery():
+    for header in ("Description | Status", "File | Filename"):
+        text = f"Files in `/tmp/output/`:\n\n| {header} |\n|---|---|\n" \
+               "| From `config.yaml` | `API.call` |"
+        assert local_links(text, "/workspace") == []
+
+
+def test_artifact_directory_table_requires_a_matching_separator():
+    for separator in ("| : | : |", "|---|", "|---|---|---|", "| arbitrary | text |"):
+        text = f"Files in `/tmp/output/`:\n| File | Description |\n{separator}\n" \
+               "| `report.pdf` | From `config.yaml` |"
+        assert local_links(text, "/workspace") == []
+
+
+def test_artifact_table_columns_reset_between_directories():
+    text = """Files in `/tmp/one/`:
+| Description | File |
+|---|---|
+| From `config.yaml` | `first.pdf` |
+
+Files in `/tmp/two/`:
+| 文件 | 说明 |
+|---|---|
+| `second.pdf` | From `other.yaml` |
+"""
+    assert local_links(text, "/workspace") == ["/tmp/one/first.pdf", "/tmp/two/second.pdf"]
+
+
 @pytest.mark.parametrize("directory,expected", [
     ("/tmp/output", "/tmp/output"),
     ("./output", "/workspace/output"),
@@ -263,8 +313,9 @@ def test_artifact_inline_discovery_is_bounded_and_deduplicated():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", ["claude", "codex"])
 @pytest.mark.parametrize("trailing_slash", ["", "/"])
+@pytest.mark.parametrize("presentation", ["list", "table"])
 async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalog(
-        tmp_path, engine, trailing_slash):
+        tmp_path, engine, trailing_slash, presentation):
     machine, _ = _mk_machine()
     ctx = _mk_ctx("session", "session")
     ctx.engine = engine
@@ -274,8 +325,13 @@ async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalo
     names = ["runtime-layers.png", "delivery-flow.png", "qwen-call.png"]
     for name in names:
         (output / name).write_bytes(_test_image())
-    text = f"三张图已生成，文件在 `{output}{trailing_slash}`：\n\n" + "\n".join(
-        f"- `{name}`：图的说明。" for name in names)
+    (output / "config.yaml").write_text("source: input")
+    text = f"三张图已生成，文件在 `{output}{trailing_slash}`：\n\n"
+    if presentation == "table":
+        text += "| 文件 | 说明 |\n|---|---|\n" + "\n".join(
+            f"| `{name}` | 从 `config.yaml` 生成。 |" for name in names)
+    else:
+        text += "\n".join(f"- `{name}`：图的说明。" for name in names)
     service = machine._artifacts
     for part in [text[:27], text[27:]]:
         await service.observe(ctx, Delta(message_id="answer", text=part))
