@@ -7,6 +7,9 @@ import io
 from PIL import IcoImagePlugin, Image
 
 MAX_IMAGE_BYTES = 256 * 1024
+MAX_ICON_BYTES = 64 * 1024
+MAX_IMAGE_SOURCE_BYTES = 1024 * 1024
+MAX_ICON_SOURCE_BYTES = 256 * 1024
 MAX_SOURCE_PIXELS = 4_000_000
 MAX_SOURCE_EDGE = 4096
 MAX_ICON_PIXELS = 1_000_000
@@ -55,8 +58,9 @@ def _check_eager_headers(content: bytes, pixels: int) -> None:
 
 
 def raster_data(content: bytes, *, icon: bool = False) -> str | None:
-    limit = 64 * 1024 if icon else MAX_IMAGE_BYTES
-    if not content or len(content) > limit:
+    limit = MAX_ICON_BYTES if icon else MAX_IMAGE_BYTES
+    source_limit = MAX_ICON_SOURCE_BYTES if icon else MAX_IMAGE_SOURCE_BYTES
+    if not content or len(content) > source_limit:
         return None
     try:
         pixels = MAX_ICON_PIXELS if icon else MAX_SOURCE_PIXELS
@@ -68,11 +72,18 @@ def raster_data(content: bytes, *, icon: bool = False) -> str | None:
             with source.convert("RGBA") as thumbnail:
                 thumbnail.thumbnail((128, 128) if icon else (1024, 768))
                 thumbnail.info.clear()
-                output = io.BytesIO()
-                thumbnail.save(output, format="PNG")
-                normalized = output.getvalue()
-        if len(normalized) <= limit:
-            return "data:image/png;base64," + base64.b64encode(normalized).decode("ascii")
+                # Input bytes and output bytes have different budgets: a
+                # multi-size ICO or large social image can make a small preview.
+                # Bound encoding work as well as the final cached payload.
+                for attempt in range(4):
+                    output = io.BytesIO()
+                    thumbnail.save(output, format="PNG")
+                    normalized = output.getvalue()
+                    if len(normalized) <= limit:
+                        return "data:image/png;base64," + base64.b64encode(normalized).decode("ascii")
+                    if attempt < 3:
+                        thumbnail.thumbnail((max(1, thumbnail.width * 3 // 4),
+                                             max(1, thumbnail.height * 3 // 4)))
     except (ValueError, OSError, SyntaxError, EOFError, IndexError, OverflowError,
             Image.DecompressionBombError, Image.DecompressionBombWarning):
         pass

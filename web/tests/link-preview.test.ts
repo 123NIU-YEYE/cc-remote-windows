@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
 import { createServer } from "vite";
+import { isNeutralSilhouette } from "../src/site-icon.ts";
+
+const pixels = (...rgba: number[][]) => new Uint8ClampedArray(rgba.flat());
+const clear = [0, 0, 0, 0], dark = [36, 41, 47, 255], white = [255, 255, 255, 255];
+assert.equal(isNeutralSilhouette(pixels(clear, dark, dark)), true, "dark transparent logos follow the theme");
+assert.equal(isNeutralSilhouette(pixels(clear, white, white)), true, "white logos also adapt to light themes");
+assert.equal(isNeutralSilhouette(pixels(clear, dark, [36, 41, 47, 96])), true, "antialiased edges keep their alpha");
+assert.equal(isNeutralSilhouette(pixels(clear, [255, 210, 30, 255], dark)), false, "colored artwork retains brand colors");
+assert.equal(isNeutralSilhouette(pixels(clear, white, dark)), false, "internal light/dark details are not flattened");
+assert.equal(isNeutralSilhouette(pixels(white, dark, dark)), false, "opaque icons keep their own background");
+assert.equal(isNeutralSilhouette(pixels(clear, clear)), false, "empty icons are not silhouettes");
 
 const icon = "data:image/png;base64,aWNvbg==";
 const originalFetch = globalThis.fetch;

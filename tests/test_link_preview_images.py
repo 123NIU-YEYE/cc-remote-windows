@@ -9,6 +9,7 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from cc_remote.relay.link_preview import raster_data
+from cc_remote.relay.preview_image import MAX_ICON_SOURCE_BYTES, MAX_IMAGE_SOURCE_BYTES
 
 
 def encoded_image(size=(32, 32), *, format="PNG", **kwargs):
@@ -112,6 +113,38 @@ def test_icon_has_a_smaller_source_pixel_budget():
     content = encoded_image((1200, 1200))
     assert raster_data(content, icon=True) is None
     assert raster_data(content) is not None
+
+
+def test_multi_size_bitmap_icon_can_exceed_its_thumbnail_budget():
+    content = encoded_image((128, 128), format="ICO", bitmap_format="bmp")
+    assert 64 * 1024 < len(content) < MAX_ICON_SOURCE_BYTES
+    data = raster_data(content, icon=True)
+    with decoded_preview(data) as image:
+        assert image.size == (128, 128)
+    assert len(base64.b64decode(data.split(",", 1)[1])) <= 64 * 1024
+
+
+def test_large_cover_is_reduced_until_its_static_png_fits():
+    pixels = random.Random(1).randbytes(600 * 400 * 3)
+    with Image.frombytes("RGB", (600, 400), pixels) as image:
+        output = io.BytesIO()
+        image.save(output, format="PNG")
+    content = output.getvalue()
+    assert 256 * 1024 < len(content) < MAX_IMAGE_SOURCE_BYTES
+    data = raster_data(content)
+    with decoded_preview(data) as image:
+        assert image.width < 600 and image.height < 400
+        assert image.n_frames == 1 and not image.info
+    assert len(base64.b64decode(data.split(",", 1)[1])) <= 256 * 1024
+
+
+@pytest.mark.parametrize("icon,limit", [(False, MAX_IMAGE_SOURCE_BYTES), (True, MAX_ICON_SOURCE_BYTES)])
+def test_source_byte_budget_is_checked_before_opening_image(icon, limit, monkeypatch):
+    def no_open(*args, **kwargs):
+        pytest.fail("Oversized source reached the image decoder")
+
+    monkeypatch.setattr(Image, "open", no_open)
+    assert raster_data(b"x" * (limit + 1), icon=icon) is None
 
 
 def test_tall_thin_image_is_rejected():
