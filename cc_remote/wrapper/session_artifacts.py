@@ -108,12 +108,22 @@ def _inline_local_paths(text: str, cwd: str):
                     continue
             values.append(value)
         directories = [value for value in values if value.endswith("/")]
+        if (not directories and len(values) == 1 and not in_list
+                and stripped.endswith((":", "："))):
+            # A path-shaped, extensionless introduction is unambiguous.
+            # Bare/dotted directory names need an explicit location cue.
+            value = values[0]
+            location = re.search(
+                r"(?:\b(?:in|under|inside|directory|folder)\b|目录|文件夹|位于|在|保存到|输出到)"
+                r"\s*[:：]?\s*(`{1,2})[^`\n]+\1\s*[:：]$", stripped, re.I)
+            if ("/" in value and not Path(value).suffix) or location:
+                directories = [value]
         if directories:
             directory = (os.path.abspath(os.path.join(cwd, os.path.expanduser(directories[0])))
                          if len(directories) == 1 and not in_list
                          and stripped.endswith((":", "：")) else None)
         for index, value in enumerate(values):
-            if value.endswith("/"):
+            if value.endswith("/") or (directory and value in directories):
                 continue
             value = re.sub(r":\d+(?::\d+)?$", "", value)
             if not re.fullmatch(r"\.[a-zA-Z0-9]{1,16}", Path(value).suffix):

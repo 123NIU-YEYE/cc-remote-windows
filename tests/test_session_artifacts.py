@@ -189,6 +189,31 @@ def test_artifact_discovery_handles_directory_and_separate_delivery_names():
         "/workspace/output/报告 中文.pdf", "/workspace/output/chart.svg"]
 
 
+@pytest.mark.parametrize("directory,expected", [
+    ("/tmp/output", "/tmp/output"),
+    ("./output", "/workspace/output"),
+    ("../output", "/output"),
+    ("docs/output", "/workspace/docs/output"),
+    ("output", "/workspace/output"),
+    ("output.v1", "/workspace/output.v1"),
+    ("输出目录", "/workspace/输出目录"),
+])
+def test_artifact_directory_introduction_does_not_require_trailing_slash(directory, expected):
+    text = f"Files are in `{directory}`:\n\n- `report.pdf`\n- `chart.svg`"
+    assert local_links(text, "/workspace") == [
+        f"{expected}/report.pdf", f"{expected}/chart.svg"]
+    table = f"文件在 `{directory}`：\n\n| 文件 | 说明 |\n|---|---|\n| `report.pdf` | 报告 |"
+    assert local_links(table, "/workspace") == [f"{expected}/report.pdf"]
+
+
+def test_artifact_directory_introduction_does_not_reinterpret_files_or_commands():
+    assert local_links("Read `/tmp/report.pdf`:\n- `unrelated.png`", "/workspace") == [
+        "/tmp/report.pdf"]
+    assert local_links("Run `ls /tmp/output`:\n- `unrelated.png`", "/workspace") == []
+    assert local_links("In `/tmp/one` or `/tmp/two`:\n- `unrelated.png`", "/workspace") == []
+    assert local_links("Example `identifier`:\n- `unrelated.png`", "/workspace") == []
+
+
 def test_artifact_inline_paths_are_explicit_and_do_not_reinterpret_link_labels():
     text = """结果：`/tmp/my diagram.png`、`./output/report.pdf`、`docs/notes.md:12`。
 [`fake/label.png`](actual.png)
@@ -237,7 +262,9 @@ def test_artifact_inline_discovery_is_bounded_and_deduplicated():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("engine", ["claude", "codex"])
-async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalog(tmp_path, engine):
+@pytest.mark.parametrize("trailing_slash", ["", "/"])
+async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalog(
+        tmp_path, engine, trailing_slash):
     machine, _ = _mk_machine()
     ctx = _mk_ctx("session", "session")
     ctx.engine = engine
@@ -247,7 +274,7 @@ async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalo
     names = ["runtime-layers.png", "delivery-flow.png", "qwen-call.png"]
     for name in names:
         (output / name).write_bytes(_test_image())
-    text = f"三张图已生成，文件在 `{output}/`：\n\n" + "\n".join(
+    text = f"三张图已生成，文件在 `{output}{trailing_slash}`：\n\n" + "\n".join(
         f"- `{name}`：图的说明。" for name in names)
     service = machine._artifacts
     for part in [text[:27], text[27:]]:
