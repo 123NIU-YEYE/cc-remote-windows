@@ -69,18 +69,25 @@ def image_thumbnail(data: bytes) -> bytes:
 
 
 def _table_cells(line: str) -> list[str]:
-    """Split a pipe-led Markdown row without treating escaped pipes as columns."""
+    """Split a Markdown row with optional outer pipes and escaped cell pipes."""
     cells = []
-    start, escaped = 1, False
-    for index in range(1, len(line)):
+    start, escaped = 0, False
+    for index in range(len(line)):
         char = line[index]
         if char == "|" and not escaped:
             cells.append(line[start:index].strip())
             start = index + 1
         escaped = char == "\\" and not escaped
-    if start < len(line):
+    if start < len(line) or not cells:
         cells.append(line[start:].strip())
+    if line.startswith("|"):
+        cells.pop(0)
     return cells
+
+
+def _table_separator(cells: list[str], width: int) -> bool:
+    return bool(cells) and len(cells) == width and all(
+        re.fullmatch(r":?-+:?", cell) for cell in cells)
 
 
 _FILE_TABLE_HEADERS = frozenset({
@@ -100,13 +107,27 @@ def _inline_local_paths(text: str, cwd: str):
     fence = None
     table_started, table_ready = False, False
     table_column, table_width = None, 0
-    for line in text.splitlines():
+    lines = text.splitlines()
+    for line_number, line in enumerate(lines):
         stripped = line.strip()
-        is_table = stripped.startswith("|")
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        in_bullet = bool(re.match(r"^\s*(?:[-+*]\s+|\d+[.)]\s+)", line))
+        block_start = marker or in_bullet or re.match(
+            r"^(?:#{1,6}(?:\s|$)|>|<[!/?A-Za-z]|(?:[-*_]\s*){3,}$)", stripped)
+        cells = _table_cells(stripped)
+        # A pipe in prose is not enough: a new table needs its delimiter row.
+        # Once open, a short body row can omit cells (and therefore all pipes).
+        table_header = (directory and line_number + 1 < len(lines)
+                        and (len(cells) > 1 or stripped.startswith("|") or stripped.endswith("|"))
+                        and _table_separator(
+                            _table_cells(lines[line_number + 1].strip()), len(cells)))
+        delimiter = table_started and not table_ready and _table_separator(cells, table_width)
+        is_table = bool(stripped and (delimiter or not block_start and (table_started or table_header)))
         if not is_table:
+            if table_started:
+                directory = None
             table_started, table_ready = False, False
             table_column = None
-        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
         if fence:
             if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
                 fence = None
@@ -117,11 +138,10 @@ def _inline_local_paths(text: str, cwd: str):
             continue
         if not stripped:
             continue
-        in_list = bool(re.match(r"^\s*(?:[-+*]\s+|\d+[.)]\s+|\|)", line))
+        in_list = in_bullet or is_table
         if not in_list:
             directory = None
         if directory and is_table:
-            cells = _table_cells(stripped)
             if not table_started:
                 columns = [index for index, cell in enumerate(cells)
                            if re.sub(r"\s+", "", cell.strip("*_` ")).lower()
@@ -132,8 +152,7 @@ def _inline_local_paths(text: str, cwd: str):
             if table_column is None:
                 continue
             if not table_ready:
-                if (len(cells) != table_width
-                        or not all(re.fullmatch(r":?-+:?", cell) for cell in cells)):
+                if not _table_separator(cells, table_width):
                     table_column = None
                 else:
                     table_ready = True
