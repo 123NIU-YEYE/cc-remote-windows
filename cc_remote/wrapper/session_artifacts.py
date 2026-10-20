@@ -68,8 +68,68 @@ def image_thumbnail(data: bytes) -> bytes:
         return result
 
 
+def _inline_local_paths(text: str, cwd: str):
+    """Recognize quoted paths and directory-led file lists, without filesystem I/O.
+
+    A bare filename needs a directory explicitly introduced immediately before
+    its list/table. Do not carry that directory into another paragraph, heading,
+    code example or assistant message, or infer paths from shell commands.
+    """
+    directory = None
+    fence = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+            directory = None
+            continue
+        if not stripped:
+            continue
+        in_list = bool(re.match(r"^\s*(?:[-+*]\s+|\d+[.)]\s+|\|)", line))
+        if not in_list:
+            directory = None
+        values = []
+        for match in re.finditer(r"(?<!`)(`{1,2})([^`\n]+)\1(?!`)", line):
+            value = match[2].strip()
+            if (not value or len(value) > 4096
+                    or any(ord(char) < 32 for char in value)
+                    or re.search(r"[<>|*?;$={}\\]", value)
+                    or value.startswith(("//", "#"))
+                    or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", value)):
+                continue
+            # Relative path prefixes must look like directories, not commands.
+            if "/" in value and not value.startswith(("/", "~/", "./", "../")):
+                if not re.fullmatch(r"[\w.-]+", value.split("/", 1)[0]):
+                    continue
+            values.append(value)
+        directories = [value for value in values if value.endswith("/")]
+        if directories:
+            directory = (os.path.abspath(os.path.join(cwd, os.path.expanduser(directories[0])))
+                         if len(directories) == 1 and not in_list
+                         and stripped.endswith((":", "：")) else None)
+        for index, value in enumerate(values):
+            if value.endswith("/"):
+                continue
+            value = re.sub(r":\d+(?::\d+)?$", "", value)
+            if not re.fullmatch(r"\.[a-zA-Z0-9]{1,16}", Path(value).suffix):
+                continue
+            if "/" in value:
+                yield os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
+            elif directory and in_list and (index == 0 or stripped.startswith("|")):
+                # Only the file label in a bullet, not identifiers in its description.
+                yield os.path.abspath(os.path.join(directory, value))
+
+
 def local_links(text: str, cwd: str) -> list[str]:
-    """Only explicit Markdown destinations / visualize outputs, not tool reads."""
+    """Explicit delivered file references, not tool reads or directory scans."""
+    # Link labels can themselves contain code spans; their destination, not the
+    # display label, is the file identity.
+    inline_text = re.sub(r"!?\[[^\]\n]*\]\([^\n]*?\)", "", text)
     text = re.sub(r"```[^\n]*\n.*?```|~~~[^\n]*\n.*?~~~", "", text, flags=re.S)
     candidates = []
     for match in re.finditer(r"\]\(\s*(?:<([^>\n]+)>|([^\s]+?))(?:\s+\"[^\"]*\")?\s*\)", text):
@@ -93,6 +153,11 @@ def local_links(text: str, cwd: str) -> list[str]:
         if not path or not Path(path).suffix:
             continue
         path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+        if path not in paths:
+            paths.append(path)
+    for path in _inline_local_paths(inline_text, cwd):
+        if len(paths) >= 128:
+            break
         if path not in paths:
             paths.append(path)
     return paths

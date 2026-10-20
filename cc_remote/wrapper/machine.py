@@ -2353,6 +2353,7 @@ class WrapperMachine:
         self._codex_watch_lock = asyncio.Lock()
         self._codex_task_sync_lock = asyncio.Lock()
         self._codex_task_read_errors: set[Path] = set()
+        self._codex_agent_activity: dict[Path, object] = {}
         self._codex_probe_warned = False
         self._codex_tui_log_trackers = {
             profile.id: CodexTuiLogTracker(
@@ -6868,6 +6869,7 @@ class WrapperMachine:
     ) -> None:
         """Project detached task state without querying or waking an engine."""
         from cc_remote.wrapper.codex_tasks import read_task_activity
+        from cc_remote.wrapper.codex_agent_activity import CodexAgentActivity
 
         async with self._codex_task_sync_lock:
             accounts: dict[Path, list[tuple[SessionContext, str]]] = {}
@@ -6880,6 +6882,9 @@ class WrapperMachine:
             for home, residents in accounts.items():
                 try:
                     activity = await asyncio.to_thread(read_task_activity, home)
+                    reader = self._codex_agent_activity.setdefault(home, CodexAgentActivity())
+                    agents = await asyncio.to_thread(
+                        reader.read, home, {sid for _, sid in residents})
                 except Exception as exc:
                     # Failure is not an empty level; don't retire real tasks.
                     if home not in self._codex_task_read_errors:
@@ -6892,8 +6897,12 @@ class WrapperMachine:
                     if (not self._is_resident_context(ctx) or ctx.session_id != native_sid
                             or self._codex_profile_for_ctx(ctx).home != home):
                         continue
+                    combined = activity.get(native_sid, []) + agents.get(native_sid, [])
+                    # Active native agents must not be hidden behind retained
+                    # MCP delivery warnings when the public snapshot is full.
+                    combined.sort(key=lambda item: item.status not in {"running", "pending"})
                     replacement = {item.item_id: item for item in
-                                   activity.get(native_sid, [])[:MAX_BACKGROUND_PROCESS_ITEMS]}
+                                   combined[:MAX_BACKGROUND_PROCESS_ITEMS]}
                     if replacement == ctx.codex_background_processes:
                         continue
                     previous = ctx.codex_background_processes

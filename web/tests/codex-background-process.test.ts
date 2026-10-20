@@ -120,6 +120,25 @@ try {
   assert.match(failedDock, /1 项需要查看/);
   assert.match(failedDock, /background-task-indicator attention/);
   assert.doesNotMatch(failedDock, /进行中/);
+
+  const agent = { item_id: "codex-agent:native-child", kind: "agent", status: "running",
+    title: "/root/finish_release", summary: "协作代理运行中" };
+  send({ type: "background_process_sync", generation: "generation", items: [agent] });
+  send({ type: "process", item_id: "spawn-call", kind: "agent", phase: "end",
+    status: "succeeded", title: "协作代理已启动",
+    input: { agent_run_id: agent.item_id } });
+  assert.equal(state.runtimes[sid].backgroundProcesses[0].item_id, agent.item_id,
+    "a successful spawn tool is not the native agent's completion");
+  send({ type: "user_msg", msg_id: "parent-turn", prompt: "continue" });
+  send({ type: "turn_end", turn_id: "parent-turn", result: { status: "completed" } });
+  const agentDock = renderToStaticMarkup(createElement(BackgroundTaskControl, {
+    processes: state.runtimes[sid].backgroundProcesses,
+  }));
+  assert.match(agentDock, /后台任务 · 1/);
+  assert.equal(state.runtimes[sid].backgroundProcesses[0].status, "running");
+  send({ type: "background_process_sync", generation: "generation", items: [] });
+  assert.equal(state.runtimes[sid].backgroundProcesses.length, 0,
+    "the child's own native terminal clears the agent");
   console.log("Codex background tasks: activity, narrative order, replay and rendering passed");
 } finally {
   await harness.close();
