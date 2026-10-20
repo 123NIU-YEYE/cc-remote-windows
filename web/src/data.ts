@@ -454,3 +454,30 @@ export function parseSlash(input: string): { slash: string; args: string } | nul
   if (!m || /[/\\]/.test(m[1])) return null;
   return { slash: m[1].toLowerCase(), args: m[2].trim() };
 }
+
+/** Shared by the welcome composer and the live conversation. Client commands
+ * must never accidentally become model prompts just because a session is new. */
+export function routeComposerInput(
+  input: string, engine?: string, surface: CommandSurface = "code",
+): { kind: "empty" } | { kind: "blocked"; message: string }
+  | { kind: "client"; slash: string; args: string }
+  | { kind: "prompt"; prompt: string } {
+  const raw = input.trim();
+  if (raw === "/") return { kind: "empty" };
+  const parsed = parseSlash(raw);
+  if (surface === "work" && parsed && isKnownCodeOnlySlash(parsed.slash, engine)) {
+    return { kind: "blocked", message: `/${parsed.slash} 是 Code 指令，请切换到 Code 使用` };
+  }
+  if (parsed && clientSlashesFor(engine).has(parsed.slash)) {
+    return { kind: "client", ...parsed };
+  }
+  if (engine === "codex" && parsed) {
+    // Use an own-property lookup: arbitrary slash names are untrusted input.
+    if (Object.hasOwn(CODEX_PROMPTS, parsed.slash)) {
+      return { kind: "prompt", prompt: CODEX_PROMPTS[parsed.slash]
+        + (parsed.args ? "\n\n" + parsed.args : "") };
+    }
+    return { kind: "blocked", message: `Codex 无此指令：/${parsed.slash}` };
+  }
+  return { kind: "prompt", prompt: raw };
+}

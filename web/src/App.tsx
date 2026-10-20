@@ -1237,6 +1237,9 @@ export default function App() {
   const focusedSkillCatalogKey = skillCatalogKey(
     machineId, focusedEngine, space, capabilityCwd,
     focusedCodexProfileId, focusedClaudeProfileId);
+  const newChatSkillCatalogKey = skillCatalogKey(
+    machineId, engine, space, state.newChat?.cwd ?? currentCwd,
+    newChatCodexProfileId, newChatClaudeProfileId);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
@@ -5939,6 +5942,16 @@ export default function App() {
             autoFocus={newChatAutoFocus}
             engine={engine}
             catalog={newChatCatalog}
+            skills={skillCatalogs[newChatSkillCatalogKey]?.items}
+            onRequestSkills={() => {
+              if (!state.newChat) return;
+              requestSkillCatalog({
+                key: newChatSkillCatalogKey,
+                engine, space, cwd: state.newChat.cwd, skillsOnly: true,
+                claudeProfileId: newChatClaudeProfileId,
+                codexProfileId: newChatCodexProfileId,
+              }, true);
+            }}
             onRequestModels={() => wsRef.current?.sendGetModels(
               engine, engine === "claude" && space === "code" ? state.newChat?.cwd : undefined,
               newChatCodexProfileId, newChatClaudeProfileId)}

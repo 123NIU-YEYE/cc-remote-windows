@@ -10842,7 +10842,7 @@ try {
       (markup.match(/<button[^>]+aria-label="添加附件"/g) ?? []).length, 1);
     assert.equal(
       (markup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
-    assert.match(markup, />开始</);
+    assert.match(markup, /aria-label="开始"/);
     assert.match(markup, /title="选择模型"/);
     assert.match(markup, /title="选择思考强度"/);
     assert.match(markup, /本机默认/);
@@ -10863,10 +10863,11 @@ try {
     "closed selection surfaces are mounted only when opened");
   assert.doesNotMatch(newChatMarkup, /class="newchat-access"/);
   for (const markup of [newChatMarkup, codexNewChatMarkup]) {
-    assert.doesNotMatch(markup, /class="newchat-context"/,
-      "single-account and Claude new-chat preserve the historical cwd DOM");
-    assert.match(markup, /<\/div><button class="newchat-cwd"/,
-      "the historical cwd button remains a direct new-chat-card child");
+    assert.match(markup, /class="newchat-context"/);
+    assert.match(markup, /class="newchat-cwd"/,
+      "single-account new chats retain the working-directory picker");
+    assert.match(markup, /class="newchat-inputbar"/);
+    assert.match(markup, /rows="1"/, "Code starts with a compact input");
   }
   assert.doesNotMatch(codexNewChatMarkup, /aria-label="选择 Codex 账号"/,
     "single-account installs keep the historical new-chat layout");
