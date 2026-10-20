@@ -3,20 +3,21 @@
 // A null override is intentional: the wrapper/engine keeps its own local default.
 /* oxlint-disable react/only-export-components */
 import {
-  lazy, Suspense, useEffect, useRef, useState, type ClipboardEvent,
+  lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent,
 } from "react";
-import { Icon } from "../icons";
+import { EngineIcon, Icon } from "../icons";
 import { SpeedPicker } from "./SpeedPicker";
-import { newChatSpeed } from "../codex-speed";
+import { newChatSpeed, normalizeSpeed, speedsFor } from "../codex-speed";
 import {
-  modelsFor, parseSlash, type Catalog, type Effort, type Model,
+  clientSlashesFor, matchCommands, matchSkills, modelsFor, routeComposerInput, skillToken, slashToken,
+  type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, snapshotAttachmentFiles } from "../img";
 import {
   readClipboardImport, resolveClipboardImport, insertClipboardText,
   type ClipboardImport,
 } from "../clipboard-import";
-import type { ClaudeProfileInfo, CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { ClaudeProfileInfo, CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, EngineCapabilityItem, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { useClipboardPasteGuard } from "../use-clipboard-paste-guard";
 import type { PasteReceipt } from "../clipboard-paste-guard";
@@ -56,6 +57,8 @@ interface Props {
   engine?: Engine;  // which backend this new chat will use
   catalog?: Catalog;
   onRequestModels?: () => void;
+  skills?: EngineCapabilityItem[];
+  onRequestSkills?: () => void;
   model?: string | null;
   effort?: string | null;
   autoCompact?: AutoCompactSelection;
@@ -98,6 +101,7 @@ interface SelectorOption {
 
 interface NewChatExecutionControls {
   scopeKey: string;
+  collaborationMode: CollaborationModeName;
   permissionMode: CodexPermissionMode;
   permissionProfile: string | null;
   webSearch: CodexWebSearchMode | null;
@@ -109,6 +113,7 @@ const defaultExecutionControls = (
   scopeKey: string,
 ): NewChatExecutionControls => ({
   scopeKey,
+  collaborationMode: "default",
   permissionMode: "never",
   permissionProfile: null,
   webSearch: null,
@@ -171,7 +176,7 @@ export function NewChatView({ cwd, controlScopeKey,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
   onPickModel, onPickEffort, onPickAutoCompact, onPickClaudeProfile, onRequestModels,
-  onPickCodexProfile,
+  onPickCodexProfile, skills, onRequestSkills,
   permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -193,6 +198,39 @@ export function NewChatView({ cwd, controlScopeKey,
   const pasteGuard = useClipboardPasteGuard(taRef, `${controlScopeKey}:${cwd}:${engine}`);
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
+  const commandToken = slashToken(text);
+  const commandMatches = commandToken === null ? [] : matchCommands(commandToken, engine, space);
+  const currentSkillToken = engine === "codex" ? skillToken(text) : null;
+  const skillMatches = currentSkillToken !== null && skills ? matchSkills(currentSkillToken, skills) : [];
+  const skillLoading = currentSkillToken !== null && skills === undefined;
+  const skillOpen = currentSkillToken !== null
+    && (skillLoading || currentSkillToken === "" || skillMatches.length > 0);
+  const suggestionOpen = commandMatches.length > 0 || skillOpen;
+  const requestedSkillScopeRef = useRef<string | null>(null);
+  const skillScope = `${controlScopeKey}:${engine}:${space}:${cwd}`;
+  useEffect(() => {
+    if (currentSkillToken === null) {
+      requestedSkillScopeRef.current = null;
+      return;
+    }
+    if (!onRequestSkills || requestedSkillScopeRef.current === skillScope) return;
+    requestedSkillScopeRef.current = skillScope;
+    onRequestSkills();
+  }, [currentSkillToken, skillScope, onRequestSkills]);
+
+  useLayoutEffect(() => {
+    const textarea = taRef.current;
+    if (!textarea || space !== "code") return;
+    const grow = () => {
+      textarea.style.height = "auto";
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 132)}px`;
+    };
+    grow();
+    // Rotation, desktop resizing and the phone keyboard can change wrapping
+    // without changing the draft.
+    window.addEventListener("resize", grow);
+    return () => window.removeEventListener("resize", grow);
+  }, [text, space]);
 
   useEffect(() => {
     if (createError) setCreating(false);
@@ -235,6 +273,7 @@ export function NewChatView({ cwd, controlScopeKey,
       ? executionControls
       : defaultExecutionControls(controlScopeKey);
   const {
+    collaborationMode,
     permissionMode,
     permissionProfile,
     webSearch,
@@ -356,26 +395,110 @@ export function NewChatView({ cwd, controlScopeKey,
     if (attachments) void onPick(null, clipboard, paste);
   };
 
-  const send = (value = taRef.current?.value ?? text) => {
-    const command = parseSlash(value.trim());
-    if (command?.slash === "open") {
-      onPickCwd();
+  const submitPrompt = (value: string, mode = collaborationMode) => {
+    const composed = composePastePrompt(pastes, value.trim());
+    if (!composed.ok) {
+      window.alert(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
+      return;
+    }
+    const prompt = composed.prompt;
+    if ((!prompt && !hasAttachments) || creating || importingRef.current
+        || selectedProfileMissing) return;
+    setCreating(true);
+    const queued = onSend(
+      prompt, images.length ? images : undefined, files.length ? files : undefined,
+      engine === "codex" ? mode : undefined,
+      engine === "codex"
+        ? (space === "work" ? "never" : permissionMode)
+        : undefined,
+      engine === "codex" && space === "code"
+        ? (permissionProfile ?? undefined)
+        : undefined,
+      engine === "codex" && space === "code"
+        ? (webSearch ?? undefined)
+        : undefined,
+      engine === "codex" ? serviceTier : undefined);
+    if (!queued) setCreating(false);
+  };
+
+  const runClientSlash = (slash: string, args: string) => {
+    if (slash === "model") {
+      if (args) {
+        const selected = modelList.find(candidate =>
+          candidate.id === args || candidate.name.toLowerCase() === args.toLowerCase());
+        if (!selected || !onPickModel) {
+          setAutoCompactNotice("未找到此模型，请从模型列表中选择。");
+          onRequestModels?.();
+          setSheetKind("models");
+          return;
+        }
+        onPickModel(selected.id);
+        setAutoCompactNotice(`已选择模型：${selected.name}`);
+      } else {
+        onRequestModels?.();
+        setSheetKind("models");
+      }
       setText("");
       return;
     }
-    if (command?.slash === "autocompact") {
+    if (slash === "open") {
+      onPickCwd();
+      setAutoCompactNotice(args ? "请在目录选择器中选择工作目录。" : null);
+      setText("");
+      return;
+    }
+    if (slash === "clear") {
+      setText(""); setImages([]); setFiles([]); setPastes([]);
+      setAutoCompactNotice(null);
+      return;
+    }
+    if (slash === "permissions" && engine === "codex") {
+      setPermissionsOpen(true);
+      onGetPermissionProfiles?.(cwd);
+      setText("");
+      return;
+    }
+    if ((slash === "plan" || slash === "normal") && engine === "codex") {
+      const nextMode = slash === "plan" ? "plan" : "default";
+      updateExecutionControls({ collaborationMode: nextMode });
+      if (args) submitPrompt(args, nextMode);
+      else {
+        setText("");
+        setAutoCompactNotice(nextMode === "plan" ? "新会话将使用计划模式。" : "已切换为普通模式。");
+      }
+      return;
+    }
+    if (slash === "fast" && engine === "codex") {
+      const available = speedsFor(effectiveModel, catalog);
+      const fastTier = normalizeSpeed("fast");
+      if (!available.known) {
+        onRequestModels?.();
+        setAutoCompactNotice("正在读取当前模型支持的速度，请稍后重试。");
+        return;
+      }
+      if (!available.options.some(option => option.id === fastTier)) {
+        setAutoCompactNotice("当前模型不支持快速模式。");
+        return;
+      }
+      const nextTier = serviceTier === fastTier ? "default" : fastTier;
+      updateExecutionControls({ serviceTier: nextTier, serviceTierScope: speedScope });
+      setText("");
+      setAutoCompactNotice(nextTier === fastTier ? "已切换为快速模式。" : "已切换为标准速度。");
+      return;
+    }
+    if (slash === "autocompact") {
       if (engine !== "claude") {
         setAutoCompactNotice("创建 Codex 会话后，可单独设置压缩阈值。");
         setText("");
         return;
       }
-      if (!command.args) {
+      if (!args) {
         setAutoCompactOpen(true);
         setAutoCompactNotice(null);
         setText("");
         return;
       }
-      const parsed = parseAutoCompactArgument(command.args);
+      const parsed = parseAutoCompactArgument(args);
       if (!parsed.ok) {
         setAutoCompactNotice(parsed.error);
         return;
@@ -391,29 +514,32 @@ export function NewChatView({ cwd, controlScopeKey,
       setText("");
       return;
     }
-    const composed = composePastePrompt(pastes, value.trim());
-    if (!composed.ok) {
-      window.alert(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
-      return;
+    // These act on a native session. Keep the draft (including any arguments)
+    // and do not create a model turn pretending that the command was executed.
+    setAutoCompactNotice(`/${slash} 需要已有会话，请开始对话后使用。`);
+  };
+
+  const send = (value = taRef.current?.value ?? text) => {
+    if (creating || importingRef.current || selectedProfileMissing) return;
+    const route = routeComposerInput(value, engine, space);
+    if (route.kind === "empty") return;
+    if (route.kind === "blocked") { setAutoCompactNotice(route.message); return; }
+    if (route.kind === "client") { runClientSlash(route.slash, route.args); return; }
+    submitPrompt(route.prompt);
+  };
+
+  const pickCommand = (slash: string) => {
+    if (creating || importingRef.current || selectedProfileMissing) return;
+    if (slash !== "autocompact" && clientSlashesFor(engine).has(slash)) {
+      runClientSlash(slash, "");
+    } else {
+      setText(`/${slash} `);
+      taRef.current?.focus();
     }
-    const prompt = composed.prompt;
-    if ((!prompt && !hasAttachments) || creating || importing
-        || selectedProfileMissing) return;
-    setCreating(true);
-    const queued = onSend(
-      prompt, images.length ? images : undefined, files.length ? files : undefined,
-      engine === "codex" ? "default" : undefined,
-      engine === "codex"
-        ? (space === "work" ? "never" : permissionMode)
-        : undefined,
-      engine === "codex" && space === "code"
-        ? (permissionProfile ?? undefined)
-        : undefined,
-      engine === "codex" && space === "code"
-        ? (webSearch ?? undefined)
-        : undefined,
-      engine === "codex" ? serviceTier : undefined);
-    if (!queued) setCreating(false);
+  };
+  const pickSkill = (name: string) => {
+    setText(`$${name} `);
+    taRef.current?.focus();
   };
 
   const requestButtonSend = () => {
@@ -439,6 +565,7 @@ export function NewChatView({ cwd, controlScopeKey,
     ? onPickCodexProfile : onPickClaudeProfile;
   const profileSelector = showProfileSelector ? (
     <ChoicePicker key={`${controlScopeKey}:account`} className="newchat-profile"
+      showChevron={space === "work"}
       label={`选择 ${engine === "codex" ? "Codex" : "Claude"} 账号`}
       value={accountProfileId ?? ""} onChange={value => pickAccountProfile?.(value)}
       disabled={creating || importing || !pickAccountProfile}
@@ -450,7 +577,7 @@ export function NewChatView({ cwd, controlScopeKey,
           description: profile.error ? "目录暂不可用" : undefined, icon: "user",
         })),
       ]}>
-      <Icon name="user" size={14} /><span>账号</span>
+      <Icon name="user" size={14} />{space === "work" && <span>账号</span>}
       <b>{selectedProfileMissing ? "已移除账号" : codexProfilePresentation(
         accountProfiles, defaultAccountProfileId, accountProfileId,
       )?.fullLabel ?? "选择账号"}</b>
@@ -462,14 +589,79 @@ export function NewChatView({ cwd, controlScopeKey,
       <span>{selectedProfileWarning}</span>
     </div>
   ) : null;
+  const input = (
+    <textarea className="newchat-input" data-chat-composer
+      placeholder={space === "work" ? "描述要完成的工作，或上传文档、表格、演示…"
+        : engine === "codex" ? "输入 / 命令，$ Skill" : "输入 / 命令"}
+      aria-label="新会话消息" ref={taRef}
+      value={text} onChange={(e) => {
+        setText(e.target.value);
+        setAutoCompactNotice(null);
+      }} onPaste={onPaste}
+      autoFocus={autoFocus} rows={space === "work" ? 3 : 1}
+      disabled={creating || importing}
+      onCompositionStart={() => imeSubmitRef.current.startComposition()}
+      onCompositionEnd={(e) => {
+        imeSubmitRef.current.endComposition();
+        setText(e.currentTarget.value);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && suggestionOpen) {
+          e.preventDefault(); setText(""); return;
+        }
+        if (!imeSubmitRef.current.shouldSubmitKey({
+          key: e.key, shiftKey: e.shiftKey,
+          isComposing: e.nativeEvent.isComposing, keyCode: e.nativeEvent.keyCode,
+        })) return;
+        e.preventDefault();
+        if (commandMatches.length && commandToken) {
+          pickCommand(commandMatches[0].slash);
+          return;
+        }
+        if (skillMatches.length && currentSkillToken !== null) {
+          pickSkill(skillMatches[0].name); return;
+        }
+        if (commandToken === "" || currentSkillToken === "") return;
+        send(e.currentTarget.value);
+      }} />
+  );
+  const attachmentPicker = (
+    <AttachmentPicker key={controlScopeKey} onPick={onPick}
+      label={space === "work" ? "添加资料" : "添加附件"}
+      disabled={creating || importing} />
+  );
+  const sendButton = (
+    <button className="newchat-send" aria-label="开始" title="开始新对话"
+      onPointerDown={() => {
+        if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
+      }}
+      onClick={requestButtonSend} disabled={!canSend}>
+      <Icon name="send" size={20} />{space === "work" && "开始"}
+    </button>
+  );
+  const accessControl = engine === "codex" && space === "code" ? (
+    <button type="button" className="newchat-access"
+      onClick={() => {
+        setPermissionsOpen(true);
+        onGetPermissionProfiles?.(cwd);
+      }}
+      disabled={creating || importing}
+      title={`执行环境：${permissionProfileLabel(permissionProfile) ?? "默认"}；审批：${permissionMode}；网页搜索：${webSearch ?? "默认"}`}>
+      <Icon name="shield" size={14} />
+      <span>{permissionProfileLabel(permissionProfile) ?? "默认环境"}</span>
+    </button>
+  ) : space === "code" ? (
+    <span className="newchat-default-note" title="沿用本机 Claude 权限设置；创建后可在会话中调整">
+      <Icon name="shield" size={14} />本机默认
+    </span>
+  ) : null;
 
   return (
     <div className={"newchat " + (space === "work" ? "work-newchat" : "code-newchat")}>
       <div className="newchat-card">
-        <div className="newchat-greet">{space === "work"
-          ? "开始一项工作"
-          : engine === "codex" ? "开始 Codex 新对话" : "开始新对话"}
-          <span className={`newchat-engine ${engine}`}>{engine === "codex" ? "◇ Codex" : "✳ Claude"}</span>
+        <div className="newchat-greet">
+          <EngineIcon engine={engine} size={30} />
+          <span>{space === "work" ? "开始一项工作" : "开始新对话"}</span>
         </div>
         {space === "work" ? (
           <>
@@ -498,17 +690,12 @@ export function NewChatView({ cwd, controlScopeKey,
               <span>{workDashboard.plugins.length} 个工作模板</span>
             </div>}
           </>
-        ) : profileSelector ? (
+        ) : (
           <div className="newchat-context">
             {profileSelector}
             {cwdButton}
             {profileWarning}
           </div>
-        ) : (
-          <>
-            {cwdButton}
-            {profileWarning}
-          </>
         )}
 
         {space === "work" && !text && !hasAttachments && pastes.length === 0 && (
@@ -543,43 +730,67 @@ export function NewChatView({ cwd, controlScopeKey,
           </div>
         )}
 
-        <textarea className="newchat-input" data-chat-composer
-          placeholder={space === "work" ? "描述要完成的工作，或上传文档、表格、演示…" : "发条消息开始…"} ref={taRef}
-          value={text} onChange={(e) => {
-            setText(e.target.value);
-            setAutoCompactNotice(null);
-          }} onPaste={onPaste}
-          autoFocus={autoFocus} rows={3}
-          disabled={creating || importing}
-          onCompositionStart={() => imeSubmitRef.current.startComposition()}
-          onCompositionEnd={(e) => {
-            imeSubmitRef.current.endComposition();
-            setText(e.currentTarget.value);
-          }}
-          onKeyDown={(e) => {
-            if (!imeSubmitRef.current.shouldSubmitKey({
-              key: e.key, shiftKey: e.shiftKey,
-              isComposing: e.nativeEvent.isComposing, keyCode: e.nativeEvent.keyCode,
-            })) return;
-            e.preventDefault();
-            send(e.currentTarget.value);
-          }} />
+        <div className="newchat-editor">
+          {suggestionOpen && !creating && !importing && (
+            <div className="cmd-pop" role="listbox" aria-label={skillOpen ? "Skills" : "命令"} data-lock-horizontal-swipe>
+              {commandMatches.map(command => (
+                <button key={command.slash} type="button" className="cmd"
+                  onClick={() => pickCommand(command.slash)}>
+                  <span className="cmd-ic"><Icon name={command.ic} size={17} /></span>
+                  <span className="cmd-tx">
+                    <span className="cmd-nm"><span className="slash">/{command.slash}</span></span>
+                    <span className="cmd-ds">{command.slash === "model"
+                      ? "选择模型，或输入 /model 模型名称"
+                      : `${command.name} — ${command.ds}`}</span>
+                  </span>
+                  <span className="cmd-kbd">↵</span>
+                </button>
+              ))}
+              {skillOpen && (skillLoading ? (
+                <div className="cmd-empty">正在读取 Skills…</div>
+              ) : skillMatches.length > 0 ? skillMatches.map(skill => (
+                <button key={skill.name} type="button" className="cmd" onClick={() => pickSkill(skill.name)}>
+                  <span className="cmd-ic"><Icon name="spark" size={17} /></span>
+                  <span className="cmd-tx">
+                    <span className="cmd-nm"><span className="slash">${skill.name}</span></span>
+                    <span className="cmd-ds">{skill.description || "调用此 Skill"}</span>
+                  </span>
+                  <span className="cmd-kbd">↵</span>
+                </button>
+              )) : <div className="cmd-empty">当前目录没有已启用的 Skills</div>)}
+            </div>
+          )}
+          {space === "code" ? (
+            <div className="newchat-inputbar">
+              {attachmentPicker}{input}{sendButton}
+            </div>
+          ) : input}
+        </div>
 
         <div className="newchat-foot">
+          {accessControl}
           <div className="newchat-ctls">
-            <AttachmentPicker key={controlScopeKey} onPick={onPick}
-              label={space === "work" ? "添加资料" : "添加附件"}
-              disabled={creating || importing} />
+            {space === "work" && attachmentPicker}
+            {space === "code" && engine === "codex" && collaborationMode === "plan" && (
+              <button type="button" className="hint-ctl newchat-plan"
+                disabled={creating || importing}
+                title="计划模式，点击切换为普通模式"
+                onClick={() => updateExecutionControls({ collaborationMode: "default" })}>
+                <Icon name="plan" size={13} />计划
+              </button>
+            )}
             <button type="button" className="hint-ctl"
               onClick={() => { onRequestModels?.(); setSheetKind("models"); }}
               title="选择模型" disabled={creating || importing || !onPickModel}>
-              {modelLabel}
+              <span title={modelLabel}>{space === "code"
+                ? displayModel(effectiveModel, modelList) ?? "本机默认" : modelLabel}</span>
             </button>
             <button type="button" className="hint-ctl"
               onClick={() => setSheetKind("efforts")}
               title="选择思考强度"
               disabled={creating || importing || !onPickEffort}>
-              {effortLabel}
+              <span title={effortLabel}>{space === "code"
+                ? displayEffort(effort, effortList) ?? localEffortName ?? "默认" : effortLabel}</span>
             </button>
             {engine === "codex" && (
               <SpeedPicker newSession model={effectiveModel} catalog={catalog}
@@ -589,35 +800,17 @@ export function NewChatView({ cwd, controlScopeKey,
                   serviceTier: tier, serviceTierScope: speedScope,
                 })} />
             )}
-            {engine === "codex" && space === "code" && (
-              <button type="button" className="newchat-access"
-                onClick={() => {
-                  setPermissionsOpen(true);
-                  onGetPermissionProfiles?.(cwd);
-                }}
-                disabled={creating || importing}
-                title={`执行环境：${permissionProfileLabel(permissionProfile) ?? "默认"}；审批：${permissionMode}；网页搜索：${webSearch ?? "默认"}`}>
-                <Icon name="shield" size={15} />
-                <span>{permissionProfileLabel(permissionProfile) ?? "默认环境"}</span>
-                <span aria-hidden="true">▾</span>
-              </button>
-            )}
           </div>
-          <div className="newchat-foot-right">
-            <span className="newchat-hint">{createError
+          {(space === "work" || createError || importing || creating || autoCompactNotice) && (
+            <div className="newchat-foot-right">
+            <span className="newchat-hint" role="status">{createError
               ? `创建失败：${createError}`
               : importing ? "正在导入附件…"
                 : creating ? "正在创建会话…"
                   : autoCompactNotice ?? "Enter 发送"}</span>
-            <button className="newchat-send"
-              onPointerDown={() => {
-                if (imeSubmitRef.current.shouldCommitBeforeButtonSubmit()) taRef.current?.blur();
-              }}
-              onClick={requestButtonSend}
-              disabled={!canSend}>
-              <Icon name="send" size={16} />开始
-            </button>
+            {space === "work" && sendButton}
           </div>
+          )}
         </div>
       </div>
 

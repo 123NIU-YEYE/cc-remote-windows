@@ -11595,6 +11595,163 @@ async function chooseDangerousNewChatControls(
 
 let newChatSubmissionSequence = 0;
 
+test("new-chat controls route slash commands without creating a model turn", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
+  const input = page.locator(".newchat-input");
+  const submission = page.getByTestId("newchat-submission");
+  await input.fill("/");
+  await expect(page.getByRole("listbox", { name: "命令" })).toBeVisible();
+  await input.press("Enter");
+  await expect(submission).toHaveText("null");
+  await input.fill("/mo");
+  await input.press("Enter");
+  await expect(page.getByRole("dialog", { name: "选择模型", exact: true })).toBeVisible();
+  await expect(submission).toHaveText("null");
+  await page.keyboard.press("Escape");
+  await input.fill("/compact");
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect(page.locator(".newchat-hint")).toContainText("需要已有会话");
+  await expect(input).toHaveValue("/compact");
+  await expect(submission).toHaveText("null");
+  await input.fill("/unknown-command");
+  await input.press("Enter");
+  await expect(page.locator(".newchat-hint")).toContainText("Codex 无此指令");
+  await expect(submission).toHaveText("null");
+  await input.fill("/permissions");
+  await input.press("Enter");
+  await expect(page.getByRole("dialog", { name: "权限与执行环境" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByTestId("switch-newchat-space").click();
+  await input.fill("/plan change files");
+  await input.press("Enter");
+  await expect(page.locator(".newchat-hint")).toContainText("Code 指令");
+  await expect(submission).toHaveText("null");
+});
+
+test("new-chat controls pass native prompts and preserve command arguments", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  const input = page.locator(".newchat-input");
+  const submission = page.getByTestId("newchat-submission");
+  await input.fill("/plan inspect this repository");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "inspect this repository", collaborationMode: "plan",
+  });
+  await page.getByTestId("switch-newchat-device").click();
+  await input.fill("/Users/Tester/My Project 请检查此目录");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "/Users/Tester/My Project 请检查此目录", collaborationMode: "default",
+  });
+  await input.fill("/init follow project conventions");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
+    .toMatch(/^Create or update AGENTS\.md[\s\S]*\n\nfollow project conventions$/);
+  await page.getByTestId("switch-newchat-engine").click();
+  await input.fill("/plugin:review 检查当前改动");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
+    .toBe("/plugin:review 检查当前改动");
+  await input.fill("/plan");
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect(page.locator(".newchat-hint")).toContainText("需要已有会话");
+  await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
+    .toBe("/plugin:review 检查当前改动");
+});
+
+test("new-chat controls keep attachments through local commands and IME confirmation", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  const input = page.locator(".newchat-input");
+  await page.getByLabel("添加文件", { exact: true }).setInputFiles({
+    name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("inspect these notes"),
+  });
+  await expect(page.locator(".attach-file")).toContainText("notes.txt");
+  await input.fill("/model");
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  const models = page.getByRole("dialog", { name: "选择模型", exact: true });
+  await models.locator(".cmd").nth(1).click();
+  await expect(page.locator(".attach-file")).toContainText("notes.txt");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.fill("检查附件");
+  await input.dispatchEvent("compositionstart");
+  await input.press("Enter");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.dispatchEvent("compositionend");
+  // A pointer submit deliberately commits the IME before the deferred send.
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect.poll(async () => JSON.parse(await page.getByTestId("newchat-submission").innerText()))
+    .toMatchObject({ prompt: "检查附件", files: ["notes.txt"] });
+});
+
+test("new-chat controls offer enabled Codex skills before the first message", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
+  const input = page.locator(".newchat-input");
+  await input.fill("$");
+  const skills = page.getByRole("listbox", { name: "Skills" });
+  await expect(skills).toContainText("$review");
+  await expect(skills).not.toContainText("$retired");
+  await input.fill("$rev");
+  await input.press("Enter");
+  await expect(input).toHaveValue("$review ");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.fill("$review inspect the changes");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await page.getByTestId("newchat-submission").innerText()).prompt)
+    .toBe("$review inspect the changes");
+});
+
+test("new-chat controls apply fast and model commands to the first native query", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
+  const input = page.locator(".newchat-input");
+  const submission = page.getByTestId("newchat-submission");
+  await input.fill("/model fixture-codex");
+  await input.press("Enter");
+  await expect(input).toHaveValue("");
+  await expect(submission).toHaveText("null");
+  await input.fill("/fast");
+  await input.press("Enter");
+  await expect(page.getByRole("button", { name: "速度：快速", exact: true })).toBeVisible();
+  await expect(submission).toHaveText("null");
+  await input.fill("inspect the project");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "inspect the project", model: "fixture-codex", serviceTier: "priority",
+  });
+  await input.fill("/fast");
+  await input.press("Enter");
+  await expect(page.getByRole("button", { name: "速度：标准", exact: true })).toBeVisible();
+});
+
+for (const width of [320, 390, 1280]) {
+  test(`new-chat controls compact layout grows with text at ${width}px`, async ({ page }, info) => {
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
+    for (const engine of ["codex", "claude"]) {
+      const input = page.locator(".newchat-input");
+      await input.fill("");
+      const bar = page.locator(".newchat-inputbar");
+      const compactHeight = (await bar.boundingBox())!.height;
+      expect(compactHeight).toBeLessThanOrEqual(66);
+      await expect(page.locator(`.newchat-greet use[href$="#${engine}"]`)).toHaveCount(1);
+      expect(await page.locator(".newchat-profile svg").count()).toBe(1);
+      const layout = await page.locator(".newchat-card").evaluate(card => ({
+        width: card.clientWidth, scroll: card.scrollWidth,
+        page: document.documentElement.scrollWidth, viewport: window.innerWidth,
+      }));
+      expect(layout.scroll).toBeLessThanOrEqual(layout.width);
+      expect(layout.page).toBeLessThanOrEqual(layout.viewport);
+      await input.fill(Array.from({ length: 12 }, (_, i) => `第 ${i + 1} 行：检查输入区域`).join("\n"));
+      expect((await bar.boundingBox())!.height).toBeGreaterThan(compactHeight);
+      expect((await bar.boundingBox())!.height).toBeLessThanOrEqual(152);
+      await input.fill("/mo");
+      const popup = await page.getByRole("listbox", { name: "命令" }).boundingBox();
+      expect(popup!.y).toBeGreaterThanOrEqual(0);
+      await page.screenshot({ path: info.outputPath(`newchat-${engine}-${width}.png`) });
+      await page.getByTestId("switch-newchat-engine").click();
+    }
+  });
+}
+
 test("new-chat controls center selections and recover after the phone keyboard closes", async ({ page }, info) => {
   await page.setViewportSize({ width: 393, height: 852 });
   await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
@@ -11748,34 +11905,33 @@ test("new-chat controls reset across engine authorization scopes", async ({
 test("new-chat controls reset and normalize across Code and Work", async ({
   page,
 }) => {
-  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
   await chooseDangerousNewChatControls(page);
 
   await page.getByTestId("switch-newchat-space").click();
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:work:codex");
   await expect(page.locator(".newchat-access")).toHaveCount(0);
-  const fast = page.getByRole("button", {
-    name: "新工作 Fast 服务档位",
-  });
+  const fast = page.getByRole("button", { name: /^速度：/ });
   await expect(fast).toHaveText("标准");
   await fast.click();
+  await page.getByRole("menuitemradio", { name: /快速/ }).click();
   await expect(fast).toHaveText("快速");
   const workSubmission = await submitNewChatFixture(page);
   expect(workSubmission.permissionMode).toBe("never");
   expect(workSubmission).not.toHaveProperty("permissionProfile");
   expect(workSubmission).not.toHaveProperty("webSearch");
-  expect(workSubmission.serviceTier).toBe("fast");
+  expect(workSubmission.serviceTier).toBe("priority");
 
   await page.getByTestId("switch-newchat-engine").click();
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:work:claude");
   await expect(page.getByRole("button", {
-    name: "新工作 Fast 服务档位",
+    name: /^速度：/,
   })).toHaveCount(0);
   await page.getByTestId("switch-newchat-engine").click();
   await expect(page.getByRole("button", {
-    name: "新工作 Fast 服务档位",
+    name: /^速度：/,
   })).toHaveText("标准");
 
   await page.getByTestId("switch-newchat-space").click();
