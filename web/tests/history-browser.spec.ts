@@ -11700,6 +11700,54 @@ test("new-chat controls offer enabled Codex skills before the first message", as
     .toBe("$review inspect the changes");
 });
 
+test("new-chat controls omit Code-directory skills in a new Work session", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
+  const input = page.locator(".newchat-input");
+  const skills = page.getByRole("listbox", { name: "Skills" });
+  const requests = page.getByTestId("newchat-skill-requests");
+  await input.fill("$");
+  await expect(skills).toContainText("$review");
+  await expect(requests).toHaveText("1");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(page.locator(".work-newchat")).toBeVisible();
+  await expect(skills).toHaveCount(0);
+  await input.fill("$rev");
+  await expect(requests).toHaveText("1");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(skills).toContainText("$review");
+  await expect(requests).toHaveText("2");
+});
+
+for (const engine of ["claude", "codex"] as const) {
+  test(`new-chat controls preserve raw ${engine} model IDs through catalog refresh and creation`, async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const relay = await mockRightPanelRelay(page, { engine, visible: false, retained: false });
+    await page.goto("/");
+    await page.getByRole("button", { name: "显示会话侧栏", exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    await input.fill("/model provider/hidden-model[1m]");
+    await input.press("Enter");
+    await expect(input).toHaveValue("");
+    await expect(page.getByTitle("选择模型", { exact: true })).toContainText("provider/hidden-model[1m]");
+    expect(relay.commands.filter(command => command.type === "new_session")).toEqual([]);
+    const request = relay.commands.filter(command => command.type === "get_models").at(-1)!;
+    relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
+      models: [{ id: "catalog-model", display_name: "Listed model", description: "", efforts: ["high"] }] });
+    // Observe catalog application before checking that reconciliation kept the raw ID.
+    await page.getByTitle("选择模型", { exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "选择模型" })).toContainText("Listed model");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTitle("选择模型", { exact: true })).toContainText("provider/hidden-model[1m]");
+    await input.fill("hello");
+    await input.press("Enter");
+    await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
+      engine: command.engine ?? "claude", model: command.model, effort: command.effort ?? null,
+    })))
+      .toMatchObject([{ engine, model: "provider/hidden-model[1m]", effort: null }]);
+  });
+}
+
 test("new-chat controls apply fast and model commands to the first native query", async ({ page }) => {
   await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
   const input = page.locator(".newchat-input");

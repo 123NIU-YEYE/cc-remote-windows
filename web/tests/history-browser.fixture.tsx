@@ -1311,6 +1311,7 @@ function HistoryConversationBrowserFixture() {
   const [newChatAccount, setNewChatAccount] = useState("primary");
   const [newChatModel, setNewChatModel] = useState<string | null>(null);
   const [newChatEffort, setNewChatEffort] = useState<string | null>(null);
+  const [newChatSkillRequests, setNewChatSkillRequests] = useState(0);
   const selectionAccounts = params.has("selection-controls")
     ? [{ id: "primary", label: "Main" }, { id: "secondary", label: "Secondary" }]
     : [];
@@ -1877,6 +1878,7 @@ function HistoryConversationBrowserFixture() {
             <output data-testid="newchat-submission">{
               JSON.stringify(newChatSubmission)
             }</output>
+            <output data-testid="newchat-skill-requests">{newChatSkillRequests}</output>
           </>
         )}
         {queuedQueryFixture && (
@@ -1962,6 +1964,7 @@ function HistoryConversationBrowserFixture() {
               { id: "review-skill", kind: "skill", name: "review", description: "Review the current project", enabled: true },
               { id: "disabled-skill", kind: "skill", name: "retired", enabled: false },
             ] : undefined}
+            onRequestSkills={() => setNewChatSkillRequests(count => count + 1)}
             permissionProfiles={newChatProfiles}
             claudeProfiles={selectionAccounts}
             codexProfiles={selectionAccounts}

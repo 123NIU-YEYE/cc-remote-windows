@@ -404,6 +404,8 @@ export interface AppState {
     cwd: string;
     cwdSource: "default" | "inherited" | "explicit";
     model: string | null;
+    /** Explicit /model IDs can be absent from discovery; picker choices cannot. */
+    modelSource?: "command";
     effort: string | null;
     autoCompactMode: AutoCompactMode;
     autoCompactThresholdTokens: number | null;
@@ -577,7 +579,7 @@ export type Action =
   | { type: "set_new_chat_codex_profile"; scopeKey: string; profileId: string }
   | { type: "set_new_chat_claude_profile"; scopeKey: string; profileId: string }
   | { type: "clear_scope_cwd"; scopeKey: string }
-  | { type: "set_new_chat_model"; model: string | null }
+  | { type: "set_new_chat_model"; model: string | null; modelSource?: "command" }
   | { type: "set_new_chat_effort"; effort: string | null }
   | { type: "set_new_chat_auto_compact"; mode: AutoCompactMode; thresholdTokens: number | null }
   | { type: "set_new_chat_selection"; model: string | null; effort: string | null }
@@ -3331,6 +3333,7 @@ export function reduce(state: AppState, action: Action): AppState {
           // Catalog and execution controls are account-owned. Never carry an
           // explicit choice into another CODEX_HOME before its catalog arrives.
           model: null,
+          modelSource: undefined,
           effort: null,
         },
       };
@@ -3351,6 +3354,7 @@ export function reduce(state: AppState, action: Action): AppState {
           ...state.newChat,
           claudeProfileId: action.profileId,
           model: null,
+          modelSource: undefined,
           effort: null,
         },
       };
@@ -3362,7 +3366,10 @@ export function reduce(state: AppState, action: Action): AppState {
       return { ...state, cwdByScope };
     }
     case "set_new_chat_model":
-      return state.newChat ? { ...state, newChat: { ...state.newChat, model: action.model } } : state;
+      return state.newChat ? { ...state, newChat: {
+        ...state.newChat, model: action.model,
+        modelSource: action.model ? action.modelSource : undefined,
+      } } : state;
     case "set_new_chat_effort":
       return state.newChat ? { ...state, newChat: { ...state.newChat, effort: action.effort } } : state;
     case "set_new_chat_auto_compact":
