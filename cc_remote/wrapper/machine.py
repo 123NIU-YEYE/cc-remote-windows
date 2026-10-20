@@ -6873,14 +6873,19 @@ class WrapperMachine:
         from cc_remote.wrapper.codex_agent_activity import CodexAgentActivity
 
         async with self._codex_task_sync_lock:
+            selected = None if contexts is None else {id(ctx) for ctx in contexts}
             accounts: dict[Path, list[tuple[SessionContext, str]]] = {}
-            for ctx in list(self.sessions.values()) if contexts is None else contexts:
+            for ctx in list(self.sessions.values()):
                 if (ctx.engine != "codex" or ctx.space != "code"
                         or not ctx.session_id or not self._is_resident_context(ctx)):
                     continue
                 profile = self._codex_profile_for_ctx(ctx)
                 accounts.setdefault(profile.home, []).append((ctx, ctx.session_id))
-            for home, residents in accounts.items():
+            for home, account_residents in accounts.items():
+                residents = [entry for entry in account_residents
+                             if selected is None or id(entry[0]) in selected]
+                if not residents:
+                    continue
                 activity = agents = None
                 try:
                     activity = await asyncio.to_thread(read_task_activity, home)
@@ -6895,8 +6900,10 @@ class WrapperMachine:
                     self._codex_task_read_errors.discard(home)
                 try:
                     reader = self._codex_agent_activity.setdefault(home, CodexAgentActivity())
+                    # The reader replaces an account-wide cache. Focus/BTW
+                    # limits publication, not the resident set retained there.
                     agents = await asyncio.to_thread(
-                        reader.read, home, {sid for _, sid in residents})
+                        reader.read, home, {sid for _, sid in account_residents})
                 except Exception as exc:
                     if home not in self._codex_agent_read_errors:
                         log.warning("Codex native agent snapshot unavailable",
