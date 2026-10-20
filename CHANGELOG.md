@@ -2,6 +2,15 @@
 
 [中文](CHANGELOG_zh.md)
 
+## v4.0.27
+
+Restore link previews for larger site images and keep monochrome site icons readable across themes. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.27.md).
+
+- Accept bounded larger source images and multi-size favicons, including Hugging Face assets, then resize them to the existing static PNG output limits.
+- Render transparent neutral single-color icons, such as GitHub's, in the theme's foreground color in message links and preview headers.
+- Preserve colored and opaque artwork, image decoding limits, public-address validation and metadata-only fallback.
+- Include unchanged signed Android preview.2 and unsigned HarmonyOS preview.5 shells; existing mobile users need no native reinstall.
+
 ## v4.0.26
 
 Customize colors and fonts independently for each engine and appearance mode, with clearer preset content colors. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.26.md).
