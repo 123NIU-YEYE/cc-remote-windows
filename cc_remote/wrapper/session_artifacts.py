@@ -68,8 +68,147 @@ def image_thumbnail(data: bytes) -> bytes:
         return result
 
 
+def _table_cells(line: str) -> list[str]:
+    """Split a Markdown row with optional outer pipes and escaped cell pipes."""
+    cells = []
+    start, escaped = 0, False
+    for index in range(len(line)):
+        char = line[index]
+        if char == "|" and not escaped:
+            cells.append(line[start:index].strip())
+            start = index + 1
+        escaped = char == "\\" and not escaped
+    if start < len(line) or not cells:
+        cells.append(line[start:].strip())
+    if line.startswith("|"):
+        cells.pop(0)
+    return cells
+
+
+def _table_separator(cells: list[str], width: int) -> bool:
+    return bool(cells) and len(cells) == width and all(
+        re.fullmatch(r":?-+:?", cell) for cell in cells)
+
+
+_FILE_TABLE_HEADERS = frozenset({
+    "file", "files", "filename", "filenames", "path", "paths", "artifact", "artifacts",
+    "文件", "文件名", "文件路径", "路径", "产物", "输出文件", "交付文件",
+})
+
+
+def _inline_local_paths(text: str, cwd: str):
+    """Recognize quoted paths and directory-led file lists, without filesystem I/O.
+
+    A bare filename needs a directory explicitly introduced immediately before
+    its list/table. Do not carry that directory into another paragraph, heading,
+    code example or assistant message, or infer paths from shell commands.
+    """
+    directory = None
+    fence = None
+    table_started, table_ready = False, False
+    table_column, table_width = None, 0
+    lines = text.splitlines()
+    for line_number, line in enumerate(lines):
+        stripped = line.strip()
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        in_bullet = bool(re.match(r"^\s*(?:[-+*]\s+|\d+[.)]\s+)", line))
+        block_start = marker or in_bullet or re.match(
+            r"^(?:#{1,6}(?:\s|$)|>|<[!/?A-Za-z]|(?:[-*_]\s*){3,}$)", stripped)
+        cells = _table_cells(stripped)
+        # A pipe in prose is not enough: a new table needs its delimiter row.
+        # Once open, a short body row can omit cells (and therefore all pipes).
+        table_header = (directory and line_number + 1 < len(lines)
+                        and (len(cells) > 1 or stripped.startswith("|") or stripped.endswith("|"))
+                        and _table_separator(
+                            _table_cells(lines[line_number + 1].strip()), len(cells)))
+        delimiter = table_started and not table_ready and _table_separator(cells, table_width)
+        is_table = bool(stripped and (delimiter or not block_start and (table_started or table_header)))
+        if not is_table:
+            if table_started:
+                directory = None
+            table_started, table_ready = False, False
+            table_column = None
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence):
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+            directory = None
+            continue
+        if not stripped:
+            continue
+        in_list = in_bullet or is_table
+        if not in_list:
+            directory = None
+        if directory and is_table:
+            if not table_started:
+                columns = [index for index, cell in enumerate(cells)
+                           if re.sub(r"\s+", "", cell.strip("*_` ")).lower()
+                           in _FILE_TABLE_HEADERS]
+                table_column = columns[0] if len(columns) == 1 else None
+                table_width, table_started = len(cells), True
+                continue
+            if table_column is None:
+                continue
+            if not table_ready:
+                if not _table_separator(cells, table_width):
+                    table_column = None
+                else:
+                    table_ready = True
+                continue
+            if table_column >= len(cells):
+                continue
+            # Descriptions may contain source filenames or code identifiers.
+            # Only the explicitly named file column participates in discovery.
+            line = cells[table_column]
+        values = []
+        for match in re.finditer(r"(?<!`)(`{1,2})([^`\n]+)\1(?!`)", line):
+            value = match[2].strip()
+            if (not value or len(value) > 4096
+                    or any(ord(char) < 32 for char in value)
+                    or re.search(r"[<>|*?;$={}\\]", value)
+                    or value.startswith(("//", "#"))
+                    or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", value)):
+                continue
+            # Relative path prefixes must look like directories, not commands.
+            if "/" in value and not value.startswith(("/", "~/", "./", "../")):
+                if not re.fullmatch(r"[\w.-]+", value.split("/", 1)[0]):
+                    continue
+            values.append(value)
+        directories = [value for value in values if value.endswith("/")] if not is_table else []
+        if (not directories and len(values) == 1 and not in_list
+                and stripped.endswith((":", "："))):
+            # A path-shaped, extensionless introduction is unambiguous.
+            # Bare/dotted directory names need an explicit location cue.
+            value = values[0]
+            location = re.search(
+                r"(?:\b(?:in|under|inside|directory|folder)\b|目录|文件夹|位于|在|保存到|输出到)"
+                r"\s*[:：]?\s*(`{1,2})[^`\n]+\1\s*[:：]$", stripped, re.I)
+            if ("/" in value and not Path(value).suffix) or location:
+                directories = [value]
+        if directories:
+            directory = (os.path.abspath(os.path.join(cwd, os.path.expanduser(directories[0])))
+                         if len(directories) == 1 and not in_list
+                         and stripped.endswith((":", "：")) else None)
+        for index, value in enumerate(values):
+            if value.endswith("/") or (directory and value in directories):
+                continue
+            value = re.sub(r":\d+(?::\d+)?$", "", value)
+            if not re.fullmatch(r"\.[a-zA-Z0-9]{1,16}", Path(value).suffix):
+                continue
+            if "/" in value:
+                yield os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
+            elif directory and in_list and (index == 0 or is_table):
+                # Only the file label in a bullet, not identifiers in its description.
+                yield os.path.abspath(os.path.join(directory, value))
+
+
 def local_links(text: str, cwd: str) -> list[str]:
-    """Only explicit Markdown destinations / visualize outputs, not tool reads."""
+    """Explicit delivered file references, not tool reads or directory scans."""
+    # Link labels can themselves contain code spans; their destination, not the
+    # display label, is the file identity.
+    inline_text = re.sub(r"!?\[[^\]\n]*\]\([^\n]*?\)", "", text)
     text = re.sub(r"```[^\n]*\n.*?```|~~~[^\n]*\n.*?~~~", "", text, flags=re.S)
     candidates = []
     for match in re.finditer(r"\]\(\s*(?:<([^>\n]+)>|([^\s]+?))(?:\s+\"[^\"]*\")?\s*\)", text):
@@ -93,6 +232,11 @@ def local_links(text: str, cwd: str) -> list[str]:
         if not path or not Path(path).suffix:
             continue
         path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+        if path not in paths:
+            paths.append(path)
+    for path in _inline_local_paths(inline_text, cwd):
+        if len(paths) >= 128:
+            break
         if path not in paths:
             paths.append(path)
     return paths

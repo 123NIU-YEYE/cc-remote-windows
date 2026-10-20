@@ -928,13 +928,14 @@ def test_holder_scan_reports_missing_proc_as_incomplete(tmp_path):
     assert scan.complete is False and scan.holders == {"sid": set()}
 
 
-def test_turn_marker_parser_preserves_partial_and_skips_malformed():
+@pytest.mark.parametrize("completion_kind", ["task_complete", "task_completed"])
+def test_turn_marker_parser_preserves_partial_and_skips_malformed(completion_kind):
     start = _event("task_started", "external-1")
     split = len(start) // 2
     first = parse_turn_markers(start[:split])
     assert not first.started and first.partial == start[:split]
     second = parse_turn_markers(
-        start[split:] + b"not-json\n" + _event("task_complete", "external-1"),
+        start[split:] + b"not-json\n" + _event(completion_kind, "external-1"),
         first.partial,
     )
     assert second.started == {"external-1"}
@@ -942,16 +943,20 @@ def test_turn_marker_parser_preserves_partial_and_skips_malformed():
     assert second.partial == b""
     assert second.ordered == (
         ("task_started", "external-1"),
-        ("task_complete", "external-1"),
+        (completion_kind, "external-1"),
     )
+    assert len(second.terminals) == 1
+    assert second.terminals[0].turn_id == "external-1"
+    assert second.terminals[0].status == "completed"
 
 
-def test_turn_marker_parser_bounds_terminal_wire_metadata():
+@pytest.mark.parametrize("completion_kind", ["task_complete", "task_completed"])
+def test_turn_marker_parser_bounds_terminal_wire_metadata(completion_kind):
     records = [
         {
             "type": "event_msg",
             "payload": {
-                "type": "task_complete",
+                "type": completion_kind,
                 "turn_id": "valid-terminal",
                 "duration_ms": float("inf"),
                 "completed_at": float("nan"),
@@ -960,7 +965,7 @@ def test_turn_marker_parser_bounds_terminal_wire_metadata():
         {
             "type": "event_msg",
             "payload": {
-                "type": "task_complete",
+                "type": completion_kind,
                 "turn_id": "oversized-terminal",
                 "duration_ms": MAX_SAFE_WIRE_INTEGER + 1,
                 "completed_at": MAX_SAFE_WIRE_INTEGER + 1,
@@ -969,7 +974,7 @@ def test_turn_marker_parser_bounds_terminal_wire_metadata():
         {
             "type": "event_msg",
             "payload": {
-                "type": "task_complete",
+                "type": completion_kind,
                 "turn_id": "not/a/wire/id",
                 "duration_ms": 1,
             },
@@ -995,9 +1000,10 @@ def test_turn_marker_parser_bounds_terminal_wire_metadata():
         assert by_id[turn_id].completed_at is None
 
 
-def test_task_complete_with_provider_error_is_a_failed_terminal():
+@pytest.mark.parametrize("completion_kind", ["task_complete", "task_completed"])
+def test_task_complete_with_provider_error_is_a_failed_terminal(completion_kind):
     parsed = parse_turn_markers((json.dumps({"type": "event_msg", "payload": {
-        "type": "task_complete", "turn_id": "capacity-failed", "duration_ms": 337204,
+        "type": completion_kind, "turn_id": "capacity-failed", "duration_ms": 337204,
         "error": {"codex_error_info": "server_overloaded"},
     }}) + "\n").encode())
     assert parsed.finished == {"capacity-failed"}
