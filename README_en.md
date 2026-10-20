@@ -117,8 +117,21 @@ the question unanswered. Confirming an IME composition does not submit it.
 
 Side conversations, file previews, diffs, session files, agent details and remote
 previews have a header button to expand into a centered view or dock on the right.
+
+Native Codex agents and MCP background tasks appear above the composer in the
+background task control. Click an agent to inspect its activity. Refreshing or
+reconnecting restores ongoing work; finishing the main response does not clear
+an agent that is still running.
+
 **More → Artifacts** lists uploads and delivered file links for the current session;
-side chats have their own Artifacts entry. Opening a file replaces the list with
+side chats have their own Artifacts entry. Discovery also recognizes
+code-formatted local paths and filenames in a list or
+table introduced by an explicit directory. It does not crawl directories or
+automatically treat tool-read files as deliverables.
+Tables may omit or mix leading/trailing pipes and use an explicitly labeled
+filename/path column; code-formatted source
+filenames or identifiers in description columns are not treated as deliverables.
+Opening a file replaces the list with
 its preview; Back returns to the list. New uploads have durable private copies,
 while delivered files reference their original paths. Older sessions are indexed
 one history page at a time; previously deleted temporary uploads cannot be recovered.
