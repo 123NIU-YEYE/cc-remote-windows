@@ -27,6 +27,12 @@ assert.deepEqual(reconcileNewChatSelection("claude", "claude-opus-5-5", "max", c
   { model: "claude-opus-5-5", effort: "max" });
 assert.deepEqual(reconcileNewChatSelection("claude", "claude-opus-5[1m]", "max", catalog, null),
   { model: null, effort: null }, "unavailable fallback selections must clear after native discovery");
+for (const engine of ["claude", "codex"] as const) {
+  assert.deepEqual(reconcileNewChatSelection(
+    engine, "provider/hidden-model[1m]", "max", catalog, null, "command"),
+  { model: "provider/hidden-model[1m]", effort: null },
+  "explicit model IDs survive discovery without inventing effort capabilities");
+}
 
 const workCatalog = { claude: [
   { id: "default", display_name: "Default", description: "Native default",

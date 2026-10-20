@@ -77,7 +77,7 @@ interface Props {
   onSelectProject?: (projectId: string | null) => void;
   onManageWork?: () => void;
   onPickCwd: () => void;  // open the directory picker
-  onPickModel?: (model: string | null) => void;
+  onPickModel?: (model: string | null, source?: "command") => void;
   onPickEffort?: (effort: string | null) => void;
   onPickAutoCompact?: (selection: AutoCompactSelection) => void;
   onPickClaudeProfile?: (profileId: string) => void;
@@ -200,7 +200,8 @@ export function NewChatView({ cwd, controlScopeKey,
   const buttonSendTimerRef = useRef<number | null>(null);
   const commandToken = slashToken(text);
   const commandMatches = commandToken === null ? [] : matchCommands(commandToken, engine, space);
-  const currentSkillToken = engine === "codex" ? skillToken(text) : null;
+  // Work gets a private cwd only when created; the Code cwd cannot describe it.
+  const currentSkillToken = engine === "codex" && space === "code" ? skillToken(text) : null;
   const skillMatches = currentSkillToken !== null && skills ? matchSkills(currentSkillToken, skills) : [];
   const skillLoading = currentSkillToken !== null && skills === undefined;
   const skillOpen = currentSkillToken !== null
@@ -426,14 +427,13 @@ export function NewChatView({ cwd, controlScopeKey,
       if (args) {
         const selected = modelList.find(candidate =>
           candidate.id === args || candidate.name.toLowerCase() === args.toLowerCase());
-        if (!selected || !onPickModel) {
-          setAutoCompactNotice("未找到此模型，请从模型列表中选择。");
-          onRequestModels?.();
-          setSheetKind("models");
+        if (!onPickModel) {
+          setAutoCompactNotice("模型设置当前不可用。");
           return;
         }
-        onPickModel(selected.id);
-        setAutoCompactNotice(`已选择模型：${selected.name}`);
+        // Native engines accept hidden/provider IDs that discovery may omit.
+        onPickModel(selected?.id ?? args, "command");
+        setAutoCompactNotice(`已选择模型：${selected?.name ?? args}`);
       } else {
         onRequestModels?.();
         setSheetKind("models");

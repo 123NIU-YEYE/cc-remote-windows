@@ -85,8 +85,9 @@ export function reconcileNewChatSelection(
   effort: string | null,
   catalog: Catalog,
   localDefaultModel: string | null,
+  modelSource?: "command",
 ): { model: string | null; effort: string | null } {
-  if (model && !modelsFor(engine, catalog).some(
+  if (model && modelSource !== "command" && !modelsFor(engine, catalog).some(
     (candidate) => candidate.id === model,
   )) {
     // A fallback model can disappear when the authoritative, entitlement-
@@ -94,6 +95,8 @@ export function reconcileNewChatSelection(
     // now-inaccessible model with a stale effort.
     return { model: null, effort: null };
   }
+  // An explicitly typed /model ID is validated by the native engine. Discovery
+  // is not exhaustive, but unknown models still cannot inherit a stale effort.
   return {
     model,
     effort: compatibleNewChatEffort(

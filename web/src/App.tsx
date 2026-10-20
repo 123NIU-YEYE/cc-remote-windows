@@ -1920,6 +1920,7 @@ export default function App() {
       state.newChat.effort,
       newChatCatalog,
       newChatDefaults.model,
+      state.newChat.modelSource,
     );
     if (reconciled.model === state.newChat.model
         && reconciled.effort === state.newChat.effort) return;
@@ -5043,7 +5044,7 @@ export default function App() {
     }
     return queued;
   };
-  const pickNewChatModel = (model: string | null) => {
+  const pickNewChatModel = (model: string | null, modelSource?: "command") => {
     const current = state.newChat;
     if (!current) return;
     const compatibleEffort = compatibleNewChatEffort(
@@ -5053,7 +5054,7 @@ export default function App() {
       newChatCatalog,
       newChatDefaults.model,
     );
-    dispatch({ type: "set_new_chat_model", model });
+    dispatch({ type: "set_new_chat_model", model, modelSource });
     if (compatibleEffort !== current.effort) {
       dispatch({
         type: "set_new_chat_effort",
@@ -5942,9 +5943,9 @@ export default function App() {
             autoFocus={newChatAutoFocus}
             engine={engine}
             catalog={newChatCatalog}
-            skills={skillCatalogs[newChatSkillCatalogKey]?.items}
+            skills={space === "code" ? skillCatalogs[newChatSkillCatalogKey]?.items : undefined}
             onRequestSkills={() => {
-              if (!state.newChat) return;
+              if (!state.newChat || space !== "code") return;
               requestSkillCatalog({
                 key: newChatSkillCatalogKey,
                 engine, space, cwd: state.newChat.cwd, skillsOnly: true,
