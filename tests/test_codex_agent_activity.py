@@ -36,11 +36,12 @@ def append(path, *rows):
             stream.write(json.dumps({"type": typ, "payload": payload}) + "\n")
 
 
-def test_native_lifecycle_ignores_inherited_turn_and_unrelated_terminals(tmp_path):
+@pytest.mark.parametrize("completion_kind", ["task_complete", "task_completed"])
+def test_native_lifecycle_ignores_inherited_turn_and_unrelated_terminals(tmp_path, completion_kind):
     catalog(tmp_path, "parent", rows=[task("parent-turn")])
     child = catalog(tmp_path, "child", "parent", rows=[
         task("parent-turn"), boundary("child"), task("child-turn"),
-        terminal("parent-turn"), terminal("other-turn"),
+        terminal("parent-turn", completion_kind), terminal("other-turn", completion_kind),
     ])
     reader = CodexAgentActivity()
     initial = reader.read(tmp_path, {"parent"})["parent"]
@@ -50,24 +51,27 @@ def test_native_lifecycle_ignores_inherited_turn_and_unrelated_terminals(tmp_pat
     assert initial[0].title == "/root/child"
     assert reader.read(tmp_path, {"parent"})["parent"] == initial
     assert CodexAgentActivity().read(tmp_path, {"parent"})["parent"] == initial
-    append(child, terminal("child-turn"))
+    append(child, terminal("child-turn", completion_kind))
     assert reader.read(tmp_path, {"parent"})["parent"] == []
+    assert CodexAgentActivity().read(tmp_path, {"parent"})["parent"] == []
     append(child, task("followup"))
     assert reader.read(tmp_path, {"parent"})["parent"][0].status == "running"
-    append(child, terminal("child-turn"))  # Delayed old receipt is not a new finish.
+    append(child, terminal("child-turn", completion_kind))  # Delayed old receipt is not a new finish.
     assert reader.read(tmp_path, {"parent"})["parent"][0].status == "running"
     append(child, terminal("followup", "turn_aborted"))
     assert reader.read(tmp_path, {"parent"})["parent"] == []
 
 
-def test_legacy_native_agent_excludes_parent_context(tmp_path):
+@pytest.mark.parametrize("completion_kind", ["task_complete", "task_completed"])
+def test_legacy_native_agent_excludes_parent_context(tmp_path, completion_kind):
     catalog(tmp_path, "parent", rows=[task("inherited")])
     child = catalog(tmp_path, "child", "parent", rows=[
-        task("inherited"), task("own"), terminal("inherited")])
+        task("inherited"), task("own"), terminal("inherited", completion_kind)])
     reader = CodexAgentActivity()
     assert reader.read(tmp_path, {"parent"})["parent"][0].status == "running"
-    append(child, terminal("own"))
+    append(child, terminal("own", completion_kind))
     assert reader.read(tmp_path, {"parent"})["parent"] == []
+    assert CodexAgentActivity().read(tmp_path, {"parent"})["parent"] == []
 
 
 def test_only_direct_agents_in_same_account_and_not_ordinary_forks(tmp_path):
