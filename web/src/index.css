@@ -489,7 +489,8 @@ body{
 .message-link-anchor,.message-web-link{ display:inline; }
 .message-link-icon{ display:inline-flex; width:18px; height:18px; margin:0 4px 0 0; padding:1px;
   border:0; border-radius:4px; background:transparent; color:var(--accent-ink); vertical-align:-3px; cursor:pointer; }
-.message-link-icon img,.message-web-preview-header img{ width:16px; height:16px; object-fit:contain; border-radius:3px; }
+.message-site-icon{ display:inline-block; flex:0 0 16px; width:16px; height:16px; object-fit:contain; border-radius:3px; }
+.message-site-icon.is-monochrome{ background:var(--text); mask-size:contain; mask-position:center; mask-repeat:no-repeat; }
 .message-link-icon:focus-visible{ outline:2px solid var(--accent); outline-offset:2px; }
 .message-web-preview{ position:fixed; z-index:120; box-sizing:border-box;
   width:min(360px,calc(100vw - 20px)); max-height:calc(100dvh - 20px); overflow:auto;
@@ -497,7 +498,7 @@ body{
   box-shadow:var(--shadow-lg); font:400 13px/1.5 var(--sans); text-align:left; }
 .message-web-preview-header{ display:flex; align-items:center; gap:8px; padding:11px 14px;
   border-bottom:1px solid var(--border); color:var(--dim); }
-.message-web-preview-header>span{ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.message-web-preview-header>span:not(.message-site-icon){ flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .message-web-preview-header>svg{ flex-shrink:0; }
 .message-web-preview-header a{ flex-shrink:0; color:var(--dim); text-decoration:none; font-size:12px; }
 .message-web-preview-header button{ display:flex; padding:3px; border:0; border-radius:5px;

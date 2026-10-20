@@ -18,11 +18,11 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .preview_image import raster_data
+from .preview_image import MAX_ICON_SOURCE_BYTES, MAX_IMAGE_SOURCE_BYTES, raster_data
 
 HTML_LIMIT = 256 * 1024
-IMAGE_LIMIT = 256 * 1024
-ICON_LIMIT = 64 * 1024
+IMAGE_LIMIT = MAX_IMAGE_SOURCE_BYTES
+ICON_LIMIT = MAX_ICON_SOURCE_BYTES
 CACHE_LIMIT = 64
 # Image decoding/encoding must not block control-link traffic. Timed-out
 # requests cannot create extra active decoders beyond these two workers.
