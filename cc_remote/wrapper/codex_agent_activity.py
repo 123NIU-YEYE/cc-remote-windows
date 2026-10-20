@@ -18,7 +18,7 @@ from cc_remote.wrapper.codex_agents import _ID, _parent
 from cc_remote.wrapper.codex_external import parse_turn_markers
 from cc_remote.wrapper.codex_sessions import _state_db_path, MAX_META_RECORD_BYTES
 
-_MAX_CHILDREN = 512
+_MAX_CHILDREN = 512  # Per resident parent, including completed native catalog rows.
 _MAX_RECORD = 16 * 1024 * 1024
 _READ_BUDGET = 32 * 1024 * 1024
 _MAX_TURNS = 4096
@@ -30,6 +30,7 @@ def _catalog(home: Path, parents: set[str]) -> dict[str, tuple[str, str]]:
     if database is None:
         return {}
     uri = Path(database).resolve().as_uri() + "?mode=ro"
+    result = {}
     with sqlite3.connect(uri, uri=True, timeout=1) as db:
         # Bound work even with an unexpectedly large/corrupt native catalog.
         steps = 0
@@ -40,22 +41,24 @@ def _catalog(home: Path, parents: set[str]) -> dict[str, tuple[str, str]]:
             return int(steps > 2000)
 
         db.set_progress_handler(bounded, 1000)
-        slots = ",".join("?" for _ in parents)
         source = "CASE WHEN length(source)<=65536 AND json_valid(source) THEN source ELSE '{}' END"
-        rows = db.execute(
-            f"SELECT id, rollout_path, {source} FROM threads WHERE "
-            f"json_extract({source}, '$.subagent.thread_spawn.parent_thread_id') "
-            f"IN ({slots}) LIMIT ?", (*sorted(parents), _MAX_CHILDREN + 1),
-        ).fetchall()
-    if len(rows) > _MAX_CHILDREN:
-        raise ValueError("native agent catalog exceeds activity limit")
-    result = {}
-    for sid, path, source in rows:
-        parent = _parent({"source": json.loads(source)})
-        if (not isinstance(sid, str) or not _ID.fullmatch(sid)
-                or not isinstance(path, str) or len(path) > 16384 or parent not in parents):
-            raise ValueError("invalid native agent catalog")
-        result[sid] = (parent, path)
+        for parent in sorted(parents):
+            steps = 0
+            rows = db.execute(
+                f"SELECT id, rollout_path, {source} FROM threads WHERE "
+                f"json_extract({source}, '$.subagent.thread_spawn.parent_thread_id') "
+                "= ? LIMIT ?", (parent, _MAX_CHILDREN + 1),
+            ).fetchall()
+            if len(rows) > _MAX_CHILDREN:
+                # Do not publish a truncated inventory or block other parents.
+                # Missing rows retain this parent's previous agents as unknown.
+                continue
+            for sid, path, raw_source in rows:
+                if (not isinstance(sid, str) or not _ID.fullmatch(sid)
+                        or not isinstance(path, str) or len(path) > 16384
+                        or _parent({"source": json.loads(raw_source)}) != parent):
+                    raise ValueError("invalid native agent catalog")
+                result[sid] = (parent, path)
     return result
 
 

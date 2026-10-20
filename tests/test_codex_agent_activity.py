@@ -152,6 +152,73 @@ def test_no_catalog_has_no_filesystem_side_effects(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_native_catalog_limit_is_per_parent(tmp_path, monkeypatch):
+    from cc_remote.wrapper import codex_agent_activity as module
+
+    monkeypatch.setattr(module, "_MAX_CHILDREN", 2)
+    for sid in ("first-old", "first-recent"):
+        catalog(tmp_path, sid, "first", rows=[boundary(sid), task(sid), terminal(sid)])
+    child = catalog(tmp_path, "second-child", "second", rows=[
+        boundary("second-child"), task("own")])
+    reader = CodexAgentActivity()
+    data = reader.read(tmp_path, {"first", "second"})
+    assert data["first"] == []
+    assert [item.item_id for item in data["second"]] == ["codex-agent:second-child"]
+    assert data["second"][0].status == "running"
+
+    append(child, terminal("own"))
+    catalog(tmp_path, "second-new", "second", rows=[boundary("second-new"), task("new")])
+    data = reader.read(tmp_path, {"first", "second"})
+    assert data["first"] == []
+    assert [item.item_id for item in data["second"]] == ["codex-agent:second-new"]
+    assert data["second"][0].status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("warm", [False, True])
+async def test_oversized_parent_does_not_block_other_sessions(tmp_path, monkeypatch, warm):
+    from cc_remote.wrapper import codex_agent_activity as module
+
+    monkeypatch.setattr(module, "_MAX_CHILDREN", 2)
+    first, second = sorted([str(uuid4()), str(uuid4())])
+    child = catalog(tmp_path, "first-child", first, rows=[boundary("first-child"), task("first")])
+    other = catalog(tmp_path, "second-child", second, rows=[boundary("second-child"), task("second")])
+    machine, transport = _mk_machine()
+    contexts = [_mk_ctx(sid, sid) for sid in (first, second)]
+    for ctx in contexts:
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+    monkeypatch.setattr(machine, "_codex_profile_for_ctx", lambda _: SimpleNamespace(home=tmp_path))
+    if warm:
+        await machine._refresh_codex_background_processes()
+    for sid in ("first-old", "first-older"):
+        catalog(tmp_path, sid, first, rows=[boundary(sid), task(sid), terminal(sid)])
+    append(child, terminal("first"))
+    append(other, terminal("second"))
+    latest = catalog(tmp_path, "second-new", second, rows=[boundary("second-new"), task("new")])
+    transport.sent.clear()
+
+    await machine._refresh_codex_background_processes()
+    assert set(contexts[1].codex_background_processes) == {"codex-agent:second-new"}
+    assert contexts[1].codex_background_processes["codex-agent:second-new"].status == "running"
+    assert any(event.sid == second for event in transport.sent)
+    retained = contexts[0].codex_background_processes
+    assert set(retained) == ({"codex-agent:first-child"} if warm else set())
+    if warm:
+        assert retained["codex-agent:first-child"].status == "unknown"
+    transport.sent.clear()
+    await machine._refresh_codex_background_processes()
+    assert transport.sent == [], "an overflowing parent must not cause repeated broadcasts"
+
+    # Returning below the cap permits reading the retained child's real terminal.
+    with sqlite3.connect(tmp_path / "state_5.sqlite") as db:
+        db.execute("DELETE FROM threads WHERE id IN ('first-old', 'first-older')")
+    append(latest, terminal("new"))
+    await machine._refresh_codex_background_processes()
+    assert all(ctx.codex_background_processes == {} and ctx.state == "idle" for ctx in contexts)
+    assert {event.sid for event in transport.sent} == ({first, second} if warm else {second})
+
+
 @pytest.mark.asyncio
 async def test_wrapper_merges_native_and_mcp_and_reseeds_after_parent_completion(tmp_path, monkeypatch):
     from cc_remote.protocol import Hello
