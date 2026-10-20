@@ -164,6 +164,112 @@ def test_artifact_discovery_only_follows_explicit_local_destinations():
         "/project/a b.py", "/workspace/docs/report.md", "/tmp/report.pdf", "/output/page.html"]
 
 
+def test_artifact_discovery_handles_directory_and_separate_delivery_names():
+    text = """三张图已生成，文件还在 `/tmp/diagrams/`：
+
+- `runtime-layers.png`：分层图，使用 `Module.Type`。
+- `delivery-flow.png`：交付链路。
+- `qwen-call.png`：调用时序。
+
+其他源码：`not-delivered.py`。
+"""
+    assert local_links(text, "/workspace") == [
+        "/tmp/diagrams/runtime-layers.png",
+        "/tmp/diagrams/delivery-flow.png",
+        "/tmp/diagrams/qwen-call.png",
+    ]
+    table = """Files are in `./output/`:
+
+| File | Description |
+|---|---|
+| `报告 中文.pdf` | Report |
+| `chart.svg` | Diagram |
+"""
+    assert local_links(table, "/workspace") == [
+        "/workspace/output/报告 中文.pdf", "/workspace/output/chart.svg"]
+
+
+def test_artifact_inline_paths_are_explicit_and_do_not_reinterpret_link_labels():
+    text = """结果：`/tmp/my diagram.png`、`./output/report.pdf`、`docs/notes.md:12`。
+[`fake/label.png`](actual.png)
+`https://example.com/a.png` `//server/a.png` `cat /tmp/read.png`
+`/tmp/*.png` `result.png` `API.call` `$OUTPUT/result.png`
+"""
+    assert local_links(text, "/workspace") == [
+        "/workspace/actual.png", "/tmp/my diagram.png",
+        "/workspace/output/report.pdf", "/workspace/docs/notes.md"]
+
+
+@pytest.mark.parametrize("separator", [
+    "另一个段落。", "## Another section", "```sh\nls /tmp/diagrams\n```",
+    "~~~text\nexample\n~~~", "可能在 `/tmp/one/` 或 `/tmp/two/`：",
+])
+def test_artifact_directory_context_does_not_escape_its_file_list(separator):
+    text = f"""Files in `/tmp/diagrams/`:
+- `first.png`
+{separator}
+- `unrelated.png`
+"""
+    assert local_links(text, "/workspace") == ["/tmp/diagrams/first.png"]
+
+
+def test_artifact_inline_discovery_skips_closed_and_unclosed_code_examples():
+    text = """Example:
+```md
+`/tmp/example.png`
+Files in `/tmp/example/`:
+- `example.svg`
+```
+Actual file: `/tmp/actual.png`
+~~~md
+`/tmp/unclosed.png`
+"""
+    assert local_links(text, "/workspace") == ["/tmp/actual.png"]
+
+
+def test_artifact_inline_discovery_is_bounded_and_deduplicated():
+    text = "\n".join(f"`/tmp/result-{i}.png`" for i in range(300))
+    paths = local_links(text, "/workspace")
+    assert len(paths) == 128
+    assert paths[-1] == "/tmp/result-127.png"
+    assert local_links("[result](/tmp/a.png) `/tmp/a.png`", "/workspace") == ["/tmp/a.png"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalog(tmp_path, engine):
+    machine, _ = _mk_machine()
+    ctx = _mk_ctx("session", "session")
+    ctx.engine = engine
+    ctx.cwd = str(tmp_path)
+    output = tmp_path / "diagrams"
+    output.mkdir()
+    names = ["runtime-layers.png", "delivery-flow.png", "qwen-call.png"]
+    for name in names:
+        (output / name).write_bytes(_test_image())
+    text = f"三张图已生成，文件在 `{output}/`：\n\n" + "\n".join(
+        f"- `{name}`：图的说明。" for name in names)
+    service = machine._artifacts
+    for part in [text[:27], text[27:]]:
+        await service.observe(ctx, Delta(message_id="answer", text=part))
+    await service.observe(ctx, AssistantMsgEnd(message_id="answer", channel="final"))
+    scope = service.context_scope(ctx)
+    live = service.store.page(scope)[0]
+    assert {row["name"] for row in live} == set(names)
+    assert all(public_entry(row)["available"] for row in live)
+    history = History(session_id="session", revision="rev", detail="summary", turns=[
+        {"id": "turn", "ts": 1000, "blocks": [{"kind": "text", "text": text}]},
+    ])
+    service.store.history(scope, history, ctx.cwd)
+    assert len(service.store.page(scope)[0]) == 3
+    # A cold/history-only catalog uses the same discovery, without engine calls.
+    cold_scope = service.scope(engine, "code", "cold")
+    service.store.history(cold_scope, history, ctx.cwd)
+    assert {row["path"] for row in service.store.page(cold_scope)[0]} == {
+        str(output / name) for name in names}
+    assert service.store.page(service.scope(engine, "code", "unrelated"))[0] == []
+
+
 def test_artifact_root_symlink_is_rejected(tmp_path):
     target = tmp_path / "elsewhere"
     target.mkdir()
@@ -583,7 +689,8 @@ async def test_thumbnail_is_small_readonly_and_never_opens_full_preview(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_automatic_thumbnail_does_not_grant_external_file_access(tmp_path):
+@pytest.mark.parametrize("reference", ["markdown", "inline"])
+async def test_automatic_thumbnail_does_not_grant_external_file_access(tmp_path, reference):
     machine, _ = _mk_machine()
     ctx = _mk_ctx("session", "session")
     cwd = tmp_path / "project"
@@ -593,7 +700,8 @@ async def test_automatic_thumbnail_does_not_grant_external_file_access(tmp_path)
     service = machine._artifacts
     outside = tmp_path / "private.png"
     outside.write_bytes(_test_image())
-    service.store.text(service.context_scope(ctx), f"[image]({outside})", ctx.cwd)
+    text = f"[image]({outside})" if reference == "markdown" else f"结果：`{outside}`"
+    service.store.text(service.context_scope(ctx), text, ctx.cwd)
     row = service.store.page(service.context_scope(ctx))[0][0]
     cmd = GetSessionArtifactPreview(sid="session", engine="claude", artifact_id=row["id"],
         request_id="thumb", client_id="reader", variant="thumbnail")
