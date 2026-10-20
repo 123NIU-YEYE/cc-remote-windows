@@ -60,7 +60,7 @@ _LOADED_THREAD_RESUME_SID_RE = re.compile(
     r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b"
 )
 _TERMINAL_EVENTS = frozenset({
-    "task_complete", "turn_aborted", "task_failed", "turn_failed",
+    "task_complete", "task_completed", "turn_aborted", "task_failed", "turn_failed",
     "task_error", "task_cancelled",
 })
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -978,7 +978,7 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
             reason = str(payload.get("reason") or "").lower()
             status = (
                 "completed"
-                if kind == "task_complete" and payload.get("error") is None
+                if kind in {"task_complete", "task_completed"} and payload.get("error") is None
                 else "interrupted"
                 if kind == "task_cancelled" or (
                     kind == "turn_aborted"
