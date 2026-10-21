@@ -46,7 +46,7 @@ export class TurnFilePageRequests {
     const id = event.request_id;
     const pending = id ? this.pending.get(id) : undefined;
     if (!pending) return event.type === "turn_file_changes_page"
-      || !!(id && this.retired.get(id) === event.sid);
+      || !!(id && this.retired.has(id) && this.retired.get(id) === event.sid);
     const { scope, finish } = pending;
     if (event.sid !== scope.sid) return event.type === "turn_file_changes_page";
     if (event.type === "error") {

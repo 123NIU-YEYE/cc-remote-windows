@@ -1960,11 +1960,13 @@ function HistoryConversationBrowserFixture() {
             } : undefined}
             defaultModel={params.has("newchat-commands") && newChatSurface.engine === "codex" ? "fixture-codex" : undefined}
             defaultEffort={params.has("newchat-commands") ? "max" : undefined}
-            skills={params.has("newchat-commands") ? [
+            skills={params.has("newchat-commands") && newChatSkillRequests > 0 ? [
               { id: "review-skill", kind: "skill", name: "review", description: "Review the current project", enabled: true },
               { id: "disabled-skill", kind: "skill", name: "retired", enabled: false },
             ] : undefined}
-            onRequestSkills={() => setNewChatSkillRequests(count => count + 1)}
+            onRequestSkills={() => {
+              if (params.has("newchat-commands")) setNewChatSkillRequests(count => count + 1);
+            }}
             permissionProfiles={newChatProfiles}
             claudeProfiles={selectionAccounts}
             codexProfiles={selectionAccounts}

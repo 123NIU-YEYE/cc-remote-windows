@@ -58,6 +58,8 @@ interface Props {
   catalog?: Catalog;
   onRequestModels?: () => void;
   skills?: EngineCapabilityItem[];
+  skillsOnline?: boolean;
+  skillsError?: boolean;
   onRequestSkills?: () => void;
   model?: string | null;
   effort?: string | null;
@@ -176,7 +178,7 @@ export function NewChatView({ cwd, controlScopeKey,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
   onPickModel, onPickEffort, onPickAutoCompact, onPickClaudeProfile, onRequestModels,
-  onPickCodexProfile, skills, onRequestSkills,
+  onPickCodexProfile, skills, skillsOnline = true, skillsError = false, onRequestSkills,
   permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -205,19 +207,14 @@ export function NewChatView({ cwd, controlScopeKey,
   const skillMatches = currentSkillToken !== null && skills ? matchSkills(currentSkillToken, skills) : [];
   const skillLoading = currentSkillToken !== null && skills === undefined;
   const skillOpen = currentSkillToken !== null
-    && (skillLoading || currentSkillToken === "" || skillMatches.length > 0);
+    && (skillLoading || skillsError || currentSkillToken === "" || skillMatches.length > 0);
   const suggestionOpen = commandMatches.length > 0 || skillOpen;
-  const requestedSkillScopeRef = useRef<string | null>(null);
-  const skillScope = `${controlScopeKey}:${engine}:${space}:${cwd}`;
+  // The App's request coordinator owns in-flight deduplication. A component
+  // latch would outlive reads cancelled by reconnect or cache invalidation.
   useEffect(() => {
-    if (currentSkillToken === null) {
-      requestedSkillScopeRef.current = null;
-      return;
-    }
-    if (!onRequestSkills || requestedSkillScopeRef.current === skillScope) return;
-    requestedSkillScopeRef.current = skillScope;
-    onRequestSkills();
-  }, [currentSkillToken, skillScope, onRequestSkills]);
+    if (currentSkillToken === null || skills !== undefined || !skillsOnline || skillsError) return;
+    onRequestSkills?.();
+  }, [currentSkillToken, skills, skillsOnline, skillsError, onRequestSkills]);
 
   useLayoutEffect(() => {
     const textarea = taRef.current;
@@ -746,7 +743,16 @@ export function NewChatView({ cwd, controlScopeKey,
                   <span className="cmd-kbd">↵</span>
                 </button>
               ))}
-              {skillOpen && (skillLoading ? (
+              {skillOpen && (!skillsOnline ? (
+                <div className="cmd-empty">连接恢复后将重新读取 Skills…</div>
+              ) : skillsError ? (
+                <>
+                  <div className="cmd-empty" role="status">Skills 读取失败，请重试。</div>
+                  <button type="button" className="cmd" onClick={onRequestSkills}>
+                    <span className="cmd-tx"><span className="cmd-nm">重试读取 Skills</span></span>
+                  </button>
+                </>
+              ) : skillLoading ? (
                 <div className="cmd-empty">正在读取 Skills…</div>
               ) : skillMatches.length > 0 ? skillMatches.map(skill => (
                 <button key={skill.name} type="button" className="cmd" onClick={() => pickSkill(skill.name)}>
