@@ -383,6 +383,109 @@ function newChatSkillResponse(command: Record<string, unknown>, name: string, er
     items: [{ id: name, name, kind: "skill", enabled: true, description: "Project skill" }] };
 }
 
+for (const engine of ["claude", "codex"] as const) {
+  test(`new-chat controls open ${engine} extension catalogs before creating a session`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { engine, retained: false,
+      capabilityReply: command => ({ type: "engine_capabilities",
+        request_id: String(command.cmd_id), engine, space: "code",
+        cwd: String(command.cwd), skills_only: !!command.skills_only,
+        items: [{ id: "available", name: "Available skill", kind: "skill" }],
+      }),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    const sheet = page.getByRole("dialog", { name: "Extensions", exact: true });
+    for (const [slash, label] of [
+      ["extensions", "全部"], ["skills", "Skills"], ["plugins", "Plugins"],
+      ["apps", "Apps"], ["mcp", "MCP"], ["hooks", "Hooks"],
+    ]) {
+      // Cover both palette selection and submitting a complete command.
+      await input.fill(`/${slash}`);
+      if (slash === "skills" || slash === "mcp") {
+        await page.getByRole("listbox", { name: "命令" }).getByRole("button").first().click();
+      } else await page.getByRole("button", { name: "开始", exact: true }).click();
+      await expect(sheet).toBeVisible();
+      await expect(sheet.locator(".capabilities-tabs .active")).toHaveText(label);
+      await expect(sheet).not.toContainText("正在读取扩展目录");
+      if (slash === "skills" || slash === "extensions") await expect(sheet).toContainText("Available skill");
+      await expect(input).toHaveValue("");
+      await sheet.getByRole("button", { name: "关闭", exact: true }).click();
+    }
+    expect(relay.commands.filter(c => c.type === "get_engine_capabilities" && !c.skills_only)).toHaveLength(6);
+    expect(relay.commands.some(c => ["new_session", "query", "steer"].includes(String(c.type)))).toBe(false);
+  });
+
+  test(`new-chat controls keep ${engine} extension reads and edits in the selected account and directory`, async ({ page }) => {
+    const profileField = engine === "claude" ? "claude_profile_id" : "codex_profile_id";
+    const response = (command: Record<string, unknown>, name: string): PanelRelayEvent => ({
+      type: "engine_capabilities", request_id: String(command.cmd_id), engine, space: "code",
+      cwd: String(command.cwd), skills_only: !!command.skills_only,
+      [profileField]: command[profileField],
+      items: [{ id: name, name, kind: "skill" }],
+    });
+    let hold = false;
+    const relay = await mockRightPanelRelay(page, { engine, retained: false,
+      listReply: command => ({ type: "session_list", engine, space: "code",
+        request_id: String(command.cmd_id),
+        [`${engine}_profiles`]: [{ id: "default", label: "Primary" }, { id: "secondary", label: "Secondary" }],
+        [`default_${engine}_profile_id`]: "default",
+        sessions: [{ session_id: "layout-parent", engine, space: "code", cwd: "/tmp/layout",
+          summary: "Layout parent", state: "idle", last_modified: "100", [profileField]: "default" }],
+      }),
+      capabilityReply: command => hold ? undefined : response(command, "Original skill"),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    const sheet = page.getByRole("dialog", { name: "Extensions", exact: true });
+    const reads = () => relay.commands.filter(c => c.type === "get_engine_capabilities" && !c.skills_only);
+    hold = true;
+    await input.fill("/skills");
+    await input.press("Enter");
+    await expect.poll(() => reads().length).toBe(1);
+    const oldRead = reads()[0];
+    await expect(sheet).toContainText("正在读取扩展目录");
+    await sheet.getByRole("button", { name: "关闭", exact: true }).click();
+    await page.locator(".newchat-profile").click();
+    await page.getByRole("dialog", { name: `选择 ${engine === "claude" ? "Claude" : "Codex"} 账号` })
+      .getByRole("button", { name: /Secondary/ }).click();
+    await page.getByTitle("更改工作目录", { exact: true }).click();
+    const directory = page.getByRole("dialog", { name: "选择本地工作区" });
+    await directory.getByPlaceholder("或粘贴绝对路径…").fill("/tmp/selected-project");
+    await directory.getByRole("button", { name: "在此创建" }).click();
+    await expect(directory).not.toBeVisible();
+    await expect(page.getByTitle("更改工作目录", { exact: true })).toContainText("/tmp/selected-project");
+    await input.fill("/skills");
+    await input.press("Enter");
+    // A delayed response from the old account must not populate the new sheet.
+    relay.emit(response(oldRead, "Stale skill"));
+    await expect.poll(() => reads().length).toBe(2);
+    const selectedRead = reads()[1];
+    expect(selectedRead).toMatchObject({ engine, space: "code", cwd: "/tmp/selected-project", [profileField]: "secondary" });
+    await expect(sheet).not.toContainText("Stale skill");
+    relay.emit(response(selectedRead, "Selected skill"));
+    await expect(sheet).toContainText("Selected skill");
+    await expect(sheet).not.toContainText("正在读取扩展目录");
+    relay.emit({ type: "wrapper_reconnected", state: "idle", generation: "extension-generation" });
+    await expect.poll(() => reads().length).toBe(3);
+    expect(reads()[2]).toMatchObject({ cwd: "/tmp/selected-project", [profileField]: "secondary", skills_only: false });
+    relay.emit(response(reads()[2], "Refreshed skill"));
+    await expect(sheet).toContainText("Refreshed skill");
+    await sheet.getByRole("button", { name: "+ 新建 Skill", exact: true }).click();
+    await sheet.getByPlaceholder("Skill 名称").fill("new-skill");
+    await sheet.getByPlaceholder("何时使用，以及应该如何执行…").fill("Review files when requested.");
+    await sheet.getByRole("button", { name: "创建", exact: true }).click();
+    await expect.poll(() => relay.commands.filter(c => c.type === "manage_engine_skill")).toEqual([
+      expect.objectContaining({ engine, space: "code", cwd: "/tmp/selected-project",
+        [profileField]: "secondary", action: "create", name: "new-skill" }),
+    ]);
+    expect(relay.commands.some(c => ["new_session", "query", "steer"].includes(String(c.type)))).toBe(false);
+  });
+}
+
 for (const failure of ["response", "error"] as const) {
   test(`new-chat controls retry skill discovery after a ${failure} failure without editing the draft`, async ({ page }) => {
     let hold = false;
@@ -11808,6 +11911,12 @@ test("new-chat controls omit Code-directory skills in a new Work session", async
   await expect(skills).toHaveCount(0);
   await input.fill("$rev");
   await expect(requests).toHaveText("1");
+  await input.fill("/extensions");
+  await input.press("Enter");
+  await expect(page.locator(".newchat-hint")).toContainText("Work 会在创建后分配独立目录");
+  await expect(input).toHaveValue("/extensions");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.fill("$rev");
   await page.getByTestId("switch-newchat-space").click();
   await expect(skills).toContainText("$review");
   await expect(requests).toHaveText("1");

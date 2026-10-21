@@ -17,7 +17,7 @@ import {
   readClipboardImport, resolveClipboardImport, insertClipboardText,
   type ClipboardImport,
 } from "../clipboard-import";
-import type { ClaudeProfileInfo, PermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, EngineCapabilityItem, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { ClaudeProfileInfo, PermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, EngineCapabilityItem, EngineCapabilityKind, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { useClipboardPasteGuard } from "../use-clipboard-paste-guard";
 import type { PasteReceipt } from "../clipboard-paste-guard";
@@ -61,6 +61,7 @@ interface Props {
   skillsOnline?: boolean;
   skillsError?: boolean;
   onRequestSkills?: () => void;
+  onOpenExtensions?: (kind: EngineCapabilityKind | "all") => void;
   model?: string | null;
   effort?: string | null;
   autoCompact?: AutoCompactSelection;
@@ -179,7 +180,7 @@ export function NewChatView({ cwd, controlScopeKey,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
   onPickModel, onPickEffort, onPickAutoCompact, onPickClaudeProfile, onRequestModels,
   onPickCodexProfile, skills, skillsOnline = true, skillsError = false, onRequestSkills,
-  permissionProfiles, onGetPermissionProfiles,
+  permissionProfiles, onGetPermissionProfiles, onOpenExtensions,
   onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
@@ -420,6 +421,21 @@ export function NewChatView({ cwd, controlScopeKey,
   };
 
   const runClientSlash = (slash: string, args: string) => {
+    const extensionKinds: Partial<Record<string, EngineCapabilityKind | "all">> = {
+      extensions: "all", skills: "skill", plugins: "plugin",
+      apps: "app", mcp: "mcp", hooks: "hook",
+    };
+    const extensionKind = extensionKinds[slash];
+    if (extensionKind) {
+      if (space === "work") {
+        setAutoCompactNotice("Work 会在创建后分配独立目录，请开始对话后查看扩展。");
+      } else if (onOpenExtensions) {
+        onOpenExtensions(extensionKind);
+        setText("");
+        setAutoCompactNotice(null);
+      } else setAutoCompactNotice("扩展目录当前不可用。");
+      return;
+    }
     if (slash === "model") {
       if (args) {
         const selected = modelList.find(candidate =>

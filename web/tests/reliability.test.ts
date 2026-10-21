@@ -18346,10 +18346,10 @@ assert.match(appSource,
   /onRequestSkills=\{\(\) => \{[\s\S]{0,500}skillsOnly: true/,
   "$ completion must request only the lightweight Skill inventory");
 assert.match(appSource,
-  /onOpenExtensions=\{\(kind\) => \{[\s\S]{0,600}skillsOnly: false/,
+  /const capabilitiesScope =[\s\S]*?skillsOnly: false/,
   "the extensions sheet must continue requesting the complete inventory");
 assert.match(appSource,
-  /report=\{capabilitiesByScope\[focusedSkillCatalogKey\] \?\? null\}/,
+  /report=\{capabilitiesScope \? capabilitiesByScope\[capabilitiesScope\.key\] \?\? null : null\}/,
   "the full Extensions report must share the machine and cwd scope key");
 assert.match(appSource,
   /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,
