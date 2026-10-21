@@ -2,13 +2,17 @@
 
 [中文](CHANGELOG_zh.md)
 
-## Unreleased
+## v4.0.29
 
-- Configure Claude Code permissions from the new-chat composer, including
-  `/permissions`, `/plan`, `/normal` and Shift+Tab, before sending the first message.
-- Apply the selected mode atomically at session creation, preserve default and
-  Work policies, and reset choices when the device, account or surface changes.
-- Wire protocol v79: Web, Relay and Wrapper must upgrade together.
+Refresh the new-chat composer and make Claude/Codex controls usable before the first message. Wire protocol advances to v79. See the bilingual [release notes](docs/releases/v4.0.29.md).
+
+- Use a compact, growing Code composer with current engine icons and consistent account, directory, attachment, model, effort, speed and permission controls.
+- Route slash commands like active conversations; keep local controls local and preserve drafts for commands requiring an existing session.
+- Configure Claude permissions before creation and apply the selected mode to the first message, preserving existing defaults and Work policy.
+- Preserve explicit hidden/provider model IDs; share effort choices with validation so unavailable levels are not offered and supported selections survive catalog refresh.
+- Open extension catalogs using the draft account and directory; recover scoped skill discovery after failures and reconnects without creating a model turn.
+- Keep Work's private-directory boundary and reuse unchanged signed Android preview.2 and unsigned HarmonyOS preview.5 shells with original provenance.
+- Web, Relay and Wrapper must upgrade together to wire protocol v79.
 
 ## v4.0.28
 
