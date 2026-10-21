@@ -68,13 +68,7 @@ export function compatibleNewChatEffort(
   localDefaultModel: string | null,
 ): string | null {
   if (!currentEffort) return null;
-  const effectiveModel = nextModel ?? localDefaultModel
-    ?? (engine === "claude" ? catalog.claude?.find((entry) => entry.is_default)?.id : null);
-  if (!effectiveModel) return null;
-  if (!modelsFor(engine, catalog).some(
-    (candidate) => candidate.id === effectiveModel,
-  )) return null;
-  return effortsFor(engine, effectiveModel, catalog).some(
+  return newChatEfforts(engine, nextModel ?? localDefaultModel, catalog).some(
     (candidate) => candidate.id === currentEffort,
   ) ? currentEffort : null;
 }
@@ -109,10 +103,10 @@ export function newChatEfforts(
   effectiveModel: string | null,
   catalog: Catalog,
 ): Effort[] {
-  // Without an authoritative Codex default there is no model against which an
-  // explicit effort can be validated. Keep only the null/default choice.
-  if (engine === "codex" && !effectiveModel) return [];
   const model = effectiveModel
     ?? (engine === "claude" ? catalog.claude?.find((entry) => entry.is_default)?.id : null);
+  // The picker and reconciliation share this list. Unknown command IDs and
+  // unresolved defaults cannot expose fallback levels that validation rejects.
+  if (!model || !modelsFor(engine, catalog).some(candidate => candidate.id === model)) return [];
   return effortsFor(engine, model, catalog);
 }

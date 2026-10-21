@@ -10752,6 +10752,35 @@ try {
   "an authoritative empty effort list must not fall back to guessed levels");
   assert.deepEqual(newChatEfforts("codex", null, {}), [],
   "an unknown Codex default cannot expose unvalidated effort overrides");
+  for (const engine of ["claude", "codex"] as const) {
+    for (const catalog of [{}, { [engine]: [] }, {
+      [engine]: [{ id: "listed-model", display_name: "Listed", description: "", efforts: ["high"] }],
+    }]) {
+      assert.deepEqual(newChatEfforts(engine, "provider/hidden-model", catalog), [],
+        "uncatalogued models must not advertise effort choices that will be cleared");
+      assert.deepEqual(newChatEfforts(engine, null, catalog), [],
+        "an unresolved default must not advertise guessed effort choices");
+      assert.deepEqual(reconcileNewChatSelection(
+        engine, "provider/hidden-model", "high", catalog, null, "command",
+      ), { model: "provider/hidden-model", effort: null },
+      "raw model commands survive while unverified effort overrides are cleared");
+    }
+    const catalog = { [engine]: [{ id: "discovered-model", display_name: "Discovered",
+      description: "", efforts: ["low", "high"], is_default: true }] };
+    assert.deepEqual(newChatEfforts(engine, "discovered-model", catalog).map((item: { id: string }) => item.id),
+      ["low", "high"], "discovered model effort choices remain selectable");
+    for (const choice of ["low", "high"]) {
+      assert.equal(compatibleNewChatEffort(engine, "discovered-model", choice, catalog, null), choice);
+      assert.equal(compatibleNewChatEffort(engine, null, choice, catalog, "discovered-model"), choice);
+      assert.deepEqual(reconcileNewChatSelection(
+        engine, "discovered-model", choice, catalog, null, "command",
+      ), { model: "discovered-model", effort: choice });
+    }
+    if (engine === "claude") {
+      assert.deepEqual(newChatEfforts(engine, null, catalog).map((item: { id: string }) => item.id), ["low", "high"]);
+      assert.equal(compatibleNewChatEffort(engine, null, "high", catalog, null), "high");
+    }
+  }
   assert.deepEqual(reconcileNewChatSelection(
     "codex", "gpt-5.6-sol", "ultra", liveNewChatCatalog, "gpt-future",
   ), { model: null, effort: null },
