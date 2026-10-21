@@ -11934,6 +11934,11 @@ for (const engine of ["claude", "codex"] as const) {
     await input.press("Enter");
     await expect(input).toHaveValue("");
     await expect(page.getByTitle("选择模型", { exact: true })).toContainText("provider/hidden-model[1m]");
+    await page.getByTitle("选择思考强度", { exact: true }).click();
+    const efforts = page.getByRole("dialog", { name: "选择思考强度", exact: true });
+    await expect(efforts.locator(".sheet-scroll").getByRole("button")).toHaveCount(1);
+    await expect(efforts.locator(".sheet-scroll").getByRole("button")).toContainText("默认");
+    await page.keyboard.press("Escape");
     expect(relay.commands.filter(command => command.type === "new_session")).toEqual([]);
     const request = relay.commands.filter(command => command.type === "get_models").at(-1)!;
     relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
@@ -11943,12 +11948,49 @@ for (const engine of ["claude", "codex"] as const) {
     await expect(page.getByRole("dialog", { name: "选择模型" })).toContainText("Listed model");
     await page.keyboard.press("Escape");
     await expect(page.getByTitle("选择模型", { exact: true })).toContainText("provider/hidden-model[1m]");
+    await page.getByTitle("选择思考强度", { exact: true }).click();
+    await expect(efforts.locator(".sheet-scroll").getByRole("button")).toHaveCount(1);
+    await page.keyboard.press("Escape");
     await input.fill("hello");
     await input.press("Enter");
     await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
       engine: command.engine ?? "claude", model: command.model, effort: command.effort ?? null,
     })))
       .toMatchObject([{ engine, model: "provider/hidden-model[1m]", effort: null }]);
+  });
+
+  test(`new-chat controls keep ${engine} effort choices consistent through model discovery`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { engine, retained: false });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    const model = "provider/discovered-model";
+    await input.fill(`/model ${model}`);
+    await input.press("Enter");
+    await expect(input).toHaveValue("");
+    const request = relay.commands.filter(command => command.type === "get_models").at(-1)!;
+    const effortButton = page.getByTitle("选择思考强度", { exact: true });
+    const efforts = page.getByRole("dialog", { name: "选择思考强度", exact: true });
+    await effortButton.click();
+    await expect(efforts.locator(".sheet-scroll .cmd")).toHaveCount(1);
+    relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
+      models: [{ id: model, display_name: "Discovered model", description: "", efforts: ["low", "high"] }] });
+    await expect(efforts.locator(".sheet-scroll .cmd-nm")).toHaveText(["默认", "low", "high"]);
+    await efforts.getByRole("button", { name: /^high / }).click();
+    await expect(efforts).not.toBeVisible();
+    await expect(effortButton).toHaveText("high");
+    // A catalog refresh must not silently clear a supported explicit choice.
+    relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
+      models: [{ id: model, display_name: "Refreshed model", description: "", efforts: ["high"] }] });
+    await expect(page.getByTitle("选择模型", { exact: true })).toHaveText("Refreshed model");
+    await expect(effortButton).toHaveText("high");
+    expect(relay.commands.some(command => command.type === "new_session")).toBe(false);
+    await input.fill("hello");
+    await input.press("Enter");
+    await expect.poll(() => relay.commands.filter(command => command.type === "new_session")).toEqual([
+      expect.objectContaining({ model, effort: "high", prompt: "hello" }),
+    ]);
   });
 }
 
