@@ -1084,10 +1084,12 @@ def test_claude_multi_profile_default_ignores_project_and_ambient_models(
 
 
 @pytest.mark.parametrize("space", ["code", "work"])
+@pytest.mark.parametrize("permission", [None, "default", "acceptEdits", "plan", "auto", "bypassPermissions"])
 def test_fresh_claude_spawn_inherits_native_defaults(
     monkeypatch,
     tmp_path,
     space,
+    permission,
 ):
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -1123,13 +1125,17 @@ def test_fresh_claude_spawn_inherits_native_defaults(
             machine._claude_new_session_defaults = forbidden_default
 
         ctx = await machine._spawn(
-            resume_id=None, cwd=cwd, engine="claude", space=space, work_id=work_id)
+            resume_id=None, cwd=cwd, engine="claude", space=space, work_id=work_id,
+            permission_mode=permission)
 
         assert ctx is not None
         assert ctx.sdk.model == "claude-mythos-5"
         assert _FakeClaudeClient.created[-1].model_calls == []
         assert _FakeClaudeClient.created[-1].options.model is None
         assert _FakeClaudeClient.created[-1].options.effort is None
+        expected_permission = "acceptEdits" if space == "work" else permission or "bypassPermissions"
+        assert _FakeClaudeClient.created[-1].options.permission_mode == expected_permission
+        assert ctx.sdk.permission_mode == expected_permission
         await ctx.sdk.disconnect()
 
     asyncio.run(go())

@@ -24,6 +24,7 @@ interface Props {
   onPickEffort?: (effort: string) => void;
   currentPerm?: string;
   onPickPerm?: (perm: string) => void;
+  onUseDefaultPerm?: () => void;
   currentPermissionProfile?: string | null;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onPickPermissionProfile?: (profile: string) => void;
@@ -34,7 +35,7 @@ interface Props {
 export function CommandSheet({
   open, kind, engine, catalog, filter = "", onClose, onPickCommand,
   currentModel, onPickModel, currentEffort, onPickEffort, currentPerm,
-  onPickPerm, currentPermissionProfile, permissionProfiles,
+  onPickPerm, onUseDefaultPerm, currentPermissionProfile, permissionProfiles,
   onPickPermissionProfile, currentWebSearch, onPickWebSearch,
 }: Props) {
   const isCmdMode = kind === "commands";
@@ -91,6 +92,17 @@ export function CommandSheet({
             <>
               {engine === "codex" && <div className="cmd-group">审批方式</div>}
               <div className="permission-options permission-approvals">
+                {onUseDefaultPerm && (
+                  <button className={"cmd" + (!currentPerm ? " sel" : "")}
+                    onClick={onUseDefaultPerm}>
+                    <span className="cmd-ic"><Icon name="shield" size={17} /></span>
+                    <span className="cmd-tx">
+                      <span className="cmd-nm">默认权限</span>
+                      <span className="cmd-ds">使用新会话的默认权限设置</span>
+                    </span>
+                    {!currentPerm && <span className="cmd-check"><Icon name="check" size={19} /></span>}
+                  </button>
+                )}
                 {PERMS.map((p) => (
                   <button
                     key={p.id}

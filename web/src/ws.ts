@@ -8,7 +8,7 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  AutoCompactMode, DiffTheme, Engine, GoalStatus, QueryFile,
+  AutoCompactMode, DiffTheme, Engine, GoalStatus, PermissionMode, QueryFile,
   QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
 import {
@@ -1393,7 +1393,7 @@ export class RelayWs {
                  model?: string | null, effort?: string | null,
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
                  collaborationMode?: "default" | "plan",
-                 permissionMode?: "never" | "on-request" | "untrusted",
+                 permissionMode?: PermissionMode,
                  permissionProfile?: string,
                  webSearch?: "cached" | "live",
                  serviceTier?: string,
@@ -1444,7 +1444,7 @@ export class RelayWs {
     if (engine === "codex" && collaborationMode) {
       obj.collaboration_mode = collaborationMode;
     }
-    if (engine === "codex" && permissionMode) {
+    if (permissionMode && (targetEngine === "codex" || space === "code")) {
       obj.permission_mode = permissionMode;
     }
     if (engine === "codex" && permissionProfile) {

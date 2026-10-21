@@ -10861,7 +10861,8 @@ try {
   assert.match(codexNewChatMarkup, /class="newchat-access"/);
   assert.doesNotMatch(codexNewChatMarkup, /role="dialog"/,
     "closed selection surfaces are mounted only when opened");
-  assert.doesNotMatch(newChatMarkup, /class="newchat-access"/);
+  assert.match(newChatMarkup, /class="newchat-access"/);
+  assert.match(newChatMarkup, /title="选择权限模式"/);
   for (const markup of [newChatMarkup, codexNewChatMarkup]) {
     assert.match(markup, /class="newchat-context"/);
     assert.match(markup, /class="newchat-cwd"/,
@@ -18016,6 +18017,20 @@ const defaultSessionFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(defaultSessionFrame.type, "new_session");
 assert.equal("model" in defaultSessionFrame, false);
 assert.equal("effort" in defaultSessionFrame, false);
+assert.equal("permission_mode" in defaultSessionFrame, false);
+for (const permission of ["default", "acceptEdits", "plan", "auto", "bypassPermissions"] as const) {
+  relay.sendNewSession("/tmp/project", "claude", null, null,
+    { prompt: "respect chosen permissions", msg_id: `first-claude-${permission}` },
+    undefined, permission);
+  const firstClaudeFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+  assert.equal(firstClaudeFrame.type, "new_session");
+  assert.equal(firstClaudeFrame.permission_mode, permission);
+}
+relay.sendNewSession(null, "claude", null, null,
+  { prompt: "Work keeps its isolated permissions", msg_id: "work-claude-permission" },
+  undefined, "bypassPermissions", undefined, undefined, undefined, "work");
+assert.equal("permission_mode" in JSON.parse(socket.sent.at(-1) ?? "{}"), false);
+
 
 relay.sendGetModels("claude", "/tmp/project");
 const claudeDefaultsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
@@ -18251,7 +18266,7 @@ assert.match(newChatSource, /<PendingImageAttachments/,
   "new-chat attachments must share the interactive image preview");
 assert.match(newChatSource, /executionControls\.scopeKey === controlScopeKey/,
   "new-chat execution controls must be scoped before the first switched render");
-assert.match(newChatSource, /space === "work" \? "never" : permissionMode/,
+assert.match(newChatSource, /space === "work" \? "never" : permission \?\? "never"/,
   "Codex Work must request its authoritative non-escalating approval policy");
 assert.match(appSource, /space === "work" \? "never" : permissionMode/,
   "the atomic new-session wire must retain the authoritative Work policy");

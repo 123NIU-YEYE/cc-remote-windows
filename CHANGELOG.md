@@ -2,6 +2,14 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Configure Claude Code permissions from the new-chat composer, including
+  `/permissions`, `/plan`, `/normal` and Shift+Tab, before sending the first message.
+- Apply the selected mode atomically at session creation, preserve default and
+  Work policies, and reset choices when the device, account or surface changes.
+- Wire protocol v79: Web, Relay and Wrapper must upgrade together.
+
 ## v4.0.28
 
 Restore delivered files in Artifacts and show native Codex agents in background tasks. Wire protocol v78 is unchanged. See the bilingual [release notes](docs/releases/v4.0.28.md).
