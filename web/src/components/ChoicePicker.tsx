@@ -3,13 +3,14 @@ import { Icon } from "../icons";
 import { CenteredSheet } from "./CenteredSheet";
 
 export function ChoicePicker({ label, value, options, onChange, disabled = false,
-  className = "", children }: {
+  className = "", showChevron = true, children }: {
   label: string;
   value: string;
   options: { value: string; label: string; description?: string; icon?: string; disabled?: boolean }[];
   onChange: (value: string) => void;
   disabled?: boolean;
   className?: string;
+  showChevron?: boolean;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -17,7 +18,7 @@ export function ChoicePicker({ label, value, options, onChange, disabled = false
     <button type="button" className={`choice-picker-trigger ${className}`} disabled={disabled}
       aria-label={label} aria-haspopup="dialog" aria-expanded={open && !disabled}
       onClick={() => setOpen(!open)}>
-      {children}<Icon name="chev" size={14} />
+      {children}{showChevron && <Icon name="chev" size={14} />}
     </button>
     <CenteredSheet open={open && !disabled} label={label} onClose={() => setOpen(false)} maxWidth={440}>
       <div className="sheet-scroll" onKeyDown={event => {

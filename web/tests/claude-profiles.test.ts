@@ -42,6 +42,30 @@ try {
     reduce,
   } = await harness.ssrLoadModule("/src/reducer.ts");
 
+  let commandModelState = reduce(initialState, { type: "enter_new_chat", cwd: "/repo" });
+  commandModelState = reduce(commandModelState, {
+    type: "set_new_chat_model", model: "provider/hidden-model", modelSource: "command",
+  });
+  assert.equal(commandModelState.newChat?.modelSource, "command");
+  const pickerModelState = reduce(commandModelState, {
+    type: "set_new_chat_model", model: "gpt-future",
+  });
+  assert.equal(pickerModelState.newChat?.modelSource, undefined,
+    "choosing from the picker must restore catalog reconciliation");
+  for (const engine of ["claude", "codex"] as const) {
+    const switched = reduce({
+      ...commandModelState,
+      claudeProfiles: [{ id: "other", label: "Other" }],
+      codexProfiles: [{ id: "other", label: "Other" }],
+    }, {
+      type: engine === "claude" ? "set_new_chat_claude_profile" : "set_new_chat_codex_profile",
+      scopeKey: `machine:code:${engine}`, profileId: "other",
+    });
+    assert.equal(switched.newChat?.model, null);
+    assert.equal(switched.newChat?.modelSource, undefined,
+      "switching accounts clears the command model and its provenance");
+  }
+
   assert.deepEqual(
     newChatCatalogRequest(
       "claude", "code", "/repo", undefined, "company"),

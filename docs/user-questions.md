@@ -57,7 +57,7 @@ question has 2–4 unique options and always supports a custom answer. Do not mi
 {"answers":[{"question":"How should files be sorted?","answer":"Recent first"},{"question":"Which files should be included?","answer":["Uploads","Generated files"]}]}
 ```
 
-Question batches were introduced in wire protocol v77 (current protocol v78).
+Question batches were introduced in wire protocol v77 (current protocol v79).
 Web, Relay and Wrapper must upgrade together.
 It does not change the SDK pin or require restarting an active Claude service.
 Existing native processes may keep the old MCP tool schema until their next

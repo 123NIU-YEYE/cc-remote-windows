@@ -142,13 +142,16 @@ assert.match(appSource,
   "TurnEnd cache reads must not overtake a deferred native refresh");
 assert.match(composerSource, /if \(!ctxOpen\) p\.onContext\(\);/,
   "closing a context popover must not issue another native control request");
-for (const source of [newChatSource, btwSource]) {
-  assert.match(source, /command\?\.slash === "autocompact"/,
+for (const [source, argument, condition] of [
+  [newChatSource, "args", /slash === "autocompact"/],
+  [btwSource, "command.args", /command\?\.slash === "autocompact"/],
+] as const) {
+  assert.match(source, condition,
     "secondary composers must intercept autocompact before model submission");
   assert.match(source,
-    /if \(!command\.args\) \{[\s\S]{0,160}setAutoCompactOpen\(true\)/,
+    new RegExp(`if \\(!${argument.replace(".", "\\.")}\\) \\{[\\s\\S]{0,160}setAutoCompactOpen\\(true\\)`),
     "a bare autocompact command must open its hidden editor");
-  assert.match(source, /parseAutoCompactArgument\(command\.args\)/,
+  assert.ok(source.includes(`parseAutoCompactArgument(${argument})`),
     "a parameterized autocompact command must apply directly");
 }
 

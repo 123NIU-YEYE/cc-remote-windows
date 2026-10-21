@@ -10752,6 +10752,35 @@ try {
   "an authoritative empty effort list must not fall back to guessed levels");
   assert.deepEqual(newChatEfforts("codex", null, {}), [],
   "an unknown Codex default cannot expose unvalidated effort overrides");
+  for (const engine of ["claude", "codex"] as const) {
+    for (const catalog of [{}, { [engine]: [] }, {
+      [engine]: [{ id: "listed-model", display_name: "Listed", description: "", efforts: ["high"] }],
+    }]) {
+      assert.deepEqual(newChatEfforts(engine, "provider/hidden-model", catalog), [],
+        "uncatalogued models must not advertise effort choices that will be cleared");
+      assert.deepEqual(newChatEfforts(engine, null, catalog), [],
+        "an unresolved default must not advertise guessed effort choices");
+      assert.deepEqual(reconcileNewChatSelection(
+        engine, "provider/hidden-model", "high", catalog, null, "command",
+      ), { model: "provider/hidden-model", effort: null },
+      "raw model commands survive while unverified effort overrides are cleared");
+    }
+    const catalog = { [engine]: [{ id: "discovered-model", display_name: "Discovered",
+      description: "", efforts: ["low", "high"], is_default: true }] };
+    assert.deepEqual(newChatEfforts(engine, "discovered-model", catalog).map((item: { id: string }) => item.id),
+      ["low", "high"], "discovered model effort choices remain selectable");
+    for (const choice of ["low", "high"]) {
+      assert.equal(compatibleNewChatEffort(engine, "discovered-model", choice, catalog, null), choice);
+      assert.equal(compatibleNewChatEffort(engine, null, choice, catalog, "discovered-model"), choice);
+      assert.deepEqual(reconcileNewChatSelection(
+        engine, "discovered-model", choice, catalog, null, "command",
+      ), { model: "discovered-model", effort: choice });
+    }
+    if (engine === "claude") {
+      assert.deepEqual(newChatEfforts(engine, null, catalog).map((item: { id: string }) => item.id), ["low", "high"]);
+      assert.equal(compatibleNewChatEffort(engine, null, "high", catalog, null), "high");
+    }
+  }
   assert.deepEqual(reconcileNewChatSelection(
     "codex", "gpt-5.6-sol", "ultra", liveNewChatCatalog, "gpt-future",
   ), { model: null, effort: null },
@@ -10842,7 +10871,7 @@ try {
       (markup.match(/<button[^>]+aria-label="添加附件"/g) ?? []).length, 1);
     assert.equal(
       (markup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
-    assert.match(markup, />开始</);
+    assert.match(markup, /aria-label="开始"/);
     assert.match(markup, /title="选择模型"/);
     assert.match(markup, /title="选择思考强度"/);
     assert.match(markup, /本机默认/);
@@ -10861,12 +10890,14 @@ try {
   assert.match(codexNewChatMarkup, /class="newchat-access"/);
   assert.doesNotMatch(codexNewChatMarkup, /role="dialog"/,
     "closed selection surfaces are mounted only when opened");
-  assert.doesNotMatch(newChatMarkup, /class="newchat-access"/);
+  assert.match(newChatMarkup, /class="newchat-access"/);
+  assert.match(newChatMarkup, /title="选择权限模式"/);
   for (const markup of [newChatMarkup, codexNewChatMarkup]) {
-    assert.doesNotMatch(markup, /class="newchat-context"/,
-      "single-account and Claude new-chat preserve the historical cwd DOM");
-    assert.match(markup, /<\/div><button class="newchat-cwd"/,
-      "the historical cwd button remains a direct new-chat-card child");
+    assert.match(markup, /class="newchat-context"/);
+    assert.match(markup, /class="newchat-cwd"/,
+      "single-account new chats retain the working-directory picker");
+    assert.match(markup, /class="newchat-inputbar"/);
+    assert.match(markup, /rows="1"/, "Code starts with a compact input");
   }
   assert.doesNotMatch(codexNewChatMarkup, /aria-label="选择 Codex 账号"/,
     "single-account installs keep the historical new-chat layout");
@@ -18015,6 +18046,20 @@ const defaultSessionFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(defaultSessionFrame.type, "new_session");
 assert.equal("model" in defaultSessionFrame, false);
 assert.equal("effort" in defaultSessionFrame, false);
+assert.equal("permission_mode" in defaultSessionFrame, false);
+for (const permission of ["default", "acceptEdits", "plan", "auto", "bypassPermissions"] as const) {
+  relay.sendNewSession("/tmp/project", "claude", null, null,
+    { prompt: "respect chosen permissions", msg_id: `first-claude-${permission}` },
+    undefined, permission);
+  const firstClaudeFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+  assert.equal(firstClaudeFrame.type, "new_session");
+  assert.equal(firstClaudeFrame.permission_mode, permission);
+}
+relay.sendNewSession(null, "claude", null, null,
+  { prompt: "Work keeps its isolated permissions", msg_id: "work-claude-permission" },
+  undefined, "bypassPermissions", undefined, undefined, undefined, "work");
+assert.equal("permission_mode" in JSON.parse(socket.sent.at(-1) ?? "{}"), false);
+
 
 relay.sendGetModels("claude", "/tmp/project");
 const claudeDefaultsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
@@ -18250,7 +18295,7 @@ assert.match(newChatSource, /<PendingImageAttachments/,
   "new-chat attachments must share the interactive image preview");
 assert.match(newChatSource, /executionControls\.scopeKey === controlScopeKey/,
   "new-chat execution controls must be scoped before the first switched render");
-assert.match(newChatSource, /space === "work" \? "never" : permissionMode/,
+assert.match(newChatSource, /space === "work" \? "never" : permission \?\? "never"/,
   "Codex Work must request its authoritative non-escalating approval policy");
 assert.match(appSource, /space === "work" \? "never" : permissionMode/,
   "the atomic new-session wire must retain the authoritative Work policy");
@@ -18330,10 +18375,10 @@ assert.match(appSource,
   /onRequestSkills=\{\(\) => \{[\s\S]{0,500}skillsOnly: true/,
   "$ completion must request only the lightweight Skill inventory");
 assert.match(appSource,
-  /onOpenExtensions=\{\(kind\) => \{[\s\S]{0,600}skillsOnly: false/,
+  /const capabilitiesScope =[\s\S]*?skillsOnly: false/,
   "the extensions sheet must continue requesting the complete inventory");
 assert.match(appSource,
-  /report=\{capabilitiesByScope\[focusedSkillCatalogKey\] \?\? null\}/,
+  /report=\{capabilitiesScope \? capabilitiesByScope\[capabilitiesScope\.key\] \?\? null : null\}/,
   "the full Extensions report must share the machine and cwd scope key");
 assert.match(appSource,
   /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,

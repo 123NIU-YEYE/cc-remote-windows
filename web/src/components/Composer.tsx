@@ -23,8 +23,8 @@ import { AttachmentPicker } from "./AttachmentPicker";
 import { parseContextCapacity } from "../codex-context";
 const CodexContextControl = lazy(() => import("./CodexContextControl"));
 import {
-  clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
-  matchCommands, matchSkills, parseSlash, skillToken,
+  clientSlashesFor, routeComposerInput, slashToken,
+  matchCommands, matchSkills, skillToken,
   modelsFor, effortNameForDisplay, permsFor,
   permissionProfileLabel, type Catalog,
 } from "../data";
@@ -667,28 +667,11 @@ export function Composer(p: Props) {
 
   const send = (value = taRef.current?.value ?? input) => {
     if (locked || importing) return;
-    const raw = value.trim();
-    if (raw === "/") return;
-    const parsed = parseSlash(raw);
-    if (p.surface === "work" && parsed
-        && isKnownCodeOnlySlash(parsed.slash, p.engine)) {
-      flash(`/${parsed.slash} 是 Code 指令，请切换到 Code 使用`);
-      return;
-    }
-    if (parsed && clientSlashesFor(p.engine).has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
-    // Codex has no TUI slash layer over the app-server. /init is the one
-    // compatibility prompt left; lifecycle operations above use native RPCs.
-    if (p.engine === "codex" && parsed && CODEX_PROMPTS[parsed.slash]) {
-      submitPrompt(CODEX_PROMPTS[parsed.slash] + (parsed.args ? "\n\n" + parsed.args : ""));
-      return;
-    }
-    // Codex has no TUI slash layer, so an unknown "/xxx" is NOT a command — don't
-    // ship it to the model as literal text (it would just improvise a fake reply,
-    // e.g. "/fast" -> "已切到快节奏…"). Hint and keep the input. (cc is different:
-    // it has its own slash/skill layer, so unknown slashes fall through to it.)
-    if (p.engine === "codex" && parsed) { flash(`Codex 无此指令：/${parsed.slash}`); return; }
-    // plain text, or a cc skill slash (/code-review …) forwarded verbatim to cc
-    submitPrompt(raw);
+    const route = routeComposerInput(value, p.engine, p.surface);
+    if (route.kind === "empty") return;
+    if (route.kind === "blocked") { flash(route.message); return; }
+    if (route.kind === "client") { runClientSlash(route.slash, route.args); return; }
+    submitPrompt(route.prompt);
   };
 
   const requestButtonSend = () => {

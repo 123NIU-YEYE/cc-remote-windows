@@ -184,7 +184,7 @@ type PanelRelayEvent<T = ServerEvent> = T extends ServerEvent
 async function mockRightPanelRelay(
   page: import("@playwright/test").Page,
   { visible = false, retained = true, engine = "codex", seedTurns = [], parentSid = "layout-parent",
-    secondParent = false, parentState = "idle", btwReadOnly = false, imageAssets = false, imageData, externalPreview, historyReply, listReply }: {
+    secondParent = false, parentState = "idle", btwReadOnly = false, imageAssets = false, imageData, externalPreview, historyReply, listReply, capabilityReply }: {
     visible?: boolean;
     retained?: boolean;
     engine?: "codex" | "claude";
@@ -198,6 +198,7 @@ async function mockRightPanelRelay(
     externalPreview?: "allow" | "replace";
     historyReply?: (command: Record<string, unknown>) => PanelRelayEvent<Extract<ServerEvent, { type: "history" }>> | null;
     listReply?: (command: Record<string, unknown>) => PanelRelayEvent | undefined;
+    capabilityReply?: (command: Record<string, unknown>) => PanelRelayEvent | undefined;
   } = {},
 ) {
   const btwSid = "btw-layout-child";
@@ -317,6 +318,9 @@ async function mockRightPanelRelay(
             message_id: "retained-answer", text: "仍可查看的侧边回答" });
         }
         snapshot(String(command.sid));
+      } else if (command.type === "get_engine_capabilities") {
+        const response = capabilityReply?.(command);
+        if (response) emit(response);
       } else if (command.type === "get_diff") {
         emit({ type: "diff_report", sid: String(command.sid),
           request_id: String(command.cmd_id), file: "", diff: "" });
@@ -370,6 +374,190 @@ test("side chat scope restores long Claude history atomically at the bottom with
   }
   expect(relay.commands.some(c => ["query", "steer", "open_btw"].includes(String(c.type)))).toBe(false);
 });
+
+function newChatSkillResponse(command: Record<string, unknown>, name: string, errors: string[] = []): PanelRelayEvent {
+  return { type: "engine_capabilities", request_id: String(command.cmd_id),
+    engine: "codex", space: "code", cwd: String(command.cwd ?? "/tmp/layout"),
+    codex_profile_id: command.codex_profile_id as string | undefined,
+    skills_only: true, errors,
+    items: [{ id: name, name, kind: "skill", enabled: true, description: "Project skill" }] };
+}
+
+for (const engine of ["claude", "codex"] as const) {
+  test(`new-chat controls open ${engine} extension catalogs before creating a session`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { engine, retained: false,
+      capabilityReply: command => ({ type: "engine_capabilities",
+        request_id: String(command.cmd_id), engine, space: "code",
+        cwd: String(command.cwd), skills_only: !!command.skills_only,
+        items: [{ id: "available", name: "Available skill", kind: "skill" }],
+      }),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    const sheet = page.getByRole("dialog", { name: "Extensions", exact: true });
+    for (const [slash, label] of [
+      ["extensions", "全部"], ["skills", "Skills"], ["plugins", "Plugins"],
+      ["apps", "Apps"], ["mcp", "MCP"], ["hooks", "Hooks"],
+    ]) {
+      // Cover both palette selection and submitting a complete command.
+      await input.fill(`/${slash}`);
+      if (slash === "skills" || slash === "mcp") {
+        await page.getByRole("listbox", { name: "命令" }).getByRole("button").first().click();
+      } else await page.getByRole("button", { name: "开始", exact: true }).click();
+      await expect(sheet).toBeVisible();
+      await expect(sheet.locator(".capabilities-tabs .active")).toHaveText(label);
+      await expect(sheet).not.toContainText("正在读取扩展目录");
+      if (slash === "skills" || slash === "extensions") await expect(sheet).toContainText("Available skill");
+      await expect(input).toHaveValue("");
+      await sheet.getByRole("button", { name: "关闭", exact: true }).click();
+    }
+    expect(relay.commands.filter(c => c.type === "get_engine_capabilities" && !c.skills_only)).toHaveLength(6);
+    expect(relay.commands.some(c => ["new_session", "query", "steer"].includes(String(c.type)))).toBe(false);
+  });
+
+  test(`new-chat controls keep ${engine} extension reads and edits in the selected account and directory`, async ({ page }) => {
+    const profileField = engine === "claude" ? "claude_profile_id" : "codex_profile_id";
+    const response = (command: Record<string, unknown>, name: string): PanelRelayEvent => ({
+      type: "engine_capabilities", request_id: String(command.cmd_id), engine, space: "code",
+      cwd: String(command.cwd), skills_only: !!command.skills_only,
+      [profileField]: command[profileField],
+      items: [{ id: name, name, kind: "skill" }],
+    });
+    let hold = false;
+    const relay = await mockRightPanelRelay(page, { engine, retained: false,
+      listReply: command => ({ type: "session_list", engine, space: "code",
+        request_id: String(command.cmd_id),
+        [`${engine}_profiles`]: [{ id: "default", label: "Primary" }, { id: "secondary", label: "Secondary" }],
+        [`default_${engine}_profile_id`]: "default",
+        sessions: [{ session_id: "layout-parent", engine, space: "code", cwd: "/tmp/layout",
+          summary: "Layout parent", state: "idle", last_modified: "100", [profileField]: "default" }],
+      }),
+      capabilityReply: command => hold ? undefined : response(command, "Original skill"),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    const sheet = page.getByRole("dialog", { name: "Extensions", exact: true });
+    const reads = () => relay.commands.filter(c => c.type === "get_engine_capabilities" && !c.skills_only);
+    hold = true;
+    await input.fill("/skills");
+    await input.press("Enter");
+    await expect.poll(() => reads().length).toBe(1);
+    const oldRead = reads()[0];
+    await expect(sheet).toContainText("正在读取扩展目录");
+    await sheet.getByRole("button", { name: "关闭", exact: true }).click();
+    await page.locator(".newchat-profile").click();
+    await page.getByRole("dialog", { name: `选择 ${engine === "claude" ? "Claude" : "Codex"} 账号` })
+      .getByRole("button", { name: /Secondary/ }).click();
+    await page.getByTitle("更改工作目录", { exact: true }).click();
+    const directory = page.getByRole("dialog", { name: "选择本地工作区" });
+    await directory.getByPlaceholder("或粘贴绝对路径…").fill("/tmp/selected-project");
+    await directory.getByRole("button", { name: "在此创建" }).click();
+    await expect(directory).not.toBeVisible();
+    await expect(page.getByTitle("更改工作目录", { exact: true })).toContainText("/tmp/selected-project");
+    await input.fill("/skills");
+    await input.press("Enter");
+    // A delayed response from the old account must not populate the new sheet.
+    relay.emit(response(oldRead, "Stale skill"));
+    await expect.poll(() => reads().length).toBe(2);
+    const selectedRead = reads()[1];
+    expect(selectedRead).toMatchObject({ engine, space: "code", cwd: "/tmp/selected-project", [profileField]: "secondary" });
+    await expect(sheet).not.toContainText("Stale skill");
+    relay.emit(response(selectedRead, "Selected skill"));
+    await expect(sheet).toContainText("Selected skill");
+    await expect(sheet).not.toContainText("正在读取扩展目录");
+    relay.emit({ type: "wrapper_reconnected", state: "idle", generation: "extension-generation" });
+    await expect.poll(() => reads().length).toBe(3);
+    expect(reads()[2]).toMatchObject({ cwd: "/tmp/selected-project", [profileField]: "secondary", skills_only: false });
+    relay.emit(response(reads()[2], "Refreshed skill"));
+    await expect(sheet).toContainText("Refreshed skill");
+    await sheet.getByRole("button", { name: "+ 新建 Skill", exact: true }).click();
+    await sheet.getByPlaceholder("Skill 名称").fill("new-skill");
+    await sheet.getByPlaceholder("何时使用，以及应该如何执行…").fill("Review files when requested.");
+    await sheet.getByRole("button", { name: "创建", exact: true }).click();
+    await expect.poll(() => relay.commands.filter(c => c.type === "manage_engine_skill")).toEqual([
+      expect.objectContaining({ engine, space: "code", cwd: "/tmp/selected-project",
+        [profileField]: "secondary", action: "create", name: "new-skill" }),
+    ]);
+    expect(relay.commands.some(c => ["new_session", "query", "steer"].includes(String(c.type)))).toBe(false);
+  });
+}
+
+for (const failure of ["response", "error"] as const) {
+  test(`new-chat controls retry skill discovery after a ${failure} failure without editing the draft`, async ({ page }) => {
+    let hold = false;
+    const relay = await mockRightPanelRelay(page, { retained: false,
+      capabilityReply: command => hold ? undefined : newChatSkillResponse(command, "warm"),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const reads = () => relay.commands.filter(command => command.type === "get_engine_capabilities");
+    hold = true;
+    const before = reads().length;
+    const input = page.locator(".newchat-input");
+    await input.fill("$rev");
+    await expect.poll(() => reads().length).toBeGreaterThan(before);
+    const first = reads().at(-1)!;
+    if (failure === "response") relay.emit(newChatSkillResponse(first, "", ["skills: unavailable"]));
+    else relay.emit({ type: "error", request_id: String(first.cmd_id), code: "discovery_failed", message: "unavailable" });
+    const retry = page.getByRole("button", { name: "重试读取 Skills", exact: true });
+    await expect(retry).toBeVisible();
+    const failedCount = reads().length;
+    await input.fill("$revi");
+    await expect(retry).toBeVisible();
+    expect(reads().length).toBe(failedCount);
+    await retry.click();
+    await expect.poll(() => reads().length).toBe(failedCount + 1);
+    relay.emit(newChatSkillResponse(reads().at(-1)!, "review"));
+    await expect(page.getByRole("listbox", { name: "Skills" })).toContainText("$review");
+    await expect(input).toHaveValue("$revi");
+    await expect(retry).toHaveCount(0);
+    expect(relay.commands.some(command => command.type === "new_session")).toBe(false);
+  });
+}
+
+for (const loaded of [false, true]) {
+  test(`new-chat controls recover ${loaded ? "loaded" : "pending"} skills after wrapper reconnect`, async ({ page }) => {
+    let hold = false;
+    const relay = await mockRightPanelRelay(page, { retained: false,
+      capabilityReply: command => hold ? undefined : newChatSkillResponse(command, "warm"),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    hold = true;
+    const reads = () => relay.commands.filter(command => command.type === "get_engine_capabilities");
+    const before = reads().length;
+    const input = page.locator(".newchat-input");
+    await input.fill("$rev");
+    await expect.poll(() => reads().length).toBeGreaterThan(before);
+    const first = reads().at(-1)!;
+    if (loaded) {
+      relay.emit(newChatSkillResponse(first, "review-old"));
+      await expect(page.getByRole("listbox", { name: "Skills" })).toContainText("$review-old");
+    }
+    const pendingCount = reads().length;
+    relay.emit({ type: "wrapper_reconnected", state: "idle", generation: "replacement-generation" });
+    await expect.poll(() => reads().length).toBeGreaterThan(pendingCount);
+    // A delayed pre-reconnect result must not satisfy the replacement read.
+    relay.emit(newChatSkillResponse(first, "review-stale"));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const next = reads().at(-1)!;
+      relay.emit(newChatSkillResponse(next, "review-restored"));
+      // The coordinator may first drain a different focused-directory read.
+      await expect.poll(async () => (await page.getByRole("listbox", { name: "Skills" }).innerText()).includes("$review-restored")
+        || reads().at(-1) !== next).toBe(true);
+    }
+    await expect(page.getByRole("listbox", { name: "Skills" })).toContainText("$review-restored");
+    await expect(page.getByRole("listbox", { name: "Skills" })).not.toContainText("review-stale");
+    await expect(input).toHaveValue("$rev");
+    expect(relay.commands.some(command => command.type === "new_session")).toBe(false);
+  });
+}
 
 for (const engine of ["claude", "codex"] as const) {
   test(`side chat scope reopens ${engine} history without a blank frame during sync`, async ({ page }) => {
@@ -11595,6 +11783,348 @@ async function chooseDangerousNewChatControls(
 
 let newChatSubmissionSequence = 0;
 
+test("new-chat controls route slash commands without creating a model turn", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
+  const input = page.locator(".newchat-input");
+  const submission = page.getByTestId("newchat-submission");
+  await input.fill("/");
+  await expect(page.getByRole("listbox", { name: "命令" })).toBeVisible();
+  await input.press("Enter");
+  await expect(submission).toHaveText("null");
+  await input.fill("/mo");
+  await input.press("Enter");
+  await expect(page.getByRole("dialog", { name: "选择模型", exact: true })).toBeVisible();
+  await expect(submission).toHaveText("null");
+  await page.keyboard.press("Escape");
+  await input.fill("/compact");
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect(page.locator(".newchat-hint")).toContainText("需要已有会话");
+  await expect(input).toHaveValue("/compact");
+  await expect(submission).toHaveText("null");
+  await input.fill("/unknown-command");
+  await input.press("Enter");
+  await expect(page.locator(".newchat-hint")).toContainText("Codex 无此指令");
+  await expect(submission).toHaveText("null");
+  await input.fill("/permissions");
+  await input.press("Enter");
+  await expect(page.getByRole("dialog", { name: "权限与执行环境" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await page.getByTestId("switch-newchat-space").click();
+  await input.fill("/plan change files");
+  await input.press("Enter");
+  await expect(page.locator(".newchat-hint")).toContainText("Code 指令");
+  await expect(submission).toHaveText("null");
+});
+
+test("new-chat controls pass native prompts and preserve command arguments", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  const input = page.locator(".newchat-input");
+  const submission = page.getByTestId("newchat-submission");
+  await input.fill("/plan inspect this repository");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "inspect this repository", collaborationMode: "plan",
+  });
+  await page.getByTestId("switch-newchat-device").click();
+  await input.fill("/Users/Tester/My Project 请检查此目录");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "/Users/Tester/My Project 请检查此目录", collaborationMode: "default",
+  });
+  await input.fill("/init follow project conventions");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
+    .toMatch(/^Create or update AGENTS\.md[\s\S]*\n\nfollow project conventions$/);
+  await page.getByTestId("switch-newchat-engine").click();
+  await input.fill("/plugin:review 检查当前改动");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
+    .toBe("/plugin:review 检查当前改动");
+  await input.fill("/plan");
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect(page.locator(".newchat-access")).toHaveText("Plan");
+  await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
+    .toBe("/plugin:review 检查当前改动");
+  await input.fill("/normal inspect files");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "inspect files", permissionMode: "bypassPermissions",
+  });
+});
+
+test("new-chat controls keep attachments through local commands and IME confirmation", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  const input = page.locator(".newchat-input");
+  await page.getByLabel("添加文件", { exact: true }).setInputFiles({
+    name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("inspect these notes"),
+  });
+  await expect(page.locator(".attach-file")).toContainText("notes.txt");
+  await input.fill("/model");
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  const models = page.getByRole("dialog", { name: "选择模型", exact: true });
+  await models.locator(".cmd").nth(1).click();
+  await expect(page.locator(".attach-file")).toContainText("notes.txt");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.fill("检查附件");
+  await input.dispatchEvent("compositionstart");
+  await input.press("Enter");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.dispatchEvent("compositionend");
+  // A pointer submit deliberately commits the IME before the deferred send.
+  await page.getByRole("button", { name: "开始", exact: true }).click();
+  await expect.poll(async () => JSON.parse(await page.getByTestId("newchat-submission").innerText()))
+    .toMatchObject({ prompt: "检查附件", files: ["notes.txt"] });
+});
+
+test("new-chat controls offer enabled Codex skills before the first message", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
+  const input = page.locator(".newchat-input");
+  await input.fill("$");
+  const skills = page.getByRole("listbox", { name: "Skills" });
+  await expect(skills).toContainText("$review");
+  await expect(skills).not.toContainText("$retired");
+  await input.fill("$rev");
+  await input.press("Enter");
+  await expect(input).toHaveValue("$review ");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.fill("$review inspect the changes");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await page.getByTestId("newchat-submission").innerText()).prompt)
+    .toBe("$review inspect the changes");
+});
+
+test("new-chat controls omit Code-directory skills in a new Work session", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
+  const input = page.locator(".newchat-input");
+  const skills = page.getByRole("listbox", { name: "Skills" });
+  const requests = page.getByTestId("newchat-skill-requests");
+  await page.getByTestId("switch-newchat-space").click();
+  await input.fill("$");
+  await expect(page.locator(".work-newchat")).toBeVisible();
+  await expect(skills).toHaveCount(0);
+  await expect(requests).toHaveText("0");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(skills).toContainText("$review");
+  await expect(requests).toHaveText("1");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(page.locator(".work-newchat")).toBeVisible();
+  await expect(skills).toHaveCount(0);
+  await input.fill("$rev");
+  await expect(requests).toHaveText("1");
+  await input.fill("/extensions");
+  await input.press("Enter");
+  await expect(page.locator(".newchat-hint")).toContainText("Work 会在创建后分配独立目录");
+  await expect(input).toHaveValue("/extensions");
+  await expect(page.getByTestId("newchat-submission")).toHaveText("null");
+  await input.fill("$rev");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(skills).toContainText("$review");
+  await expect(requests).toHaveText("1");
+});
+
+for (const engine of ["claude", "codex"] as const) {
+  test(`new-chat controls preserve raw ${engine} model IDs through catalog refresh and creation`, async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    const relay = await mockRightPanelRelay(page, { engine, visible: false, retained: false });
+    await page.goto("/");
+    await page.getByRole("button", { name: "显示会话侧栏", exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    await input.fill("/model provider/hidden-model[1m]");
+    await input.press("Enter");
+    await expect(input).toHaveValue("");
+    await expect(page.getByTitle("选择模型", { exact: true })).toContainText("provider/hidden-model[1m]");
+    await page.getByTitle("选择思考强度", { exact: true }).click();
+    const efforts = page.getByRole("dialog", { name: "选择思考强度", exact: true });
+    await expect(efforts.locator(".sheet-scroll").getByRole("button")).toHaveCount(1);
+    await expect(efforts.locator(".sheet-scroll").getByRole("button")).toContainText("默认");
+    await page.keyboard.press("Escape");
+    expect(relay.commands.filter(command => command.type === "new_session")).toEqual([]);
+    const request = relay.commands.filter(command => command.type === "get_models").at(-1)!;
+    relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
+      models: [{ id: "catalog-model", display_name: "Listed model", description: "", efforts: ["high"] }] });
+    // Observe catalog application before checking that reconciliation kept the raw ID.
+    await page.getByTitle("选择模型", { exact: true }).click();
+    await expect(page.getByRole("dialog", { name: "选择模型" })).toContainText("Listed model");
+    await page.keyboard.press("Escape");
+    await expect(page.getByTitle("选择模型", { exact: true })).toContainText("provider/hidden-model[1m]");
+    await page.getByTitle("选择思考强度", { exact: true }).click();
+    await expect(efforts.locator(".sheet-scroll").getByRole("button")).toHaveCount(1);
+    await page.keyboard.press("Escape");
+    await input.fill("hello");
+    await input.press("Enter");
+    await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
+      engine: command.engine ?? "claude", model: command.model, effort: command.effort ?? null,
+    })))
+      .toMatchObject([{ engine, model: "provider/hidden-model[1m]", effort: null }]);
+  });
+
+  test(`new-chat controls keep ${engine} effort choices consistent through model discovery`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { engine, retained: false });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    const model = "provider/discovered-model";
+    await input.fill(`/model ${model}`);
+    await input.press("Enter");
+    await expect(input).toHaveValue("");
+    const request = relay.commands.filter(command => command.type === "get_models").at(-1)!;
+    const effortButton = page.getByTitle("选择思考强度", { exact: true });
+    const efforts = page.getByRole("dialog", { name: "选择思考强度", exact: true });
+    await effortButton.click();
+    await expect(efforts.locator(".sheet-scroll .cmd")).toHaveCount(1);
+    relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
+      models: [{ id: model, display_name: "Discovered model", description: "", efforts: ["low", "high"] }] });
+    await expect(efforts.locator(".sheet-scroll .cmd-nm")).toHaveText(["默认", "low", "high"]);
+    await efforts.getByRole("button", { name: /^high / }).click();
+    await expect(efforts).not.toBeVisible();
+    await expect(effortButton).toHaveText("high");
+    // A catalog refresh must not silently clear a supported explicit choice.
+    relay.emit({ type: "models", engine, cwd: request.cwd as string | undefined,
+      models: [{ id: model, display_name: "Refreshed model", description: "", efforts: ["high"] }] });
+    await expect(page.getByTitle("选择模型", { exact: true })).toHaveText("Refreshed model");
+    await expect(effortButton).toHaveText("high");
+    expect(relay.commands.some(command => command.type === "new_session")).toBe(false);
+    await input.fill("hello");
+    await input.press("Enter");
+    await expect.poll(() => relay.commands.filter(command => command.type === "new_session")).toEqual([
+      expect.objectContaining({ model, effort: "high", prompt: "hello" }),
+    ]);
+  });
+}
+
+for (const [mode, label] of [
+  ["default", "Default"], ["acceptEdits", "Accept Edits"], ["plan", "Plan"],
+  ["auto", "Auto"], ["bypassPermissions", "Bypass Permissions"], [null, "默认权限"],
+] as const) {
+  test(`new-chat controls Claude permissions apply ${mode ?? "inherited"} to the first message`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { engine: "claude", visible: false, retained: false });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    await input.fill("inspect the project");
+    await page.getByTitle("选择权限模式", { exact: true }).click();
+    const sheet = page.getByRole("dialog", { name: "选择权限模式" });
+    await sheet.getByRole("button", { name: new RegExp(`^${label} `) }).click();
+    await expect(sheet).not.toBeVisible();
+    await expect(input).toHaveValue("inspect the project");
+    await expect(page.locator(".newchat-access")).toHaveText(label);
+    expect(relay.commands.some(command => ["new_session", "set_perm"].includes(String(command.type)))).toBe(false);
+    await input.press("Enter");
+    await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
+      prompt: command.prompt, permission: command.permission_mode ?? null,
+      engine: command.engine ?? "claude",
+    }))).toEqual([{ prompt: "inspect the project", permission: mode, engine: "claude" }]);
+  });
+}
+
+test("new-chat controls Claude permissions use local commands and reset on account and surface changes", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
+  await page.getByTestId("switch-newchat-engine").click();
+  const input = page.locator(".newchat-input");
+  const access = page.locator(".newchat-access");
+  const sheet = page.getByRole("dialog", { name: "选择权限模式" });
+  await input.fill("/permissions");
+  await input.press("Enter");
+  await expect(sheet).toBeVisible();
+  await sheet.getByRole("button", { name: /^Accept Edits / }).click();
+  await expect(access).toHaveText("Accept Edits");
+  await input.press("Shift+Tab");
+  await expect(access).toHaveText("Plan");
+  await input.fill("keep this draft");
+  await page.locator(".newchat-profile").click();
+  await page.getByRole("dialog", { name: "选择 Claude 账号" }).getByRole("button", { name: /Secondary/ }).click();
+  await expect(access).toHaveText("默认权限");
+  await expect(input).toHaveValue("keep this draft");
+  await access.click();
+  await sheet.getByRole("button", { name: /^Bypass Permissions / }).click();
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(access).toHaveCount(0);
+  const work = await submitNewChatFixture(page);
+  expect(work).not.toHaveProperty("permissionMode");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(access).toHaveText("默认权限");
+  await access.click();
+  await sheet.getByRole("button", { name: /^Plan / }).click();
+  await access.click();
+  await sheet.getByRole("button", { name: /^默认权限 / }).click();
+  expect(await submitNewChatFixture(page)).not.toHaveProperty("permissionMode");
+  await access.click();
+  await sheet.getByRole("button", { name: /^Plan / }).click();
+  await page.getByTestId("switch-newchat-device").click();
+  await expect(access).toHaveText("默认权限");
+});
+
+test("new-chat controls Claude permissions keyboard changes never target the old session", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", visible: false, retained: false });
+  await page.goto("/");
+  await page.getByLabel("显示会话侧栏", { exact: true }).click();
+  await page.getByRole("button", { name: "新会话", exact: true }).click();
+  const input = page.locator(".newchat-input");
+  await input.press("Shift+Tab");
+  await expect(page.locator(".newchat-access")).toHaveText("Default");
+  expect(relay.commands.some(command => command.type === "set_perm")).toBe(false);
+  await input.fill("/plan inspect files");
+  await input.press("Enter");
+  await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
+    prompt: command.prompt, permission: command.permission_mode,
+  }))).toEqual([{ prompt: "inspect files", permission: "plan" }]);
+});
+
+test("new-chat controls apply fast and model commands to the first native query", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
+  const input = page.locator(".newchat-input");
+  const submission = page.getByTestId("newchat-submission");
+  await input.fill("/model fixture-codex");
+  await input.press("Enter");
+  await expect(input).toHaveValue("");
+  await expect(submission).toHaveText("null");
+  await input.fill("/fast");
+  await input.press("Enter");
+  await expect(page.getByRole("button", { name: "速度：快速", exact: true })).toBeVisible();
+  await expect(submission).toHaveText("null");
+  await input.fill("inspect the project");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "inspect the project", model: "fixture-codex", serviceTier: "priority",
+  });
+  await input.fill("/fast");
+  await input.press("Enter");
+  await expect(page.getByRole("button", { name: "速度：标准", exact: true })).toBeVisible();
+});
+
+for (const width of [320, 390, 1280]) {
+  test(`new-chat controls compact layout grows with text at ${width}px`, async ({ page }, info) => {
+    await page.setViewportSize({ width, height: 844 });
+    await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
+    for (const engine of ["codex", "claude"]) {
+      const input = page.locator(".newchat-input");
+      await input.fill("");
+      const bar = page.locator(".newchat-inputbar");
+      const compactHeight = (await bar.boundingBox())!.height;
+      expect(compactHeight).toBeLessThanOrEqual(66);
+      await expect(page.locator(`.newchat-greet use[href$="#${engine}"]`)).toHaveCount(1);
+      expect(await page.locator(".newchat-profile svg").count()).toBe(1);
+      const layout = await page.locator(".newchat-card").evaluate(card => ({
+        width: card.clientWidth, scroll: card.scrollWidth,
+        page: document.documentElement.scrollWidth, viewport: window.innerWidth,
+      }));
+      expect(layout.scroll).toBeLessThanOrEqual(layout.width);
+      expect(layout.page).toBeLessThanOrEqual(layout.viewport);
+      await input.fill(Array.from({ length: 12 }, (_, i) => `第 ${i + 1} 行：检查输入区域`).join("\n"));
+      expect((await bar.boundingBox())!.height).toBeGreaterThan(compactHeight);
+      expect((await bar.boundingBox())!.height).toBeLessThanOrEqual(152);
+      await input.fill("/mo");
+      const popup = await page.getByRole("listbox", { name: "命令" }).boundingBox();
+      expect(popup!.y).toBeGreaterThanOrEqual(0);
+      await page.screenshot({ path: info.outputPath(`newchat-${engine}-${width}.png`) });
+      await page.getByTestId("switch-newchat-engine").click();
+    }
+  });
+}
+
 test("new-chat controls center selections and recover after the phone keyboard closes", async ({ page }, info) => {
   await page.setViewportSize({ width: 393, height: 852 });
   await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
@@ -11733,7 +12263,7 @@ test("new-chat controls reset across engine authorization scopes", async ({
   await page.getByTestId("switch-newchat-engine").click();
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:code:claude");
-  await expect(page.locator(".newchat-access")).toHaveCount(0);
+  await expect(page.locator(".newchat-access")).toHaveText("默认权限");
   const claudeSubmission = await submitNewChatFixture(page);
   expect(claudeSubmission).not.toHaveProperty("permissionMode");
 
@@ -11748,34 +12278,33 @@ test("new-chat controls reset across engine authorization scopes", async ({
 test("new-chat controls reset and normalize across Code and Work", async ({
   page,
 }) => {
-  await page.goto("/tests/history-browser.html?newchat-controls=1");
+  await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
   await chooseDangerousNewChatControls(page);
 
   await page.getByTestId("switch-newchat-space").click();
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:work:codex");
   await expect(page.locator(".newchat-access")).toHaveCount(0);
-  const fast = page.getByRole("button", {
-    name: "新工作 Fast 服务档位",
-  });
+  const fast = page.getByRole("button", { name: /^速度：/ });
   await expect(fast).toHaveText("标准");
   await fast.click();
+  await page.getByRole("menuitemradio", { name: /快速/ }).click();
   await expect(fast).toHaveText("快速");
   const workSubmission = await submitNewChatFixture(page);
   expect(workSubmission.permissionMode).toBe("never");
   expect(workSubmission).not.toHaveProperty("permissionProfile");
   expect(workSubmission).not.toHaveProperty("webSearch");
-  expect(workSubmission.serviceTier).toBe("fast");
+  expect(workSubmission.serviceTier).toBe("priority");
 
   await page.getByTestId("switch-newchat-engine").click();
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:work:claude");
   await expect(page.getByRole("button", {
-    name: "新工作 Fast 服务档位",
+    name: /^速度：/,
   })).toHaveCount(0);
   await page.getByTestId("switch-newchat-engine").click();
   await expect(page.getByRole("button", {
-    name: "新工作 Fast 服务档位",
+    name: /^速度：/,
   })).toHaveText("标准");
 
   await page.getByTestId("switch-newchat-space").click();

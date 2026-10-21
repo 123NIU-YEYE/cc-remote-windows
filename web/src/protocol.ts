@@ -365,7 +365,7 @@ export interface NewSession extends Base {
   auto_compact_mode?: AutoCompactMode | null;
   auto_compact_threshold_tokens?: number | null;
   collaboration_mode?: CollaborationModeName | null;
-  permission_mode?: CodexPermissionMode | null;
+  permission_mode?: PermissionMode | null;
   permission_profile?: CodexPermissionProfileId | null;
   web_search?: CodexWebSearchMode | null;
   service_tier?: CodexServiceTier | null;
@@ -743,7 +743,7 @@ export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 78;
+export const PROTOCOL_VERSION = 79;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
 export const MAX_AUTO_COMPACT_TOKENS = 1_000_000;
 

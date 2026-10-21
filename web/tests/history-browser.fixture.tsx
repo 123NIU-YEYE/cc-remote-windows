@@ -1311,6 +1311,7 @@ function HistoryConversationBrowserFixture() {
   const [newChatAccount, setNewChatAccount] = useState("primary");
   const [newChatModel, setNewChatModel] = useState<string | null>(null);
   const [newChatEffort, setNewChatEffort] = useState<string | null>(null);
+  const [newChatSkillRequests, setNewChatSkillRequests] = useState(0);
   const selectionAccounts = params.has("selection-controls")
     ? [{ id: "primary", label: "Main" }, { id: "secondary", label: "Secondary" }]
     : [];
@@ -1877,6 +1878,7 @@ function HistoryConversationBrowserFixture() {
             <output data-testid="newchat-submission">{
               JSON.stringify(newChatSubmission)
             }</output>
+            <output data-testid="newchat-skill-requests">{newChatSkillRequests}</output>
           </>
         )}
         {queuedQueryFixture && (
@@ -1944,11 +1946,27 @@ function HistoryConversationBrowserFixture() {
             cwd="/tmp/project"
             controlScopeKey={
               `${newChatSurface.machine}:${newChatSurface.space}:`
-              + newChatSurface.engine
+              + `${newChatSurface.engine}:${newChatAccount}`
             }
             engine={newChatSurface.engine}
             space={newChatSurface.space}
             autoFocus={false}
+            catalog={params.has("newchat-commands") ? {
+              codex: [{
+                id: "fixture-codex", display_name: "GPT-6-Astra",
+                description: "Fixture model", efforts: ["medium", "high", "max"],
+                service_tiers: [{ id: "fast", name: "快速", description: "更快的响应速度" }],
+              }],
+            } : undefined}
+            defaultModel={params.has("newchat-commands") && newChatSurface.engine === "codex" ? "fixture-codex" : undefined}
+            defaultEffort={params.has("newchat-commands") ? "max" : undefined}
+            skills={params.has("newchat-commands") && newChatSkillRequests > 0 ? [
+              { id: "review-skill", kind: "skill", name: "review", description: "Review the current project", enabled: true },
+              { id: "disabled-skill", kind: "skill", name: "retired", enabled: false },
+            ] : undefined}
+            onRequestSkills={() => {
+              if (params.has("newchat-commands")) setNewChatSkillRequests(count => count + 1);
+            }}
             permissionProfiles={newChatProfiles}
             claudeProfiles={selectionAccounts}
             codexProfiles={selectionAccounts}
