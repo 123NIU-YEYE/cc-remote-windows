@@ -20,13 +20,14 @@ import {
   useVirtualizer,
 } from "@tanstack/react-virtual";
 import type {
-  TextBlock, Turn,
+  ProcessBlock, TextBlock, Turn,
 } from "../domain/conversation";
 import type { Space } from "../protocol";
 import type { LoadTurnFilePage } from "../turn-file-pages";
 import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
 import { assistantContinuations, type AssistantContinuation } from "../assistant-continuations";
+import { returnRunId, returnedAgents } from "../agent-returns";
 import { TimedMessageTag } from "./TimedMessageTag";
 import { Icon, ClaudeMark, EngineWorking, EngineDone } from "../icons";
 import { canForkTurn } from "../session-worktree";
@@ -93,6 +94,7 @@ import type { QueryAcceptanceResult } from "../outbox";
 
 const SessionMessageLinks = lazy(() => import("./SessionMessageLinks"));
 const TurnUsageIndicator = lazy(() => import("./TurnUsageIndicator").then(m => ({ default: m.TurnUsageIndicator })));
+const DshProducedFiles = lazy(() => import("./DshProducedFiles"));
 const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
 const AsyncQuestionHost = lazy(() => import("./AsyncQuestionDialog"));
 const PagePreviewLinks = lazy(() => import("./PagePreviewLinks").then((module) => ({ default: module.PagePreviewLinks })));
@@ -345,7 +347,7 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
   sid: string | null;
   turns: Turn[];
   surface?: Space;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   loading?: boolean;
   hasMore?: boolean;
   historyPagingReady?: boolean;
@@ -1794,6 +1796,8 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       window.clearTimeout(userScrollIntentTimerRef.current);
       userScrollIntentTimerRef.current = null;
     }
+    const reachedLatestIntentionally = userScrollIntentRef.current
+      && userScrollDirectionRef.current === "latest";
     userScrollIntentRef.current = false;
     userScrollDirectionRef.current = null;
     flushHistoryViewportLease();
@@ -1809,6 +1813,17 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
       return;
     }
     const controller = controllerRef.current;
+    const el = scrollRef.current;
+    // At the physical edge, a final downward gesture may produce no scroll
+    // event (clamping, coalescing, or short content). Settle that explicit
+    // intent here; layout alone must never resume a paused history reader.
+    if (reachedLatestIntentionally && !browseMode && !historyRequestRef.current
+        && !scrollCoordinatorRef.current.isInteractionLocked()
+        && !textSelectionRef.current?.dragging && el && controller
+        && measureBottom(readScrollMetrics(el)).atBottom) {
+      syncScrollState(controller.resume(readScrollMetrics(el)));
+      setMeasurementBoundary(null);
+    }
     // A tap or a pull beyond the latest edge can leave follow enabled while
     // suppressing a queued resize correction. Catch up only after the native
     // gesture has settled; a history reader keeps their paused state.
@@ -2748,6 +2763,13 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
             const generatedImages = generatedOutputImages(timelineBlocks);
             const modelNotices = modelFallbackNotices(timelineBlocks);
             const narrative = assistantContinuations(timelineBlocks, finalBlocks, engine);
+            const renderAgentReturn = (receipt: ProcessBlock) => {
+              const runId = returnRunId(receipt);
+              return runId && onOpenAgent ? <button key={receipt.item_id} type="button" className="agent-return-link"
+                onClick={() => onOpenAgent(runId, receipt.summary || receipt.title)}>
+                <span>代理返回 · {receipt.summary || receipt.title}</span><Icon name="chev" size={13} />
+              </button> : null;
+            };
             const lastContinuation = narrative.continuations.at(-1);
             const originalProcessItems = presentableProcessBlocks(
               narrative.original, engine);
@@ -2985,6 +3007,12 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                   turnNodeRefs.current.delete(t.id);
                 }
               }}>
+            {t.continuation && !t.prompt && (
+              <div className="turn-continuation">
+                {returnedAgents(timelineBlocks).map(renderAgentReturn)}
+                <span>收到子代理结果，继续处理</span>
+              </div>
+            )}
             {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
                 {t.prompt && <div className="ubub">
@@ -3093,14 +3121,15 @@ export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "
                 {narrative.continuations.map((segment) => (
                   <div key={segment.id} className="background-followup">
                     <div className="background-followup-boundary">
-                      <span>{engine === "codex"
-                        ? "Codex 收到后台消息，继续处理" : "Claude 继续处理"}</span>
+                      {segment.returns.map(renderAgentReturn)}
+                      <span>{engine === "codex" ? "Codex 收到后台消息，继续处理" : engine === "dsh" ? "DSH 继续处理" : "Claude 继续处理"}</span>
                       {segment.startedTs != null && <time>{formatTime(segment.startedTs)}</time>}
                     </div>
                     {renderProcess(segment)}
                     {segment.answers.map(renderAnswer)}
                   </div>
                 ))}
+                {engine === "dsh" && onOpenFile && <Suspense fallback={null}><DshProducedFiles turn={t} onOpen={onOpenFile} /></Suspense>}
                 {t.error && <TurnProblem message={t.error} continuing={activeTurnIndex > ti} />}
                 {/* Final metadata already has a stable row. While running,
                     page discovery shares the existing working indicator below

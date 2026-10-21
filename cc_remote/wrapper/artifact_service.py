@@ -77,6 +77,10 @@ class ArtifactService:
         machine = self.machine
         if not cmd.sid:
             raise ValueError("请先打开一个会话")
+        if cmd.engine == "dsh":
+            await machine._dsh.connection()
+            ctx = await machine._dsh.ctx(cmd.sid)
+            return ctx.key, ctx.cwd, self.context_scope(ctx)
         scope, cwd = await machine._viewer_page_scope(PageScope(
             sid=cmd.sid, engine=cmd.engine, space=cmd.space))
         if not cwd:
@@ -92,14 +96,18 @@ class ArtifactService:
             if cmd.scan_history:
                 ctx = machine._ctx_for(sid)
                 if ctx is None or not ctx.btw:
-                    history = await machine._history_page_singleflight(GetHistory(
-                        session_id=sid, before=cmd.history_before, limit=12, detail="summary",
-                        cwd=cwd), sid)
+                    request = GetHistory(session_id=sid, before=cmd.history_before, limit=12, detail="summary", cwd=cwd)
+                    history = (await machine._dsh.handle_get_history(request, publish=False) if cmd.engine == "dsh"
+                               else await machine._history_page_singleflight(request, sid))
                     if history.error:
                         raise ValueError("历史附件整理暂时失败，请重试")
                     await asyncio.to_thread(self.store.history, scope, history, cwd)
                     response.history_before = history.oldest_id
                     response.history_more = history.has_more
+            if cmd.engine == "dsh":
+                metadata = await machine._dsh.client.metadata(sid)
+                for file in metadata.get("deliverables", [])[:256]:
+                    await asyncio.to_thread(self.store.text, scope, f"[file](<{file['path']}>)", cwd)
             rows, response.next_before, response.has_more = await asyncio.to_thread(self.store.page, scope, cmd.before)
             response.entries = await asyncio.to_thread(lambda: [SessionArtifactInfo(**public_entry(row)) for row in rows])
         except Exception as exc:
@@ -124,7 +132,7 @@ class ArtifactService:
                     data=base64.b64encode(data).decode(), media_type="image/webp",
                     size=len(data), writable=False, sid=sid, to=cmd.client_id)
             elif row["image_id"]:
-                image = await machine._handle_get_history_image(GetHistoryImage(
+                image = await (machine._dsh.handle_get_history_image if cmd.engine == "dsh" else machine._handle_get_history_image)(GetHistoryImage(
                     session_id=sid, turn_id=row["turn_id"], image_id=row["image_id"],
                     variant="full", request_id=cmd.request_id, client_id=cmd.client_id), publish=False)
                 response = FilePreview(path=path, request_id=cmd.request_id, format="image",
@@ -161,7 +169,7 @@ class ArtifactService:
     async def thumbnail(self, cmd, sid, cwd, row):
         machine = self.machine
         if row["image_id"]:
-            image = await machine._handle_get_history_image(GetHistoryImage(
+            image = await (machine._dsh.handle_get_history_image if cmd.engine == "dsh" else machine._handle_get_history_image)(GetHistoryImage(
                 session_id=sid, turn_id=row["turn_id"], image_id=row["image_id"],
                 variant="thumbnail", request_id=cmd.request_id, client_id=cmd.client_id), publish=False)
             if image.error or not image.data:

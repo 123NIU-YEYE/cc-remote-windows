@@ -68,6 +68,39 @@ try {
   assert.match(restored, /Before callback\.[\s\S]*Codex 收到后台消息，继续处理[\s\S]*After callback\./,
     "compact history shows the source label before process details load");
 
+  for (const engine of ["claude", "codex"] as const) {
+    const agent: ProcessBlock = { ...receipt("return-native-child"), processKind: "agent",
+      server: "cc_remote", tool: "agent_return", title: "界面审查", summary: undefined,
+      input: { agent_run_id: "native-child" } };
+    const render = (items: Block[]) => renderToStaticMarkup(createElement(ChatView, {
+      sid: "parent", engine, onOpenAgent: () => {}, turns: [{ id: "turn", prompt: "Review",
+        done: true, blocks: items, processDetailState: "present", detailEventCount: 3 }],
+    }));
+    assert.doesNotMatch(render([before, agent]), /agent-return-link|继续处理/,
+      "a child return alone cannot create a parent continuation row");
+    assert.doesNotMatch(render([before, agent, after]), /agent-return-link|继续处理/,
+      "a return during foreground work cannot segment or collapse that work");
+    const resumedAnswer = { ...after, background: true };
+    const nativeBoundary: Block[] = engine === "codex" ? [receipt("native-callback")] : [];
+    const baseline = assistantContinuations([before, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine);
+    const enhanced = assistantContinuations([before, agent, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine);
+    assert.deepEqual(enhanced, { ...baseline,
+      continuations: baseline.continuations.map(segment => ({ ...segment, returns: [agent] })) },
+      "only the link metadata changes; native segment IDs, clocks, blocks and answers remain identical");
+    assert.match(render([before, agent, ...nativeBoundary, resumedAnswer]),
+      /代理返回 · 界面审查[\s\S]*继续处理[\s\S]*After callback/);
+    const task = { ...agent, processKind: "task" as const, tool: "task_return", input: undefined };
+    assert.deepEqual(assistantContinuations([before, task, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine), baseline);
+    assert.doesNotMatch(render([before, task, ...nativeBoundary, resumedAnswer]), /任务返回|agent-return-link/);
+    const second = { ...agent, item_id: "return-second", input: { agent_run_id: "other-child" } };
+    const grouped = assistantContinuations([before, agent, second, ...nativeBoundary, resumedAnswer], [before, resumedAnswer], engine);
+    assert.equal(grouped.continuations.length, 1);
+    assert.deepEqual(grouped.continuations[0]?.returns, [agent, second]);
+    const consumed = assistantContinuations([before, agent, after, ...nativeBoundary, resumedAnswer], [before, after], engine);
+    assert.equal(consumed.continuations[0]?.returns.length, 0,
+      "an in-flight result cannot be attributed to a later unrelated continuation");
+  }
+
   const sid = "codex-session", otherSid = "another-account-session";
   let state = { ...initialState, focusedSid: sid, runtimes: {
     [sid]: { ...createRuntime(), state: "idle", controlGeneration: "generation" },

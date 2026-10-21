@@ -11,7 +11,7 @@ import type { AppearanceController } from "../use-theme";
 const ThemePicker = lazy(() => import("./ThemePicker"));
 
 interface Props {
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   appearance: AppearanceController;
   boldText: boolean;
   onBoldText: (enabled: boolean) => void;
@@ -24,6 +24,7 @@ interface Props {
   onOpenUsageActivity: () => void;
   onOpenBtw?: () => void;
   onOpenViewer?: () => void;
+  onOpenDshTools?: () => void;
   onOpenArtifacts?: () => void;
   onOpenFiles?: () => void;
   onLogout: () => void;
@@ -56,6 +57,7 @@ export function HeaderMenu({
   onOpenViewer,
   onOpenFiles,
   onOpenArtifacts,
+  onOpenDshTools,
   onLogout,
 }: Props) {
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -181,6 +183,7 @@ export function HeaderMenu({
                   <span><b>远程预览</b><small>打开设备上的交互页面</small></span>
                   <Icon name="chevron-right" size={16} />
                 </button>}
+                {onOpenDshTools && <button type="button" className="header-menu-item" onClick={() => { close(); onOpenDshTools(); }}><Icon name="plan" size={18} /><span><b>DSH 会话工具</b><small>子代理、任务、插件与导出</small></span><Icon name="chevron-right" size={16} /></button>}
                 {onOpenArtifacts && <button type="button" className="header-menu-item" aria-label="打开 Artifacts" onClick={() => {
                   close(); onOpenArtifacts();
                 }}><Icon name="archive" size={18} />

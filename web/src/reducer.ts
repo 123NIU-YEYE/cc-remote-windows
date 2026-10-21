@@ -1,3 +1,5 @@
+import type { DshState, DshPreset, DshPermissionOption, DshCommandResult } from "./protocol";
+import { isSyntheticReturnReceipt } from "./agent-returns";
 // Turn/block state model for the chat UI.
 //
 // Multi-session: AppState holds a `runtimes` map keyed by session id (or a
@@ -203,6 +205,8 @@ export interface Artifact {
 
 export interface SessionRuntime {
   turnUsage?: TurnUsageReadings;
+  dsh?: DshState;
+  dshCommandResult?: DshCommandResult;
   turns: Turn[];
   state: State;
   // Display-only activity observed from a native/external client. It must not
@@ -386,6 +390,9 @@ export interface SessionRuntime {
 }
 
 export interface AppState {
+  dshPresets?: DshPreset[];
+  dshPermissions?: DshPermissionOption[];
+  dshError?: string | null;
   // connection / global UI
   connState: ConnState;
   wrapperOnline: boolean;
@@ -459,7 +466,7 @@ export interface AppState {
 
 export interface BtwChat {
   sid: string;
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   createdAt: number;
   state: "idle" | "running" | "interrupting" | "draining";
 }
@@ -2081,6 +2088,7 @@ function claimClaudeContinuation(
 const MAX_LIVE_DETAIL_TURN_IDS = 128;
 
 function isStateVisibleProcessBlock(block: Block): boolean {
+  if (isSyntheticReturnReceipt(block)) return false;
   if (block.kind === "tool") return true;
   if (block.kind === "text") {
     return block.channel === "commentary" && block.text.length > 0;
@@ -5048,6 +5056,8 @@ function reduceEvent(
       });
     }
     case "turn_file_changes_page":
+    case "dsh_read_result":
+    case "dsh_download_chunk":
     case "files_listed":
     case "session_artifacts":
     case "agent_detail":
@@ -5066,6 +5076,10 @@ function reduceEvent(
       };
     // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
     // what we have (data.ts's static table) rather than blanking the pickers.
+    case "dsh_command_result":
+      return patch(state, e.sid, (rt) => { rt.dshCommandResult = e; });
+    case "dsh_state":
+      return patch(state, e.sid, (rt) => { rt.dsh = e; });
     case "models": {
       const cacheKey = modelCatalogScopeKey(
         e.engine,
@@ -5076,7 +5090,7 @@ function reduceEvent(
             : null,
       );
       const catalogKey = e.engine === "claude" && e.cwd ? `${cacheKey}\u0000${e.cwd}` : cacheKey;
-      const catalog = e.models.length
+      const catalog = e.models.length || e.engine === "dsh"
         ? { ...state.catalog, [catalogKey]: e.models }
         : state.catalog;
       if (e.cwd && e.cwd !== state.newChat?.cwd) {
@@ -5118,6 +5132,7 @@ function reduceEvent(
       }
       return {
         ...state, catalog, catalogDefault, catalogDefaultEffort,
+        ...(e.engine === "dsh" ? { dshPresets: e.dsh_presets ?? [], dshPermissions: e.dsh_permissions ?? [], dshError: e.error ?? null } : {}),
         catalogDefaultCwd,
       };
     }
@@ -6718,6 +6733,16 @@ function reduceEvent(
         }
         let turns = cloneTurns(rt.turns);
         const seq = typeof e.seq === "number" ? e.seq : 0;
+        if (e.autonomous) {
+          let owner = turns.find(turn => turnHasIdentityAlias(turn, e.msg_id));
+          if (!owner) {
+            // Native rounds without a human prompt retain their exact owner.
+            owner = { id: e.msg_id, prompt: "", blocks: [], done: false,
+              forkPointId: e.turn_id, ts: eventTimestampMs(e.ts) };
+            turns.push(owner);
+          }
+          if (e.continuation) owner.continuation = e.continuation;
+        }
         const binding = {
           msgId: e.msg_id,
           turnId: e.turn_id,
@@ -6839,9 +6864,13 @@ function reduceEvent(
             t.forkPointId = e.turn_id;
             t.liveTaskId = undefined;
           }
+          if (e.sid?.startsWith("dsh@")) {
+            t.forkAvailable = e.result.subtype !== "steered";
+          }
           if (e.checkpoint_id) t.checkpointId = e.checkpoint_id;
           t.progress = undefined;
-          if (e.result.subtype === "error_during_execution") t.interrupted = true;
+          const nativeDshInterrupt = !!e.sid?.startsWith("dsh@") && e.result.subtype === "interrupted";
+          if (e.result.subtype === "error_during_execution" || nativeDshInterrupt) t.interrupted = true;
           if (e.result.is_error) {
             if (e.result.subtype !== "error_during_execution") {
               t.error ??= "本次回复未完成，请重试。";
@@ -6862,8 +6891,10 @@ function reduceEvent(
           t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
           finishOpenBlocks(
             t,
-            e.result.is_error ? "interrupted" : "succeeded",
-            e.result.is_error,
+            nativeDshInterrupt ? "interrupted"
+              : e.result.is_error ? (e.sid?.startsWith("dsh@") ? "failed" : "interrupted")
+                : "succeeded",
+            e.result.is_error || nativeDshInterrupt,
             e.result.subtype === "steered",
           );
           settleVisibleProcessIfComplete(
