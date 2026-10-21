@@ -70,7 +70,8 @@ def test_new_session_query_and_turn_binding_roundtrip():
     assert deserialize(serialize(binding)) == binding
 
 
-def test_new_session_starts_initial_query_on_the_new_ctx():
+@pytest.mark.parametrize("permission", [None, "default", "acceptEdits", "plan", "auto", "bypassPermissions"])
+def test_new_session_starts_initial_query_on_the_new_ctx(permission):
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("tmp-new", None)
@@ -113,6 +114,7 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             cwd="/tmp",
             model="claude-test",
             effort="high",
+            permission_mode=permission,
             prompt="first prompt",
             msg_id="msg-new",
             images=[{"media_type": "image/png", "data": _PNG_1X1}],
@@ -141,7 +143,7 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "auto_compact_mode": None,
             "auto_compact_threshold_tokens": None,
             "collaboration_mode": None,
-            "permission_mode": None,
+            "permission_mode": permission,
             "permission_profile": None,
             "web_search": None,
             "service_tier": None,
@@ -154,6 +156,24 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
         assert images == cmd.images and files == cmd.files
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["default", "acceptEdits", "plan", "auto", "bypassPermissions"])
+def test_new_session_claude_permissions_are_engine_and_space_scoped(mode):
+    command = NewSession(engine="claude", permission_mode=mode)
+    assert deserialize(serialize(command)) == command
+    with pytest.raises(ValidationError, match="selected engine"):
+        NewSession(engine="codex", permission_mode=mode)
+    with pytest.raises(ValidationError, match="fixed by the wrapper"):
+        NewSession(engine="claude", space="work", permission_mode=mode)
+
+
+@pytest.mark.parametrize("mode", ["never", "on-request", "untrusted"])
+def test_new_session_codex_permissions_remain_engine_scoped(mode):
+    command = NewSession(engine="codex", permission_mode=mode)
+    assert deserialize(serialize(command)) == command
+    with pytest.raises(ValidationError, match="selected engine"):
+        NewSession(engine="claude", permission_mode=mode)
 
 
 def test_invalid_new_session_cwd_is_single_correlated_error(tmp_path):

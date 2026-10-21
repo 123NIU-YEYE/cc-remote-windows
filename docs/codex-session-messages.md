@@ -37,7 +37,7 @@ explicit engine/account-qualified, device-local references, so its links can
 resolve across configured Code accounts and between Claude and Codex. Neither
 form can nominate another device or turn display metadata into authorization.
 
-Native source fields were introduced in protocol **v74** (current: **v78**).
+Native source fields were introduced in protocol **v74** (current: **v79**).
 The unified entrance reuses those bounded fields and adds a queued receipt
 state; Web, Relay and Wrapper must upgrade together.
 Existing history caches remain valid when adding the unified entrance; new

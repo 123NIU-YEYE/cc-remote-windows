@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 78
+PROTOCOL_VERSION = 79
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -1350,9 +1350,7 @@ class NewSession(_Command):
         le=MAX_AUTO_COMPACT_TOKENS,
     )
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
-    permission_mode: Optional[
-        Literal["never", "on-request", "untrusted"]
-    ] = None  # Codex only; persisted before the first turn
+    permission_mode: Optional[PermissionMode] = None  # Engine-specific; applied before connect
     permission_profile: Optional[PermissionProfileId] = None  # Codex only
     web_search: Optional[WebSearchMode] = None  # Codex Code only
     service_tier: Optional[str] = Field(
@@ -1375,7 +1373,6 @@ class NewSession(_Command):
         codex_only = {
             "codex_profile_id": self.codex_profile_id,
             "collaboration_mode": self.collaboration_mode,
-            "permission_mode": self.permission_mode,
             "permission_profile": self.permission_profile,
             "web_search": self.web_search,
             "service_tier": self.service_tier,
@@ -1385,6 +1382,13 @@ class NewSession(_Command):
         if invalid:
             raise ValueError(
                 f"{', '.join(invalid)} only supported for Codex sessions")
+        if self.permission_mode is not None:
+            codex_modes = {"never", "on-request", "untrusted"}
+            if ((self.permission_mode in codex_modes)
+                    != (self.engine == "codex")):
+                raise ValueError("permission_mode does not match the selected engine")
+            if self.engine == "claude" and self.space == "work":
+                raise ValueError("Claude Work permission_mode is fixed by the wrapper")
         if self.claude_profile_id is not None and self.engine != "claude":
             raise ValueError(
                 "claude_profile_id only supported for Claude sessions")

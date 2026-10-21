@@ -2017,7 +2017,8 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 /* NEW CHAT welcome page (centered composer a la Claude app / Codex) */
 .newchat{ flex:1; display:flex; align-items:center; justify-content:center; padding:24px 20px; overflow-y:auto; }
 .newchat-card{ width:100%; max-width:560px; display:flex; flex-direction:column; gap:14px; }
-.newchat-greet{ font-size:22px; font-weight:var(--font-weight-600); font-family:var(--serif); color:var(--text); text-align:center; letter-spacing:-.01em; }
+.newchat-greet{ display:flex; align-items:center; justify-content:center; gap:12px; font-size:22px; font-weight:var(--font-weight-600); font-family:var(--serif); color:var(--text); text-align:center; letter-spacing:-.01em; }
+.newchat-editor{ position:relative; min-width:0; }
 .work-private-note{ display:flex; align-items:center; justify-content:center; gap:7px; align-self:center;
   max-width:520px; color:var(--dim); font-size:12px; line-height:1.5; text-align:center; }
 .work-private-note svg{ flex:none; color:var(--accent-text,var(--accent)); }
@@ -2072,6 +2073,56 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .newchat-send:hover{ filter:brightness(1.05); }
 .newchat-send:disabled{ opacity:.45; cursor:not-allowed; }
 .newchat-send svg{ width:16px; height:16px; }
+/* Code welcome uses the same compact input silhouette as the conversation.
+   Work keeps its project/attachment-oriented form. */
+.code-newchat{ align-items:flex-start; padding:32px 20px; }
+.code-newchat .newchat-card{ max-width:760px; gap:0; margin:auto 0; }
+.code-newchat .newchat-greet{ margin-bottom:48px; font:var(--font-weight-600) 25px/1.4 var(--sans); }
+.code-newchat .newchat-context{ gap:4px 14px; margin-bottom:10px; }
+.code-newchat .newchat-profile,.code-newchat .newchat-cwd{
+  min-height:36px; padding:6px 4px; border:0; border-radius:8px;
+  background:transparent; color:var(--dim); font:12px/1.5 var(--sans);
+}
+.code-newchat .newchat-profile > b{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--dim); }
+.code-newchat .newchat-profile svg,.code-newchat .newchat-cwd svg{ flex:none; }
+.code-newchat .newchat-profile:hover,.code-newchat .newchat-cwd:hover{ background:var(--raised); color:var(--text); }
+.code-newchat .newchat-attach{ margin:0 0 10px; }
+.newchat-inputbar{ display:flex; align-items:flex-end; gap:8px; min-height:62px; padding:8px 9px;
+  border:1px solid var(--border-strong,var(--border)); border-radius:28px;
+  background:var(--surface); box-shadow:var(--shadow-sm); transition:border-color .14s,box-shadow .14s; }
+.newchat-inputbar:focus-within{ border-color:var(--accent-line); box-shadow:0 0 0 1px var(--accent-line); }
+.newchat-inputbar > .cmdbtn{ flex:none; width:36px; height:44px; padding:0; color:var(--dim); }
+.newchat-inputbar .newchat-input{ flex:1; min-width:0; width:0; min-height:44px; max-height:132px;
+  padding:10px 0; border:0; border-radius:0; background:transparent; box-shadow:none;
+  font-size:16px; line-height:24px; overflow-y:auto; }
+.newchat-inputbar .newchat-input::placeholder{ color:var(--faint); }
+.newchat-inputbar .newchat-send{ flex:none; width:44px; height:44px; padding:0; justify-content:center; border-radius:50%; }
+.newchat-inputbar .newchat-send svg{ width:20px; height:20px; }
+.code-newchat .newchat-foot{ align-items:center; gap:0 8px; padding:4px 2px 0; }
+.code-newchat .newchat-ctls{ justify-content:flex-end; gap:0 10px; flex:1; }
+.code-newchat .newchat-ctls .hint-ctl{ border:0; border-radius:8px; background:transparent;
+  padding:7px 2px; min-height:36px; font-size:12px; max-width:min(240px,50vw); }
+.code-newchat .newchat-ctls .hint-ctl > span{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.code-newchat .newchat-ctls .hint-ctl[title="选择模型"]{ color:var(--text); }
+.code-newchat .newchat-access{ border:0; border-radius:8px; background:transparent;
+  padding:6px 2px; min-height:36px; max-width:38%; font-size:11.5px; }
+.newchat-default-note{ display:flex; align-items:center; gap:5px; color:var(--dim); font-size:11.5px; }
+.code-newchat .newchat-foot-right{ flex-basis:100%; margin:3px 0 0; }
+.code-newchat .newchat-hint{ color:var(--dim); line-height:1.6; }
+.newchat-editor .cmd-pop{ max-height:min(34vh,300px); }
+.newchat-editor .cmd-ds{ display:block; }
+@media(max-width:560px){
+  .code-newchat{ padding:24px 16px; }
+  .code-newchat .newchat-greet{ font-size:23px; }
+  .code-newchat .newchat-ctls{ gap:0 8px; }
+}
+@media(max-width:360px){
+  .code-newchat{ padding:20px 12px; }
+  .code-newchat .newchat-context{ gap:0 8px; }
+  .code-newchat .newchat-profile > b{ max-width:140px; }
+  .code-newchat .newchat-ctls{ gap:0 6px; }
+  .code-newchat .newchat-ctls .hint-ctl{ font-size:11.5px; }
+}
 @media (max-height:480px){ .newchat-card{ gap:10px; } }
 @media (max-width:560px){ .work-starters{ grid-template-columns:1fr 1fr; } }
 
