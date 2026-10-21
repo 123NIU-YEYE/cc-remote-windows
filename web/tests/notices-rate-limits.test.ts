@@ -501,6 +501,8 @@ try {
   }
   assert.equal(presentCommandProblem({ code: "internal", message: hiddenDiagnostic }),
     "操作未完成，请稍后重试。");
+  assert.equal(presentCommandProblem({ code: "dsh_session/migration-required", message: hiddenDiagnostic }),
+    "此旧版 DSH 会话需要先在官方客户端打开并完成格式升级；也可以新建会话。");
   for (const [raw, expected, heading] of [
     ["Codex 已自动更新，当前回合在更新时中断；为避免重复执行工具，"
       + "本次任务未自动重试。请确认已有结果后重新发送。",

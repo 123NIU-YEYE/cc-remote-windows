@@ -238,21 +238,21 @@ const preferenceStorage = {
   getItem: (key: string) => preferenceValues.get(key) ?? null,
 };
 assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
-  claude: "code", codex: "work",
+  claude: "code", codex: "work", dsh: "code",
 }, "legacy space migrates only to the previously active engine");
 preferenceValues.set(ENGINE_SPACES_KEY, JSON.stringify({
-  claude: "work", codex: "code",
+  claude: "work", codex: "code", dsh: "code",
 }));
 assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
-  claude: "work", codex: "code",
+  claude: "work", codex: "code", dsh: "code",
 }, "persisted engine spaces survive reload independently");
 assert.deepEqual(
-  rememberEngineSpace({ claude: "work", codex: "code" }, "codex", "work"),
-  { claude: "work", codex: "work" },
+  rememberEngineSpace({ claude: "work", codex: "code", dsh: "code" }, "codex", "work"),
+  { claude: "work", codex: "work", dsh: "code" },
   "changing one engine's space must preserve the other engine's memory",
 );
-let switchingSpaces: { claude: "code" | "work"; codex: "code" | "work" } = {
-  claude: "code", codex: "code",
+let switchingSpaces: { claude: "code" | "work"; codex: "code" | "work"; dsh: "code" | "work" } = {
+  claude: "code", codex: "code", dsh: "code",
 };
 switchingSpaces = rememberEngineSpace(switchingSpaces, "claude", "work");
 assert.equal(switchingSpaces.codex, "code",
@@ -1190,7 +1190,7 @@ assert.match(historyAppSource,
   /const refreshStatus = useCallback[\s\S]{0,300}\?\.tag === "archived"[\s\S]{0,220}sendGetStatus/,
   "archived history must not request live Codex status");
 assert.match(historyAppSource,
-  /!archivedBrowse && \(\s*<TerminalControl/,
+  /!archivedBrowse && focusedEngine !== "dsh" && \(\s*<TerminalControl/,
   "archived history must not expose terminal takeover controls");
 assert.match(historyAppSource,
   /<GoalPanel[\s\S]{0,180}revealed=\{!archivedBrowse[\s\S]{0,100}open=\{!archivedBrowse/,
@@ -18942,6 +18942,26 @@ relay.stop();
 
 // A separate socket exercises the v15 control watermark without perturbing
 // the narrative generation assertions above.
+function checkTerminalNonReplay() {
+  const terminalRelay = new RelayWs({ onEvent: () => {}, onConnState: () => {} });
+  assert.equal(terminalRelay.sendDshControl("dsh@pty", "terminal", '{"action":"input"}'), null);
+  terminalRelay.start();
+  const terminalSocket = FakeWebSocket.instances.at(-1)!;
+  terminalSocket.onopen?.();
+  const terminalCommand = terminalRelay.sendDshControl("dsh@pty", "terminal", '{"action":"input","lease":"once"}');
+  assert.ok(terminalCommand);
+  assert.equal(terminalSocket.sent.map(raw => JSON.parse(raw)).filter(frame => frame.cmd_id === terminalCommand).length, 1);
+  terminalSocket.onopen?.(); // recovery must never resend the physical input
+  assert.equal(terminalSocket.sent.map(raw => JSON.parse(raw)).filter(frame => frame.cmd_id === terminalCommand).length, 1);
+  terminalRelay.stop();
+  terminalRelay.start();
+  const reopenedTerminalSocket = FakeWebSocket.instances.at(-1)!;
+  reopenedTerminalSocket.onopen?.();
+  assert.equal(reopenedTerminalSocket.sent.map(raw => JSON.parse(raw)).some(frame => frame.kind === "terminal"), false);
+  terminalRelay.stop();
+}
+checkTerminalNonReplay();
+
 const controlObserved: ServerEvent[] = [];
 const controlRelay = new RelayWs({
   onEvent: (event) => { controlObserved.push(event); },

@@ -3051,6 +3051,20 @@ function CodexVisualizationFixture() {
   </main>;
 }
 
+function MarkdownBreakFixture() {
+  const [finished, setFinished] = useState(false);
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <button type="button" onClick={() => setFinished(true)}>Finish break stream</button>
+    <section data-testid="plain-answer"><MessageBlock text="正文第一行" done /></section>
+    <section data-testid="break-answer"><MessageBlock text="<br>正文第一行" done /></section>
+    <section data-testid="table-breaks"><MessageBlock done={finished}
+      text={"| 项 | 结果 |\n| --- | --- |\n| 唤醒后下指令 | 先向前<br>再向右<br />最后坐下 |\n\n"
+        + "正文第一行<br>第二行\n\n`<br>` 仍然是代码。\n\n"
+        + "```html\n<br>\n```\n\n"
+        + (finished ? "流式内容<br/>完成" : "流式内容<br")} /></section>
+  </main>;
+}
+
 function MarkdownDisclosureFixture() {
   const [complete, setComplete] = useState(false);
   const [opened, setOpened] = useState("");
@@ -3148,6 +3162,8 @@ createRoot(document.getElementById("root")!).render(
     ? <CodexVisualizationFixture />
     : rootParams.has("codex-file-citation")
     ? <CodexFileCitationFixture />
+    : rootParams.has("markdown-breaks")
+    ? <MarkdownBreakFixture />
     : rootParams.has("markdown-disclosure")
     ? <MarkdownDisclosureFixture />
     : rootParams.has("inline-image-capacity")

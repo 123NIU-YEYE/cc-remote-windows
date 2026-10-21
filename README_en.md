@@ -4,7 +4,7 @@
 
 Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
 
-**Product version: v4.0.29** · Wire protocol v79
+**Product version: v4.0.29** · Wire protocol v80
 
 [中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
 [Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
@@ -66,6 +66,13 @@ item has its own directory; add material through attachments or the project
 library. Work sessions and material are separate from Code.
 
 ## Engines and features
+
+This development branch adds **DSH 0.2.1-rc.2**, using the current Code chat UI
+and a separate white/blue default palette. It supports native commands, Skills,
+questions and approvals, steering/queueing, Goals, subagents, jobs and artifact
+previews. See [DSH integration](docs/dsh-integration.md) for pairing, verification
+and capability boundaries. DSH retains model authentication; connecting does
+not automatically upgrade or migrate existing DSH data.
 
 This table describes **capabilities connected in cc-remote**. Models, permissions
 and extensions still depend on the native installation on the selected device.

@@ -1,9 +1,11 @@
+import { lazyDshApi } from "./lazy-dsh-api";
+import type { DshPanelSelection } from "./components/DshPanel";
 import {
   harmonyPushSnapshot, subscribeHarmonyPush, hasHarmonyPush,
   requestHarmonyPermission, confirmHarmonyPermission,
 } from "./harmony-push";
 import { RightPanelPresentation, rekeyPanelScope } from "./right-panel-presentation";
-import type { FilePreview } from "./protocol";
+import type { DshCommandInfo, FilePreview } from "./protocol";
 import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
 import {
   lazy,
@@ -50,7 +52,7 @@ import type { QueuedQueryEditor } from "./components/QueuedQueryDialog";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
 import { presentCommandProblem } from "./problem-presentation";
-import { LoginForm } from "./components/LoginForm";
+const LoginForm = lazy(() => import("./components/LoginForm").then(m => ({ default: m.LoginForm })));
 import {
   compatibleNewChatEffort,
   newChatCatalogRequest,
@@ -60,7 +62,7 @@ import {
 const NewChatView = lazy(() => import("./components/NewChatView").then(m => ({ default: m.NewChatView })));
 const QuestionSheet = lazy(() => import("./components/QuestionSheet").then(
   m => ({ default: m.QuestionSheet })));
-import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
+const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
 import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
@@ -99,6 +101,7 @@ import {
   normalizeSessionList,
   scopedFocusForSessionList,
   shouldAcceptSessionList,
+  shortSessionId,
   updateScopedSessionLifecycle,
 } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
@@ -275,6 +278,7 @@ const HeaderMenu = lazy(() => import("./components/HeaderMenu").then(
 
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
 const MACHINE_KEY = "cc_remote_machine";
+const DshGoalPanel = lazy(() => import("./components/DshGoalPanel"));
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
 ));
@@ -313,6 +317,8 @@ const CapabilitiesSheet = lazy(() => import("./components/CapabilitiesSheet").th
 const AgentDetailController = lazy(() => import("./components/AgentDetailController").then(
   ({ AgentDetailController: Controller }) => ({ default: Controller }),
 ));
+const DshPanel = lazy(() => import("./components/DshPanel"));
+const DshConnectionNotice = lazy(() => import("./components/DshCommandFeedback").then(m => ({ default: m.DshConnectionNotice })));
 const SessionsSidebar = lazy(() => import("./components/SessionsSidebar").then(
   ({ SessionsSidebar: Sidebar }) => ({ default: Sidebar }),
 ));
@@ -365,6 +371,7 @@ export default function App() {
   const sidebar = useSidebarController();
   const setSidebarOpen = sidebar.setOpen;
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
+  const [dshPresetSelection, setDshPresetSelection] = useState<{ scope: string; value: string } | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
   // A cold Work/Code or engine switch has no trustworthy row to paint until
@@ -525,6 +532,8 @@ export default function App() {
     if (!transport || transport !== wsRef.current) throw new Error("连接已切换，请重试。");
     return goalApiRef.current ??= new GoalApi(() => wsRef.current);
   }, []);
+  const [dshApi] = useState(() => lazyDshApi(() => wsRef.current));
+  const [dshPanel, setDshPanel] = useState<{ sid: string; scope: string; selection: DshPanelSelection } | null>(null);
   const [permissionProfileRequests, setPermissionProfileRequests] =
     useState<Record<string, string>>({});
   const archivedBrowseRef = useRef<string | null>(null);
@@ -592,6 +601,7 @@ export default function App() {
         request.skillsOnly,
         request.codexProfileId,
         request.claudeProfileId,
+        request.sid, request.dshPreset,
       ) ?? null,
     );
   }
@@ -601,6 +611,7 @@ export default function App() {
     space: Space;
     cwd: string;
     skillsOnly: boolean;
+    sid?: string | null;
     claudeProfileId?: string | null;
     codexProfileId?: string | null;
   } | null>(null);
@@ -975,7 +986,7 @@ export default function App() {
   const artifactsShowing = sessionArtifacts?.parentSid === visibleParentSid
     && sessionArtifacts?.machineId === machineId && sessionArtifacts?.engine === engine
     && sessionArtifacts?.space === space;
-  const visibleRightPanel = viewerShowing ? "viewer" : agentPanel ? "agent"
+  const visibleRightPanel = dshPanel?.scope === sessionScopeKey(machineId, engine, space) && dshPanel.sid === visibleParentSid ? "dsh" : viewerShowing ? "viewer" : agentPanel ? "agent"
     : artifactsShowing ? "artifacts" : filesShowing ? "files"
     : rightView === "btw" && btwShowing ? "btw"
       : state.artifact ? "diff" : btwShowing ? "btw" : null;
@@ -1052,6 +1063,7 @@ export default function App() {
   ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
   useEffect(() => () => goalApiRef.current?.reset(), [activeScopeKey]);
+  useEffect(() => () => dshApi.reset(), [activeScopeKey, dshApi]);
   const activeWorkDashboard = workDashboardMachineId === machineId
     ? workDashboards[engine] ?? null
     : null;
@@ -1124,7 +1136,7 @@ export default function App() {
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
   const archivedBrowse = focusedSession?.tag === "archived";
-  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex" | "dsh";
   useEffect(() => {
     if (space !== "code" || state.connState !== "connected" || !state.wrapperOnline) return;
     if (!historyView.turns.some((turn) => turn.sourceThreadId?.startsWith("ccr:")
@@ -1238,12 +1250,16 @@ export default function App() {
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
   );
+  const newChatDshPreset = dshPresetSelection?.scope === activeScopeKey
+    ? dshPresetSelection.value : state.dshPresets?.find(preset => preset.is_default)?.id ?? null;
   const focusedSkillCatalogKey = skillCatalogKey(
     machineId, focusedEngine, space, capabilityCwd,
-    focusedCodexProfileId, focusedClaudeProfileId);
+    focusedCodexProfileId, focusedClaudeProfileId,
+    focusedEngine === "dsh" ? focusedSid : undefined);
   const newChatSkillCatalogKey = skillCatalogKey(
     machineId, engine, space, state.newChat?.cwd ?? currentCwd,
-    newChatCodexProfileId, newChatClaudeProfileId);
+    newChatCodexProfileId, newChatClaudeProfileId,
+    engine === "dsh" ? `preset:${newChatDshPreset ?? ""}` : undefined);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
@@ -1252,6 +1268,7 @@ export default function App() {
     skillsOnly: true,
     claudeProfileId: focusedClaudeProfileId,
     codexProfileId: focusedCodexProfileId,
+    sid: focusedSid,
   };
   // New-chat account/cwd overrides belong to the draft, not the last focused
   // session. Work has no private cwd until creation, so cannot read a catalog.
@@ -1260,15 +1277,15 @@ export default function App() {
       if (space === "work" || newChatClaudeProfileMissing || newChatCodexProfileMissing) return null;
       return { key: newChatSkillCatalogKey, engine, space, cwd: newChatCwd,
         skillsOnly: false, claudeProfileId: newChatClaudeProfileId,
-        codexProfileId: newChatCodexProfileId };
+        codexProfileId: newChatCodexProfileId, dshPreset: newChatDshPreset };
     }
     return { key: focusedSkillCatalogKey, engine: focusedEngine, space,
       cwd: capabilityCwd, skillsOnly: false,
-      claudeProfileId: focusedClaudeProfileId, codexProfileId: focusedCodexProfileId };
+      claudeProfileId: focusedClaudeProfileId, codexProfileId: focusedCodexProfileId, sid: focusedSid };
   }, [newChatCwd, space, newChatClaudeProfileMissing, newChatCodexProfileMissing,
     newChatSkillCatalogKey, engine, newChatClaudeProfileId, newChatCodexProfileId,
     focusedSkillCatalogKey, focusedEngine, capabilityCwd,
-    focusedClaudeProfileId, focusedCodexProfileId]);
+    focusedClaudeProfileId, focusedCodexProfileId, focusedSid, newChatDshPreset]);
   capabilitiesScopeRef.current = capabilitiesOpen ? capabilitiesScope : null;
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
@@ -1330,7 +1347,7 @@ export default function App() {
   }, [activeBtwSid, focusedSid]);
 
   useEffect(() => {
-    if (!authed || !focusedSid || !focusedGoalScopeKey || state.newChat
+    if (focusedEngine === "dsh" || !authed || !focusedSid || !focusedGoalScopeKey || state.newChat
         || archivedBrowse
         || state.connState !== "connected" || !state.wrapperOnline) {
       return;
@@ -1368,6 +1385,7 @@ export default function App() {
   }, [
     authed,
     archivedBrowse,
+    focusedEngine,
     focusedGoalScopeKey,
     focusedSid,
     state.connState,
@@ -1493,10 +1511,10 @@ export default function App() {
   }, []);
   const storeSkillCatalog = useCallback((
     key: string,
-    items: EngineCapabilityItem[],
+    items: EngineCapabilityItem[], dshCommands?: DshCommandInfo[],
   ) => {
     const next = cacheSkillCatalog(
-      skillCatalogsRef.current, key, items);
+      skillCatalogsRef.current, key, items, Date.now(), dshCommands);
     skillCatalogsRef.current = next;
     setSkillCatalogs(next);
     clearSkillCatalogError(key);
@@ -1518,7 +1536,7 @@ export default function App() {
     if (!accepted.superseded && skillCatalogRefreshSucceeded(msg)) {
       storeSkillCatalog(
         matchedScope.key,
-        msg.items.filter((item) => item.kind === "skill"));
+        msg.items.filter((item) => item.kind === "skill"), msg.dsh_commands);
     } else if (!accepted.superseded && msg.skills_only) {
       setSkillCatalogErrors(current => ({ ...current, [matchedScope.key]: true }));
     }
@@ -1779,7 +1797,7 @@ export default function App() {
         .find((session) => session.session_id === sid);
     const scope: HistoryPageCacheScope = {
       machineId,
-      engine: listed?.engine === "codex" || listed?.engine === "claude"
+      engine: listed?.engine === "codex" || listed?.engine === "claude" || listed?.engine === "dsh"
         ? listed.engine : fallbackEngine,
       space: listed?.space === "work" || listed?.space === "code"
         ? listed.space : fallbackSpace,
@@ -2063,7 +2081,7 @@ export default function App() {
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
-      || selected.engine === "claude"
+      || selected.engine === "claude" || selected.engine === "dsh"
       ? selected.engine : engineRef.current;
     const selectedSpace: Space = selected.space === "work"
       || selected.space === "code"
@@ -2221,7 +2239,7 @@ export default function App() {
   };
 
   const switchSpace = (next: Space) => {
-    if (next === space || !confirmArtifactDiscard()) return;
+    if ((engine === "dsh" && next !== "code") || next === space || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
     pendingCreateRef.current = null;
     setCreateError(null);
@@ -2322,6 +2340,7 @@ export default function App() {
           if (!acceptsLifecycle()) return;
           if (turnFileRequestsRef.current.accept(msg)) return;
           if (goalApiRef.current?.accept(msg)) return;
+          if (dshApi.accept(msg)) return;
           const settlesContextRequest = !!(
             (msg.type === "context_report"
                 || (msg.type === "error" && msg.code !== "wrapper_offline"))
@@ -3577,7 +3596,7 @@ export default function App() {
             // not start a second app-server and the user's first toggle is fast.
             const siblingSpace: Space = listedSpace === "work" ? "code" : "work";
             const siblingKey = `${siblingSpace}:${msg.engine}`;
-            if (!prefetchedSurfacesRef.current.has(siblingKey)) {
+            if (msg.engine !== "dsh" && !prefetchedSurfacesRef.current.has(siblingKey)) {
               prefetchedSurfacesRef.current.add(siblingKey);
               ws.sendListSessions(msg.engine, siblingSpace);
             }
@@ -3821,6 +3840,7 @@ export default function App() {
           if (s !== "connected") {
             turnFileRequestsRef.current.clear();
             goalApiRef.current?.reset();
+            dshApi.reset();
             skillCatalogRequestsRef.current?.resetReads();
             // The fork result is authoritative only for this live connection.
             // A reconnect will obtain a fresh native SessionList, so do not
@@ -3993,6 +4013,7 @@ export default function App() {
     };
   }, [
     acceptSkillCatalog,
+    dshApi,
     authed,
     clearForkFocusLease,
     clearHistoryDetailRequests,
@@ -4067,7 +4088,7 @@ export default function App() {
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "exit_new_chat" });
       dispatch({ type: "focus_session", sid: latest.session_id });
-      const latestEngine = (latest.engine as "claude" | "codex") || engineRef.current;
+      const latestEngine = (latest.engine as "claude" | "codex" | "dsh") || engineRef.current;
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
       requestHistory(
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
@@ -4118,6 +4139,7 @@ export default function App() {
       skillsOnly: true,
       claudeProfileId: focusedClaudeProfileId,
       codexProfileId: focusedCodexProfileId,
+      sid: focusedSid,
     });
   }, [
     authed,
@@ -4293,6 +4315,11 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, setSidebarOpen]);
 
+  const setPerm = useCallback((perm: string) => {
+    if (focusedEngine === "dsh" && focusedSid) wsRef.current?.sendDshControl(focusedSid, "permission", perm);
+    else wsRef.current?.sendSetPerm(perm);
+  }, [focusedEngine, focusedSid]);
+
   // Shift+Tab follows each engine's real mode control: Claude cycles permission
   // modes; Codex toggles collaboration mode without touching approvalPolicy.
   useEffect(() => {
@@ -4308,7 +4335,10 @@ export default function App() {
             rt.collaborationMode === "plan" ? "default" : "plan");
           return;
         }
-        const modes = permsFor(focusedEngine).map((p) => p.id);
+        const modes = focusedEngine === "dsh"
+          ? (rt.dsh?.permissions ?? []).filter(p => p.value !== "custom").map(p => p.value)
+          : permsFor(focusedEngine).map((p) => p.id);
+        if (!modes.length) return;
         const current = modes.indexOf(rt.perm);
         setPerm(modes[current < 0 ? 0 : (current + 1) % modes.length]);
       }
@@ -4316,7 +4346,7 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
-    rt.external, focusedEngine]);
+    rt.external, rt.dsh?.permissions, focusedEngine, setPerm]);
 
   const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
@@ -4492,7 +4522,7 @@ export default function App() {
   ]);
 
   const refreshStatus = useCallback(() => {
-    if (!focusedSid) return;
+    if (!focusedSid || focusedEngine === "dsh") return;
     const current = stateRef.current;
     if (current.sessions.find(
       (session) => session.session_id === focusedSid)?.tag === "archived") return;
@@ -4501,7 +4531,7 @@ export default function App() {
     if (requestId) {
       dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
     }
-  }, [focusedSid]);
+  }, [focusedSid, focusedEngine]);
   const consumeResetCredit = useCallback((creditId?: string | null) => {
     if (!focusedSid || focusedEngine !== "codex") return false;
     const current = stateRef.current;
@@ -4586,7 +4616,8 @@ export default function App() {
   }
 
   if (!authed) {
-    return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
+    return <Suspense fallback={<div className="login" aria-busy="true">正在加载登录页面…</div>}><LoginForm
+      onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} /></Suspense>;
   }
 
   const runtimeIsReadOnly = (sid: string): boolean => {
@@ -5025,7 +5056,7 @@ export default function App() {
                             permissionMode?: PermissionMode,
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
-                            serviceTier?: CodexServiceTier): boolean => {
+                            serviceTier?: CodexServiceTier, dshPermission?: string): boolean => {
     if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
         || newChatClaudeProfileMissing
         || restoringSurfaceScope === activeScopeKey) {
@@ -5059,7 +5090,9 @@ export default function App() {
         mode: autoCompactMode,
         thresholdTokens: autoCompactThresholdTokens,
       } : undefined,
-      engine === "claude" ? newChatClaudeProfileId : undefined);
+      engine === "claude" ? newChatClaudeProfileId : undefined,
+      engine === "dsh" ? newChatDshPreset ?? undefined : undefined,
+      engine === "dsh" ? dshPermission : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -5127,7 +5160,8 @@ export default function App() {
     wsRef.current?.sendSetModel(model);
   };
   const setEffort = (effort: string) => {
-    wsRef.current?.sendSetEffort(effort);
+    if (focusedEngine === "dsh" && focusedSid) wsRef.current?.sendDshControl(focusedSid, "effort", effort);
+    else wsRef.current?.sendSetEffort(effort);
   };
   const setAutoCompact = (selection: AutoCompactSelection): boolean => (
     wsRef.current?.sendSetAutoCompact(
@@ -5137,9 +5171,6 @@ export default function App() {
   // event owns the chip state; here we only forward the requested transition.
   const setServiceTier = (tier: string) => {
     wsRef.current?.sendSetServiceTier(tier);
-  };
-  const setPerm = (perm: string) => {
-    wsRef.current?.sendSetPerm(perm);
   };
   const getPermissionProfiles = () => {
     wsRef.current?.sendGetPermissionProfiles();
@@ -5196,6 +5227,10 @@ export default function App() {
   };
   const runGoal = (args: string) => {
     if (!focusedSid || !focusedGoalScopeKey || archivedBrowse) return;
+    if (focusedEngine === "dsh") {
+      setGoalUi({ revealed: true, open: true, loading: false });
+      return;
+    }
     const command = parseGoalCommand(args, focusedEngine);
     rememberFocusedGoalUi();
     if (command.kind === "clear") {
@@ -5374,6 +5409,9 @@ export default function App() {
     previewFileForSid(activeBtwSid, file, line);
 
   const openAgentDetail = (runId: string, title?: string) => {
+    if (focusedEngine === "dsh" && focusedSid && !runId.startsWith("dsh@")) {
+      setDshPanel({sid: focusedSid, scope: activeScopeKey, selection: {kind: runId.startsWith("dsh-job-") ? "jobs" : "subagents"}}); return;
+    }
     if (!focusedSid || space !== "code"
         || !rt.historyRevision) return;
     setSessionArtifacts(null);
@@ -5760,6 +5798,8 @@ export default function App() {
   const effectiveState = mergeSessionActivityState(
     focusedSessionState, rt.state, rt.mirroredRunning,
   ) ?? rt.state;
+  const dshConnectionError = focusedEngine === "dsh" && !state.newChat
+    && rt.dsh?.connected === false ? rt.dsh.error ?? null : null;
   // Fail closed when a migrated cache contains colliding display aliases. A
   // session-level running bit alone must never animate the wrong historical
   // row, another account, or a read-only browse projection.
@@ -5808,6 +5848,13 @@ export default function App() {
         completionBadges={completionBadges}
         activeSessionId={focusedSid}
         machineId={machineId}
+        readDsh={engine === "dsh" ? dshApi.read : undefined}
+        onDshSearch={(sid, query) => {
+          if (!focusedSid && !state.sessions.length) return;
+          setDshPanel({ sid: focusedSid ?? state.sessions[0].session_id, scope: activeScopeKey,
+            selection: { kind: "conversation", target: sid, query } });
+          if (isMobile()) setSidebarOpen(false);
+        }}
         onSelect={(id) => {
           if (!confirmArtifactDiscard()) return false;
           cancelPendingNotificationTarget();
@@ -5906,12 +5953,12 @@ export default function App() {
                 </span>
               )}
             </div>
-            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${focusedNativeSessionId.slice(0, 8)}` : "connected"}</div>
+            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>
           </div>
-          <span className={`hstat ${effectiveState}`}><span className="sd" />
-            <span className="hstat-label">{effectiveState}</span></span>
+          <span className={`hstat ${dshConnectionError ? "reconnecting" : effectiveState}`}><span className="sd" />
+            <span className="hstat-label">{dshConnectionError ? "同步中" : effectiveState}</span></span>
           {space === "code" && focusedSid && !state.newChat
-              && !archivedBrowse && (
+              && !archivedBrowse && focusedEngine !== "dsh" && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -5937,6 +5984,7 @@ export default function App() {
             notificationNative={harmonyPush.available}
             notificationError={harmonyPush.error}
             onNotificationMode={updateNotificationMode}
+            onOpenDshTools={engine === "dsh" && focusedSid ? () => setDshPanel({ sid: focusedSid, scope: activeScopeKey, selection: { kind: "subagents" } }) : undefined}
             onOpenUsageActivity={openUsageActivity}
             onOpenBtw={visibleParentSid && !archivedBrowse ? () => openBtw() : undefined}
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
@@ -5956,6 +6004,8 @@ export default function App() {
           busy={state.connState !== "connected" || !state.wrapperOnline
             || rt.replaying || historyView.recovering}
           onDismiss={dismissBanner} />
+        {focusedEngine === "dsh" && <Suspense fallback={null}><DshConnectionNotice
+          key={`${activeScopeKey}:${focusedSid}`} error={dshConnectionError} /></Suspense>}
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
@@ -5968,6 +6018,11 @@ export default function App() {
           </div>
         ) : state.newChat ? (
           <Suspense fallback={null}><NewChatView cwd={state.newChat.cwd}
+            editPrompt={editPrompt} onEditConsumed={() => setEditPrompt(null)}
+            dshPresets={state.dshPresets} dshPermissions={state.dshPermissions}
+            dshError={state.dshError}
+            dshPreset={newChatDshPreset}
+            onPickDshPreset={value => setDshPresetSelection({ scope: activeScopeKey, value })}
             controlScopeKey={`${activeScopeKey}\u0000${newChatProfileId ?? "__default__"}`}
             space={space}
             createError={createError}
@@ -5976,6 +6031,7 @@ export default function App() {
             catalog={newChatCatalog}
             skills={space === "code" && skillCatalogFresh(skillCatalogs[newChatSkillCatalogKey])
               ? skillCatalogs[newChatSkillCatalogKey]?.items : undefined}
+            dshCommands={skillCatalogs[newChatSkillCatalogKey]?.dshCommands}
             skillsOnline={state.connState === "connected" && state.wrapperOnline}
             skillsError={!!skillCatalogErrors[newChatSkillCatalogKey]}
             onOpenExtensions={openExtensions}
@@ -5983,7 +6039,7 @@ export default function App() {
               if (!state.newChat || space !== "code" || state.connState !== "connected"
                   || !state.wrapperOnline) return;
               const requested = requestSkillCatalog({
-                key: newChatSkillCatalogKey,
+                key: newChatSkillCatalogKey, dshPreset: newChatDshPreset,
                 engine, space, cwd: state.newChat.cwd, skillsOnly: true,
                 claudeProfileId: newChatClaudeProfileId,
                 codexProfileId: newChatCodexProfileId,
@@ -6136,7 +6192,12 @@ export default function App() {
               ? <span className="goal-suspense" role="status"
                   aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
               : null}>
-              <GoalPanel engine={focusedEngine} goal={rt.goal}
+              {focusedEngine === "dsh" && !archivedBrowse && <DshGoalPanel key={focusedGoalScopeKey}
+                goal={rt.dsh?.goal ?? null} open={!!goalUi?.open}
+                disabled={!state.wrapperOnline || !rt.dsh?.connected || !rt.dsh.commands.some(c => c.name === "goal")}
+                onOpen={() => setGoalUi({ open: true })} onClose={() => setGoalUi({ open: false })}
+                onAction={action => dshApi.goal(focusedSid!, action)} />}
+              {focusedEngine !== "dsh" && <GoalPanel engine={focusedEngine} goal={rt.goal}
                 revealed={!archivedBrowse && !!goalUi?.revealed}
                 open={!archivedBrowse && !!goalUi?.open}
                 key={focusedGoalScopeKey}
@@ -6184,7 +6245,7 @@ export default function App() {
                 onClear={async () => {
                   rememberFocusedGoalUi();
                   await (await getGoalApi()).clear(focusedSid!);
-                }} />
+                }} />}
             </Suspense>
 
             {rt.pendingQuestion && !activeBtwQuestionVisible && (
@@ -6225,6 +6286,11 @@ export default function App() {
             )}
 
             <Composer
+          dsh={rt.dsh}
+          dshSid={focusedSid ?? undefined}
+          readDsh={dshApi.read}
+          dshCommandResult={rt.dshCommandResult}
+          onDshCommand={(value, images, files) => focusedSid ? wsRef.current?.sendDshControl(focusedSid, "command", value, images, files) ?? null : null}
           draftKey={focusedComposerDraftKey}
           draftStore={composerDraftsRef.current}
           backgroundTasks={rt.backgroundProcesses.length > 0
@@ -6331,6 +6397,7 @@ export default function App() {
               skillsOnly: true,
               claudeProfileId: focusedClaudeProfileId,
               codexProfileId: focusedCodexProfileId,
+              sid: focusedSid,
             });
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
@@ -6354,6 +6421,30 @@ export default function App() {
       {/* Share the layout's selection: retained hidden chats reserve no space. */}
       <RightPanelPresentation.Provider value={{ expanded: panelExpanded, covered: btwExpanded, layer: 0, chat: false,
         onOpenChat: toggleCenteredBtw, onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
+      {visibleRightPanel === "dsh" && dshPanel && <Suspense fallback={null}>
+        <DshPanel key={`${dshPanel.sid}:${dshPanel.selection.target ?? ""}:${dshPanel.selection.query ?? ""}`}
+          onOpenAgent={(run, title) => { setDshPanel(null); openAgentDetail(run, title); }}
+          onCompose={(prompt, preset) => {
+            if (preset) {
+              if (!confirmArtifactDiscard()) return;
+              clearForkFocusLease(false); cancelPendingNotificationTarget();
+              pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null);
+              setNewChatAutoFocus(true); setRestoringSurfaceScope(null);
+              wsRef.current?.setFocusedSid(null);
+              setDshPresetSelection({ scope: activeScopeKey, value: preset });
+              dispatch({ type: "enter_new_chat", cwd: currentCwd, cwdSource: "explicit" });
+            }
+            setEditPrompt(prompt); setDshPanel(null);
+          }}
+          sid={dshPanel.sid} selection={dshPanel.selection} api={dshApi}
+          state={state.runtimes[dshPanel.sid]?.dsh} onClose={() => setDshPanel(null)}
+          onOpenFile={(path, sid, line) => {
+            if (previewFileForSid(sid ?? dshPanel.sid, path, line)) setDshPanel(null);
+          }} onOpenSession={sid => {
+            const selected = state.sessions.find(session => session.session_id === sid);
+            if (selected && confirmArtifactDiscard()) { focusListedSession(selected); setDshPanel(null); }
+          }} />
+      </Suspense>}
       {(() => {
         if (visibleRightPanel === "artifacts" && sessionArtifacts) {
           const owner = sessionArtifacts;
@@ -6416,7 +6507,7 @@ export default function App() {
         }
         if (visibleRightPanel === "agent" && agentPanel) {
           return <Suspense fallback={null}>
-            <AgentDetailController
+            <AgentDetailController dshApi={agentPanel.engine === "dsh" ? dshApi : undefined}
               key={`${agentPanel.sid}:${agentPanel.revision}:${agentPanel.runId}`}
               selection={{ ...agentPanel, revision: rt.historyRevision || agentPanel.revision }} ws={wsRef.current}
               onListen={setAgentDetailListener}
@@ -6590,7 +6681,7 @@ export default function App() {
           creating={forkWorktreeCreating} error={forkWorktreeError}
           onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
       </Suspense>}
-      <WorkDashboardSheet
+      {space === "work" && <Suspense fallback={null}><WorkDashboardSheet
         key={sessionScopeKey(machineId, engine, "work")}
         open={workManagerOpen && space === "work"}
         scopeKey={sessionScopeKey(machineId, engine, "work")}
@@ -6617,7 +6708,7 @@ export default function App() {
           engine === "claude" ? profileId : undefined)}
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
-        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
+        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} /></Suspense>}
       {workArtifactsOpen && space === "work" && !state.newChat
         && currentWorkArtifacts.length > 0 && <Suspense fallback={null}>
           <WorkArtifactsSheet open artifacts={currentWorkArtifacts}

@@ -45,6 +45,7 @@ import {
 } from "../pointer-tap";
 
 const DETAIL_REQUEST_ERROR = "详情请求失败";
+const DshToolTree = lazy(() => import("./DshToolTree"));
 
 const PlanProgressPopover = lazy(() => import("./PlanProgressPopover").then(
   ({ PlanProgressPopover: Popover }) => ({ default: Popover }),
@@ -421,7 +422,7 @@ export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
     );
   }
   const inlineAgent = block.processKind === "agent" && block.input?.agent_run_id === null;
-  if (block.processKind === "agent" && !inlineAgent && onOpenAgent) {
+  if ((block.processKind === "agent" && !inlineAgent || block.processKind === "task" && block.item_id.startsWith("dsh-job-")) && onOpenAgent) {
     return (
       <button type="button"
         className={`process-activity process-agent-card process-${block.status}`}
@@ -436,7 +437,8 @@ export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
             </span>
           )}
         </span>
-        <span className="process-item-status">{statusIcon(block.status, block.done)}</span>
+        {!(block.server === "dsh" && block.tool === "subagent_reference") &&
+          <span className="process-item-status">{statusIcon(block.status, block.done)}</span>}
         <span className="process-item-chev"><Icon name="chev" size={14} /></span>
       </button>
     );
@@ -742,7 +744,7 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
     variant: HistoryImageVariant,
   ) => boolean;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   /** The session-level progress strip owns this plan instead of this row. */
   externalPlanItemId?: string | null;
   openOverride?: boolean;
@@ -997,7 +999,9 @@ export function ProcessTimeline({ blocks, done, active, outcome, problem, durati
         )}
         {rows.map((row) => (
           row.kind === "tools"
-            ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools}
+            ? engine === "dsh" ? <Suspense key={`tools-${row.tools[0].tool_use_id}`} fallback={<ToolGroup tools={row.tools} active={processActive} />}>
+                <DshToolTree tools={row.tools} active={processActive} />
+              </Suspense> : <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools}
                 active={processActive} />
             : <TimelineItem key={row.block.kind === "text"
                 ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}

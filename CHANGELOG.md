@@ -2,6 +2,15 @@
 
 [中文](CHANGELOG_zh.md)
 
+## Unreleased
+
+- Add DSH 0.2.1-rc.2 on the current cc-remote UI, with a separate white/blue default palette. Wire protocol v80 requires Relay, Wrapper and Web to upgrade together. See [DSH integration](docs/dsh-integration.md).
+- Reuse the background-task dock and process side panel for DSH, with nested child navigation, folded reasoning and native PTC tool hierarchy. History reads never activate an agent.
+- Preserve clickable native agent-return receipts for Claude, Codex and DSH. Show parent continuation only after actual parent activity resumes.
+- Add DSH workflow, trajectory, automation, preset, runtime settings, plugin package and native terminal panels. Closing a terminal view retains its process, and reconnect never resends keyboard input.
+- Align DSH session cards, mode descriptions, permissions and appearance controls; hide setup-only commands and empty older-history pages from new sessions.
+- Render bare Markdown `<br>` breaks in answers and tables without adding a leading blank line; keep code examples and other HTML literal.
+
 ## v4.0.29
 
 Refresh the new-chat composer and make Claude/Codex controls usable before the first message. Wire protocol advances to v79. See the bilingual [release notes](docs/releases/v4.0.29.md).

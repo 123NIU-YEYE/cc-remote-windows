@@ -77,10 +77,10 @@ interface Props {
   onOpenArtifacts?: () => void;
   sid?: string;
   rt: SessionRuntime | undefined;
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   chats: Array<{
     sid: string;
-    engine: "claude" | "codex";
+    engine: "claude" | "codex" | "dsh";
     title: string;
     state: "idle" | "running" | "interrupting" | "draining";
     needsAnswer: boolean;
