@@ -2,6 +2,13 @@
 
 [English](CHANGELOG.md)
 
+## 未发布
+
+- Claude Code 新会话输入框支持在第一条消息前选择权限，包含 `/permissions`、
+  `/plan`、`/normal` 和 Shift+Tab。
+- 所选权限随创建会话一起生效；保留默认和 Work 权限策略，切换设备、账号或工作空间时重置选择。
+- Wire protocol v79：Web、Relay 和 Wrapper 必须一起升级。
+
 ## v4.0.28
 
 修复交付文件遗漏于 Artifacts，并在后台任务中显示 Codex 原生协作代理。通信协议保持 v78。详见[双语发布说明](docs/releases/v4.0.28.md)。

@@ -11739,9 +11739,14 @@ test("new-chat controls pass native prompts and preserve command arguments", asy
     .toBe("/plugin:review 检查当前改动");
   await input.fill("/plan");
   await page.getByRole("button", { name: "开始", exact: true }).click();
-  await expect(page.locator(".newchat-hint")).toContainText("需要已有会话");
+  await expect(page.locator(".newchat-access")).toHaveText("Plan");
   await expect.poll(async () => JSON.parse(await submission.innerText()).prompt)
     .toBe("/plugin:review 检查当前改动");
+  await input.fill("/normal inspect files");
+  await input.press("Enter");
+  await expect.poll(async () => JSON.parse(await submission.innerText())).toMatchObject({
+    prompt: "inspect files", permissionMode: "bypassPermissions",
+  });
 });
 
 test("new-chat controls keep attachments through local commands and IME confirmation", async ({ page }) => {
@@ -11837,6 +11842,85 @@ for (const engine of ["claude", "codex"] as const) {
       .toMatchObject([{ engine, model: "provider/hidden-model[1m]", effort: null }]);
   });
 }
+
+for (const [mode, label] of [
+  ["default", "Default"], ["acceptEdits", "Accept Edits"], ["plan", "Plan"],
+  ["auto", "Auto"], ["bypassPermissions", "Bypass Permissions"], [null, "默认权限"],
+] as const) {
+  test(`new-chat controls Claude permissions apply ${mode ?? "inherited"} to the first message`, async ({ page }) => {
+    const relay = await mockRightPanelRelay(page, { engine: "claude", visible: false, retained: false });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const input = page.locator(".newchat-input");
+    await input.fill("inspect the project");
+    await page.getByTitle("选择权限模式", { exact: true }).click();
+    const sheet = page.getByRole("dialog", { name: "选择权限模式" });
+    await sheet.getByRole("button", { name: new RegExp(`^${label} `) }).click();
+    await expect(sheet).not.toBeVisible();
+    await expect(input).toHaveValue("inspect the project");
+    await expect(page.locator(".newchat-access")).toHaveText(label);
+    expect(relay.commands.some(command => ["new_session", "set_perm"].includes(String(command.type)))).toBe(false);
+    await input.press("Enter");
+    await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
+      prompt: command.prompt, permission: command.permission_mode ?? null,
+      engine: command.engine ?? "claude",
+    }))).toEqual([{ prompt: "inspect the project", permission: mode, engine: "claude" }]);
+  });
+}
+
+test("new-chat controls Claude permissions use local commands and reset on account and surface changes", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?newchat-controls=1&selection-controls=1");
+  await page.getByTestId("switch-newchat-engine").click();
+  const input = page.locator(".newchat-input");
+  const access = page.locator(".newchat-access");
+  const sheet = page.getByRole("dialog", { name: "选择权限模式" });
+  await input.fill("/permissions");
+  await input.press("Enter");
+  await expect(sheet).toBeVisible();
+  await sheet.getByRole("button", { name: /^Accept Edits / }).click();
+  await expect(access).toHaveText("Accept Edits");
+  await input.press("Shift+Tab");
+  await expect(access).toHaveText("Plan");
+  await input.fill("keep this draft");
+  await page.locator(".newchat-profile").click();
+  await page.getByRole("dialog", { name: "选择 Claude 账号" }).getByRole("button", { name: /Secondary/ }).click();
+  await expect(access).toHaveText("默认权限");
+  await expect(input).toHaveValue("keep this draft");
+  await access.click();
+  await sheet.getByRole("button", { name: /^Bypass Permissions / }).click();
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(access).toHaveCount(0);
+  const work = await submitNewChatFixture(page);
+  expect(work).not.toHaveProperty("permissionMode");
+  await page.getByTestId("switch-newchat-space").click();
+  await expect(access).toHaveText("默认权限");
+  await access.click();
+  await sheet.getByRole("button", { name: /^Plan / }).click();
+  await access.click();
+  await sheet.getByRole("button", { name: /^默认权限 / }).click();
+  expect(await submitNewChatFixture(page)).not.toHaveProperty("permissionMode");
+  await access.click();
+  await sheet.getByRole("button", { name: /^Plan / }).click();
+  await page.getByTestId("switch-newchat-device").click();
+  await expect(access).toHaveText("默认权限");
+});
+
+test("new-chat controls Claude permissions keyboard changes never target the old session", async ({ page }) => {
+  const relay = await mockRightPanelRelay(page, { engine: "claude", visible: false, retained: false });
+  await page.goto("/");
+  await page.getByLabel("显示会话侧栏", { exact: true }).click();
+  await page.getByRole("button", { name: "新会话", exact: true }).click();
+  const input = page.locator(".newchat-input");
+  await input.press("Shift+Tab");
+  await expect(page.locator(".newchat-access")).toHaveText("Default");
+  expect(relay.commands.some(command => command.type === "set_perm")).toBe(false);
+  await input.fill("/plan inspect files");
+  await input.press("Enter");
+  await expect.poll(() => relay.commands.filter(command => command.type === "new_session").map(command => ({
+    prompt: command.prompt, permission: command.permission_mode,
+  }))).toEqual([{ prompt: "inspect files", permission: "plan" }]);
+});
 
 test("new-chat controls apply fast and model commands to the first native query", async ({ page }) => {
   await page.goto("/tests/history-browser.html?newchat-controls=1&newchat-commands=1");
@@ -12028,7 +12112,7 @@ test("new-chat controls reset across engine authorization scopes", async ({
   await page.getByTestId("switch-newchat-engine").click();
   await expect(page.getByTestId("newchat-scope"))
     .toHaveText("machine-a:code:claude");
-  await expect(page.locator(".newchat-access")).toHaveCount(0);
+  await expect(page.locator(".newchat-access")).toHaveText("默认权限");
   const claudeSubmission = await submitNewChatFixture(page);
   expect(claudeSubmission).not.toHaveProperty("permissionMode");
 

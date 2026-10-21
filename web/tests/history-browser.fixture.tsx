@@ -1946,7 +1946,7 @@ function HistoryConversationBrowserFixture() {
             cwd="/tmp/project"
             controlScopeKey={
               `${newChatSurface.machine}:${newChatSurface.space}:`
-              + newChatSurface.engine
+              + `${newChatSurface.engine}:${newChatAccount}`
             }
             engine={newChatSurface.engine}
             space={newChatSurface.space}

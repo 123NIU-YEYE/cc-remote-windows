@@ -128,7 +128,7 @@ import {
 } from "./session-worktree";
 import { matchesBtwRequest,
   normalizeEngine, type Snapshot, type QueryImg,
-  type QueryFile, type SessionInfo, type CodexPermissionMode,
+  type QueryFile, type SessionInfo, type PermissionMode,
   type CodexWebSearchMode, type PermissionProfileInfo,
   type CodexServiceTier, type CollaborationModeName,
   type Engine, type Space,
@@ -4286,7 +4286,7 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented) return;
+      if (e.defaultPrevented || stateRef.current.newChat) return;
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
         if ((rt.control && sessionControlLocksInput(rt.control))
@@ -5010,7 +5010,7 @@ export default function App() {
   // to route or trigger this message.
   const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[],
                             collaborationMode?: CollaborationModeName,
-                            permissionMode?: CodexPermissionMode,
+                            permissionMode?: PermissionMode,
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
@@ -5033,7 +5033,7 @@ export default function App() {
       engine === "codex" ? collaborationMode : undefined,
       engine === "codex"
         ? (space === "work" ? "never" : permissionMode)
-        : undefined,
+        : space === "code" ? permissionMode : undefined,
       engine === "codex" && space === "code"
         ? permissionProfile
         : undefined,

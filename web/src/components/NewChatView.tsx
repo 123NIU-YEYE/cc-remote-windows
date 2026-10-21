@@ -9,7 +9,7 @@ import { EngineIcon, Icon } from "../icons";
 import { SpeedPicker } from "./SpeedPicker";
 import { newChatSpeed, normalizeSpeed, speedsFor } from "../codex-speed";
 import {
-  clientSlashesFor, matchCommands, matchSkills, modelsFor, routeComposerInput, skillToken, slashToken,
+  clientSlashesFor, matchCommands, matchSkills, modelsFor, permsFor, routeComposerInput, skillToken, slashToken,
   type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, snapshotAttachmentFiles } from "../img";
@@ -17,7 +17,7 @@ import {
   readClipboardImport, resolveClipboardImport, insertClipboardText,
   type ClipboardImport,
 } from "../clipboard-import";
-import type { ClaudeProfileInfo, CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, EngineCapabilityItem, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { ClaudeProfileInfo, PermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, EngineCapabilityItem, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { useClipboardPasteGuard } from "../use-clipboard-paste-guard";
 import type { PasteReceipt } from "../clipboard-paste-guard";
@@ -88,7 +88,7 @@ interface Props {
   onGetPermissionProfiles?: (cwd: string) => void;
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
            collaborationMode?: CollaborationModeName,
-           permissionMode?: CodexPermissionMode,
+           permissionMode?: PermissionMode,
            permissionProfile?: string,
            webSearch?: CodexWebSearchMode,
            serviceTier?: CodexServiceTier) => boolean;
@@ -104,7 +104,7 @@ interface SelectorOption {
 interface NewChatExecutionControls {
   scopeKey: string;
   collaborationMode: CollaborationModeName;
-  permissionMode: CodexPermissionMode;
+  permissionMode: PermissionMode | null;
   permissionProfile: string | null;
   webSearch: CodexWebSearchMode | null;
   serviceTier: CodexServiceTier;
@@ -116,7 +116,7 @@ const defaultExecutionControls = (
 ): NewChatExecutionControls => ({
   scopeKey,
   collaborationMode: "default",
-  permissionMode: "never",
+  permissionMode: null,
   permissionProfile: null,
   webSearch: null,
   serviceTier: "default",
@@ -393,7 +393,7 @@ export function NewChatView({ cwd, controlScopeKey,
     if (attachments) void onPick(null, clipboard, paste);
   };
 
-  const submitPrompt = (value: string, mode = collaborationMode) => {
+  const submitPrompt = (value: string, mode = collaborationMode, permission = permissionMode) => {
     const composed = composePastePrompt(pastes, value.trim());
     if (!composed.ok) {
       window.alert(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
@@ -407,8 +407,8 @@ export function NewChatView({ cwd, controlScopeKey,
       prompt, images.length ? images : undefined, files.length ? files : undefined,
       engine === "codex" ? mode : undefined,
       engine === "codex"
-        ? (space === "work" ? "never" : permissionMode)
-        : undefined,
+        ? (space === "work" ? "never" : permission ?? "never")
+        : space === "code" ? permission ?? undefined : undefined,
       engine === "codex" && space === "code"
         ? (permissionProfile ?? undefined)
         : undefined,
@@ -449,10 +449,20 @@ export function NewChatView({ cwd, controlScopeKey,
       setAutoCompactNotice(null);
       return;
     }
-    if (slash === "permissions" && engine === "codex") {
+    if (slash === "permissions") {
       setPermissionsOpen(true);
-      onGetPermissionProfiles?.(cwd);
+      if (engine === "codex") onGetPermissionProfiles?.(cwd);
       setText("");
+      return;
+    }
+    if ((slash === "plan" || slash === "normal") && engine === "claude") {
+      const permission = slash === "plan" ? "plan" : "bypassPermissions";
+      updateExecutionControls({ permissionMode: permission });
+      if (args) submitPrompt(args, collaborationMode, permission);
+      else {
+        setText("");
+        setAutoCompactNotice(slash === "plan" ? "新会话将使用计划模式。" : "已切换为 Bypass Permissions。");
+      }
       return;
     }
     if ((slash === "plan" || slash === "normal") && engine === "codex") {
@@ -603,6 +613,17 @@ export function NewChatView({ cwd, controlScopeKey,
         setText(e.currentTarget.value);
       }}
       onKeyDown={(e) => {
+        if (e.key === "Tab" && e.shiftKey && space === "code") {
+          e.preventDefault();
+          if (engine === "codex") {
+            updateExecutionControls({ collaborationMode: collaborationMode === "plan" ? "default" : "plan" });
+          } else {
+            const modes = permsFor(engine);
+            const current = modes.findIndex(mode => mode.id === permissionMode);
+            updateExecutionControls({ permissionMode: modes[(current + 1) % modes.length].id as PermissionMode });
+          }
+          return;
+        }
         if (e.key === "Escape" && suggestionOpen) {
           e.preventDefault(); setText(""); return;
         }
@@ -643,14 +664,16 @@ export function NewChatView({ cwd, controlScopeKey,
         onGetPermissionProfiles?.(cwd);
       }}
       disabled={creating || importing}
-      title={`执行环境：${permissionProfileLabel(permissionProfile) ?? "默认"}；审批：${permissionMode}；网页搜索：${webSearch ?? "默认"}`}>
+      title={`执行环境：${permissionProfileLabel(permissionProfile) ?? "默认"}；审批：${permissionMode ?? "never"}；网页搜索：${webSearch ?? "默认"}`}>
       <Icon name="shield" size={14} />
       <span>{permissionProfileLabel(permissionProfile) ?? "默认环境"}</span>
     </button>
   ) : space === "code" ? (
-    <span className="newchat-default-note" title="沿用本机 Claude 权限设置；创建后可在会话中调整">
-      <Icon name="shield" size={14} />本机默认
-    </span>
+    <button type="button" className="newchat-access" title="选择权限模式"
+      onClick={() => setPermissionsOpen(true)} disabled={creating || importing}>
+      <Icon name={permsFor(engine).find(mode => mode.id === permissionMode)?.ic ?? "shield"} size={14} />
+      <span>{permsFor(engine).find(mode => mode.id === permissionMode)?.short ?? "默认权限"}</span>
+    </button>
   ) : null;
 
   return (
@@ -854,10 +877,15 @@ export function NewChatView({ cwd, controlScopeKey,
         kind="perms"
         engine={engine}
         onClose={() => setPermissionsOpen(false)}
-        currentPerm={permissionMode}
-        onPickPerm={(mode) => updateExecutionControls({
-          permissionMode: mode as CodexPermissionMode,
-        })}
+        currentPerm={permissionMode ?? (engine === "codex" ? "never" : undefined)}
+        onPickPerm={(mode) => {
+          updateExecutionControls({ permissionMode: mode as PermissionMode });
+          if (engine === "claude") setPermissionsOpen(false);
+        }}
+        onUseDefaultPerm={engine === "claude" ? () => {
+          updateExecutionControls({ permissionMode: null });
+          setPermissionsOpen(false);
+        } : undefined}
         currentPermissionProfile={permissionProfile}
         permissionProfiles={permissionProfiles}
         onPickPermissionProfile={(profile) => updateExecutionControls({
