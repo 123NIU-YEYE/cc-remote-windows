@@ -443,6 +443,7 @@ export default function App() {
     useState<Record<string, EngineCapabilities>>({});
   const [skillCatalogs, setSkillCatalogs] =
     useState<Record<string, SkillCatalogCacheEntry>>({});
+  const [skillCatalogErrors, setSkillCatalogErrors] = useState<Record<string, boolean>>({});
   const [notificationMode, setNotificationMode] = useState<NotificationMode>(
     () => readNotificationMode(localStorage));
   const [pushBinding, setPushBinding] = useState<PushBindingSnapshot>({
@@ -877,6 +878,7 @@ export default function App() {
     skillCatalogsRef.current = {};
     skillCatalogRequestsRef.current?.reset();
     setSkillCatalogs({});
+    setSkillCatalogErrors({});
     setCapabilitiesByScope({});
     setStatusOpenSid(null);
     setUsageActivityOpen(false);
@@ -1462,6 +1464,14 @@ export default function App() {
     focusedSession?.completion_unread,
   ]);
 
+  const clearSkillCatalogError = useCallback((key: string) => {
+    setSkillCatalogErrors(current => {
+      if (!current[key]) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
   const storeSkillCatalog = useCallback((
     key: string,
     items: EngineCapabilityItem[],
@@ -1470,7 +1480,8 @@ export default function App() {
       skillCatalogsRef.current, key, items);
     skillCatalogsRef.current = next;
     setSkillCatalogs(next);
-  }, []);
+    clearSkillCatalogError(key);
+  }, [clearSkillCatalogError]);
   const requestSkillCatalog = useCallback((
     request: SkillCatalogRequest,
     force = false,
@@ -1489,6 +1500,8 @@ export default function App() {
       storeSkillCatalog(
         matchedScope.key,
         msg.items.filter((item) => item.kind === "skill"));
+    } else if (!accepted.superseded && msg.skills_only) {
+      setSkillCatalogErrors(current => ({ ...current, [matchedScope.key]: true }));
     }
     if (!accepted.superseded && !msg.skills_only) {
       setCapabilitiesByScope((current) => ({
@@ -2458,6 +2471,9 @@ export default function App() {
             const coordinator = skillCatalogRequestsRef.current;
             const failedSkills = msg.code === "wrapper_offline"
               ? null : coordinator?.fail(msg.request_id);
+            if (failedSkills?.skillsOnly) {
+              setSkillCatalogErrors(current => ({ ...current, [failedSkills.key]: true }));
+            }
             if (failedSkills && failedSkills.key === focusedSkillScopeRef.current?.key
                 && !coordinator?.hasPendingRead(failedSkills.key, false)
                 && !coordinator?.hasPendingMutation(failedSkills.key)) {
@@ -3738,6 +3754,7 @@ export default function App() {
           if (msg.type === "wrapper_reconnected") {
             skillCatalogsRef.current = {};
             setSkillCatalogs({});
+            setSkillCatalogErrors({});
             skillCatalogRequestsRef.current?.resetReads();
             const focusedSkills = focusedSkillScopeRef.current;
             if (focusedSkills?.cwd) {
@@ -3790,6 +3807,7 @@ export default function App() {
             clearForkFocusLease(false);
           }
           if (s === "connected") {
+            setSkillCatalogErrors({});
             goalRecoveryRequestsRef.current.clear();
             goalRequestScopeByIdRef.current.clear();
             // Recovery preamble replay happens before this callback. Forget
@@ -3843,6 +3861,7 @@ export default function App() {
           skillCatalogsRef.current = {};
           skillCatalogRequestsRef.current?.reset();
           setSkillCatalogs({});
+          setSkillCatalogErrors({});
           setCapabilitiesByScope({});
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
@@ -5943,15 +5962,24 @@ export default function App() {
             autoFocus={newChatAutoFocus}
             engine={engine}
             catalog={newChatCatalog}
-            skills={space === "code" ? skillCatalogs[newChatSkillCatalogKey]?.items : undefined}
+            skills={space === "code" && skillCatalogFresh(skillCatalogs[newChatSkillCatalogKey])
+              ? skillCatalogs[newChatSkillCatalogKey]?.items : undefined}
+            skillsOnline={state.connState === "connected" && state.wrapperOnline}
+            skillsError={!!skillCatalogErrors[newChatSkillCatalogKey]}
             onRequestSkills={() => {
-              if (!state.newChat || space !== "code") return;
-              requestSkillCatalog({
+              if (!state.newChat || space !== "code" || state.connState !== "connected"
+                  || !state.wrapperOnline) return;
+              const requested = requestSkillCatalog({
                 key: newChatSkillCatalogKey,
                 engine, space, cwd: state.newChat.cwd, skillsOnly: true,
                 claudeProfileId: newChatClaudeProfileId,
                 codexProfileId: newChatCodexProfileId,
               }, true);
+              if (requested || skillCatalogRequestsRef.current?.hasPendingRead(newChatSkillCatalogKey, true)) {
+                clearSkillCatalogError(newChatSkillCatalogKey);
+              } else {
+                setSkillCatalogErrors(current => ({ ...current, [newChatSkillCatalogKey]: true }));
+              }
             }}
             onRequestModels={() => wsRef.current?.sendGetModels(
               engine, engine === "claude" && space === "code" ? state.newChat?.cwd : undefined,

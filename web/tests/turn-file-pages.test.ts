@@ -10,6 +10,11 @@ const page: TurnFileChangesPage = {
   files: [{ path: "src/last.py", state: "available", additions: 1, deletions: 1 }],
 };
 const requests = new TurnFilePageRequests();
+for (const sid of [undefined, null, "other-session"]) {
+  assert.equal(requests.accept({ v: PROTOCOL_VERSION, ts: 1, type: "error",
+    request_id: "skill-catalog-request", code: "internal", message: "discovery failed", sid }), false,
+  "unrelated request errors must reach their owner even without a session id");
+}
 const first = requests.request(scope, () => "request", new AbortController().signal);
 let settled = false;
 void first.then(() => { settled = true; });
@@ -30,6 +35,9 @@ const failed = requests.request(scope, () => "failed", new AbortController().sig
 requests.accept({ v: PROTOCOL_VERSION, ts: 1, type: "error", code: "internal", sid: scope.sid,
   request_id: "failed", message: "该版本暂不可用" });
 await assert.rejects(failed, /该版本暂不可用/);
+assert.equal(requests.accept({ v: PROTOCOL_VERSION, ts: 1, type: "error", code: "internal",
+  sid: scope.sid, request_id: "failed", message: "late duplicate" }), true,
+"a correlated retired file request still absorbs its late error");
 const retry = requests.request(scope, () => "retry", new AbortController().signal);
 requests.accept({ ...page, request_id: "retry" });
 assert.deepEqual((await retry).files, page.files);

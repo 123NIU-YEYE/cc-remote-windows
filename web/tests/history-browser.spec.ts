@@ -184,7 +184,7 @@ type PanelRelayEvent<T = ServerEvent> = T extends ServerEvent
 async function mockRightPanelRelay(
   page: import("@playwright/test").Page,
   { visible = false, retained = true, engine = "codex", seedTurns = [], parentSid = "layout-parent",
-    secondParent = false, parentState = "idle", btwReadOnly = false, imageAssets = false, imageData, externalPreview, historyReply, listReply }: {
+    secondParent = false, parentState = "idle", btwReadOnly = false, imageAssets = false, imageData, externalPreview, historyReply, listReply, capabilityReply }: {
     visible?: boolean;
     retained?: boolean;
     engine?: "codex" | "claude";
@@ -198,6 +198,7 @@ async function mockRightPanelRelay(
     externalPreview?: "allow" | "replace";
     historyReply?: (command: Record<string, unknown>) => PanelRelayEvent<Extract<ServerEvent, { type: "history" }>> | null;
     listReply?: (command: Record<string, unknown>) => PanelRelayEvent | undefined;
+    capabilityReply?: (command: Record<string, unknown>) => PanelRelayEvent | undefined;
   } = {},
 ) {
   const btwSid = "btw-layout-child";
@@ -317,6 +318,9 @@ async function mockRightPanelRelay(
             message_id: "retained-answer", text: "仍可查看的侧边回答" });
         }
         snapshot(String(command.sid));
+      } else if (command.type === "get_engine_capabilities") {
+        const response = capabilityReply?.(command);
+        if (response) emit(response);
       } else if (command.type === "get_diff") {
         emit({ type: "diff_report", sid: String(command.sid),
           request_id: String(command.cmd_id), file: "", diff: "" });
@@ -370,6 +374,87 @@ test("side chat scope restores long Claude history atomically at the bottom with
   }
   expect(relay.commands.some(c => ["query", "steer", "open_btw"].includes(String(c.type)))).toBe(false);
 });
+
+function newChatSkillResponse(command: Record<string, unknown>, name: string, errors: string[] = []): PanelRelayEvent {
+  return { type: "engine_capabilities", request_id: String(command.cmd_id),
+    engine: "codex", space: "code", cwd: String(command.cwd ?? "/tmp/layout"),
+    codex_profile_id: command.codex_profile_id as string | undefined,
+    skills_only: true, errors,
+    items: [{ id: name, name, kind: "skill", enabled: true, description: "Project skill" }] };
+}
+
+for (const failure of ["response", "error"] as const) {
+  test(`new-chat controls retry skill discovery after a ${failure} failure without editing the draft`, async ({ page }) => {
+    let hold = false;
+    const relay = await mockRightPanelRelay(page, { retained: false,
+      capabilityReply: command => hold ? undefined : newChatSkillResponse(command, "warm"),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    const reads = () => relay.commands.filter(command => command.type === "get_engine_capabilities");
+    hold = true;
+    const before = reads().length;
+    const input = page.locator(".newchat-input");
+    await input.fill("$rev");
+    await expect.poll(() => reads().length).toBeGreaterThan(before);
+    const first = reads().at(-1)!;
+    if (failure === "response") relay.emit(newChatSkillResponse(first, "", ["skills: unavailable"]));
+    else relay.emit({ type: "error", request_id: String(first.cmd_id), code: "discovery_failed", message: "unavailable" });
+    const retry = page.getByRole("button", { name: "重试读取 Skills", exact: true });
+    await expect(retry).toBeVisible();
+    const failedCount = reads().length;
+    await input.fill("$revi");
+    await expect(retry).toBeVisible();
+    expect(reads().length).toBe(failedCount);
+    await retry.click();
+    await expect.poll(() => reads().length).toBe(failedCount + 1);
+    relay.emit(newChatSkillResponse(reads().at(-1)!, "review"));
+    await expect(page.getByRole("listbox", { name: "Skills" })).toContainText("$review");
+    await expect(input).toHaveValue("$revi");
+    await expect(retry).toHaveCount(0);
+    expect(relay.commands.some(command => command.type === "new_session")).toBe(false);
+  });
+}
+
+for (const loaded of [false, true]) {
+  test(`new-chat controls recover ${loaded ? "loaded" : "pending"} skills after wrapper reconnect`, async ({ page }) => {
+    let hold = false;
+    const relay = await mockRightPanelRelay(page, { retained: false,
+      capabilityReply: command => hold ? undefined : newChatSkillResponse(command, "warm"),
+    });
+    await page.goto("/");
+    await page.getByLabel("显示会话侧栏", { exact: true }).click();
+    await page.getByRole("button", { name: "新会话", exact: true }).click();
+    hold = true;
+    const reads = () => relay.commands.filter(command => command.type === "get_engine_capabilities");
+    const before = reads().length;
+    const input = page.locator(".newchat-input");
+    await input.fill("$rev");
+    await expect.poll(() => reads().length).toBeGreaterThan(before);
+    const first = reads().at(-1)!;
+    if (loaded) {
+      relay.emit(newChatSkillResponse(first, "review-old"));
+      await expect(page.getByRole("listbox", { name: "Skills" })).toContainText("$review-old");
+    }
+    const pendingCount = reads().length;
+    relay.emit({ type: "wrapper_reconnected", state: "idle", generation: "replacement-generation" });
+    await expect.poll(() => reads().length).toBeGreaterThan(pendingCount);
+    // A delayed pre-reconnect result must not satisfy the replacement read.
+    relay.emit(newChatSkillResponse(first, "review-stale"));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const next = reads().at(-1)!;
+      relay.emit(newChatSkillResponse(next, "review-restored"));
+      // The coordinator may first drain a different focused-directory read.
+      await expect.poll(async () => (await page.getByRole("listbox", { name: "Skills" }).innerText()).includes("$review-restored")
+        || reads().at(-1) !== next).toBe(true);
+    }
+    await expect(page.getByRole("listbox", { name: "Skills" })).toContainText("$review-restored");
+    await expect(page.getByRole("listbox", { name: "Skills" })).not.toContainText("review-stale");
+    await expect(input).toHaveValue("$rev");
+    expect(relay.commands.some(command => command.type === "new_session")).toBe(false);
+  });
+}
 
 for (const engine of ["claude", "codex"] as const) {
   test(`side chat scope reopens ${engine} history without a blank frame during sync`, async ({ page }) => {
@@ -11705,7 +11790,12 @@ test("new-chat controls omit Code-directory skills in a new Work session", async
   const input = page.locator(".newchat-input");
   const skills = page.getByRole("listbox", { name: "Skills" });
   const requests = page.getByTestId("newchat-skill-requests");
+  await page.getByTestId("switch-newchat-space").click();
   await input.fill("$");
+  await expect(page.locator(".work-newchat")).toBeVisible();
+  await expect(skills).toHaveCount(0);
+  await expect(requests).toHaveText("0");
+  await page.getByTestId("switch-newchat-space").click();
   await expect(skills).toContainText("$review");
   await expect(requests).toHaveText("1");
   await page.getByTestId("switch-newchat-space").click();
@@ -11715,7 +11805,7 @@ test("new-chat controls omit Code-directory skills in a new Work session", async
   await expect(requests).toHaveText("1");
   await page.getByTestId("switch-newchat-space").click();
   await expect(skills).toContainText("$review");
-  await expect(requests).toHaveText("2");
+  await expect(requests).toHaveText("1");
 });
 
 for (const engine of ["claude", "codex"] as const) {
