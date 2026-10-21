@@ -56,7 +56,13 @@ async def test_yank_timer_clears_only_paint_not_cursor_or_scroll():
             editor.selection,
             editor.scroll_offset,
         )
-        await pilot.pause(0.3)
+        # Textual may dispatch timers late on a busy full-suite runner. Wait
+        # for the paint callback with a bound instead of assuming a 100 ms
+        # scheduling margin; cursor, selection and scroll must still be stable.
+        for _ in range(20):
+            if editor.yank_range is None:
+                break
+            await pilot.pause(0.05)
         assert editor.yank_range is None
         assert (
             editor.cursor_location,
