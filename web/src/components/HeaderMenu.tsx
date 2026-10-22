@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useRef, useState, type CSSProperties } from 
 import { createPortal } from "react-dom";
 import { Icon } from "../icons";
 import { SideChatIcon } from "./SideChatIcon";
+import { DSH_SIDECHAT_UNAVAILABLE } from "../data";
 import type { NotificationMode } from "../notification-mode";
 import type { PushBindingState } from "../push";
 import { themeLabel } from "../themes";
@@ -166,6 +167,11 @@ export function HeaderMenu({
             onPointerDown={(event) => event.stopPropagation()}>
             {page === "main" ? (
               <div className="header-menu-items">
+                {engine === "dsh" && <button type="button" className="header-menu-item"
+                  disabled aria-label="侧边聊天暂未开放" title={DSH_SIDECHAT_UNAVAILABLE}>
+                  <SideChatIcon size={18} />
+                  <span><b>侧边聊天 · 暂未开放</b><small>等待官方提供会话删除能力后再接入</small></span>
+                </button>}
                 {onOpenBtw && <button ref={firstRef} type="button"
                   className="header-menu-item" aria-label="打开侧边聊天" onClick={() => {
                     close();

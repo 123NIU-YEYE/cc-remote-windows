@@ -789,7 +789,9 @@ export class RelayWs {
 
   sendDshControl(sid: string, kind: import("./protocol").DshControlKind, value: string, images?: QueryImg[], files?: QueryFile[]): string | null {
     // PTY keystrokes belong to one physical attachment, never the recovery outbox.
-    if (kind === "terminal") {
+    if (kind === "terminal" || (kind === "manage" && (() => {
+      try { return JSON.parse(value).action === "schedule_create"; } catch { return false; }
+    })())) {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
       const cmd_id = uuid();
       this.sendUntracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, cmd_id, client_id: this.clientId });

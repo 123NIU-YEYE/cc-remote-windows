@@ -77,7 +77,8 @@ class DshFeatures:
                 sessions = {s["sessionId"]: s for s in await self.client.list_sessions()}
                 response.items = [DshItem(id=row["sessionId"], sid=wire_session_id(row["sessionId"]),
                     title=str(sessions.get(row["sessionId"], {}).get("projections", {}).get("values", {}).get("title") or row["sessionId"])[:2048],
-                    detail=row.get("snippet", "")[:65536]) for row in result.get("items", [])[:20]]
+                    detail=row.get("snippet", "")[:65536]) for row in result.get("items", [])[:20]
+                    if wire_session_id(row["sessionId"]) not in self.runtime.sidechats.check()]
                 response.has_more = bool(result.get("hasMore"))
             elif cmd.kind == "references":
                 # Session references are cold reads. File completions use the
@@ -100,6 +101,8 @@ class DshFeatures:
                             response.items.append(DshItem(id="file-" + str(len(response.items)), title=path[:2048],
                                 path=path, state=row["kind"], mention=path_mention(path, row["kind"] == "directory")))
                         else:
+                            if wire_session_id(row["sessionId"]) in self.runtime.sidechats.check():
+                                continue
                             response.items.append(DshItem(id=row["sessionId"], title=row["label"][:2048],
                                 sid=wire_session_id(row["sessionId"]), detail=row.get("cwd", "")[:4096],
                                 state="session", mention=row["mention"]))

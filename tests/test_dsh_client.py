@@ -373,3 +373,30 @@ async def test_cold_child_page_uses_verified_parent_address():
         assert not host.sockets[0].sent
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [200, 404, 422, 503, "timeout"])
+async def test_direct_schedule_write_is_authenticated_and_never_retried(outcome):
+    host, writes = Host(), []
+    original = host.request
+    def request(req):
+        if req.url.path != "/api/cc-remote.schedule":
+            return original(req)
+        assert "dsh-auth-" in req.headers["cookie"]
+        writes.append(json.loads(req.content))
+        if outcome == "timeout":
+            raise httpx.ReadTimeout("unconfirmed")
+        return httpx.Response(outcome, json={"id": "schedule"})
+    host.request = request
+    client = host.client()
+    try:
+        if outcome == 200:
+            assert await client.create_schedule("dsh@one", {"title": "Check"}) == {"id": "schedule"}
+        else:
+            with pytest.raises(DshError) as error:
+                await client.create_schedule("dsh@one", {"title": "Check"})
+            assert error.value.outcome_unknown == (outcome in {503, "timeout"})
+        assert writes == [{"sessionId": "one", "request": {"title": "Check"}}]
+    finally:
+        await client.close()

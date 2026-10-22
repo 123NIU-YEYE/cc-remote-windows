@@ -5769,9 +5769,13 @@ function reduceEvent(
       });
     case "replay_start": {
       const replaySid = e.sid ?? state.focusedSid;
+      const isSideChat = !!replaySid && (replaySid.startsWith("btw-")
+        || Object.values(state.btwByParentSid).some((group) =>
+          group.chats.some((chat) => chat.sid === replaySid)));
       // Side chats rebuild from a private item snapshot, not durable History.
+      // DSH forks retain native dsh@ ids, so use their owner catalog as well.
       const needsAuthoritativeHistory = (e.truncated || !!e.rebuild)
-        && !replaySid?.startsWith("btw-");
+        && !isSideChat;
       const submittedTurn = needsAuthoritativeHistory && !e.rebuild
         ? recoverableSubmittedTurn(
             state.runtimes[replaySid ?? ""] ?? createRuntime(),
@@ -5805,7 +5809,7 @@ function reduceEvent(
         }
       }
       const next = patch(state, e.sid, (rt) => {
-        if (replaySid?.startsWith("btw-") && !rt.btwReplayView && !rt.replaying && !rt.loading
+        if (isSideChat && !rt.btwReplayView && !rt.replaying && !rt.loading
             && rt.turns.length) {
           // SyncBtw refreshes the private snapshot on every reopen. Keep the
           // already-painted complete view while the live runtime rebuilds;
@@ -5820,7 +5824,7 @@ function reduceEvent(
         rt.replaying = true;
         rt.syncReady = false;
         rt.truncated = e.truncated;
-        if (replaySid?.startsWith("btw-") && e.rebuild) {
+        if (isSideChat && e.rebuild) {
           const pending = [...rt.turns, ...(rt.btwReplayPending ?? [])].find((turn) =>
             turn.id === rt.acceptancePending && !turnHasBoundEngineId(turn));
           rt.btwReplayPending = pending ? [pending] : [];

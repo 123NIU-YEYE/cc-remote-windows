@@ -5,7 +5,7 @@
 .dsh-panel nav{display:flex;flex-wrap:wrap;gap:4px;padding:10px 16px;border-bottom:1px solid var(--border);flex-shrink:0}
 .dsh-panel button,.dsh-panel a,.dsh-references button{font:inherit;color:inherit}
 .dsh-panel nav button,.dsh-panel-actions button,.dsh-panel-actions a,.dsh-feature-row>button,.dsh-child-composer button,.dsh-feature-error button{border:0;background:transparent;padding:7px 9px;border-radius:7px;white-space:nowrap;cursor:pointer;font-size:13px;text-decoration:none}
-.dsh-panel nav button[aria-current],.dsh-panel button:hover,.dsh-panel-actions a:hover{background:var(--accent-weak);color:var(--accent-ink)}
+.dsh-panel nav button[aria-current],.dsh-panel button:hover:not(:disabled),.dsh-panel-actions a:hover{background:var(--accent-weak);color:var(--accent-ink)}
 .dsh-panel button:disabled{opacity:.45;cursor:default}
 .dsh-panel-actions{display:flex;flex-wrap:wrap;gap:4px;align-items:center;padding:8px 16px;color:var(--dim);border-bottom:1px solid var(--border)}
 .dsh-panel-body{overflow:auto;flex:1;min-height:0;padding:8px 20px 20px;overscroll-behavior:contain}

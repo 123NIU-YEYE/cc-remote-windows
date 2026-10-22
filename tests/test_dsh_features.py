@@ -15,17 +15,21 @@ from tests.test_dsh_runtime import setup_runtime
 
 
 @pytest.mark.asyncio
-async def test_search_read_is_private_and_never_creates_an_agent():
+@pytest.mark.parametrize("private", [False, True])
+async def test_search_read_is_private_and_never_creates_an_agent(private):
     machine, transport, runtime, client = setup_runtime()
     async def rpc(endpoint, args=None):
         assert endpoint == "session/search"
         assert args == {"request": {"query": "needle"}}
         return {"items": [{"sessionId": "match", "snippet": "context needle"}], "hasMore": True}
     client.rpc = rpc
+    if private:
+        runtime.sidechats.rows["dsh@match"] = {"parent": "dsh@root", "owner": "other", "created": 1, "cut": 1}
     cmd = ReadDsh(sid="dsh@root", kind="search", query="needle", cmd_id="read-search", client_id="browser")
     assert deserialize(serialize(cmd)) == cmd
     response = await machine._handle(cmd)
-    assert response.items[0].sid == "dsh@match" and response.has_more
+    assert [item.sid for item in response.items] == ([] if private else ["dsh@match"])
+    assert response.has_more
     assert response.request_id == cmd.cmd_id and response.to == "browser"
     assert not is_downstream(response) and machine.sessions == {}
     assert not response.error

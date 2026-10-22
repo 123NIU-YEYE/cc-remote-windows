@@ -21,7 +21,7 @@ async def test_settings_exclude_credentials_and_reject_stale_revision():
                 {"ns": "llm-deepseek", "revision": 1, "value": {"key": "private"}},
                 {"ns": "subagent", "revision": 4, "value": {"maxConcurrency": 6, "secret": "private", "proxy": "private", "nested": {"key": "private"}}, "secrets": [{"path": ["proxy"], "set": True}]},
             ]}
-        return {}
+        return {"ns": args["ns"], "value": args["patch"], "applies": "live", "revision": 5}
     client.rpc = rpc
     view = await machine._handle(ReadDsh(sid="dsh@root", kind="settings", client_id="browser", cmd_id="read"))
     assert len(view.items) == 1
@@ -95,4 +95,80 @@ async def test_paged_workflow_keeps_partial_terminal_identity_for_older_page_mer
     assert page.items[0].state == "completed"
     assert page.items[0].data == {"name_known": False, "members": [{"seq": 2, "state": "failed"}]}
     assert not machine.sessions
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_native_bundles_include_optional_shipped_controls_and_missing_installs():
+    machine, _, runtime, client = setup_runtime()
+    async def rpc(endpoint, args=None):
+        return [
+            {"name": "core", "enabled": True, "installed": False, "availability": "installation", "readOnlyReason": "management-required"},
+            {"name": "optional", "enabled": False, "installed": False, "optional": True, "availability": "installation", "meta": {"title": {"zh-CN": "语音输入"}}},
+            {"name": "extra", "enabled": False, "availability": "missing", "installTarget": {"spec": "extra@1.0"}},
+        ]
+    client.rpc = rpc
+    page = await machine._handle(ReadDsh(sid="dsh@root", kind="bundles", client_id="browser", cmd_id="read"))
+    core, optional, missing = page.items
+    assert not core.controllable and core.data["readOnlyReason"] == "management-required"
+    assert optional.controllable and optional.title == "语音输入" and optional.state == "disabled"
+    assert not missing.controllable and missing.state == "not-installed" and missing.data["installTarget"]["spec"] == "extra@1.0"
+    assert not machine.sessions
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_market_search_uses_only_native_configured_source_and_paginates():
+    machine, _, runtime, client = setup_runtime()
+    calls = []
+    async def rpc(endpoint, args=None):
+        calls.append((endpoint, args))
+        if endpoint == "pluginMarket/listIndexes":
+            return [{"url": "https://example.org/approved-index"}]
+        return {"entries": [{"name": "example", "title": {"zh-CN": "示例"}, "defaultVersion": "2.0", "versions": [
+            {"version": "2.0", "install": {"spec": "example@2.0"}}], "installation": {"status": "update-available", "installedVersion": "1.0"}}], "nextOffset": 60}
+    client.rpc = rpc
+    page = await machine._handle(ReadDsh(sid="dsh@root", kind="bundles", query='{"market":true,"text":"test","url":"https://untrusted.invalid"}', before_seq=30, client_id="browser", cmd_id="read"))
+    assert page.has_more and page.next_seq == 60
+    assert page.items[0].state == "update-available" and page.items[0].data["installTarget"] is None
+    assert calls[-1][1] == {"url": "https://example.org/approved-index", "query": {"text": "test", "sort": {"kind": "relevance"}, "offset": 30, "limit": 30}}
+    await runtime.close()
+
+
+def test_settings_preserve_native_numeric_limits_and_unset_default_preset():
+    from cc_remote.wrapper.dsh_management import visible_settings
+    result = visible_settings({"writable": True, "namespaces": [
+        {"ns": "subagent", "revision": 0, "applies": "live", "value": {"maxDepth": 1}, "schema": {"uid": 2, "refs": {
+            "2": {"dict": {"maxDepth": 1}}, "1": {"type": "number", "meta": {"min": 0, "step": 1}}}}},
+        {"ns": "agent-preset-registry", "revision": 0, "applies": "live", "value": {}, "schema": {"uid": 2, "refs": {
+            "2": {"dict": {"selectedDefault": 1}}, "1": {"type": "string"}}}},
+    ]})
+    assert result[0].data["constraints"] == {"maxDepth": {"min": 0, "step": 1}}
+    assert result[1].data["values"] == {"selectedDefault": None}
+
+
+@pytest.mark.asyncio
+async def test_settings_receipt_must_confirm_the_effective_values():
+    machine, _, runtime, client = setup_runtime()
+    async def rpc(endpoint, args=None):
+        if endpoint == "settings/describe":
+            return {"writable": True, "namespaces": [{"ns": "subagent", "revision": 1, "value": {"maxDepth": 1}}]}
+        return {"ns": "subagent", "value": {"maxDepth": 1}, "revision": 2}
+    client.rpc = rpc
+    result = await machine._handle(command("settings", ns="subagent", revision=1, patch={"maxDepth": 2}))
+    assert result.status != "success" and "实际值" in result.text
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", ["[]", "null", "not-json", '{"market":false}', '{"market":true,"text":42}'])
+async def test_invalid_market_request_does_not_call_native_sources(query):
+    machine, _, runtime, client = setup_runtime()
+    calls = []
+    async def rpc(endpoint, args=None):
+        calls.append(endpoint)
+        raise AssertionError("invalid search must not read native sources")
+    client.rpc = rpc
+    page = await machine._handle(ReadDsh(sid="dsh@root", kind="bundles", query=query, client_id="browser", cmd_id="read"))
+    assert page.error and not calls
     await runtime.close()

@@ -1,8 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
-import { PROTOCOL_VERSION, type DshState } from "../src/protocol";
+import { PROTOCOL_VERSION, type DshState, type DshItem } from "../src/protocol";
 import { staticPng } from "./fixtures/png";
 
-const sid = "dsh@session-c4edc56f-aea8-4b43-bda9-0eac124c5559";
+const sid = "dsh@native-session";
 const nativeState: Omit<DshState, "v" | "ts"> = { type: "dsh_state", sid, connected: true,
   agent_preset: "standard", permission: "read-only",
   permissions: [{ value: "read-only", name: "只读", description: "仅查看文件" },
@@ -16,11 +16,16 @@ const nativeState: Omit<DshState, "v" | "ts"> = { type: "dsh_state", sid, connec
     rounds: 3, max_rounds: 32, activation: "disarmed" },
 };
 
-async function mockDshRelay(page: Page, { running = false, commandSuccess = false, features = false, sidebarCards = false } = {}) {
+async function mockDshRelay(page: Page, { running = false, commandSuccess = false, features = false, sidebarCards = false, failSettingsNamespace = "" } = {}) {
   const commands: Record<string, unknown>[] = [];
   let historyTurns: Record<string, unknown>[] | undefined;
   let archived = false;
+  let terminalClosed = false;
   let currentGoal = nativeState.goal;
+  const settingItems: DshItem[] = [
+    { id: "subagent", title: "subagent", detail: "", state: "settings", has_children: false, controllable: true, data: { revision: 4, applies: "live", values: { maxDepth: 1, maxActiveSubagents: 8 }, constraints: { maxDepth: { min: 0, step: 1 }, maxActiveSubagents: { min: 1, step: 1 } } } },
+    { id: "agent-loop", title: "agent-loop", detail: "", state: "settings", has_children: false, controllable: true, data: { revision: 7, applies: "live", values: { maxParallelToolCalls: 10 }, constraints: { maxParallelToolCalls: { min: 1, step: 1 } } } },
+  ];
   const context = { type: "context_report", sid, total_tokens: 24000,
     max_tokens: 64000, percentage: 37.5, available: true,
     source: "recent_turn", categories: [] };
@@ -77,6 +82,23 @@ async function mockDshRelay(page: Page, { running = false, commandSuccess = fals
         archived = cmd.archived !== false;
         emit({ type: "session_list_invalidated", engine: "dsh" });
       }
+      if (cmd.type === "open_btw") {
+        emit({ type: "btw_opened", sid: "dsh@side", btw_sid: "dsh@side", parent_sid: sid, engine: "dsh",
+          request_id: cmd.request_id, revision: 1, created_at: 1 });
+        emit({ type: "snapshot", sid: "dsh@side", state: "idle", tail_text: "", cwd: "/tmp/dsh-test", generation: "dsh-generation" });
+        emit({ type: "model", sid: "dsh@side", model: "dsh:deepseek-official:deepseek-flash" });
+        emit({ type: "effort", sid: "dsh@side", effort: "off" });
+        emit({ ...nativeState, sid: "dsh@side" });
+      }
+      if (cmd.type === "sync_btw") {
+        // Match the real private replay, including its rebuild barrier. A
+        // Snapshot alone hid DSH's native-id history recovery regression.
+        emit({ type: "replay_start", sid: cmd.sid, generation: "dsh-generation",
+          from_seq: 0, to_seq: 0, truncated: false, rebuild: true });
+        emit({ type: "replay_end", sid: cmd.sid, to_seq: 0, truncated: false });
+        emit({ type: "snapshot", sid: cmd.sid, state: "idle", tail_text: "", cwd: "/tmp/dsh-test", generation: "dsh-generation" });
+      }
+      if (cmd.type === "close_btw") emit({ type: "btw_closed", sid: cmd.sid, btw_sid: cmd.sid, parent_sid: sid, revision: 2 });
       if (cmd.type === "switch_session") { emit({ type: "session_focus", session_id: cmd.session_id }); snapshot(); }
       if (cmd.type === "get_history") emit({ type: "history", sid, session_id: sid, revision: "dsh-history",
         generation: "dsh-generation", detail: "summary", events: [], turns: historyTurns ?? [{ id: "native-prompt", clientMsgId: "native-prompt",
@@ -86,6 +108,34 @@ async function mockDshRelay(page: Page, { running = false, commandSuccess = fals
               result: { content: "Presented", is_error: false }, done: true }] : []),
             { kind: "text", message_id: "answer", text: features ? "[项目目录](/tmp/dsh-test/dir) 和 [文件行号](/tmp/dsh-test/README.md:7)" : "DSH 已准备好。", channel: "final", done: true },
           ] }], has_more: false });
+      if (cmd.type === "set_dsh_control" && cmd.kind === "terminal" && JSON.parse(String(cmd.value)).action === "input") {
+        setTimeout(() => emit({ type: "dsh_command_result", sid: cmd.sid, request_id: cmd.cmd_id, status: "success", text: "" }), 350);
+        return;
+      }
+      if (cmd.type === "set_dsh_control" && cmd.kind === "terminal" && JSON.parse(String(cmd.value)).action === "attach") {
+        const body = JSON.parse(String(cmd.value));
+        emit({ type: "dsh_read_result", sid: cmd.sid, request_id: body.lease, kind: "terminal_output", next_seq: 1,
+          items: [{ id: "1", title: "screen", data: { type: "snapshot", screen: "DSH terminal ready\r\n~/workspace $ ", writable: true, info: {} } }] });
+      }
+      if (cmd.type === "set_dsh_control" && cmd.kind === "terminal" && JSON.parse(String(cmd.value)).action === "close") {
+        terminalClosed = true;
+        setTimeout(() => emit({ type: "dsh_command_result", sid, request_id: cmd.cmd_id, status: "success", text: "终端已停止" }), 350);
+        return;
+      }
+      if (terminalClosed && cmd.type === "read_dsh" && cmd.kind === "terminal_output") {
+        emit({ type: "dsh_read_result", sid, request_id: cmd.cmd_id, kind: cmd.kind, items: [], error: "终端连接已过期" }); return;
+      }
+      if (cmd.type === "set_dsh_control" && cmd.kind === "manage") {
+        const body = JSON.parse(String(cmd.value));
+        if (body.action === "settings") {
+          const row = settingItems.find(item => item.id === body.ns)!;
+          const success = commandSuccess && body.ns !== failSettingsNamespace && row.data!.revision === body.revision;
+          if (success) row.data = { ...row.data, revision: body.revision + 1, values: { ...(row.data!.values as object), ...body.patch } };
+          emit({ type: "dsh_command_result", sid, request_id: cmd.cmd_id, status: success ? "success" : "error", text: success ? "已保存" : "设置已变化，请刷新后重新修改" });
+          emit({ type: "command_ack", client_id: cmd.client_id, cmd_id: cmd.cmd_id });
+          return;
+        }
+      }
       if (cmd.type === "set_dsh_control") emit({ type: "dsh_command_result", sid, request_id: cmd.cmd_id,
         status: commandSuccess ? "success" : "error", text: commandSuccess ? "命令已执行" : "当前目标不能替换，请使用 /goal edit" });
       if (cmd.type === "get_context") emit({ ...context, request_id: cmd.cmd_id });
@@ -134,13 +184,18 @@ async function mockDshRelay(page: Page, { running = false, commandSuccess = fals
           : cmd.kind === "subagents" ? [{ id: "child", sid: "dsh@child", title: "检查构建", detail: "", mode: "continuable", state: "running", has_children: true, controllable: true }]
           : cmd.kind === "workflows" ? [{ id: "workflow", title: "审查工作流", state: "running", data: { members: [{ sid: "dsh@child", label: "检查构建", phase: "审查", state: "running" }] } }]
           : cmd.kind === "trajectory" ? [{ id: "1", title: "第 1 轮", state: "completed", data: { input: 3000, output: 420, events: [{ type: "tool/call", label: "run_code" }] } }]
-          : cmd.kind === "settings" ? [{ id: "subagent", title: "subagent", state: "settings", controllable: true, data: { revision: 4, values: { maxConcurrency: 6 } } }]
+          : cmd.kind === "settings" ? settingItems
           : cmd.kind === "presets" ? [{ id: "standard", title: "标准", state: "default", detail: "文件与命令" }, { id: "cordis", title: "配置助手", state: "available" }]
+          : cmd.kind === "schedules" && cmd.query === "sessions" ? [{ id: sid, title: "当前项目", detail: "/tmp/dsh-test" }]
           : cmd.kind === "schedules" ? [{ id: "review", sid, title: "每周审查", detail: "检查变更", state: "active", data: { id: "review", kind: "every", title: "每周审查", prompt: "检查变更", everySeconds: 300, scheduledAt: "2026-10-22T00:00:00Z" } }]
           : cmd.kind === "schedule_history" ? [{ id: "delivery", title: "2026-10-22 08:00", detail: "delivery-1", state: "delivered" }]
-          : cmd.kind === "bundles" ? [{ id: "@example/plugin", title: "Example", detail: "示例插件", state: "enabled", controllable: true, data: { version: "1.0.0", installed: true, removable: true } }]
-          : cmd.kind === "terminals" ? [{ id: "pty", title: "zsh", detail: "/tmp", state: "running", data: { cols: 80, rows: 24 } }]
-          : cmd.kind === "terminal_output" ? (cmd.before_seq ? [] : [{ id: "1", title: "screen", data: { type: "snapshot", screen: "DSH terminal ready", writable: true, info: {} } }])
+          : cmd.kind === "bundles" ? [
+            { id: "@deepseek-ai/dsh-base", title: "DSH Base", detail: "Core runtime", state: "enabled", data: { version: "0.2.1-rc.2", availability: "installation", readOnlyReason: "management-required" } },
+            { id: "@deepseek-ai/dsh-session-titles", title: "Session titles", state: "disabled", controllable: true, data: { version: "0.2.1-rc.2", availability: "installation", optional: true } },
+            { id: "@example/plugin", title: "Example", detail: "示例插件", state: "enabled", controllable: true, data: { version: "1.0.0", installed: true, removable: true } },
+          ]
+          : cmd.kind === "terminals" ? terminalClosed ? [] : [{ id: "pty", title: "zsh", detail: "/tmp", state: "running", data: { cols: 80, rows: 24 } }]
+          : cmd.kind === "terminal_output" ? (cmd.before_seq ? [] : [{ id: "1", title: "screen", data: { type: "snapshot", screen: "DSH terminal ready\r\n\x1b[36m~/workspace\x1b[0m $ pwd\r\n/home/user/workspace\r\n\x1b[36m~/workspace\x1b[0m $ ", writable: true, info: {} } }])
           : cmd.kind === "conversation" ? [{ id: "message", title: "DSH", detail: `已经检查构建 ${cmd.query ?? ""}`, state: "message" }]
           : cmd.kind === "deliverables" ? [{ id: "file", title: "report.xlsx", path: "/tmp/dsh-test/report.xlsx", detail: "交付文件" }]
           : [{ id: "version", title: "DSH 版本", detail: "0.2.1-rc.2", state: "active" }];
@@ -634,6 +689,12 @@ async function openDshTools(page: Page) {
   await expect(page.getByLabel("DSH 会话工具", { exact: true })).toBeVisible();
 }
 
+async function selectDshTool(page: Page, label: string) {
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await panel.getByRole("button", { name: "工具", exact: true }).click();
+  await panel.getByRole("menuitem", { name: label, exact: true }).click();
+}
+
 test("DSH native directory links open the file browser and retain file previews", async ({ page }) => {
   const relay = await openDsh(page, { features: true });
   await page.getByRole("button", { name: "在 Remote 中打开 /tmp/dsh-test/dir", exact: true }).click();
@@ -690,10 +751,10 @@ test("DSH subagent controls, jobs, diagnostics and complete export share a compa
   await openDshTools(page);
   const act = relay.commands.find(c => c.type === "act_dsh_subagent");
   expect(act?.sid).toBe(sid); expect(act?.target_sid).toBe("dsh@child");
-  await panel.getByRole("button", { name: "后台任务", exact: true }).click();
+  await selectDshTool(page, "后台任务");
   await expect(panel).toContainText("构建任务");
   await expect(panel).toContainText("运行中");
-  await panel.getByRole("button", { name: "连接诊断", exact: true }).click();
+  await selectDshTool(page, "连接诊断");
   await expect(panel).toContainText("0.2.1-rc.2");
   await panel.getByRole("button", { name: "导出完整会话", exact: true }).click();
   await expect(panel.getByRole("link", { name: "保存 ZIP" })).toBeVisible();
@@ -708,7 +769,7 @@ test("DSH produced XLSX files preview multiple sheets and preserve the original 
   await openDsh(page, { features: true });
   await openDshTools(page);
   const panel = page.getByLabel("DSH 会话工具", { exact: true });
-  await panel.getByRole("button", { name: "产出文件", exact: true }).click();
+  await selectDshTool(page, "产出文件");
   await panel.getByRole("button", { name: "report.xlsx", exact: true }).click();
   const sheet = page.getByRole("region", { name: "表格预览" });
   await expect(sheet).toContainText("本周进展");
@@ -968,6 +1029,7 @@ test("DSH appearance editor uses its blue defaults in both modes and shortcuts r
   await page.getByRole("button", { name: "更多设置", exact: true }).click();
   await page.getByRole("button", { name: /^外观/ }).click();
   const dialog = page.getByRole("dialog", { name: "外观", exact: true });
+  await expect(dialog.locator(".engine-brand-icon.dsh")).toBeVisible();
   for (const [mode, label, accent, ink] of [
     ["light", "浅色", "rgb(46, 111, 240)", "rgb(27, 84, 209)"],
     ["dark", "深色", "rgb(107, 165, 255)", "rgb(148, 189, 255)"],
@@ -977,6 +1039,7 @@ test("DSH appearance editor uses its blue defaults in both modes and shortcuts r
     await expect(dialog.locator(".appearance-reset")).toHaveCSS("color", ink);
     await expect(dialog.locator(".theme-picker-intro > span")).toHaveCSS("color", ink);
     await expect(dialog.locator(`.appearance-miniature.${mode}`)).toHaveCSS("outline-color", accent);
+    if (info.project.name === "desktop") expect(await dialog.locator(".theme-picker-scroll").evaluate(node => node.scrollHeight - node.clientHeight)).toBeLessThanOrEqual(1);
     await page.screenshot({ path: info.outputPath(`dsh-appearance-${mode}.png`), animations: "disabled" });
   }
   // Capture shortcuts work even inside an open sheet, without submitting work.
@@ -995,22 +1058,24 @@ test("DSH management preserves native revisions and only stages creation prompts
   const relay = await openDsh(page, { features: true, commandSuccess: true });
   await openDshTools(page);
   const panel = page.getByLabel("DSH 会话工具", { exact: true });
-  await panel.getByRole("button", { name: "运行设置", exact: true }).click();
-  await panel.getByRole("spinbutton", { name: "最大并发数" }).fill("4");
+  await selectDshTool(page, "运行设置");
+  await panel.getByRole("spinbutton", { name: "并发子代理" }).fill("4");
   await panel.getByRole("button", { name: "保存修改" }).click();
   await expect.poll(() => relay.commands.filter(command => command.type === "set_dsh_control" && command.kind === "manage").length).toBe(1);
-  expect(JSON.parse(String(relay.commands.find(command => command.kind === "manage")?.value))).toEqual({ action: "settings", ns: "subagent", revision: 4, patch: { maxConcurrency: 4 } });
-  await panel.getByRole("button", { name: "自动化", exact: true }).click();
-  await panel.getByRole("button", { name: "投递记录", exact: true }).click();
-  await expect(panel).toContainText("delivery-1");
-  await panel.getByRole("button", { name: "编辑", exact: true }).click();
+  expect(JSON.parse(String(relay.commands.find(command => command.kind === "manage")?.value))).toEqual({ action: "settings", ns: "subagent", revision: 4, patch: { maxActiveSubagents: 4 } });
+  await selectDshTool(page, "自动化");
+  await panel.getByRole("button", { name: "每周审查的操作", exact: true }).click();
+  await panel.getByRole("button", { name: "执行记录", exact: true }).click();
+  await expect(panel.locator(".dsh-deliveries")).toContainText("已送达");
+  await panel.getByRole("button", { name: "每周审查的操作", exact: true }).click();
+  await panel.getByRole("button", { name: "编辑任务", exact: true }).click();
   await panel.getByRole("textbox", { name: "任务名称" }).fill("每日审查");
-  await panel.getByRole("button", { name: "保存任务" }).click();
+  await panel.getByRole("button", { name: "保存修改" }).click();
   await expect.poll(() => relay.commands.filter(command => command.kind === "manage").length).toBe(2);
   const update = JSON.parse(String(relay.commands.filter(command => command.kind === "manage").at(-1)?.value));
   expect(update.expected.title).toBe("每周审查"); expect(update.title).toBe("每日审查"); expect(update.sid).toBe(sid);
   await page.screenshot({ path: info.outputPath("dsh-automation.png") });
-  await panel.getByRole("button", { name: "预设", exact: true }).click();
+  await selectDshTool(page, "预设");
   await panel.getByRole("button", { name: "创建预设", exact: true }).click();
   await expect(page.locator(".newchat textarea")).toHaveValue(/创建一个 DSH 代理预设/);
   expect(relay.commands.some(command => command.type === "new_session" || command.type === "query")).toBe(false);
@@ -1021,7 +1086,7 @@ test("DSH workflow opens exact children and nested work without a model request"
   const relay = await openDsh(page, { features: true });
   await openDshTools(page);
   const panel = page.getByLabel("DSH 会话工具", { exact: true });
-  await panel.getByRole("button", { name: "工作流", exact: true }).click();
+  await selectDshTool(page, "工作流");
   await panel.getByRole("button", { name: /检查构建.*运行中/ }).click();
   const agent = page.getByLabel("协作代理详情", { exact: true });
   await expect(agent).toContainText("检查构建并验证回归");
@@ -1043,9 +1108,10 @@ test("DSH terminal attaches existing PTY, sends explicit input and only detaches
   const relay = await openDsh(page, { features: true, commandSuccess: true });
   await openDshTools(page);
   const panel = page.getByLabel("DSH 会话工具", { exact: true });
-  await panel.getByRole("button", { name: "终端", exact: true }).click();
-  await panel.getByRole("button", { name: "zsh · 运行中" }).click();
-  await expect(panel.getByText("已连接 · 收起面板会保留终端")).toBeVisible();
+  await selectDshTool(page, "终端");
+  await panel.getByRole("button", { name: "选择终端", exact: true }).click();
+  await page.getByRole("dialog", { name: "选择终端", exact: true }).getByRole("button", { name: /zsh/ }).click();
+  await expect(panel.locator(".dsh-terminal-status").getByText("已连接", { exact: true })).toBeVisible();
   const input = panel.locator(".xterm-helper-textarea");
   await input.press("a");
   await expect.poll(() => relay.commands.filter(command => command.kind === "terminal").map(command => JSON.parse(String(command.value))).some(value => value.action === "input" && value.value.type === "write" && value.value.data === "a")).toBe(true);
@@ -1078,4 +1144,224 @@ test("DSH return links decorate the native autonomous round without splitting th
   await expect(page.getByLabel("协作代理详情", { exact: true })).toContainText("检查构建并验证回归");
   expect(relay.commands.some(command => command.type === "get_agent_detail" && command.run_id === "dsh@child")).toBe(true);
   expect(relay.commands.some(command => command.type === "query" || command.type === "act_dsh_subagent")).toBe(false);
+});
+
+test("DSH terminal interrupt keeps shell and explicit close does not surface a racing stream error", async ({ page }, info) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  await openDshTools(page);
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await selectDshTool(page, "终端");
+  await panel.getByRole("button", { name: "选择终端", exact: true }).click();
+  await page.getByRole("dialog", { name: "选择终端", exact: true }).getByRole("button", { name: /zsh/ }).click();
+  await expect(panel.getByRole("button", { name: "中断命令 Ctrl+C" })).toBeEnabled();
+  await panel.getByRole("button", { name: "中断命令 Ctrl+C" }).click();
+  await expect.poll(() => relay.commands.filter(c => c.kind === "terminal").map(c => JSON.parse(String(c.value))).some(v => v.action === "input" && v.value.data === "\u0003")).toBe(true);
+  expect(relay.commands.filter(c => c.kind === "terminal").map(c => JSON.parse(String(c.value))).some(v => v.action === "close")).toBe(false);
+  await panel.getByRole("button", { name: "关闭终端", exact: true }).click();
+  await page.screenshot({ path: info.outputPath("dsh-terminal-close.png") });
+  await page.getByRole("dialog", { name: "关闭终端？" }).getByRole("button", { name: "确认关闭", exact: true }).click();
+  await expect(panel.getByText("选择终端或新建一个终端", { exact: false })).toBeVisible();
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+});
+
+test("DSH bundle catalog filters locally and explains unavailable official market", async ({ page }, info) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  await page.screenshot({ path: info.outputPath("dsh-session-mode.png") });
+  await openDshTools(page);
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await selectDshTool(page, "运行设置");
+  await expect(panel.getByRole("spinbutton", { name: "最大层级" })).toHaveValue("1");
+  await page.screenshot({ path: info.outputPath("dsh-runtime-settings.png") });
+  await selectDshTool(page, "插件");
+  await expect(panel.getByText("示例插件", { exact: true })).toBeVisible();
+  await page.screenshot({ path: info.outputPath("dsh-plugins-all.png") });
+  await panel.getByRole("textbox", { name: "搜索插件" }).fill("not-there");
+  await expect(panel.getByText("没有匹配的插件")).toBeVisible();
+  await panel.getByRole("textbox", { name: "搜索插件" }).fill("example");
+  await expect(panel.getByText("示例插件", { exact: true })).toBeVisible();
+  await page.screenshot({ path: info.outputPath("dsh-plugins.png") });
+  await panel.getByRole("button", { name: "插件市场", exact: true }).click();
+  await expect(panel.getByText("DSH 暂未提供官方插件市场", { exact: true })).toBeVisible();
+  await expect(panel.getByRole("textbox", { name: "搜索插件" })).toHaveCount(0);
+  await expect(panel.getByRole("alert")).toHaveCount(0);
+  expect(relay.commands.some(c => c.type === "read_dsh" && c.kind === "bundles" && c.query)).toBe(false);
+  await page.screenshot({ path: info.outputPath("dsh-market-unavailable.png") });
+  await panel.getByRole("button", { name: "本机插件", exact: true }).click();
+  await expect(panel.getByRole("textbox", { name: "搜索插件" })).toHaveValue("example");
+  await expect(panel.getByText("示例插件", { exact: true })).toBeVisible();
+  expect(relay.commands.some(c => c.type === "query" || c.type === "new_session")).toBe(false);
+});
+
+test("DSH settings retain failed drafts after a partially successful save", async ({ page }) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true, failSettingsNamespace: "agent-loop" });
+  await openDshTools(page);
+  await selectDshTool(page, "运行设置");
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await panel.getByRole("spinbutton", { name: "并发子代理" }).fill("5");
+  await panel.getByRole("spinbutton", { name: "并行调用上限" }).fill("4");
+  await expect(panel.getByText("已修改 2 项")).toBeVisible();
+  await panel.getByRole("button", { name: "保存修改", exact: true }).click();
+  await expect(panel.getByRole("status")).toContainText("已保存 1 项");
+  await expect(panel.getByRole("status")).toContainText("未确认的修改已保留");
+  await expect(panel.getByRole("spinbutton", { name: "并发子代理" })).toHaveValue("5");
+  await expect(panel.getByRole("spinbutton", { name: "并行调用上限" })).toHaveValue("4");
+  await expect(panel.getByText("已修改 1 项")).toBeVisible();
+  const writes = () => relay.commands.filter(c => c.kind === "manage").map(c => JSON.parse(String(c.value)));
+  expect(writes().map(body => [body.ns, body.revision])).toEqual([["subagent", 4], ["agent-loop", 7]]);
+  await panel.getByRole("button", { name: "保存修改", exact: true }).click();
+  await expect.poll(() => writes().length).toBe(3);
+  expect(writes().filter(body => body.ns === "subagent")).toHaveLength(1);
+  await panel.getByRole("button", { name: "撤销", exact: true }).click();
+  await expect(panel.getByRole("spinbutton", { name: "并行调用上限" })).toHaveValue("10");
+});
+
+test("DSH compact tools menu supports keyboard dismissal and shipped plugin controls", async ({ page }, info) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  await openDshTools(page);
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  const trigger = panel.getByRole("button", { name: "工具", exact: true });
+  await trigger.click();
+  await expect(panel.getByRole("menuitem", { name: "子代理", exact: true })).toBeFocused();
+  await page.keyboard.press("End");
+  await expect(panel.getByRole("menuitem", { name: "连接诊断", exact: true })).toBeFocused();
+  await page.screenshot({ path: info.outputPath("dsh-tools-menu.png") });
+  await page.keyboard.press("Escape");
+  await expect(trigger).toBeFocused();
+  await expect(panel.getByRole("menu")).toHaveCount(0);
+  await expect(panel).toBeVisible();
+  await selectDshTool(page, "插件");
+  const core = panel.locator(".dsh-bundle-row").filter({ hasText: "DSH 核心组件" });
+  await expect(core.getByRole("button")).toHaveCount(0);
+  const optional = panel.locator(".dsh-bundle-row").filter({ hasText: "会话标题" });
+  await page.screenshot({ path: info.outputPath("dsh-plugins-dark.png") });
+  await optional.getByRole("button", { name: "启用", exact: true }).click();
+  await expect.poll(() => relay.commands.some(c => c.kind === "manage" && JSON.parse(String(c.value)).action === "bundle_enable")).toBe(true);
+  expect(relay.commands.some(c => c.type === "query" || c.type === "new_session")).toBe(false);
+});
+
+test("DSH terminal streams and preserves the last row after centering", async ({ page }, info) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  await openDshTools(page);
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await selectDshTool(page, "终端");
+  await panel.getByRole("button", { name: "选择终端", exact: true }).click();
+  const picker = page.getByRole("dialog", { name: "选择终端", exact: true });
+  await expect(picker.locator("select")).toHaveCount(0);
+  await picker.getByRole("button", { name: /zsh/ }).click();
+  await expect(panel.locator(".dsh-terminal-status").getByText("已连接", { exact: true })).toBeVisible();
+  await panel.locator(".panel-expand").click();
+  await expect(panel).toHaveClass(/panel-expanded/);
+  await expect.poll(async () => panel.evaluate(element => {
+    const viewport = element.querySelector(".dsh-terminal-viewport")!.getBoundingClientRect();
+    const screen = element.querySelector(".xterm-screen")!.getBoundingClientRect();
+    return screen.bottom <= viewport.bottom + 1 && screen.top >= viewport.top - 1;
+  })).toBe(true);
+  await panel.locator(".xterm-helper-textarea").press("a");
+  await panel.locator(".xterm-helper-textarea").press("b");
+  const writes = () => relay.commands.filter(c => c.kind === "terminal").map(c => JSON.parse(String(c.value))).filter(c => c.action === "input" && c.value.type === "write");
+  await expect.poll(() => writes().map(c => c.value.data).join("")).toBe("ab");
+  expect(relay.commands.some(c => c.type === "read_dsh" && c.kind === "terminal_output")).toBe(false);
+  await page.screenshot({ path: info.outputPath("terminal-centered.png") });
+});
+
+test("DSH terminal scrollback supports wheel and touch without sending shell input", async ({ page }, info) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  await openDshTools(page); await selectDshTool(page, "终端");
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await panel.getByRole("button", { name: "选择终端", exact: true }).click();
+  await page.getByRole("dialog", { name: "选择终端", exact: true }).getByRole("button", { name: /zsh/ }).click();
+  await expect(panel.locator(".dsh-terminal-status").getByText("已连接", { exact: true })).toBeVisible();
+  const attach = relay.commands.filter(c => c.kind === "terminal").map(c => JSON.parse(String(c.value))).find(c => c.action === "attach");
+  const output = (next_seq: number, data: string) => relay.emit({ type: "dsh_read_result", sid,
+    request_id: attach.lease, kind: "terminal_output", next_seq,
+    items: [{ id: String(next_seq), title: "output", data: { type: "output", data } }] });
+  output(2, "\r\n" + Array.from({ length: 180 }, (_, n) => `history-${String(n).padStart(3, "0")}\r\n`).join(""));
+  const rows = panel.locator(".xterm-rows");
+  await expect(rows).toContainText("history-179");
+  const bottom = (await rows.textContent())!;
+  const screen = panel.locator(".xterm-screen");
+  if (info.project.name === "desktop") {
+    await screen.hover(); await page.mouse.wheel(0, -280);
+    await expect(rows).not.toHaveText(bottom);
+    await page.mouse.wheel(0, 10000);
+    await expect(rows).toContainText("history-179");
+  }
+  const drag = (dy: number) => screen.evaluate((element, dy) => {
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+    const send = (type: string, offset: number) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      const touches = type === "touchend" ? [] : [{ identifier: 42, clientX: x, clientY: y + offset }];
+      Object.defineProperty(event, "touches", { value: touches });
+      element.dispatchEvent(event);
+    };
+    send("touchstart", 0);
+    for (let step = 1; step <= 8; step++) send("touchmove", dy * step / 8);
+    send("touchend", dy);
+  }, dy);
+  await drag(160);
+  await expect(rows).not.toHaveText(bottom);
+  const scrolled = (await rows.textContent())!;
+  output(3, "new-output-while-reading\r\n");
+  await expect.poll(() => relay.commands.filter(c => c.kind === "terminal").map(c => JSON.parse(String(c.value))).some(c => c.action === "ack" && c.cursor === 3)).toBe(true);
+  await expect(rows).toHaveText(scrolled);
+  await drag(-240);
+  await expect(rows).toContainText("new-output-while-reading");
+  expect(relay.commands.filter(c => c.kind === "terminal").map(c => JSON.parse(String(c.value)))
+    .some(c => c.action === "input" && c.value.type === "write")).toBe(false);
+});
+
+test("DSH schedule form creates directly in the selected session", async ({ page }, info) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  await openDshTools(page); await selectDshTool(page, "自动化");
+  const panel = page.getByLabel("DSH 会话工具", { exact: true });
+  await panel.getByRole("button", { name: "新建任务", exact: true }).click();
+  await panel.getByLabel("任务名称", { exact: true }).fill("每日检查");
+  await panel.getByLabel("任务内容", { exact: true }).fill("总结项目的新增改动");
+  await panel.getByLabel("时区", { exact: true }).fill("Asia/Taipei");
+  await page.screenshot({ path: info.outputPath("schedule-create.png") });
+  await panel.getByRole("button", { name: "创建任务", exact: true }).click();
+  await expect.poll(() => relay.commands.filter(c => c.kind === "manage").map(c => JSON.parse(String(c.value))).find(c => c.action === "schedule_create")).toMatchObject({
+    sid, request: { title: "每日检查", prompt: "总结项目的新增改动", daily: { time: "09:00:00", time_zone: "Asia/Taipei" } },
+  });
+  expect(relay.commands.some(c => c.type === "query")).toBe(false);
+});
+
+test("DSH side chat entry points stay disabled without changing drafts or creating sessions", async ({ page }, info) => {
+  const relay = await openDsh(page, { features: true, commandSuccess: true });
+  const composer = page.locator(".composer textarea");
+  await composer.fill("原来的草稿");
+  await page.getByRole("button", { name: "更多设置", exact: true }).click();
+  await expect(page.getByRole("button", { name: "侧边聊天暂未开放", exact: true })).toBeDisabled();
+  await expect(page.getByText("等待官方提供会话删除能力后再接入", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "打开侧边聊天", exact: true })).toHaveCount(0);
+  await page.screenshot({ path: info.outputPath("sidechat-disabled.png") });
+  await page.keyboard.press("Escape");
+  for (const key of ["Meta+Shift+k", "Control+Shift+k", "Meta+Shift+e", "Control+Shift+e"]) {
+    await page.keyboard.press(key);
+    await expect(page.getByLabel("侧边对话", { exact: true })).toHaveCount(0);
+  }
+  await expect(composer).toHaveValue("原来的草稿");
+  // An old private catalog must not reopen a dormant side panel.
+  relay.emit({ type: "btw_sync", generation: "dsh-generation", revision: 1, sessions: [
+    { btw_sid: "dsh@side", parent_sid: sid, engine: "dsh", created_at: 1, state: "idle" },
+  ] });
+  await expect(page.getByLabel("侧边对话", { exact: true })).toHaveCount(0);
+  await composer.fill("/btw");
+  await expect(page.getByRole("button", { name: /侧边对话/ })).toHaveCount(0);
+  await composer.fill("/btw 只在旁聊解释一下");
+  await composer.press("Enter");
+  await expect(page.getByText("DSH 侧聊暂未开放，等待官方提供会话删除能力后再接入。", { exact: true })).toBeVisible();
+  await expect(composer).toHaveValue("/btw 只在旁聊解释一下");
+  await page.locator(".surface-head-title").click();
+  await page.getByRole("button", { name: "新会话", exact: true }).click();
+  const newComposer = page.locator(".newchat textarea");
+  await newComposer.fill("/btw 新会话也不能创建侧聊");
+  await newComposer.press("Enter");
+  await expect(page.getByText("DSH 侧聊暂未开放，等待官方提供会话删除能力后再接入。", { exact: true })).toBeVisible();
+  await expect(newComposer).toHaveValue("/btw 新会话也不能创建侧聊");
+  expect(relay.commands.some(c => ["open_btw", "new_session", "query", "close_btw"].includes(String(c.type)))).toBe(false);
+  expect(relay.commands.some(c => c.type === "set_dsh_control" && c.kind === "command")).toBe(false);
+  expect(relay.commands.some(c => c.type === "sync_btw" && c.sid === "dsh@side")).toBe(false);
 });

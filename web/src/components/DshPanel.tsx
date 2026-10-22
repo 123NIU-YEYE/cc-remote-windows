@@ -2,18 +2,21 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
 import { PanelResizer } from "./PanelResizer";
 import { DshManagement } from "./DshManagement";
+import { DshSettings } from "./DshSettings";
+import { DshToolsMenu } from "./DshToolsMenu";
+import { dshToolLabels as labels } from "../dsh-tool-labels";
 import type { DshApiClient } from "../dsh-api";
 import type { DshItem, DshState } from "../protocol";
-import { Icon } from "../icons";
+import { EngineIcon, Icon } from "../icons";
 import { MessageBlock } from "./MessageBlock";
 import { mergeDshPages } from "../dsh-management-pages";
 import "./DshFeatures.css";
+import "./DshTools.css";
 
 const DshTerminal = lazy(() => import("./DshTerminal"));
 
 export type DshPanelSelection = { kind: "subagents" | "jobs" | "deliverables" | "diagnostics" | "conversation" | "plugins" | "workflows" | "trajectory" | "schedules" | "settings" | "presets" | "bundles" | "terminals"; target?: string; query?: string };
-const labels = { terminals: "终端", workflows: "工作流", trajectory: "执行轨迹", schedules: "自动化", settings: "运行设置", presets: "预设", bundles: "插件包", plugins: "插件", subagents: "子代理", jobs: "后台任务", deliverables: "产出文件", diagnostics: "连接诊断", conversation: "会话记录" };
-const states: Record<string, string> = { enabled: "已启用", disabled: "已停用", running: "运行中", inactive: "未运行", stopping: "停止中", completed: "已结束", killed: "已停止", failed: "失败", active: "正常", unknown: "未知", unavailable: "暂不可用", corrupt: "记录异常" };
+const states: Record<string, string> = { error: "运行异常", enabled: "已启用", disabled: "已停用", running: "运行中", inactive: "未运行", stopping: "停止中", completed: "已结束", killed: "已停止", failed: "失败", active: "正常", unknown: "未知", unavailable: "暂不可用", corrupt: "记录异常" };
 
 export default function DshPanel({ sid, selection, api, state, onClose, onOpenFile, onOpenSession, onOpenAgent, onCompose }: {
   onOpenAgent: (run: string, title?: string) => void; onCompose: (prompt: string, preset?: string) => void;
@@ -128,12 +131,11 @@ export default function DshPanel({ sid, selection, api, state, onClose, onOpenFi
   };
   return <PanelFrame className="dsh-panel" role="complementary" label="DSH 会话工具">
       <PanelResizer ariaLabel="调整 DSH 面板宽度" />
-      <header><strong>{child ? child.title : labels[tab]}</strong><PanelExpandButton label="DSH 会话工具" /><button className="iconbtn" aria-label="关闭会话工具" onClick={onClose}><Icon name="close" /></button></header>
-      <nav aria-label="会话工具">
-        {(["subagents", "jobs", "workflows", "trajectory", "deliverables", "schedules", "presets", "settings", "bundles", "plugins", "terminals", "diagnostics"] as const).map(kind => <button key={kind}
-          aria-current={tab === kind && !child ? "page" : undefined} onClick={() => { setTab(kind); setChild(null); setParent(sid); setTrail([]); setNotice(""); }}>{labels[kind]}</button>)}
-      </nav>
-      {tab === "terminals" ? <Suspense fallback={<p role="status">加载终端…</p>}><DshTerminal sid={sid} api={api} /></Suspense> : ["settings", "presets", "bundles", "schedules"].includes(tab) ? <DshManagement key={tab} sid={sid} kind={tab as "settings" | "presets" | "bundles" | "schedules"} api={api} onCompose={onCompose} /> : <>
+      <header className="dsh-panel-header"><EngineIcon engine="dsh" size={23} /><strong>{child ? child.title : labels[tab]}</strong>
+        <DshToolsMenu selected={tab} onSelect={kind => { setTab(kind); setChild(null); setParent(sid); setTrail([]); setNotice(""); }} />
+        <PanelExpandButton label="DSH 会话工具" /><button className="iconbtn" aria-label="关闭会话工具" onClick={onClose}><Icon name="close" /></button>
+      </header>
+      {tab === "terminals" ? <Suspense fallback={<p role="status">加载终端…</p>}><DshTerminal sid={sid} api={api} /></Suspense> : tab === "settings" ? <DshSettings sid={sid} api={api} /> : ["presets", "bundles", "schedules"].includes(tab) ? <DshManagement key={tab} sid={sid} kind={tab as "presets" | "bundles" | "schedules"} api={api} onCompose={onCompose} /> : <>
       <div className="dsh-panel-actions">
         {(child || trail.length > 0) && <button onClick={() => {
           if (child) { setChild(null); if (tab === "conversation") setTab("subagents"); }

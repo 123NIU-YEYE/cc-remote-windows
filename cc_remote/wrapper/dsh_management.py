@@ -10,6 +10,55 @@ READS = {"workflows", "trajectory", "schedules", "schedule_history", "settings",
 SETTINGS = {"subagent", "agent-loop", "loop", "tool-bash", "shell", "web-search", "agent-preset-registry"}
 
 
+def localized(value):
+    if isinstance(value, str):
+        return value[:4096]
+    if isinstance(value, dict):
+        return next((value[k][:4096] for k in ("zh-CN", "zh", "en", "en-US") if isinstance(value.get(k), str)), "")
+    return ""
+
+
+def bundle_item(row):
+    meta = row.get("meta") or {}
+    data = {k: row[k] for k in ("name", "version", "installed", "enabled", "removable", "optional", "availability", "readOnlyReason", "installTarget") if k in row}
+    available = row.get("availability") in {"installation", "profile"}
+    return DshItem(id=row["name"], title=localized(meta.get("title")) or row["name"],
+        detail=localized(meta.get("description")) or localized(row.get("description")),
+        state="enabled" if row.get("enabled") else "disabled" if available else "not-installed",
+        controllable=available and not row.get("readOnlyReason"), data=data)
+
+
+async def market_read(client, cmd, response):
+    try:
+        query = json.loads(cmd.query)
+    except (ValueError, TypeError):
+        raise DshError("invalid_control", "插件搜索请求无效。") from None
+    if not isinstance(query, dict) or query.get("market") is not True:
+        raise DshError("invalid_control", "插件搜索请求无效。")
+    text = query.get("text", "")
+    if not isinstance(text, str) or len(text) > 200:
+        raise DshError("invalid_control", "搜索词过长。")
+    indexes = await client.rpc("pluginMarket/listIndexes")
+    if not indexes:
+        raise DshError("market_unavailable", "DSH 尚未配置插件源，请在原生插件市场中配置。")
+    # Only the runtime's configured source, never an arbitrary browser URL.
+    page = await client.rpc("pluginMarket/search", {"url": indexes[0]["url"], "query": {
+        "text": text, "sort": {"kind": "relevance"}, "offset": cmd.before_seq or 0, "limit": 30}})
+    if response is not None:
+        response.next_seq = page.get("nextOffset")
+        response.has_more = response.next_seq is not None
+    items = []
+    for row in page["entries"][:30]:
+        version = next((v for v in row["versions"] if v["version"] == row.get("defaultVersion")), None)
+        state = row["installation"]["status"]
+        items.append(DshItem(id=row["name"], title=localized(row.get("title")) or row["name"],
+            detail=localized(row.get("description")), state=state,
+            data={"name": row["name"], "version": version["version"] if version else None,
+                  "installedVersion": row["installation"].get("installedVersion"),
+                  "installTarget": version["install"] if version and state == "not-installed" else None}))
+    return items
+
+
 def visible_settings(value):
     fields = []
     for row in value.get("namespaces", []):
@@ -22,8 +71,21 @@ def visible_settings(value):
         simple = {k: v for k, v in values.items() if k not in hidden and
                   (v is None or isinstance(v, (str, int, float, bool))) and
                   not any(word in k.lower() for word in ("secret", "token", "password", "credential", "api_key", "apikey"))}
+        schema = row.get("schema") or {}
+        refs = schema.get("refs", {})
+        properties = refs.get(str(schema.get("uid")), {}).get("dict", {})
+        if row["ns"] == "agent-preset-registry" and "selectedDefault" in properties:
+            simple.setdefault("selectedDefault", None)
+        constraints = {}
+        for key in simple:
+            field = refs.get(str(properties.get(key)), {})
+            meta = field.get("meta", {})
+            constraints[key] = {k: meta[k] for k in ("min", "max", "step") if type(meta.get(k)) in (int, float)}
+        data = {"revision": row["revision"], "values": simple}
+        if row.get("applies") == "live":
+            data.update(applies="live", constraints=constraints)
         fields.append(DshItem(id=row["ns"], title=row["ns"], state="settings",
-            controllable=bool(value.get("writable")), data={"revision": row["revision"], "values": simple}))
+            controllable=bool(value.get("writable")), data=data))
     return fields
 
 
@@ -37,14 +99,19 @@ async def read(runtime, cmd, response=None):
             detail=p.get("description") or "", state="failed" if p.get("broken") else "default" if p.get("isDefault") else "available")
             for p in roster.get("presets", [])[:128]]
     if cmd.kind == "bundles":
+        if cmd.query:
+            return await market_read(client, cmd, response)
         rows = await client.rpc("pluginManager/listBundles")
-        return [DshItem(id=r["name"], title=r.get("displayName") or r["name"], detail=str(r.get("description") or "")[:4096],
-            state="enabled" if r.get("enabled") else "disabled", controllable=bool(r.get("installed")),
-            data={k: r[k] for k in ("name", "version", "installed", "enabled", "removable") if k in r}) for r in rows[:128]]
+        return [bundle_item(r) for r in rows[:128]]
+    if cmd.kind == "schedules" and cmd.query == "sessions":
+        rows = await client.list_sessions()
+        return [DshItem(id=wire_session_id(r["sessionId"]), title=str(r.get("projections", {}).get("values", {}).get("title") or "未命名会话")[:2048],
+                       detail=r.get("cwd", "")) for r in rows if r.get("origin") != "subagent"
+                       and wire_session_id(r["sessionId"]) not in runtime.sidechats.check()][:256]
     if cmd.kind == "schedules":
         rows = await client.rpc("schedule/catalog")
         return [DshItem(id=r["id"], sid=wire_session_id(r["sessionId"]), title=r["title"], detail=r["prompt"][:65536],
-            state=r["status"], data={k: r[k] for k in ("id", "kind", "title", "prompt", "scheduledAt", "afterSeconds", "everySeconds", "time", "timeZone", "weekdays", "expression") if k in r}) for r in rows[:128]]
+            state=r["status"], data={k: r[k] for k in ("id", "kind", "title", "prompt", "scheduledAt", "afterSeconds", "everySeconds", "time", "timeZone", "weekdays", "expression") if k in r}) for r in rows[:128] if wire_session_id(r["sessionId"]) not in runtime.sidechats.check()]
     if cmd.kind == "schedule_history":
         value = await client.rpc("schedule/history", {"request": {"sessionId": native_session_id(cmd.target_sid or cmd.sid), "id": cmd.query, "limit": 30}})
         if "code" in value:
@@ -116,10 +183,28 @@ async def manage(runtime, cmd):
             raise DshError("invalid_control", "此设置不支持通过当前页面修改。")
         if any(isinstance(v, (dict, list)) for v in patch.values()):
             raise DshError("invalid_control", "设置值格式无效。")
-        await client.rpc("settings/update", {"ns": ns, "patch": patch, "expectedRevision": body["revision"]})
-        return "设置已保存，以 DSH 的原生生效范围为准。"
+        saved = await client.rpc("settings/update", {"ns": ns, "patch": patch, "expectedRevision": body["revision"]})
+        if not isinstance(saved, dict) or saved.get("ns") != ns or any(saved.get("value", {}).get(k) != v for k, v in patch.items()):
+            raise DshError("settings_unconfirmed", "设置的实际值与提交值不同，请刷新核实；修改不会自动重发。", outcome_unknown=True)
+        return "默认预设已保存，之后新建的会话使用此预设。" if action == "preset_default" else "设置已保存，DSH 已确认生效。"
+    if action == "schedule_create":
+        target = body.get("sid", cmd.sid)
+        native = native_session_id(target)
+        rows = await client.list_sessions()
+        if not any(r["sessionId"] == native and r.get("origin") != "subagent" for r in rows):
+            raise DshError("not_found", "请选择当前设备上的普通会话。")
+        if target in runtime.sidechats.check():
+            raise DshError("private_session", "请先将侧聊移至会话列表，再为它创建任务。")
+        request = body.get("request")
+        if not isinstance(request, dict):
+            raise DshError("invalid_control", "任务配置无效。")
+        await client.create_schedule(target, request)
+        return "定时任务已创建。"
     if action in {"schedule_update", "schedule_delete"}:
-        target = native_session_id(body.get("sid", cmd.sid))
+        target_sid = body.get("sid", cmd.sid)
+        if target_sid in runtime.sidechats.check():
+            raise DshError("private_session", "请先将侧聊移至会话列表，再管理它的任务。")
+        target = native_session_id(target_sid)
         rows = await client.rpc("schedule/catalog")
         row = next((r for r in rows if r["id"] == body.get("id") and r["sessionId"] == target), None)
         if not row:
@@ -138,10 +223,21 @@ async def manage(runtime, cmd):
         spec = body.get("spec")
         if not isinstance(spec, str) or not spec.strip() or len(spec) > 2048:
             raise DshError("invalid_control", "请输入插件包名或本机路径。")
-        inspected = await client.rpc("pluginManager/inspect", {"spec": spec})
+        options = {"requestId": cmd.cmd_id}
+        registry = body.get("registry")
+        if registry is not None:
+            # Preserve the native registry validation; never interpolate into a shell.
+            if not isinstance(registry, str) or len(registry) > 2048:
+                raise DshError("invalid_control", "插件源无效。")
+            options["registry"] = registry
+        inspected = await client.rpc("pluginManager/inspect", {"spec": spec,
+            **({"options": {"registry": registry}} if registry else {})})
         if inspected.get("status") != "accepted":
-            raise DshError("plugin_refused", "DSH 不接受这个插件来源，请检查包名或路径。")
-        value = await client.rpc("pluginManager/installBundle", {"spec": spec, "options": {"requestId": cmd.cmd_id}})
+            reasons = {"already-installed": "插件包已安装。此版本 DSH 不支持在运行中覆盖更新，请通过原生 CLI 更新。",
+                       "not-found": "未找到这个插件包，请检查包名或路径。", "not-a-bundle": "这个包不是 DSH 插件包。",
+                       "network": "无法连接插件源，请稍后重试。"}
+            raise DshError("plugin_refused", reasons.get(inspected.get("problem"), "DSH 不接受这个插件来源，请检查包名或路径。"))
+        value = await client.rpc("pluginManager/installBundle", {"spec": spec, "options": options})
     elif action in {"bundle_enable", "bundle_disable", "bundle_remove"}:
         name = body.get("name")
         if not isinstance(name, str) or len(name) > 256:

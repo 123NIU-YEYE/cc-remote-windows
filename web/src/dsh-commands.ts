@@ -11,7 +11,7 @@ export function dshCommandMatches(token: string, state?: Pick<DshState, "command
   const commands = state?.commands ?? [];
   const local = clientSlashesFor("dsh");
   const matches: Cmd[] = commands.filter(c => c.name.startsWith(token)
-    && !local.has(c.name)).map(c => ({
+    && c.name.toLowerCase() !== "btw" && !local.has(c.name)).map(c => ({
     slash: c.name, name: controls[c.name]?.name ?? c.name,
     ic: controls[c.name]?.ic ?? "term", ds: c.description,
   }));

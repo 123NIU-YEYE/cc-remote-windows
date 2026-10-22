@@ -6,6 +6,16 @@ import type { Turn } from "../src/reducer.ts";
 const harness = await createServer({ root: process.cwd(), appType: "custom",
   logLevel: "silent", server: { middlewareMode: true, watch: null } });
 try {
+  const { routeComposerInput, commandsFor } = await harness.ssrLoadModule("/src/data.ts");
+  const { dshCommandMatches } = await harness.ssrLoadModule("/src/dsh-commands.ts");
+  for (const input of ["/btw", "/btw question", " /BTW question "]) {
+    assert.equal(routeComposerInput(input, "dsh").kind, "blocked");
+    for (const engine of ["claude", "codex"]) {
+      assert.equal(routeComposerInput(input, engine).kind, "client");
+    }
+  }
+  assert.equal(commandsFor("dsh").some((command: { slash?: string }) => command.slash === "btw"), false);
+  assert.deepEqual(dshCommandMatches("btw", { commands: [{ name: "btw", description: "old command" }] }), []);
   const { initialState, createRuntime, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
   const { shortSessionId } = await harness.ssrLoadModule("/src/session-list.ts");
   assert.equal(shortSessionId("dsh", "session-c4edc56f-aea8-4b43-bda9-0eac124c5559"), "c4edc56f");

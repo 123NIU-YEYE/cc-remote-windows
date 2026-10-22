@@ -7,9 +7,14 @@ export type DshRead = (sid: string, kind: DshReadKind, options?: {
 }) => Promise<DshReadResult>;
 
 /** Request identity and session identity both bind every private response. */
-export type DshApiClient = Pick<DshApi, "read" | "act" | "goal" | "download" | "control">;
+export type DshApiClient = Pick<DshApi, "read" | "act" | "goal" | "download" | "control" | "watchTerminal">;
 export class DshApi {
   private pending = new Map<string, { sid: string; finish: (value?: Reply, error?: Error) => void }>();
+  private terminals = new Map<string, { sid: string; receive: (value: DshReadResult) => void; fail: () => void }>();
+  watchTerminal(sid: string, lease: string, receive: (value: DshReadResult) => void, fail: () => void) {
+    this.terminals.set(lease, { sid, receive, fail });
+    return () => { this.terminals.delete(lease); };
+  }
   private transport: () => RelayWs | null;
   constructor(transport: () => RelayWs | null) { this.transport = transport; }
 
@@ -60,6 +65,10 @@ export class DshApi {
   accept(event: ServerEvent): boolean {
     if (!["dsh_read_result", "dsh_command_result", "dsh_download_chunk", "error"].includes(event.type)
         || !("request_id" in event) || !event.request_id) return false;
+    const terminal = this.terminals.get(event.request_id);
+    if (terminal && event.sid === terminal.sid && event.type === "dsh_read_result" && event.kind === "terminal_output") {
+      terminal.receive(event); return true;
+    }
     const pending = this.pending.get(event.request_id);
     if (!pending || event.sid !== pending.sid) return false;
     if (event.type === "error") pending.finish(undefined, new Error(event.message));
@@ -68,6 +77,8 @@ export class DshApi {
   }
 
   reset() {
+    for (const terminal of [...this.terminals.values()]) terminal.fail();
+    this.terminals.clear();
     for (const pending of [...this.pending.values()]) pending.finish(undefined, new Error("连接或会话已切换；操作结果请刷新确认"));
   }
 }

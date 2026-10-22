@@ -4,7 +4,12 @@
 
 ## Unreleased
 
-- Add DSH 0.2.1-rc.2 on the current cc-remote UI, with a separate white/blue default palette. Wire protocol v80 requires Relay, Wrapper and Web to upgrade together. See [DSH integration](docs/dsh-integration.md).
+- Show the current DSH session mode beside the Code page title. Replace the unavailable official plugin-market search with an explanation while retaining local plugin management.
+- Stream DSH terminal output with bounded render acknowledgements, pipeline ordered input, and keep the final row visible when centering the panel. Use the shared terminal picker instead of a system dropdown.
+- Restore touch scrolling through DSH terminal history; incoming output preserves the reading position and swipes never send shell input.
+- Create native DSH schedules directly from a form. Keep the DSH side-chat implementation dormant until the official API supports session deletion: disable menu, shortcut and `/btw` entry points, block stale clients from creating forks, and preserve existing records. Claude/Codex side chats remain available.
+
+- Add DSH 0.2.1-rc.2 on the current cc-remote UI, with a separate white/blue default palette. Wire protocol v81 requires Relay, Wrapper and Web to upgrade together. See [DSH integration](docs/dsh-integration.md).
 - Reuse the background-task dock and process side panel for DSH, with nested child navigation, folded reasoning and native PTC tool hierarchy. History reads never activate an agent.
 - Preserve clickable native agent-return receipts for Claude, Codex and DSH. Show parent continuation only after actual parent activity resumes.
 - Add DSH workflow, trajectory, automation, preset, runtime settings, plugin package and native terminal panels. Closing a terminal view retains its process, and reconnect never resends keyboard input.

@@ -34,6 +34,7 @@ from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_ctx import ActiveTurnBinding, SessionContext
 from cc_remote.wrapper.dsh_features import DshFeatures
 from cc_remote.wrapper.dsh_changes import DshChanges
+from cc_remote.wrapper.dsh_sidechats import DshSidechats
 
 _COMMON = frozenset({
     "hello", "ping", "list_dir", "get_file_preview", "browse_files", "save_markdown",
@@ -120,6 +121,7 @@ class DshRuntime:
         self.builds: dict[str, int] = {}
         self.closed = False
         self.features = DshFeatures(self)
+        self.sidechats = DshSidechats(self)
         self.workspace_task: asyncio.Task | None = None
         self.workspace_ready = asyncio.Event()
         self.archived: set[str] = set()
@@ -172,6 +174,18 @@ class DshRuntime:
                 native_session_id(sid)
             except DshError as exc:
                 return await self.error(cmd, exc)
+        # Reject stale clients before connecting or creating a native fork.
+        # Keep private associations and the implementation for future support.
+        if cmd.type == "open_btw":
+            return await self.handle_open_btw(cmd)
+        owner = getattr(cmd, "owner_id", None) or getattr(cmd, "client_id", None)
+        for target in (sid, getattr(cmd, "target_sid", None)):
+            try:
+                private = self.sidechats.check().get(target)
+                if private and private["owner"] != owner:
+                    raise DshError("sidechat_owner", "这个侧聊属于其他用户。")
+            except DshError as exc:
+                return await self.error(cmd, exc)
         if cmd.type in {"get_file_preview", "browse_files"} and sid and sid not in self.machine.sessions:
             try:
                 await self.connection()
@@ -182,6 +196,12 @@ class DshRuntime:
                 await self.machine.transport.send(response)
                 return response
         if cmd.type in _COMMON:
+            if sid in self.sidechats.check() and sid not in self.machine.sessions:
+                try:
+                    await self.connection()
+                    await self.ctx(sid)
+                except DshError as exc:
+                    return await self.error(cmd, exc)
             return UNHANDLED_COMMAND
         try:
             await self.connection()
@@ -194,6 +214,8 @@ class DshRuntime:
 
     async def error(self, cmd, exc):
         sid = getattr(cmd, "session_id", None) or getattr(cmd, "sid", None)
+        if cmd.type == "open_btw":
+            return await self.machine._send_btw_error(cmd, "dsh_" + exc.code, str(exc))
         if (cmd.type == "act_dsh_goal" or (cmd.type == "set_dsh_control" and cmd.kind == "command")) and cmd.cmd_id:
             msg = DshCommandResult(sid=sid, request_id=cmd.cmd_id,
                 status="unknown" if exc.outcome_unknown else "error", text=str(exc), to=cmd.client_id)
@@ -257,7 +279,7 @@ class DshRuntime:
         # Respect the shared pool bound; a cold history read never evicts work.
         if len(self.machine.sessions) >= self.machine.cfg.max_concurrent_sessions:
             candidates = [c for c in self.machine.sessions.values()
-                          if c.engine == "dsh" and c.state == "idle" and not c.queued_queries
+                          if c.engine == "dsh" and not c.btw and c.state == "idle" and not c.queued_queries
                           and not c.pending_asks and not c.query_lock.locked()
                           and not self.machine._query_queue_task_active(c)
                           and not self.machine._command_scheduler.owns_target(c.key)
@@ -280,7 +302,8 @@ class DshRuntime:
         ctx = SessionContext(session_id=sid, key=sid, sdk=handle, cwd=cwd
                              , engine="dsh", buffer=RingBuffer(
                                  self.machine.cfg.ring_max_events, self.machine.cfg.ring_max_bytes))
-        self._project(snapshot, handle.projection)
+        self.sidechats.bind(ctx)
+        self._project(self.sidechats.filter_snapshot(sid, snapshot), handle.projection)
         ctx.state = "running" if handle.projection.running else "idle"
         self.machine.sessions[sid] = ctx
         handle.model, handle.effort = handle.projection.model, handle.projection.effort
@@ -352,6 +375,7 @@ class DshRuntime:
                 raise DshError("history_expired", "历史分页已过期，请刷新会话。")
         snapshot = await self.client.history_snapshot(sid, before_seq=before_seq,
                                                        max_messages=min(100, (cmd.limit or 4)*3))
+        snapshot = self.sidechats.filter_snapshot(sid, snapshot)
         projection, frames = self._project(snapshot)
         changes = {}
         for owner, reference in projection.change_refs.items():
@@ -388,6 +412,7 @@ class DshRuntime:
             sid=sid, session_id=sid, revision=self.machine.instance_id,
             generation=self.machine.instance_id, build_seq=self.builds[sid],
             live_seq=live_seq, to=cmd.client_id,
+            owner_id=ctx.owner_client_id if ctx and ctx.btw else None,
             detail=cmd.detail, events=events if cmd.detail == "full" else [],
             turns=rows if cmd.detail == "summary" else [],
             before=cmd.before, has_more=snapshot["hasMore"],
@@ -566,7 +591,7 @@ class DshRuntime:
             # The native catalog also contains delegated agents. They belong
             # in the parent's subagent panel; ordinary user forks stay here.
             # Keep DshClient.list_sessions unfiltered for descendant controls.
-            if item.get("origin") == "subagent":
+            if item.get("origin") == "subagent" or wire_session_id(item["sessionId"]) in self.sidechats.check():
                 continue
             sid = wire_session_id(item["sessionId"])
             values = item.get("projections", {}).get("values", {})
@@ -940,6 +965,20 @@ class DshRuntime:
         except (ValueError, AttributeError):
             raise DshError("invalid_turn", "DSH 分支点无效，请刷新会话。") from None
 
+    async def handle_open_btw(self, cmd):
+        return await self.error(cmd, DshError(
+            "sidechat_unavailable", "DSH 侧聊暂未开放，等待官方提供会话删除能力后再接入。"))
+
+    async def handle_sync_btw(self, cmd):
+        return await self.sidechats.sync(cmd)
+
+    async def handle_close_btw(self, cmd):
+        return await self.sidechats.release(cmd)
+
+    async def handle_set_effort(self, cmd):
+        ctx = await self.ctx(cmd.sid)
+        return await self.select_model(ctx, ctx.sdk.model or self.default_model, cmd.effort)
+
     async def handle_fork_session(self, cmd):
         native = native_session_id(cmd.session_id)
         request = {"sessionId": native}
@@ -1088,7 +1127,7 @@ class DshRuntime:
                     kind = frame.get("type")
                     if kind == "snapshot":
                         snapshot = await self.client.history_snapshot(ctx.key, through_seq=frame["cursor"], max_messages=100)
-                        projection, _ = self._project(snapshot)
+                        projection, _ = self._project(self.sidechats.filter_snapshot(ctx.key, snapshot))
                         handle.projection = projection
                         ctx.state = "running" if projection.running else "idle"
                         handle.connected = True

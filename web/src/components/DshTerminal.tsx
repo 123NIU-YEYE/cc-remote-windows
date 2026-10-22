@@ -1,9 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import type { DshApiClient } from "../dsh-api";
 import type { DshItem } from "../protocol";
 import { uuid } from "../util";
+import { Icon } from "../icons";
+import { ChoicePicker } from "./ChoicePicker";
+import { CenteredSheet } from "./CenteredSheet";
+import { attachTerminalTouchScroll } from "../dsh-terminal-touch";
 import "@xterm/xterm/css/xterm.css";
 
 export default function DshTerminal({ sid, api }: { sid: string; api: DshApiClient }) {
@@ -13,13 +17,16 @@ export default function DshTerminal({ sid, api }: { sid: string; api: DshApiClie
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [connected, setConnected] = useState(false);
-  const [stop, setStop] = useState(false);
+  const [stop, setStop] = useState("");
+  const [exited, setExited] = useState(false);
+  const interrupt = useRef<(() => void) | null>(null);
+  const suspend = useRef<(() => void) | null>(null);
   const host = useRef<HTMLDivElement>(null);
-  const reload = async () => {
+  const reload = useCallback(async () => {
     const result = await api.read(sid, "terminals");
     if (result.error) throw new Error(result.error);
     setItems(result.items);
-  };
+  }, [api, sid]);
   useEffect(() => {
     const abort = new AbortController();
     api.read(sid, "terminals", { signal: abort.signal }).then(result => {
@@ -40,50 +47,65 @@ export default function DshTerminal({ sid, api }: { sid: string; api: DshApiClie
     finally { setBusy(false); }
   };
   const close = async () => {
+    const id = stop;
+    if (!id || busy) return;
+    // Freeze the attachment before sending close: its final stream may end
+    // before the command receipt, and that is not a connection failure.
+    suspend.current?.();
     setBusy(true); setError("");
-    try { await control({ action: "close", id: target }); setTarget(""); setStop(false); await reload(); }
+    try { await control({ action: "close", id }); setTarget(""); setStop(""); await reload(); }
     catch (error) { setError((error as Error).message); }
     finally { setBusy(false); }
   };
   useEffect(() => {
     if (!target || !host.current) return;
-    let gone = false, lease = "", timer: ReturnType<typeof setTimeout>;
-    let cursor = 0, pendingBytes = 0, writable = false;
-    let chain = Promise.resolve();
-    const abort = new AbortController();
+    let gone = false, writable = false, cursor = 0, pendingBytes = 0, inFlight = 0;
+    const lease = uuid(), encoder = new TextEncoder();
+    const queue: { value: Record<string, unknown>; bytes: number }[] = [];
+    let rendering = Promise.resolve();
     const terminal = new Terminal({ cursorBlink: true, fontSize: 13, scrollback: 1000,
       theme: { background: "#10151e", foreground: "#e5eaf3", cursor: "#88afff", selectionBackground: "#496ba86b" } });
     const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(host.current);
-    setConnected(false); setError(""); setStop(false);
+    const detachTouchScroll = attachTerminalTouchScroll(host.current, terminal);
+    setConnected(false); setExited(false); setError(""); setStop("");
+    const freeze = () => { gone = true; writable = false; queue.length = 0; setConnected(false); };
+    suspend.current = freeze;
     const fail = (error: Error) => {
       if (gone) return;
-      writable = false; setConnected(false); setError(`${error.message} 输入不会自动重发。`);
-      clearTimeout(timer); abort.abort();
+      freeze(); setError(`${error.message} 输入不会自动重发。`);
+    };
+    const controlInput = async (body: Record<string, unknown>) => {
+      const result = await api.control(sid, "terminal", JSON.stringify({ ...body, lease }));
+      if (result.status !== "success") throw new Error(result.text || "终端操作结果未确认");
+    };
+    // A bounded pipeline keeps keystrokes ordered without a WAN round trip
+    // between each key. Inputs never enter the reconnect outbox.
+    const flush = () => {
+      while (!gone && writable && inFlight < 8 && queue.length) {
+        const { value, bytes } = queue.shift()!;
+        inFlight++;
+        void controlInput({ action: "input", value }).catch(fail).finally(() => {
+          inFlight--; pendingBytes -= bytes; flush();
+        });
+      }
     };
     const input = (value: Record<string, unknown>) => {
-      if (gone || !lease || !writable) return;
-      const bytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+      if (gone || !writable) return;
+      const bytes = encoder.encode(JSON.stringify(value)).byteLength;
       if (pendingBytes + bytes > 65536) { fail(new Error("待发送输入过多，请重新连接")); return; }
-      pendingBytes += bytes;
-      chain = chain.then(async () => {
-        if (gone || !writable) return;
-        try {
-          const result = await api.control(sid, "terminal", JSON.stringify({ action: "input", lease, value }));
-          if (result.status !== "success") throw new Error(result.text || "输入结果未确认");
-        } finally { pendingBytes -= bytes; }
-      }).catch(fail);
+      pendingBytes += bytes; queue.push({ value, bytes }); flush();
     };
     const onData = terminal.onData(data => {
-      // Bound each UTF-8 frame without splitting a Unicode scalar.
       let part = "", size = 0;
       for (const char of data) {
-        const n = new TextEncoder().encode(char).length;
+        const n = encoder.encode(char).length;
         if (size + n > 2048) { input({ type: "write", data: part }); part = ""; size = 0; }
         part += char; size += n;
       }
       if (part) input({ type: "write", data: part });
     });
-    let columns = 0, rows = 0;
+    interrupt.current = () => input({ type: "write", data: "\u0003" });
+    let columns = 0, rows = 0, resizeFrame = 0;
     const resize = () => {
       if (gone || !host.current?.clientWidth || !host.current.clientHeight) return;
       fit.fit();
@@ -92,47 +114,77 @@ export default function DshTerminal({ sid, api }: { sid: string; api: DshApiClie
         input({ type: "resize", cols: columns, rows });
       }
     };
-    let resizeFrame = 0;
-    const observer = new ResizeObserver(() => { cancelAnimationFrame(resizeFrame); resizeFrame = requestAnimationFrame(resize); }); observer.observe(host.current);
+    const observer = new ResizeObserver(() => { cancelAnimationFrame(resizeFrame); resizeFrame = requestAnimationFrame(resize); });
+    observer.observe(host.current);
     const write = (text: string) => new Promise<void>(resolve => terminal.write(text, resolve));
-    const read = async () => {
-      if (gone) return;
-      try {
-        const result = await api.read(sid, "terminal_output", { query: lease, before_seq: cursor, signal: abort.signal });
+    const unwatch = api.watchTerminal(sid, lease, result => {
+      rendering = rendering.then(async () => {
         if (gone) return;
         if (result.error) throw new Error(result.error);
+        let text = "", becameWritable = false;
         for (const item of result.items) {
           const frame = item.data ?? {};
-          if (frame.type === "snapshot") { terminal.reset(); await write(String(frame.screen ?? "")); }
-          else if (frame.type === "output") await write(String(frame.data ?? ""));
-          if ("writable" in frame) { writable = frame.writable === true; setConnected(writable); }
+          if (frame.type === "snapshot") { terminal.reset(); text += String(frame.screen ?? ""); }
+          else if (frame.type === "output") text += String(frame.data ?? "");
+          if ("writable" in frame) {
+            becameWritable ||= !writable && frame.writable === true;
+            writable = frame.writable === true; setConnected(writable);
+          }
+          const state = (frame.info as { state?: string } | undefined)?.state;
+          if (state === "exited" || state === "failed") {
+            writable = false; setConnected(false); setExited(true);
+            if (state === "failed") setError("终端运行失败，可刷新列表或新建终端。");
+            void reload().catch(() => {});
+          }
         }
+        if (text) await write(text);
         if (gone) return;
         cursor = result.next_seq ?? cursor;
-        resize();
-        timer = setTimeout(read, result.items.length ? 40 : 200);
-      } catch (error) { if (!gone && !abort.signal.aborted) fail(error as Error); }
-    };
-    void api.control(sid, "terminal", JSON.stringify({ action: "attach", id: target })).then(result => {
+        // Acknowledge parsed output, not merely received network bytes.
+        void controlInput({ action: "ack", cursor }).catch(fail);
+        if (becameWritable) resize();
+      }).catch(fail);
+    }, () => fail(new Error("终端连接已断开，请重新连接")));
+    const heartbeat = setInterval(() => {
+      if (!gone) void controlInput({ action: "ack", cursor }).catch(fail);
+    }, 10000);
+    void api.control(sid, "terminal", JSON.stringify({ action: "attach", id: target, lease, stream: true })).then(result => {
       if (result.status !== "success") throw new Error(result.text || "终端连接未确认");
-      lease = result.request_id;
-      if (gone) { void api.control(sid, "terminal", JSON.stringify({ action: "detach", lease })).catch(() => {}); return; }
-      terminal.focus(); void read();
-    }).catch(error => { if (!gone) fail(error); });
+      if (gone) { void controlInput({ action: "detach" }).catch(() => {}); return; }
+      terminal.focus();
+    }).catch(fail);
     return () => {
-      gone = true; writable = false; clearTimeout(timer); abort.abort();
-      observer.disconnect(); cancelAnimationFrame(resizeFrame); onData.dispose(); terminal.dispose();
-      if (lease) void api.control(sid, "terminal", JSON.stringify({ action: "detach", lease })).catch(() => {});
+      freeze(); unwatch(); clearInterval(heartbeat);
+      if (suspend.current === freeze) { suspend.current = null; interrupt.current = null; }
+      observer.disconnect(); cancelAnimationFrame(resizeFrame); detachTouchScroll(); onData.dispose(); terminal.dispose();
+      void controlInput({ action: "detach" }).catch(() => {});
     };
-  }, [sid, api, target, revision]);
+  }, [sid, api, target, revision, reload]);
+  const selected = items.find(item => item.id === target);
   return <div className="dsh-terminal">
-    <div className="dsh-panel-actions"><button disabled={busy} onClick={() => void create()}>新建终端</button><button disabled={busy} onClick={() => void reload().catch(error => setError(error.message))}>刷新列表</button>
-      {target && <><button onClick={() => setRevision(value => value + 1)}>重新连接</button><button disabled={busy} onClick={() => setStop(true)}>停止终端</button></>}
+    <div className="dsh-terminal-toolbar">
+      <ChoicePicker label="选择终端" value={target} disabled={busy || !items.length} className="dsh-terminal-picker"
+        options={items.map(item => ({ value: item.id, label: item.title, icon: "bash",
+          description: `${item.state === "running" ? "运行中" : "已退出"} · ${item.detail}` }))}
+        onChange={value => { setStop(""); setTarget(value); }}>
+        <i data-connected={connected} /><span>{selected?.title ?? "选择终端"}</span>
+      </ChoicePicker>
+      <span className="dsh-terminal-cwd" title={selected?.detail}>{selected?.detail}</span>
+      <button className="iconbtn" aria-label="刷新列表" disabled={busy} onClick={() => void reload().catch(error => setError(error.message))}><Icon name="refresh" size={16} /></button>
+      <button aria-label="新建终端" disabled={busy} onClick={() => void create()}><Icon name="plus" size={17} />新建</button>
     </div>
-    <nav aria-label="终端列表">{items.map(item => <button key={item.id} aria-current={target === item.id ? "page" : undefined} onClick={() => setTarget(item.id)}>{item.title} · {item.state === "running" ? "运行中" : "已退出"}</button>)}</nav>
     {error && <p role="alert" className="dsh-feature-error">{error}</p>}
-    {stop && <div className="dsh-inline-confirm"><p>停止这个终端及其中的命令？收起面板会保留进程。</p><button onClick={() => setStop(false)}>取消</button><button disabled={busy} onClick={() => void close()}>确认停止</button></div>}
-    {target ? <><div className="dsh-terminal-status">{connected ? "已连接" : "只读或未连接"} · 收起面板会保留终端</div><div className="dsh-terminal-screen" ref={host} /></>
-      : <p className="dsh-feature-empty">选择终端或新建一个终端。<br />这里的命令由你直接运行。</p>}
+    {target ? <div className="dsh-terminal-screen"><div className="dsh-terminal-viewport" ref={host} /></div>
+      : <div className="dsh-terminal-empty"><Icon name="bash" size={32} /><p>选择终端或新建一个终端</p><small>这里的命令由你直接运行。</small></div>}
+    {target && <div className="dsh-terminal-actions">
+      <button aria-label="中断命令 Ctrl+C" disabled={busy || !connected} onClick={() => interrupt.current?.()}><Icon name="stop" size={15} />Ctrl+C 中断</button>
+      <button disabled={busy || exited} onClick={() => setRevision(value => value + 1)}><Icon name="refresh" size={15} />重新连接</button>
+      <button className="dsh-terminal-close" disabled={busy || exited} onClick={() => setStop(target)}><Icon name="trash" size={15} />关闭终端</button>
+    </div>}
+    <div className="dsh-terminal-status"><span>{target ? exited ? "命令行已退出" : connected ? "已连接" : "只读或未连接" : ""}</span><span>收起面板保留终端</span></div>
+    {!!stop && <CenteredSheet open label="关闭终端？" maxWidth={360} maxHeight={240} minimumHeight={180} className="dsh-terminal-confirm" onClose={() => { if (!busy) setStop(""); }}>
+      <p>结束 {items.find(item => item.id === stop)?.title ?? "这个终端"} 及其中运行的命令。</p>
+      <div><button disabled={busy} onClick={() => setStop("")}>取消</button><button className="danger" disabled={busy} onClick={() => void close()}>{busy ? "正在关闭…" : "确认关闭"}</button></div>
+    </CenteredSheet>}
   </div>;
 }

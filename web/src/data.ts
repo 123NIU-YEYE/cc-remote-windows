@@ -391,6 +391,8 @@ export const commandsFor = (engine?: string, surface: CommandSurface = "code"): 
 );
 export const clientSlashesFor = (engine?: string): Set<string> => (engine === "dsh" ? new Set(["model", "context", "diff", "preview", "open", "skills"]) : engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
 
+export const DSH_SIDECHAT_UNAVAILABLE = "DSH 侧聊暂未开放，等待官方提供会话删除能力后再接入。";
+
 /** A built-in command intentionally available on Code but absent from Work.
  * Unknown slashes return false so user-installed Claude skills remain usable. */
 export function isKnownCodeOnlySlash(slash: string, engine?: string): boolean {
@@ -473,6 +475,9 @@ export function routeComposerInput(
   const raw = input.trim();
   if (raw === "/") return { kind: "empty" };
   const parsed = parseSlash(raw);
+  if (engine === "dsh" && parsed?.slash === "btw") {
+    return { kind: "blocked", message: DSH_SIDECHAT_UNAVAILABLE };
+  }
   if (surface === "work" && parsed && isKnownCodeOnlySlash(parsed.slash, engine)) {
     return { kind: "blocked", message: `/${parsed.slash} 是 Code 指令，请切换到 Code 使用` };
   }
