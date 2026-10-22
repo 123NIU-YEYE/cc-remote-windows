@@ -834,12 +834,13 @@ export default function App() {
   const shortcutRef = useRef<{
     artifact: typeof state.artifact;
     btwSid: string | null;
+    btwAvailable: boolean;
     rightView: RightPanelView;
     getDiff: (file: string) => void;
     openBtw: () => void;
     collapseBtw: () => void;
     toggleCenteredBtw: () => void;
-  }>({ artifact: null, btwSid: null, rightView: "diff",
+  }>({ artifact: null, btwSid: null, btwAvailable: false, rightView: "diff",
     getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {},
     toggleCenteredBtw: () => {} });
 
@@ -935,7 +936,9 @@ export default function App() {
   const focusedSid = state.focusedSid;
   const visibleParentSid = state.newChat || previousMachineRef.current !== machineId
     ? null : focusedSid;
-  const btwPanelKey = visibleParentSid
+  // DSH forks persist natively and cannot yet be deleted. Keep the side-chat
+  // implementation dormant, including any retained panel visibility.
+  const btwPanelKey = visibleParentSid && engine !== "dsh"
     ? btwPanelScopeKey(machineId, space, engine, visibleParentSid) : null;
   const btwPanelVisible = !!btwPanelKey && btwPanelScopes.includes(btwPanelKey);
   const btwPanelVisibleRef = useRef(btwPanelVisible);
@@ -1289,7 +1292,7 @@ export default function App() {
   capabilitiesScopeRef.current = capabilitiesOpen ? capabilitiesScope : null;
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
-    (activeBtw?.engine === "codex" ? "codex" : "claude"),
+    (activeBtw?.engine ?? focusedEngine),
     `btw:${activeBtwSid ?? visibleParentSid ?? "opening"}`,
   );
   const inlineImageAssets = focusedSid
@@ -2774,6 +2777,8 @@ export default function App() {
             }
           } else if (msg.type === "replay_start" && msg.sid
               && !msg.sid.startsWith("btw-")
+              && !Object.values(stateRef.current.btwByParentSid).some((group) =>
+                group.chats.some((chat) => chat.sid === msg.sid))
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
             clearHistoryDetailRequests();
@@ -4299,6 +4304,7 @@ export default function App() {
         e.preventDefault();
         setSidebarOpen((v) => !v);
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
+        if (!shortcutRef.current.btwAvailable) return;
         e.preventDefault();
         const latest = shortcutRef.current;
         if (document.querySelector('.btw-panel[aria-modal="true"]')
@@ -4307,6 +4313,7 @@ export default function App() {
         }
         else latest.openBtw();
       } else if (k === "e" && e.shiftKey) {
+        if (!shortcutRef.current.btwAvailable) return;
         e.preventDefault();
         shortcutRef.current.toggleCenteredBtw();
       }
@@ -5522,7 +5529,7 @@ export default function App() {
   // concern; only closeBtw sends the destructive native-fork teardown.
   const createBtw = () => {
     const parentSid = visibleParentSid;
-    if (!parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
+    if (!btwPanelKey || !parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
     const requestId = wsRef.current?.sendOpenBtw(parentSid) ?? null;
     if (!requestId) {
       setBtwOpeningFor(parentSid, false);
@@ -5559,6 +5566,7 @@ export default function App() {
     if (!btwPanelKey || !confirmArtifactDiscard()) return;
     setCenteredBtw(false);
     setSessionArtifacts(null);
+    setDshPanel(null);
     closeViewer();
     setAgentPanel(null);
     setFileBrowser(null);
@@ -5663,15 +5671,14 @@ export default function App() {
       || !!target.acceptancePending || !!target.pendingSend
       || target.queue.length > 0
     );
-    if (hasActiveWork && !window.confirm(
+    if (activeBtwGroup?.chats.find(chat => chat.sid === btwSid)?.engine !== "dsh" && hasActiveWork && !window.confirm(
       "这个侧边对话仍在工作或有排队消息，确定关闭并丢弃吗？")) return;
     if (!wsRef.current?.sendCloseBtw(btwSid)) return;
     const tracked = activeBtwByParentRef.current.get(parentSid);
     if (tracked?.sid === btwSid) activeBtwByParentRef.current.delete(parentSid);
     btwDraftsRef.current.delete(composerDraftKey(
       machineId, space,
-      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine
-        === "codex" ? "codex" : "claude"),
+      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine ?? focusedEngine),
       `btw:${btwSid}`,
     ));
     setBtwSendModeBySid((current) => {
@@ -5696,7 +5703,7 @@ export default function App() {
     }
   };
   shortcutRef.current = {
-    artifact: state.artifact, btwSid: activeBtwSid, rightView,
+    artifact: state.artifact, btwSid: activeBtwSid, btwAvailable: !!btwPanelKey, rightView,
     getDiff, openBtw, collapseBtw, toggleCenteredBtw,
   };
   const logout = async () => {
@@ -5800,6 +5807,11 @@ export default function App() {
   ) ?? rt.state;
   const dshConnectionError = focusedEngine === "dsh" && !state.newChat
     && rt.dsh?.connected === false ? rt.dsh.error ?? null : null;
+  const focusedDshPresetId = space === "code" && focusedEngine === "dsh" && !state.newChat
+    ? rt.dsh?.agent_preset : null;
+  const focusedDshPresetName = focusedDshPresetId
+    ? state.dshPresets?.find(preset => preset.id === focusedDshPresetId)?.name ?? focusedDshPresetId
+    : null;
   // Fail closed when a migrated cache contains colliding display aliases. A
   // session-level running bit alone must never animate the wrong historical
   // row, another account, or a read-only browse projection.
@@ -5937,13 +5949,17 @@ export default function App() {
         onClose={closeSessionMigration}
       /></Suspense>}
       <section className={`pane ${space}-pane`}>
-        <header className={`c-head ${space}-head`}>
+        <header className={`c-head ${space}-head${focusedDshPresetName ? " has-dsh-mode" : ""}`}>
           <div className="titlewrap">
             <div className="ttl">
               <SidebarState controller={sidebar}>{sidebarOpen => <SidebarToggle className="surface-head-title" open={sidebarOpen} onOpenChange={setSidebarOpen}>
                 <span className="surface-head-mark"><Icon name={space === "work" ? "work" : "code"} size={18} /></span>
                 <span>{space === "work" ? "Work" : "Code"}</span>
               </SidebarToggle>}</SidebarState>
+              {focusedDshPresetName && <span className="dsh-session-mode"
+                title={focusedDshPresetName} aria-label={`当前会话模式：${focusedDshPresetName}`}>
+                {focusedDshPresetName}
+              </span>}
               {focusedWorkProfile && (
                 <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
                   title={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}
@@ -5986,7 +6002,7 @@ export default function App() {
             onNotificationMode={updateNotificationMode}
             onOpenDshTools={engine === "dsh" && focusedSid ? () => setDshPanel({ sid: focusedSid, scope: activeScopeKey, selection: { kind: "subagents" } }) : undefined}
             onOpenUsageActivity={openUsageActivity}
-            onOpenBtw={visibleParentSid && !archivedBrowse ? () => openBtw() : undefined}
+            onOpenBtw={btwPanelKey && !archivedBrowse ? () => openBtw() : undefined}
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
             onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
@@ -6368,7 +6384,7 @@ export default function App() {
             codexProfileId: focusedCodexProfileId ?? newChatCodexProfileId,
           })}
           onContext={requestContext}
-          onOpenBtw={openBtw}
+          onOpenBtw={btwPanelKey ? openBtw : undefined}
           onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
           onOpenFiles={openFiles}

@@ -704,6 +704,8 @@ export function Composer(p: Props) {
 
   const send = (value = taRef.current?.value ?? input) => {
     if (locked || importing) return;
+    const route = routeComposerInput(value, p.engine, p.surface);
+    if (route.kind === "blocked") { flash(route.message); return; }
     const raw = value.trim();
     const parsed = parseSlash(raw);
     const nativeSkill = parsed && p.engine === "dsh" && p.skills?.some(skill => skill.name === parsed.slash)
@@ -724,9 +726,7 @@ export function Composer(p: Props) {
       if (requestId) dshPendingRef.current = { id: requestId, scope: p.draftKey, draft };
       return;
     }
-    const route = routeComposerInput(value, p.engine, p.surface);
     if (route.kind === "empty") return;
-    if (route.kind === "blocked") { flash(route.message); return; }
     if (route.kind === "client") { runClientSlash(route.slash, route.args); return; }
     submitPrompt(route.prompt);
   };

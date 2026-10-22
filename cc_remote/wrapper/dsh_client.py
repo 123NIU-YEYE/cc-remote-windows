@@ -37,6 +37,7 @@ log = logger("dsh_client")
 _SID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,123}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 READ_ENDPOINTS = frozenset({
+    "pluginMarket/listIndexes", "pluginMarket/search",
     "session/list", "session/search", "session/modelCatalog", "session/page",
     "session/projections", "session/attachment", "agentPresets/list",
     "commands/list", "skills/list", "permissionPresets/catalog", "goals/get",
@@ -511,6 +512,24 @@ class DshClient:
             return value
         except (httpx.HTTPError, ValueError):
             raise DshError("read_failed", "DSH 原生数据读取失败。") from None
+
+    async def create_schedule(self, sid, request):
+        peer = await self._connection()
+        try:
+            response = await peer.http.post("/api/cc-remote.schedule", json={
+                "sessionId": native_session_id(sid), "request": request})
+            if response.status_code == 404:
+                raise DshError("schedule_bridge_missing", "请更新 DSH 的 cc-remote 适配插件后再创建任务。")
+            if response.status_code in {400, 413, 422}:
+                raise DshError("schedule_invalid", "任务时间或内容无效，请检查执行时间和时区。")
+            if response.status_code != 200 or len(response.content) > 4096:
+                raise ValueError
+            value = response.json()
+            if not isinstance(value, dict) or not isinstance(value.get("id"), str):
+                raise ValueError
+            return value
+        except (httpx.HTTPError, ValueError):
+            raise DshError("schedule_unknown", "创建结果未确认，请刷新任务列表核实；任务不会自动重建。", outcome_unknown=True) from None
 
     async def workspace_changes(self, sid, seq, index=None):
         if type(seq) is not int or not 0 <= seq <= 9007199254740991 or (index is not None and (type(index) is not int or not 0 <= index < 4096)):

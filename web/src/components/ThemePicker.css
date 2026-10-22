@@ -139,3 +139,24 @@
   .appearance-miniature { width:100%; max-width:64px; height:48px; }
   .theme-picker-footer > span { font-size:10px; }
 }
+
+/* DSH uses the compact, flat editor; other engines keep their existing layout. */
+.theme-picker-dsh .appearance-mode-section { border:0; border-radius:0; padding:10px 0; }
+.theme-picker-dsh .appearance-fields { border:0; border-radius:0; padding:0; }
+.theme-picker-dsh .appearance-row { min-height:59px; }
+.theme-picker-dsh .appearance-fields { border-top:1px solid var(--border); }
+.theme-picker-dsh .appearance-color { border-color:transparent; border-radius:8px; background:transparent; }
+.theme-picker-dsh .appearance-select-trigger { border-radius:9px; }
+.theme-picker-dsh .appearance-mode-help { margin:12px 0 20px; }
+.theme-picker-dsh .appearance-help { margin:14px 0 0; font-size:11px; }
+.theme-picker-dsh .appearance-done { border-radius:10px; }
+.theme-picker-dsh .theme-picker-intro { padding-bottom:16px; }
+.theme-picker-dsh .theme-picker-scroll { padding-bottom:16px; }
+@media(max-width:600px) {
+  .theme-picker-dsh .appearance-mode-section { gap:12px; }
+  .theme-picker-dsh .appearance-row { min-height:56px; }
+  .theme-picker-dsh .appearance-miniature { width:68px; }
+}
+@media(max-width:430px) {
+  .theme-picker-dsh .appearance-miniature { width:100%; }
+}

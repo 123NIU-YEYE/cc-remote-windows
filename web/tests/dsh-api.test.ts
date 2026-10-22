@@ -26,6 +26,15 @@ try {
   };
   let current = transport;
   const api = new DshApi(() => current);
+  let terminalFrames = 0, terminalLost = 0;
+  const unwatch = api.watchTerminal("dsh@a", "lease", () => terminalFrames++, () => terminalLost++);
+  assert.equal(api.accept({ type: "dsh_read_result", sid: "dsh@b", request_id: "lease", kind: "terminal_output", items: [] }), false);
+  assert.equal(api.accept({ type: "dsh_read_result", sid: "dsh@a", request_id: "lease", kind: "terminal_output", items: [] }), true);
+  assert.equal(terminalFrames, 1);
+  api.reset();
+  assert.equal(terminalLost, 1);
+  assert.equal(api.accept({ type: "dsh_read_result", sid: "dsh@a", request_id: "lease", kind: "terminal_output", items: [] }), false);
+  unwatch();
   const waiting = api.read("dsh@a", "search", { query: "needle" });
   const request = calls.at(-1)!;
   assert.equal(api.accept({ type: "dsh_read_result", sid: "dsh@b", request_id: request.id, items: [] }), false);

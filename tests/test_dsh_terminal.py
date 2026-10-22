@@ -60,3 +60,93 @@ async def test_terminal_detach_does_not_create_or_close_process_and_rejects_stal
     result = await machine._handle(cmd("input", lease="expired", value={"type": "write", "data": "no"}))
     assert result.status == "error" and not machine.sessions
     await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["exited", "failed"])
+async def test_terminal_exit_drains_final_output_before_completed_stream_and_close(state):
+    machine, _, runtime, client = setup_runtime()
+    frames = asyncio.Queue()
+    async def stream(endpoint, args, *, on_open):
+        on_open(lambda _: None)
+        yield {"type": "snapshot", "screen": "ready", "writable": True, "info": {"state": "running"}}
+        while (frame := await frames.get()) is not None:
+            yield frame
+    async def rpc(endpoint, args=None):
+        if endpoint == "terminal/close":
+            await frames.put({"type": "output", "data": "last output"})
+            await frames.put({"type": "state", "writable": False, "info": {"state": state, "exitCode": 0}})
+            await frames.put(None)
+            await asyncio.sleep(0)
+    client.rpc, client.stream = rpc, stream
+    assert (await machine._handle(cmd("attach", id="pty", key="lease"))).status == "success"
+    assert (await machine._handle(cmd("close", id="pty"))).status == "success"
+    read = ReadDsh(sid="dsh@root", kind="terminal_output", query="lease", client_id="browser", cmd_id="read")
+    page = await machine._handle(read)
+    assert not page.error
+    assert page.items[-2].data["data"] == "last output"
+    assert page.items[-1].data["info"]["state"] == state
+    read.before_seq = page.next_seq
+    assert not (await machine._handle(read)).error
+    assert (await machine._handle(cmd("input", lease="lease", value={"type": "write", "data": "no"}))).status == "error"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_push_without_polling_and_pipeline_before_native_ack():
+    machine, transport, runtime, client = setup_runtime()
+    frames, writes = asyncio.Queue(), asyncio.Queue()
+    async def stream(endpoint, args, *, on_open):
+        async def send(value):
+            await writes.put(value)
+        on_open(send)
+        yield {"type": "snapshot", "screen": "ready", "info": {}, "writable": True}
+        while True:
+            yield await frames.get()
+    client.stream = stream
+    attached = await machine._handle(cmd("attach", id="pty", lease="live", stream=True))
+    assert attached.status == "success"
+    await asyncio.sleep(0)
+    pushed = [e for e in transport.sent if e.type == "dsh_read_result"]
+    assert len(pushed) == 1 and pushed[0].request_id == "live"
+    assert pushed[0].to == "browser" and not is_downstream(pushed[0])
+    first = asyncio.create_task(machine._handle(cmd("input", key="a", lease="live", value={"type": "write", "data": "a"})))
+    assert (await asyncio.wait_for(writes.get(), 1))["sequence"] == 1
+    second = asyncio.create_task(machine._handle(cmd("input", key="b", lease="live", value={"type": "write", "data": "b"})))
+    assert (await asyncio.wait_for(writes.get(), 1))["sequence"] == 2
+    assert not first.done() and not second.done()
+    await frames.put({"type": "ack", "sequence": 1})
+    await frames.put({"type": "ack", "sequence": 2})
+    assert all(r.status == "success" for r in await asyncio.gather(first, second))
+    assert (await machine._handle(cmd("ack", lease="live", cursor=1))).status == "success"
+    assert not runtime.features.terminals.attachments["live"].frames
+    assert (await machine._handle(cmd("ack", browser="other", lease="live", cursor=1))).status == "error"
+    await frames.put({"type": "output", "data": "new output"})
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert any(e.type == "dsh_read_result" and any(i.data.get("data") == "new output" for i in e.items) for e in transport.sent)
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_output_render_window_is_bounded():
+    machine, transport, runtime, client = setup_runtime()
+    frames = asyncio.Queue()
+    async def stream(endpoint, args, *, on_open):
+        on_open(lambda _: None)
+        yield {"type": "snapshot", "screen": "", "info": {}, "writable": True}
+        while True:
+            yield await frames.get()
+    client.stream = stream
+    await machine._handle(cmd("attach", id="pty", lease="live", stream=True))
+    for _ in range(80):
+        frames.put_nowait({"type": "output", "data": "x" * 8192})
+    for _ in range(5):
+        await asyncio.sleep(0)
+    row = runtime.features.terminals.attachments["live"]
+    assert 1 < row.sent < row.cursor
+    before = row.sent
+    await machine._handle(cmd("ack", lease="live", cursor=row.sent))
+    await asyncio.sleep(0)
+    assert row.sent > before
+    await runtime.close()

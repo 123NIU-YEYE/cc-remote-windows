@@ -12243,7 +12243,7 @@ class WrapperMachine:
         return BtwSessionInfo(
             btw_sid=ctx.key,
             parent_sid=ctx.parent_sid,
-            engine="codex" if ctx.engine == "codex" else "claude",
+            engine=ctx.engine,
             created_at=max(0.0, ctx.btw_created_at),
             state=ctx.buffer.latest_state() or ctx.state,
         )
@@ -12262,6 +12262,9 @@ class WrapperMachine:
                 and ctx.parent_sid
             )
         ]
+        if self._dsh.sidechats.rows is not None:
+            known = {entry.btw_sid for entry in sessions}
+            sessions.extend(entry for entry in self._dsh.sidechats.catalog(owner_id) if entry.btw_sid not in known)
         sessions.sort(key=lambda item: (item.created_at, item.btw_sid))
         return sessions
 
@@ -20927,7 +20930,7 @@ class WrapperMachine:
 
             if ctx.engine == "claude":
                 await send(self._claude_auto_compact_event(ctx))
-            else:
+            elif ctx.engine == "codex":
                 permission_profile = _session_permission_profile(ctx)
                 ctx.announced_permission_profile = permission_profile
                 await send(PermissionProfile(profile=permission_profile))
@@ -20939,6 +20942,8 @@ class WrapperMachine:
                     mode=getattr(ctx.sdk, "collaboration_mode", "default")))
                 await send(_codex_speed_event(
                     getattr(ctx.sdk, "service_tier", None)))
+            elif ctx.engine == "dsh":
+                await send(ctx.sdk.state.model_copy(deep=True))
         return None
 
     async def _handle_set_perm(self, cmd):

@@ -1,10 +1,14 @@
-/** Optional read-only catalogs; history and execution use the official APIs. */
+/** Bounded authenticated integration endpoints over native DSH services. */
 import { createRequire } from 'node:module';
 import { isAbsolute } from 'node:path';
 export const name = 'cc-remote-metadata';
 export const inject = ['connection', 'sessionQuery', 'agents', 'commands', 'agentPresets', 'skills'];
 const SID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/u;
 export function apply(ctx) {
+  ctx.inject(['schedule'], scoped => {
+    scoped.connection.fetch.register({ path: '/api/cc-remote.schedule', methods: ['POST'], requestBody: 'buffered',
+      fetch: request => createSchedule(scoped, request) });
+  });
   ctx.connection.fetch.register({ path: '/api/cc-remote.catalog', methods: ['GET'], requestBody: 'buffered', fetch: request => catalog(ctx, request) });
   ctx.connection.fetch.register({ path: '/api/cc-remote.metadata', methods: ['GET'], requestBody: 'buffered', fetch: request => metadata(ctx, request) });
 }
@@ -71,4 +75,31 @@ export async function catalog(ctx, request) {
     return new Response(body,{headers:{'content-type':'application/json','cache-control':'no-store'}});
   } catch { return Response.json({}, {status:503}); }
   finally { await lease?.[Symbol.asyncDispose](); }
+}
+
+/** Native Host creation does not activate an Agent or run a model turn. */
+export async function createSchedule(ctx, request) {
+  let body;
+  try {
+    const text = await request.text();
+    if (Buffer.byteLength(text) > 32768) return Response.json({}, {status:413});
+    body = JSON.parse(text);
+  } catch { return Response.json({}, {status:400}); }
+  const allowed = ['title','prompt','after_seconds','at','every_seconds','daily','weekly','cron'];
+  const rule = body?.request;
+  if (!SID.test(body?.sessionId ?? '') || !rule || typeof rule !== 'object' || Array.isArray(rule)
+    || Object.keys(body).some(k => !['sessionId','request'].includes(k))
+    || Object.keys(rule).some(k => !allowed.includes(k))
+    || typeof rule.title !== 'string' || !rule.title.trim() || rule.title.length > 120
+    || typeof rule.prompt !== 'string' || !rule.prompt.trim() || rule.prompt.length > 24000
+    || allowed.slice(2).filter(k => rule[k] !== undefined).length !== 1) return Response.json({}, {status:400});
+  try {
+    const record = await ctx.schedule.create(body.sessionId, rule, request.signal);
+    return Response.json({id:record.id}, {headers:{'cache-control':'no-store'}});
+  } catch (error) {
+    // Native validation errors are safe to classify; never expose prompts,
+    // filesystem details or internal exception strings through this bridge.
+    const invalid = error?.name === 'ScheduleError' || error?.name === 'ScheduleInputError';
+    return Response.json({}, {status:invalid ? 422 : 503});
+  }
 }

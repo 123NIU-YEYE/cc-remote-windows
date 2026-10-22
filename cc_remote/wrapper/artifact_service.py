@@ -51,7 +51,7 @@ class ArtifactService:
         if isinstance(msg, (UserMsg, TurnSteered)) and msg.images:
             if not await asyncio.to_thread(self.store.has_uploads, scope, msg.msg_id):
                 await self.uploads(ctx, msg.msg_id, images=msg.images)
-        elif isinstance(msg, Delta) and msg.channel != "thinking":
+        elif isinstance(msg, Delta) and msg.channel != "thinking" and ctx.engine != "dsh":
             # Discovery never holds full long answers or reasoning streams in RAM.
             pending = ctx.artifact_text
             pending[msg.message_id] = ("" if msg.replace else pending.get(msg.message_id, "")) + msg.text
@@ -101,13 +101,13 @@ class ArtifactService:
                                else await machine._history_page_singleflight(request, sid))
                     if history.error:
                         raise ValueError("历史附件整理暂时失败，请重试")
-                    await asyncio.to_thread(self.store.history, scope, history, cwd)
+                    await asyncio.to_thread(self.store.history, scope, history, cwd,
+                                            discover_text=cmd.engine != "dsh")
                     response.history_before = history.oldest_id
                     response.history_more = history.has_more
             if cmd.engine == "dsh":
                 metadata = await machine._dsh.client.metadata(sid)
-                for file in metadata.get("deliverables", [])[:256]:
-                    await asyncio.to_thread(self.store.text, scope, f"[file](<{file['path']}>)", cwd)
+                await asyncio.to_thread(self.store.native_outputs, scope, metadata["deliverables"], cwd)
             rows, response.next_before, response.has_more = await asyncio.to_thread(self.store.page, scope, cmd.before)
             response.entries = await asyncio.to_thread(lambda: [SessionArtifactInfo(**public_entry(row)) for row in rows])
         except Exception as exc:

@@ -260,6 +260,7 @@ body{
 .header-menu-item{ width:100%; min-height:54px; display:flex; align-items:center;
   gap:11px; padding:8px 10px; border-radius:10px; text-align:left; color:var(--dim); }
 .header-menu-item:hover{ color:var(--text); background:var(--raised); }
+.header-menu-item:disabled{ cursor:default; background:transparent; }
 .header-menu-item>span{ flex:1; min-width:0; display:flex; flex-direction:column; }
 .header-menu-item b,.header-menu-modes b{ color:var(--text); font-size:12.5px; }
 .header-menu-item small,.header-menu-modes small{ color:var(--dim); font-size:10.5px;
@@ -297,6 +298,11 @@ body{
 .surface-head-title{ display:flex; align-items:center; gap:9px; min-width:0; color:var(--text);
   font:var(--font-weight-600) 18px/1.2 var(--serif); letter-spacing:-.01em; }
 .surface-head-title:hover{ color:var(--accent-ink); }
+.has-dsh-mode .surface-head-title{ flex-shrink:0; }
+.dsh-session-mode{ min-width:0; max-width:180px; padding:3px 7px; border-radius:7px;
+  border:1px solid var(--accent-line); color:var(--accent-ink); background:var(--accent-weak);
+  font:var(--font-weight-600) 11px/1.25 var(--sans); letter-spacing:0;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .surface-head-mark{ width:30px; height:30px; border-radius:9px; display:grid; place-items:center;
   color:var(--accent-ink); background:var(--accent-weak); border:1px solid var(--accent-line); }
 .work-profile-owner{ display:inline-flex; align-items:center; gap:5px; min-width:0;

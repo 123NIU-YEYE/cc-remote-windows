@@ -67,7 +67,7 @@ Use Node 24 and an independently installed `@deepseek-ai/dsh@0.2.1-rc.2`.
 Do not point migration experiments at an existing DSH home. DSH still owns its
 provider login, API endpoints, credentials, presets, and plugin configuration.
 
-Add this read-only extension to the native DSH patch configuration, using the
+Add this integration extension to the native DSH patch configuration, using the
 absolute path in the active cc-remote source tree or Wrapper release:
 
 ```yaml
@@ -93,7 +93,9 @@ the public network. Re-pair if DSH rotates its native control credential.
 
 The metadata extension is required for this integration's command/Skill catalog,
 full-text match location, and declared deliverables. It adds authenticated,
-bounded, read-only endpoints. Session execution, native history, models,
+bounded read endpoints and a schedule-creation adapter to the native Host API.
+The adapter validates a single timing rule and never retries an uncertain write.
+Session execution, native history, models,
 questions, approvals, goals, jobs, subagents, and plugin toggles use official
 DSH Remote APIs. The extension never performs model requests or mutates native
 session files.
@@ -108,6 +110,9 @@ session files.
 - New sessions select native agent presets, models, reasoning and permissions.
   `/` commands use native dispatch; selecting a Skill inserts DSH's native
   `/skill-name` syntax. Controls and metadata follow the selected preset.
+  Existing DSH sessions show their actual native preset beside the Code page
+  title, using the catalog's display name. Missing state never falls back to
+  the default preset or the new-chat selection.
 - Idle history, search, previews and catalogs never create a model turn. Native
   cold history requires V4; old sessions that require migration are reported
   explicitly and must be migrated by the official client first.
@@ -138,24 +143,39 @@ session files.
   recorded phases and child identities, and retain newer terminal outcomes when
   earlier pages load. They do not invent future phases or start missing agents.
   Automation reads the global native catalog, edits/deletes the original owning
-  session's task, and shows recent delivery history. Creating a schedule or
-  preset stages a native conversational request for the user to review and send.
+  session's task, and shows recent delivery history. A form creates native tasks
+  for an explicitly selected session (once, interval, daily, weekly or cron);
+  conversational creation remains available. Preset creation stages a native
+  conversational request for the user to review and send.
 - Runtime settings expose only simple execution preferences from an allowlist
   of native namespaces. Writes use the observed native revision. Provider
   configuration and credential fields stay in DSH's native manager.
 - Plugin inventory and enable/disable reflect native application receipts,
   including restart-required outcomes. Package install/remove uses the native
   package manager; a restart-required result never restarts DSH automatically.
+  The market tab explains that this DSH release has no official plugin market;
+  it does not request optional custom-market endpoints or imply a default source.
+  Local plugin search and management remain available.
   No DSH Work mode, quota estimate, worktree
   migration, rollback or session deletion is synthesized. Unsupported actions
   are unavailable instead of silently falling back to Claude/Codex.
 - The terminal is a lazily loaded xterm view of DSH's own PTY. Only explicit
-  creation starts a shell, and only explicit Stop closes it. Closing a panel,
+  creation starts a shell; Ctrl+C interrupts the foreground command, while
+  Close terminal ends the shell. Closing a panel,
   changing sessions or detaching the Wrapper only detaches the viewer. Each
   attachment belongs to one browser, native session and API Peer generation;
-  keyboard input is serialized and acknowledged by DSH, never stored in the
-  recovery outbox or automatically resent after an unknown result.
-- Wire protocol v80 must be activated across all tiers together. This branch
+  keyboard input is ordered and pipelined within the native acknowledged input
+  window, never stored in the recovery outbox or resent after an unknown result.
+  Output is privately pushed over the existing control link, batched for xterm
+  and bounded by browser render acknowledgements; there is no output polling.
+- DSH side chats are temporarily unavailable until the official API supports
+  session deletion. The session menu explains this limitation; side-chat
+  shortcuts and `/btw` cannot open a panel or create a fork. Wrapper also rejects
+  stale clients' open requests before contacting DSH. The exact-prefix fork
+  implementation and existing private associations remain intact for future
+  integration; no existing session is deleted, archived or transferred by this
+  change. Claude/Codex side chats remain available.
+- Wire protocol v81 must be activated across all tiers together. This branch
   does not automatically upgrade, migrate, deploy, or restart any existing DSH
   installation.
 

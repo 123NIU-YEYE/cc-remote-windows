@@ -10,6 +10,12 @@ export function lazyDshApi(transport: () => RelayWs | null): DshApiClient & { re
     return current ??= new DshApi(transport);
   };
   return {
+    watchTerminal: (...args) => {
+      let disposed = false, unsubscribe: (() => void) | undefined;
+      void get().then(api => { if (!disposed) unsubscribe = api.watchTerminal(...args); })
+        .catch(() => { if (!disposed) args[3](); });
+      return () => { disposed = true; unsubscribe?.(); };
+    },
     read: async (...args) => (await get()).read(...args),
     act: async (...args) => (await get()).act(...args),
     goal: async (...args) => (await get()).goal(...args),
