@@ -434,3 +434,40 @@
   color: inherit;
   cursor: pointer;
 }
+/* Per-member actions: steer, cancel, jump to the member's own session. */
+.rooms-member {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rooms-member-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.rooms-member-row:hover .rooms-member-actions,
+.rooms-member[data-state="running"] .rooms-member-actions {
+  opacity: 1;
+}
+
+.rooms-member-actions button {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.rooms-member-actions button:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.rooms-steer {
+  padding-left: 26px;
+}

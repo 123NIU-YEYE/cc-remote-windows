@@ -6047,6 +6047,18 @@ export default function App() {
               }}
               onCreateRoom={(name, cwd, members) => wsRef.current?.sendCreateRoom(name, cwd, members)}
               onPostMessage={(roomId, text) => wsRef.current?.sendPostRoomMessage(roomId, text)}
+              onSteer={(roomId, memberId, text) => wsRef.current?.sendSteerRoomMember(roomId, memberId, text)}
+              onCancel={(roomId, memberId) => wsRef.current?.sendCancelRoomMember(roomId, memberId)}
+              onOpenSession={(member) => {
+                if (!member.session_id) return;
+                setRoomsOpen(false);
+                setSpace("code");
+                wsRef.current?.sendSwitchSession(
+                  member.session_id,
+                  member.engine as "claude" | "codex" | "dsh",
+                  "code",
+                );
+              }}
               onRefresh={() => wsRef.current?.sendListRooms()}
             />
             </Suspense>
