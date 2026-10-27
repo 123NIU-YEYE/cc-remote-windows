@@ -12150,6 +12150,40 @@ class WrapperMachine:
             self._remember_command(client_id, cmd_id, responses)
             await self._send_command_ack(client_id, cmd_id)
 
+    # ---- collaboration rooms -------------------------------------------
+    @property
+    def room_service(self):
+        """Lazily created: a wrapper that never opens a room pays nothing."""
+        service = getattr(self, "_room_service", None)
+        if service is None:
+            from cc_remote.wrapper.room_service import RoomService
+            service = RoomService(self, self.cfg.state_dir)
+            self._room_service = service
+        return service
+
+    async def _handle_list_rooms(self, cmd):
+        await self.room_service.on_list_rooms(cmd)
+
+    async def _handle_get_room(self, cmd):
+        await self.room_service.on_get_room(cmd)
+
+    async def _handle_create_room(self, cmd):
+        await self.room_service.on_create_room(cmd)
+
+    async def _handle_update_room(self, cmd):
+        await self.room_service.on_update_room(cmd)
+
+    async def _handle_delete_room(self, cmd):
+        await self.room_service.on_delete_room(cmd)
+
+    async def _handle_post_room_message(self, cmd):
+        await self.room_service.on_post(cmd)
+
+    async def _handle_steer_room_member(self, cmd):
+        await self.room_service.on_steer(cmd)
+
+    async def _handle_cancel_room_member(self, cmd):
+        await self.room_service.on_cancel(cmd)
     async def _handle(self, cmd) -> None:
         rejected = await self._reject_nonowner_btw_command(cmd)
         if rejected is not None:
