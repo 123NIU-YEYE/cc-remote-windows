@@ -40,6 +40,7 @@ import { uuid } from "./util";
 import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
 import { ChatView, type ChatViewHandle } from "./components/ChatView";
+import { applyRoomEvent, type RoomsState } from "./rooms-state";
 import type { QuestionDraft } from "./components/QuestionSheet";
 import { Composer } from "./components/Composer";
 import { usePanelWidthPreference } from "./use-panel-width";
@@ -62,7 +63,11 @@ import {
 const NewChatView = lazy(() => import("./components/NewChatView").then(m => ({ default: m.NewChatView })));
 const QuestionSheet = lazy(() => import("./components/QuestionSheet").then(
   m => ({ default: m.QuestionSheet })));
-const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
+const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
+// The rooms surface is a separate chunk: it must not join the initial bundle.
+const RoomsView = lazy(() => import("./components/RoomsView").then(
+  ({ RoomsView: View }) => ({ default: View }),
+));
 import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
@@ -487,7 +492,12 @@ export default function App() {
     enabled: false, expires_at: null,
   });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
-  const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+  const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+  // Collaboration rooms live in App-local state: a room is not a session, so it
+  // deliberately stays out of the session reducer and its surfaces.
+  const [rooms, setRooms] = useState<RoomsState>({});
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
+  const [roomsOpen, setRoomsOpen] = useState(false);
   const [workDashboardMachineId, setWorkDashboardMachineId] =
     useState(machineId);
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
@@ -2339,7 +2349,10 @@ export default function App() {
       try { seeded = await import("./cache").then((m) => m.loadAllReplayState()); } catch { /* best-effort */ }
       if (cancelled) return;
       const ws = new RelayWs({
-        onEvent: (msg, ownership) => {
+        onEvent: (msg, ownership) => {          // Room frames are folded here and never reach the session reducer.
+          if (msg.type.startsWith("room_")) {
+            setRooms((prev) => applyRoomEvent(prev, msg) ?? prev);
+          }
           if (!acceptsLifecycle()) return;
           if (turnFileRequestsRef.current.accept(msg)) return;
           if (goalApiRef.current?.accept(msg)) return;
@@ -5971,7 +5984,15 @@ export default function App() {
             </div>
             <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>
           </div>
-          <span className={`hstat ${dshConnectionError ? "reconnecting" : effectiveState}`}><span className="sd" />
+          <button className={`rooms-entry${roomsOpen ? " is-on" : ""}`}
+            onClick={() => {
+              const next = !roomsOpen;
+              setRoomsOpen(next);
+              if (next) wsRef.current?.sendListRooms();
+            }}
+            aria-label="协作房间" title="协作房间">
+            协作
+          </button>          <span className={`hstat ${dshConnectionError ? "reconnecting" : effectiveState}`}><span className="sd" />
             <span className="hstat-label">{dshConnectionError ? "同步中" : effectiveState}</span></span>
           {space === "code" && focusedSid && !state.newChat
               && !archivedBrowse && focusedEngine !== "dsh" && (
@@ -6009,6 +6030,28 @@ export default function App() {
             onLogout={() => void logout()}
           /></Suspense>
         </header>
+        {roomsOpen && (
+          <div className="rooms-overlay">
+            <button type="button" className="rooms-overlay-close"
+              onClick={() => setRoomsOpen(false)} aria-label="关闭协作">
+              ✕
+            </button>
+            <Suspense fallback={null}>
+            <RoomsView
+              rooms={rooms}
+              activeRoomId={activeRoomId}
+              defaultCwd={state.newChat?.cwd || ""}
+              onSelectRoom={(roomId) => {
+                setActiveRoomId(roomId);
+                wsRef.current?.sendGetRoom(roomId);
+              }}
+              onCreateRoom={(name, cwd, members) => wsRef.current?.sendCreateRoom(name, cwd, members)}
+              onPostMessage={(roomId, text) => wsRef.current?.sendPostRoomMessage(roomId, text)}
+              onRefresh={() => wsRef.current?.sendListRooms()}
+            />
+            </Suspense>
+          </div>
+        )}
 
         {versionNotice && <div className="notice-bar attention version-notice" role="status">
           <span className="notice-icon" aria-hidden="true"><Icon name="info" size={16} /></span>

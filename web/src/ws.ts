@@ -1585,6 +1585,50 @@ export class RelayWs {
       v: PROTOCOL_VERSION, type: "get_work_dashboard", engine, ts: nowTs(),
     });
   }
+  // ---- collaboration rooms ----
+  sendListRooms(): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "list_rooms", ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendGetRoom(roomId: string, limit = 100, before?: number): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "get_room", room_id: roomId, limit,
+      ...(before === undefined ? {} : { before }), ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendCreateRoom(
+    name: string, cwd: string,
+    members: { member_id: string; label: string; engine?: string; profile_id?: string | null }[],
+  ): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "create_room", name, cwd, members,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendPostRoomMessage(roomId: string, text: string, delivery: "queue" | "immediate" = "queue"): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "post_room_message", room_id: roomId, text,
+      delivery, ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendSteerRoomMember(roomId: string, memberId: string, text: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "steer_room_member", room_id: roomId,
+      member_id: memberId, text, ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendCancelRoomMember(roomId: string, memberId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "cancel_room_member", room_id: roomId,
+      member_id: memberId, ts: nowTs(), cmd_id: uuid(),
+    });
+  }
 
   sendGetWorkArtifacts(engine: "claude" | "codex" | "dsh", sessionId: string): void {
     this.send({

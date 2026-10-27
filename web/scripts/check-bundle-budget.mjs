@@ -56,12 +56,16 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // Per-engine/mode appearance migration and derived colors add <6 KiB at startup
 // so saved colors apply before paint. The editor remains lazy; no new dependency
 // or initial request. Allow <2 KiB gzip for the persistence/color calculations.
-const MAX_INITIAL_BYTES = 958 * 1024;
+// Collaboration rooms fold their frames in App-local state so a room never
+// enters the session reducer or its surfaces. The fold costs ~2 KiB of startup;
+// the rooms UI itself, its styles and the markdown-free list stay in a lazy
+// chunk, so entry size, request count and the gzip cap move by ~2 KiB only.
+const MAX_INITIAL_BYTES = 962 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
 // DSH engine routing/defaults and native return-receipt boundaries add <1 KiB
 // gzip. Management panels and xterm stay lazy; retain entry/raw/request caps.
-const MAX_INITIAL_GZIP_BYTES = 289 * 1024;
+const MAX_INITIAL_GZIP_BYTES = 291 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");
