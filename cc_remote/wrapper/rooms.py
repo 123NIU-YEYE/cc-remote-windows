@@ -317,7 +317,29 @@ class RoomStore:
             self._persist()
         return room
 
-    # ---- internals -----------------------------------------------------
+    def rebind_session(self, old_key: str, session_id: str) -> list[str]:
+        """Follow a session that got its real id after the first turn.
+
+        A freshly spawned session is keyed by a temporary id; the engine's real
+        id appears once the first turn starts. A member bound to the temporary
+        key must follow it, or its terminal result can never be attributed.
+        Returns the ids of the rooms that moved.
+        """
+        moved: list[str] = []
+        with self._lock:
+            for room in self._rooms.values():
+                touched = False
+                for member in room.members:
+                    if member.session_id == old_key:
+                        member.session_id = session_id
+                        touched = True
+                if touched:
+                    moved.append(room.room_id)
+            if moved:
+                self._persist()
+        return moved
+
+    # ---- internals -----------------------------------------------------    # ---- internals -----------------------------------------------------
     def _validate_members(self, members: Iterable[RoomMember]) -> list[RoomMember]:
         collected = list(members)
         if len(collected) > MEMBER_LIMIT:

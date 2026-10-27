@@ -8943,6 +8943,14 @@ class WrapperMachine:
             "engine": engine,
         }
         self._session_aliases.move_to_end(old_key)
+        # A room member may be bound to the temporary key; follow the real id,
+        # otherwise its turn terminal can never be attributed back to the room.
+        room_service = getattr(self, "_room_service", None)
+        if room_service is not None:
+            try:
+                room_service.rebind_session(old_key, session_id)
+            except Exception:  # noqa: BLE001 - rooms must not affect aliasing
+                pass
         while len(self._session_aliases) > self.SESSION_ALIAS_CAP:
             self._session_aliases.popitem(last=False)
         try:

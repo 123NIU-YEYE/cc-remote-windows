@@ -81,6 +81,22 @@ class RoomTurnCollector:
                 return text.strip()
         return ""
 
+    def rebind(self, old_session: str, session_id: str) -> None:
+        """Move buffered text when a session gets its real id.
+
+        Deltas arrive under the temporary key and the terminal arrives under the
+        real one, so without this the room would collect nothing at all.
+        """
+        if not old_session or not session_id or old_session == session_id:
+            return
+        moved = self._text.pop(old_session, None)
+        if not moved:
+            return
+        bucket = self._text.setdefault(session_id, {})
+        for message_id, text in moved.items():
+            bucket[message_id] = bucket.get(message_id, "") + text
+        self._trim(bucket)
+
     def forget(self, session_id: str) -> None:
         self._text.pop(session_id, None)
 
@@ -213,7 +229,39 @@ class RoomService:
         except RoomError as exc:
             return await self._error(cmd, str(exc))
 
-    # ---- turn results --------------------------------------------------
+    # ---- session identity -----------------------------------------------
+    def rebind_session(self, old_key: str, session_id: str) -> None:
+        """Follow a spawned session once the engine reveals its real id.
+
+        Synchronous because the wrapper records aliases from a sync method;
+        the room_state refresh is scheduled separately.
+        """
+        if not old_key or not session_id or old_key == session_id:
+            return
+        self._turns.rebind(old_key, session_id)
+        moved = self.store.rebind_session(old_key, session_id)
+        for room_id in moved:
+            for state in self._dispatcher.runtime(room_id):
+                if state.session_id == old_key:
+                    state.session_id = session_id
+        if moved:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # Called from a sync context (alias bookkeeping during tests or
+                # shutdown); the next state frame will carry the new id anyway.
+                return
+            loop.create_task(self._refresh_states(moved))
+
+    async def _refresh_states(self, room_ids: list[str]) -> None:
+        for room_id in room_ids:
+            for state in self._dispatcher.runtime(room_id):
+                try:
+                    await self._on_member_state(room_id, state)
+                except Exception:  # noqa: BLE001 - presentation only
+                    pass
+
+    # ---- turn results --------------------------------------------------    # ---- turn results --------------------------------------------------
     def observe_frame(self, session_id: str, frame: Any) -> Optional[str]:
         """Feed one session frame; return the final text at a turn terminal."""
         return self._turns.observe(session_id, frame)

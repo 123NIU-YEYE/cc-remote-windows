@@ -177,3 +177,22 @@ def test_machine_observer_is_free_without_a_room_service():
     machine = _FakeMachine()          # no _room_service attribute at all
     observe = WrapperMachine._observe_room_frame.__get__(machine, type(machine))
     observe(None, _end())             # must not raise
+
+
+def test_collector_follows_a_renamed_session():
+    """Deltas arrive under the temp key, the terminal under the real one."""
+    collector = RoomTurnCollector()
+    collector.observe("tmp-1", _start())
+    collector.observe("tmp-1", _delta("已收到"))
+    collector.rebind("tmp-1", "real-1")
+    assert collector.observe("real-1", _end()) == "已收到"
+    assert collector.observe("real-1", _end()) == ""
+
+
+def test_collector_rebind_is_a_noop_for_empty_or_same_ids():
+    collector = RoomTurnCollector()
+    collector.observe("tmp-1", _start())
+    collector.observe("tmp-1", _delta("x"))
+    collector.rebind("", "real-1")
+    collector.rebind("tmp-1", "tmp-1")
+    assert collector.observe("tmp-1", _end()) == "x"
