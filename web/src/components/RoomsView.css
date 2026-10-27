@@ -566,3 +566,51 @@
   padding: 4px 6px;
   font-size: 12px;
 }
+/* Member chips: remove one member, or invite another into the room. */
+.rooms-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.rooms-chip-remove {
+  border: none;
+  background: transparent;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.rooms-chip-remove:hover {
+  color: var(--danger);
+}
+
+.rooms-chip-invite {
+  border-style: dashed;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.rooms-chip-invite:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.rooms-invite {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.rooms-invite-engine {
+  width: 110px;
+  flex: none;
+}
+
+.rooms-invite .rooms-primary {
+  padding: 6px 12px;
+}

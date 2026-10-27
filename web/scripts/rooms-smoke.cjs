@@ -82,7 +82,14 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   const entry = page.locator('button[aria-label="协作房间"]');
   await entry.waitFor({ timeout: 30000 });
   await entry.click();
-  await page.waitForTimeout(4000);
+  // Wait for the actual response instead of a fixed delay: right after a deploy
+  // the bundle swap can race the first click and produce a flaky "0 cards".
+  await page.waitForFunction(
+    () => (window.__wsLog || []).includes("in:room_list"),
+    undefined,
+    { timeout: 20000 },
+  ).catch(() => {});
+  await page.waitForTimeout(1500);
 
   const log = await page.evaluate(() => window.__wsLog || []);
   const roomFrames = log.filter((entry) => entry.includes("room"));

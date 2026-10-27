@@ -35,6 +35,8 @@ export interface RoomsViewProps {
   /** 跳转会话: leave the room and open the member's own session. */
   onOpenSession: (member: RoomMemberView) => void;
   onRenameRoom: (roomId: string, name: string) => void;
+  /** Invite or remove members: the full replacement list. */
+  onUpdateMembers: (roomId: string, members: RoomMemberDraft[]) => void;
   onDeleteRoom: (roomId: string) => void;
   onRefresh: () => void;
 }
@@ -202,6 +204,64 @@ function MemberRow({
     </div>
   );
 }
+function toDrafts(members: RoomMemberView[]): RoomMemberDraft[] {
+  return members.map((member) => ({
+    member_id: member.member_id,
+    label: member.label,
+    engine: member.engine as RoomMemberDraft["engine"],
+  }));
+}
+
+const ENGINE_LABELS: Record<RoomMemberDraft["engine"], string> = {
+  claude: "Claude",
+  codex: "Codex",
+  dsh: "DSH",
+};
+
+function InviteRow({ onInvite, onCancel }: {
+  onInvite: (draft: RoomMemberDraft) => void;
+  onCancel: () => void;
+}) {
+  const [engine, setEngine] = useState<RoomMemberDraft["engine"]>("claude");
+  const [name, setName] = useState("");
+
+  const submit = () => {
+    const suffix = name.trim() || "new";
+    onInvite({
+      // The id only has to be unique inside this room.
+      member_id: `${engine}-${suffix}-${Date.now().toString(36)}`,
+      label: `${ENGINE_LABELS[engine]} · ${suffix}`,
+      engine,
+    });
+  };
+
+  return (
+    <div className="rooms-invite">
+      <select
+        className="rooms-input rooms-invite-engine"
+        value={engine}
+        onChange={(event) => setEngine(event.target.value as RoomMemberDraft["engine"])}
+      >
+        {(Object.keys(ENGINE_LABELS) as RoomMemberDraft["engine"][]).map((key) => (
+          <option key={key} value={key}>{ENGINE_LABELS[key]}</option>
+        ))}
+      </select>
+      <input
+        className="rooms-input"
+        autoFocus
+        placeholder="成员名，如 iris（Enter 邀请）"
+        value={name}
+        onChange={(event) => setName(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") { event.preventDefault(); submit(); }
+          if (event.key === "Escape") onCancel();
+        }}
+      />
+      <button type="button" className="rooms-primary" onClick={submit}>邀请</button>
+    </div>
+  );
+}
+
 function NewRoomForm({ defaultCwd, onSubmit }: {
   defaultCwd: string;
   onSubmit: (name: string, cwd: string, members: RoomMemberDraft[]) => void;
@@ -251,11 +311,13 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 
 export function RoomsView({
   rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
-  onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onRefresh,
+  onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onUpdateMembers,
+  onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
   const [composing, setComposing] = useState(false);
+  const [inviting, setInviting] = useState(false);
 
   const ordered = useMemo(() => roomOrder(rooms), [rooms]);
   const listed = useMemo(() => filterRooms(rooms, query), [rooms, query]);
@@ -322,10 +384,36 @@ export function RoomsView({
                 {active.members.map((member) => (
                   <span key={member.member_id} className={`rooms-chip rooms-chip-${member.engine}`}>
                     {member.label}
+                    {active.members.length > 1 && (
+                      <button
+                        type="button"
+                        className="rooms-chip-remove"
+                        title={`移除 ${member.label}（不会删除它的会话）`}
+                        onClick={() => onUpdateMembers(active.room_id,
+                          toDrafts(active.members.filter((item) => item.member_id !== member.member_id)))}
+                      >
+                        ×
+                      </button>
+                    )}
                   </span>
                 ))}
+                <button
+                  type="button"
+                  className="rooms-chip rooms-chip-invite"
+                  onClick={() => setInviting((value) => !value)}
+                >
+                  + 邀请
+                </button>
               </div>
             </header>
+            {inviting && (
+              <InviteRow
+                onCancel={() => setInviting(false)}
+                onInvite={(draft) => {
+                  onUpdateMembers(active.room_id, toDrafts([...active.members, draft]));
+                  setInviting(false);
+                }} />
+            )}
 
             <div className="rooms-timeline">
               {active.messages.map((message) => (
