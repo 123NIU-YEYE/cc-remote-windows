@@ -37,6 +37,8 @@ export interface RoomsViewProps {
   onRenameRoom: (roomId: string, name: string) => void;
   /** Invite or remove members: the full replacement list. */
   onUpdateMembers: (roomId: string, members: RoomMemberDraft[]) => void;
+  /** Re-target the room's working directory. */
+  onChangeCwd: (roomId: string, cwd: string) => void;
   onDeleteRoom: (roomId: string) => void;
   onRefresh: () => void;
 }
@@ -54,15 +56,18 @@ function Clock({ member }: { member: RoomMemberView }) {
 }
 
 function RoomCard({
-  room, active, onSelect, onRename, onDelete,
+  room, active, onSelect, onRename, onDelete, onCwd,
 }: {
   room: RoomView;
   active: boolean;
   onSelect: () => void;
   onRename: (name: string) => void;
   onDelete: () => void;
+  onCwd: (cwd: string) => void;
 }) {
   const [renaming, setRenaming] = useState(false);
+  const [editingCwd, setEditingCwd] = useState(false);
+  const [draftCwd, setDraftCwd] = useState(room.cwd);
   const [draftName, setDraftName] = useState(room.name);
   const busy = runningMembers(room).length;
 
@@ -99,6 +104,7 @@ function RoomCard({
         )}
         <span className="rooms-card-tools">
           <button type="button" title="重命名" onClick={() => setRenaming(true)}>改名</button>
+          <button type="button" title="修改工作目录" onClick={() => setEditingCwd(true)}>目录</button>
           <button
             type="button"
             title="删除房间（成员会话会保留）"
@@ -128,6 +134,28 @@ function RoomCard({
           )}
         </span>
       </button>
+      {editingCwd && (
+        <input
+          className="rooms-input rooms-rename"
+          autoFocus
+          value={draftCwd}
+          onChange={(event) => setDraftCwd(event.target.value)}
+          onBlur={() => {
+            if (draftCwd.trim() && draftCwd !== room.cwd) onCwd(draftCwd.trim());
+            setEditingCwd(false);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              if (draftCwd.trim() && draftCwd !== room.cwd) onCwd(draftCwd.trim());
+              setEditingCwd(false);
+            }
+            if (event.key === "Escape") {
+              setDraftCwd(room.cwd);
+              setEditingCwd(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -312,6 +340,7 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 export function RoomsView({
   rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
   onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onUpdateMembers,
+  onChangeCwd,
   onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
@@ -352,6 +381,7 @@ export function RoomsView({
               onSelect={() => onSelectRoom(room.room_id)}
               onRename={(name) => onRenameRoom(room.room_id, name)}
               onDelete={() => onDeleteRoom(room.room_id)}
+              onCwd={(cwd) => onChangeCwd(room.room_id, cwd)}
             />
           ))}
           {listed.length === 0 && (
