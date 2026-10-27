@@ -17,7 +17,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional, Protocol
+import inspect
+from typing import Any, Callable, Iterable, Optional, Protocol
 
 ROOM_LIMIT = 200
 MEMBER_LIMIT = 8
@@ -452,13 +453,17 @@ class RoomDispatcher:
     """Turn a room message into per-member turns, and their results back in."""
 
     def __init__(self, store: RoomStore, host: RoomHost, *,
-                 max_parallel: int = DEFAULT_MAX_PARALLEL):
+                 max_parallel: int = DEFAULT_MAX_PARALLEL,
+                 on_state: Optional[Callable[[str, "MemberRuntime"], Any]] = None):
         self._store = store
         self._host = host
         self._max_parallel = max(1, int(max_parallel))
         self._semaphore = asyncio.Semaphore(self._max_parallel)
         self._runtime: dict[str, dict[str, MemberRuntime]] = {}
         self._tasks: set[asyncio.Task] = set()
+        # Called on every member state transition so the service layer can push
+        # a RoomState frame without the dispatcher knowing about the transport.
+        self._on_state = on_state
 
     # ---- inspection ----------------------------------------------------
     def runtime(self, room_id: str) -> list[MemberRuntime]:
@@ -517,6 +522,7 @@ class RoomDispatcher:
             state.queued += 1
             if state.state == MEMBER_IDLE:
                 state.state = MEMBER_QUEUED
+            await self._notify(room_id, state)
             self._spawn(self._dispatch(room, member, message, delivery))
         return message
 
@@ -554,6 +560,7 @@ class RoomDispatcher:
         state.started_at = None
         state.error = None if ok else "turn failed"
         self._release(state)
+        await self._notify(room_id, state)
 
         body = _bounded_text((text or "").strip())
         if not body and ok:
@@ -596,6 +603,17 @@ class RoomDispatcher:
             raise RoomError("unknown member")
         return self._state(room_id, member_id), member
 
+    async def _notify(self, room_id: str, state: "MemberRuntime") -> None:
+        callback = self._on_state
+        if callback is None:
+            return
+        try:
+            result = callback(room_id, state)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - observers must not break dispatch
+            pass
+
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
         self._tasks.add(task)
@@ -624,6 +642,7 @@ class RoomDispatcher:
             state.state = MEMBER_RUNNING
             state.started_at = time.time()
             state.queued = max(0, state.queued - 1)
+            await self._notify(room.room_id, state)
             prompt = f"{CONTEXT_HEADER.format(name=room.name, cwd=room.cwd)}\n{message.text}"
             await self._host.dispatch_query(
                 session_id, prompt, msg_id=message.msg_id, delivery=delivery)
@@ -636,6 +655,7 @@ class RoomDispatcher:
             state.started_at = None
             state.queued = max(0, state.queued - 1)
             self._release(state)
+            await self._notify(room.room_id, state)
             self._store.append_message(room.room_id, RoomMessage(
                 msg_id=_new_id("msg"), ts=time.time(), author_kind="member",
                 author_label=member.label,
