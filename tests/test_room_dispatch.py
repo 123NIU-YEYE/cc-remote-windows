@@ -1,0 +1,236 @@
+"""Room dispatch: mention routing to per-member turns, results back to the room."""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from cc_remote.wrapper.rooms import (
+    MEMBER_DONE,
+    MEMBER_FAILED,
+    MEMBER_QUEUED,
+    MEMBER_RUNNING,
+    RoomDispatcher,
+    RoomError,
+    RoomMember,
+    RoomStore,
+)
+
+
+class FakeHost:
+    """Records what the room asks for; optionally blocks inside a dispatch."""
+
+    def __init__(self) -> None:
+        self.sessions: dict[str, str] = {}
+        self.queries: list[tuple[str, str, str, str]] = []
+        self.steers: list[tuple[str, str]] = []
+        self.cancels: list[str] = []
+        self.gate: asyncio.Event | None = None
+        self.fail_dispatch = False
+
+    async def ensure_session(self, room, member) -> str:
+        session_id = f"s-{member.member_id}"
+        self.sessions[member.member_id] = session_id
+        return session_id
+
+    async def dispatch_query(self, session_id, text, *, msg_id, delivery) -> None:
+        if self.fail_dispatch:
+            raise RuntimeError("engine unavailable")
+        self.queries.append((session_id, text, msg_id, delivery))
+        if self.gate is not None:
+            await self.gate.wait()
+
+    async def steer_session(self, session_id, text) -> None:
+        self.steers.append((session_id, text))
+
+    async def cancel_session(self, session_id) -> None:
+        self.cancels.append(session_id)
+
+
+def _room(tmp_path, max_parallel=2):
+    store = RoomStore(tmp_path)
+    room = store.create("cc-remote 协作", "~/cooperation", [
+        RoomMember(member_id="m-claude", label="Claude · iris", engine="claude"),
+        RoomMember(member_id="m-codex", label="Codex · nyx", engine="codex"),
+    ])
+    host = FakeHost()
+    dispatcher = RoomDispatcher(store, host, max_parallel=max_parallel)
+    return store, room, host, dispatcher
+
+
+def test_message_without_mention_only_records(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        message = await dispatcher.post(room.room_id, "大家先别动，我先看下代码")
+        await dispatcher.wait_idle()
+        return message
+
+    message = asyncio.run(scenario())
+    assert message.mentions == []
+    assert host.queries == []
+    assert len(store.get(room.room_id).messages) == 1
+
+
+def test_mention_dispatches_to_that_member_session(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 先整理一下架构思路。")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+
+    assert len(host.queries) == 1
+    session_id, text, msg_id, delivery = host.queries[0]
+    assert session_id == "s-m-claude"
+    # The member must know which room/cwd it is working in, and see the raw ask.
+    assert text.startswith("[房间 cc-remote 协作 · 目录 ~/cooperation]")
+    assert "先整理一下架构思路。" in text
+    assert delivery == "queue"
+    # The session binding is persisted so a restart resumes the same conversation.
+    assert store.get(room.room_id).member("m-claude").session_id == "s-m-claude"
+    assert store.get(room.room_id).member("m-codex").session_id is None
+
+    states = {state.member_id: state for state in dispatcher.runtime(room.room_id)}
+    assert states["m-claude"].state == MEMBER_RUNNING
+    assert states["m-claude"].session_id == "s-m-claude"
+    assert states["m-codex"].state == "idle"
+
+
+def test_broadcast_dispatches_to_every_member(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@全体 各自检查一下当前方案，先不要改代码。")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    assert {query[0] for query in host.queries} == {"s-m-claude", "s-m-codex"}
+
+
+def test_max_parallel_bounds_running_turns(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path, max_parallel=1)
+    host.gate = asyncio.Event()
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@全体 开始")
+        # Let the scheduler start the first dispatch; the second must wait for a
+        # permit because only one turn may run at a time.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        started = len(host.queries)
+        first = host.queries[0][0]
+        member = "m-claude" if first == "s-m-claude" else "m-codex"
+        await dispatcher.on_turn_terminal(room.room_id, member, "done one")
+        host.gate.set()
+        await dispatcher.wait_idle()
+        return started
+
+    started = asyncio.run(scenario())
+    assert started == 1
+    assert len(host.queries) == 2
+
+
+def test_terminal_appends_member_message_and_frees_member(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@nyx 看一下工具链")
+        await dispatcher.wait_idle()
+        return await dispatcher.on_turn_terminal(
+            room.room_id, "m-codex", "工具链正常，无需改动。")
+
+    message = asyncio.run(scenario())
+    assert message is not None
+    assert message.author_kind == "member"
+    assert message.author_label == "Codex · nyx"
+    assert message.state == MEMBER_DONE
+
+    timeline = store.get(room.room_id).messages
+    assert [item.author_kind for item in timeline] == ["user", "member"]
+    state = {s.member_id: s for s in dispatcher.runtime(room.room_id)}["m-codex"]
+    assert state.state == MEMBER_DONE
+    assert state.started_at is None
+
+
+def test_failed_turn_is_recorded_as_failed(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 试试")
+        await dispatcher.wait_idle()
+        return await dispatcher.on_turn_terminal(
+            room.room_id, "m-claude", "", ok=False)
+
+    message = asyncio.run(scenario())
+    assert message is not None and message.state == MEMBER_FAILED
+
+
+def test_dispatch_failure_fails_closed_and_releases_permit(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path, max_parallel=1)
+    host.fail_dispatch = True
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@全体 开始")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+
+    states = {state.member_id: state for state in dispatcher.runtime(room.room_id)}
+    assert all(state.holding_permit is False for state in states.values())
+    failures = [m for m in store.get(room.room_id).messages if m.state == MEMBER_FAILED]
+    assert failures, "a failed dispatch must be visible in the timeline"
+
+
+def test_steer_routes_to_running_session(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 开始")
+        await dispatcher.wait_idle()
+        await dispatcher.steer(room.room_id, "m-claude", "顺便看下测试覆盖")
+
+    asyncio.run(scenario())
+    assert host.steers == [("s-m-claude", "顺便看下测试覆盖")]
+
+
+def test_steer_when_idle_becomes_queued_followup(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.steer(room.room_id, "m-claude", "补充一下结论")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    assert host.steers == []
+    assert len(host.queries) == 1
+    assert "补充一下结论" in host.queries[0][1]
+
+
+def test_cancel_routes_to_session(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Codex 跑一下")
+        await dispatcher.wait_idle()
+        await dispatcher.cancel(room.room_id, "m-codex")
+
+    asyncio.run(scenario())
+    assert host.cancels == ["s-m-codex"]
+
+
+def test_unknown_room_and_member_are_rejected(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        with pytest.raises(RoomError):
+            await dispatcher.post("room-missing", "@Claude 你好")
+        with pytest.raises(RoomError):
+            await dispatcher.steer(room.room_id, "m-missing", "hi")
+        with pytest.raises(RoomError):
+            await dispatcher.cancel(room.room_id, "m-missing")
+        with pytest.raises(RoomError):
+            await dispatcher.post(room.room_id, "   ")
+
+    asyncio.run(scenario())

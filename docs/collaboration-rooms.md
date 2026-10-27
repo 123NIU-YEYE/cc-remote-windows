@@ -181,13 +181,18 @@ state_dir/
 
 ## 7. 分阶段落地
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| **P1（本轮）** | 协议契约 + 房间存储 + mention 解析 | 单测覆盖 CRUD、mention、有界时间线 |
-| **P2** | wrapper 派发：创建成员会话、并行投递、回合终止回收 | 两个成员在同一房间各自产出结果 |
-| **P3** | 协议接入 `_dispatch_incoming_command` + relay 透传 | 用脚本客户端跑通建房间→发言→收结果 |
-| **P4** | 前端：`协作` surface、房间列表、房间视图、成员状态 | 截图里的主流程可用 |
-| **P5** | 右栏详情、引导/排队、跳转会话 | 与截图一致 |
+| 阶段 | 内容 | 验收 | 状态 |
+|---|---|---|---|
+| **P1** | 协议契约 + 房间存储 + mention 解析 | 单测覆盖 CRUD、mention、有界时间线 | ✅ 15 测试 |
+| **P2** | 派发：成员会话绑定、并行派发、permit 限流、失败回滚 | 两成员各自收到派发、结果回填 | ✅ 11 测试 |
+| **P3** | 协议消息 + wrapper 适配器 | 类型可 round-trip、适配器映射到既有入口 | 🟡 协议/适配器完成，`_dispatch_incoming_command` 接入与回合终止回收待做 |
+| **P4** | 前端：`协作` surface、房间列表、房间视图、成员状态 | 截图里的主流程可用 | ⬜ |
+| **P5** | 右栏详情、引导/排队、跳转会话 | 与截图一致 | ⬜ |
+
+> 已落地代码：`cc_remote/wrapper/rooms.py`（存储 + mention + 派发）、
+> `cc_remote/wrapper/room_host.py`（映射到 `_spawn` / `_handle_query` /
+> `_handle_steer` / `_handle_interrupt`）、`cc_remote/protocol.py`（13 条房间消息）。
+> 测试：`tests/test_rooms.py`、`tests/test_room_dispatch.py`、`tests/test_room_host.py`。
 
 ### 已知取舍
 
