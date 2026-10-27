@@ -1,0 +1,436 @@
+/* Collaboration rooms surface. Kept scoped under .rooms so it cannot leak into
+   the chat surfaces; colours follow the app's dark palette via CSS variables. */
+
+.rooms {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  gap: 12px;
+  padding: 12px;
+}
+
+.rooms-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 268px;
+  min-width: 220px;
+  min-height: 0;
+}
+
+.rooms-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+  padding: 0 4px;
+}
+
+.rooms-icon-button {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 14px;
+  opacity: 0.7;
+}
+
+.rooms-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font-size: 13px;
+}
+
+.rooms-input::placeholder {
+  opacity: 0.45;
+}
+
+.rooms-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+}
+
+.rooms-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rooms-card:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.rooms-card.is-active {
+  border-color: rgba(255, 143, 92, 0.55);
+  background: rgba(255, 143, 92, 0.10);
+}
+
+.rooms-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rooms-card-name {
+  font-size: 13px;
+  font-weight: 600;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rooms-card-current,
+.rooms-card-busy {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.10);
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.rooms-card-busy {
+  background: rgba(255, 196, 92, 0.18);
+  color: #ffd08a;
+}
+
+.rooms-card-path {
+  font-size: 11px;
+  opacity: 0.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rooms-card-members {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.rooms-card-count {
+  margin-left: auto;
+  font-size: 10px;
+  opacity: 0.4;
+}
+
+.rooms-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.rooms-avatar-claude { background: #d97757; }
+.rooms-avatar-codex { background: #6b7280; }
+.rooms-avatar-dsh { background: #7c5cff; }
+
+.rooms-avatar[data-state="running"] {
+  box-shadow: 0 0 0 2px rgba(255, 196, 92, 0.55);
+}
+
+.rooms-empty {
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  opacity: 0.45;
+}
+
+.rooms-empty-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+}
+
+.rooms-primary {
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 143, 92, 0.5);
+  background: rgba(255, 143, 92, 0.16);
+  color: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.rooms-primary:hover {
+  background: rgba(255, 143, 92, 0.26);
+}
+
+.rooms-new-toggle {
+  width: 100%;
+}
+
+.rooms-new {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rooms-new-members {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.rooms-new-members label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.rooms-new-members .rooms-primary {
+  margin-left: auto;
+  padding: 4px 10px;
+}
+
+.rooms-detail {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.rooms-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.rooms-detail-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.rooms-detail-path {
+  font-size: 11px;
+  opacity: 0.45;
+  margin-top: 2px;
+}
+
+.rooms-detail-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.rooms-chip {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  white-space: nowrap;
+}
+
+.rooms-chip-claude { border: 1px solid rgba(217, 119, 87, 0.5); }
+.rooms-chip-codex { border: 1px solid rgba(107, 114, 128, 0.6); }
+.rooms-chip-dsh { border: 1px solid rgba(124, 92, 255, 0.5); }
+
+.rooms-timeline {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.rooms-msg {
+  border-radius: 10px;
+  padding: 8px 10px;
+  max-width: 88%;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rooms-msg-user {
+  align-self: flex-end;
+  background: rgba(124, 92, 255, 0.16);
+}
+
+.rooms-msg-member {
+  align-self: flex-start;
+  border-left: 2px solid rgba(255, 143, 92, 0.6);
+}
+
+.rooms-msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  opacity: 0.55;
+  margin-bottom: 4px;
+}
+
+.rooms-msg-author {
+  font-weight: 600;
+  opacity: 1;
+}
+
+.rooms-badge-fail {
+  color: #ff8a8a;
+}
+
+.rooms-msg-text {
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rooms-members-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.rooms-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.rooms-member-row[data-state="running"] .rooms-member-state {
+  color: #ffd08a;
+}
+
+.rooms-member-row[data-state="failed"] .rooms-member-state {
+  color: #ff8a8a;
+}
+
+.rooms-member-label {
+  font-weight: 600;
+}
+
+.rooms-member-state {
+  opacity: 0.7;
+}
+
+.rooms-member-queue,
+.rooms-clock {
+  font-size: 11px;
+  opacity: 0.5;
+}
+
+.rooms-member-error {
+  font-size: 11px;
+  color: #ff8a8a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rooms-composer {
+  display: flex;
+  gap: 8px;
+  padding: 10px 14px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.rooms-textarea {
+  flex: 1;
+  min-height: 44px;
+  max-height: 140px;
+  resize: vertical;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+.rooms-textarea::placeholder {
+  opacity: 0.45;
+}
+
+@media (max-width: 720px) {
+  .rooms {
+    flex-direction: column;
+  }
+
+  .rooms-sidebar {
+    width: auto;
+    max-height: 40vh;
+  }
+}
+
+/* Entry point in the pane header and the full-pane rooms overlay. */
+.rooms-entry {
+  margin-left: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 143, 92, 0.35);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rooms-entry:hover,
+.rooms-entry.is-on {
+  background: rgba(255, 143, 92, 0.18);
+  border-color: rgba(255, 143, 92, 0.65);
+}
+
+.rooms-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  background: var(--surface, #16171f);
+}
+
+.rooms-overlay-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 41;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  cursor: pointer;
+}
