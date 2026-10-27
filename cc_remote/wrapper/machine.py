@@ -10807,6 +10807,7 @@ class WrapperMachine:
         return None
 
     async def _emit(self, ctx: SessionContext, msg) -> None:
+        self._observe_room_frame(ctx, msg)
         try:
             await self._observe_codex_process_clock(ctx, msg)
         except Exception as exc:
@@ -12160,6 +12161,35 @@ class WrapperMachine:
             service = RoomService(self, self.cfg.state_dir)
             self._room_service = service
         return service
+
+    def _observe_room_frame(self, ctx, msg) -> None:
+        """Feed turn frames to the room collector, but only for room sessions.
+
+        Hooked into ``_emit`` because that is the one place every engine frame
+        passes through (TurnEnd has several exits: normal, interrupted, error,
+        background, retry). Nothing here may affect the hot path: no room service
+        means one attribute read, and any failure is swallowed.
+        """
+        service = getattr(self, "_room_service", None)
+        if service is None:
+            return
+        try:
+            session_id = self._ctx_wire_sid(ctx)
+            if not session_id or service.member_for_session(session_id) is None:
+                return
+            text = service.observe_frame(session_id, msg)
+        except Exception:  # noqa: BLE001 - presentation-only sidecar
+            return
+        if text is None or getattr(msg, "type", None) != "turn_end":
+            return
+        ok = not bool(getattr(getattr(msg, "result", None), "is_error", False))
+        tasks = getattr(self, "_room_turn_tasks", None)
+        if tasks is None:
+            tasks = self._room_turn_tasks = set()
+        task = asyncio.create_task(
+            service.on_turn_terminal(session_id, text, ok=ok))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
     async def _handle_list_rooms(self, cmd):
         await self.room_service.on_list_rooms(cmd)

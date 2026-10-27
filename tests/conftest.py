@@ -3,6 +3,19 @@
 from __future__ import annotations
 
 import pytest
+import sys
+from pathlib import Path
+
+# The Windows port installs dependencies into a repo-local ``.pydeps`` tree
+# because the portable interpreter ships a ``python312._pth`` that disables both
+# PYTHONPATH and site discovery. Put that tree on sys.path for the suite; on a
+# normal virtualenv the directory simply does not exist and nothing changes.
+_ROOT = Path(__file__).resolve().parents[1]
+for _candidate in (_ROOT, _ROOT / ".pydeps"):
+    if _candidate.is_dir():
+        _entry = str(_candidate)
+        if _entry not in sys.path:
+            sys.path.insert(0, _entry)
 
 
 _ACCOUNT_PROFILE_ENV = (
