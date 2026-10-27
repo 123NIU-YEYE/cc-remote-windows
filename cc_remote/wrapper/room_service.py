@@ -38,6 +38,57 @@ def _spec_to_member(spec: protocol.RoomMemberSpec) -> RoomMember:
     )
 
 
+class RoomTurnCollector:
+    """Reassemble a member turn's assistant text from streaming deltas.
+
+    The wire has no "assistant message" frame to read back later: text arrives as
+    ``Delta`` chunks, and ``Delta.replace`` rewrites the message prefix instead of
+    appending. The room only needs the final text, so keep the chunks per message
+    and hand back the last non-empty one at the turn terminal.
+    """
+
+    def __init__(self, max_messages: int = 32) -> None:
+        self._max_messages = max(1, max_messages)
+        # session_id -> {message_id -> text} in first-seen order
+        self._text: dict[str, dict[str, str]] = {}
+
+    def observe(self, session_id: str, frame: Any) -> Optional[str]:
+        """Consume one frame; return the final text when the turn ends."""
+        kind = getattr(frame, "type", None)
+        if kind == "assistant_msg_start":
+            bucket = self._text.setdefault(session_id, {})
+            bucket[str(frame.message_id)] = ""
+            self._trim(bucket)
+            return None
+        if kind == "delta":
+            bucket = self._text.setdefault(session_id, {})
+            key = str(frame.message_id)
+            chunk = frame.text or ""
+            if getattr(frame, "replace", False):
+                bucket[key] = chunk
+            else:
+                bucket[key] = bucket.get(key, "") + chunk
+            self._trim(bucket)
+            return None
+        if kind == "turn_end":
+            return self.pop_final(session_id)
+        return None
+
+    def pop_final(self, session_id: str) -> str:
+        bucket = self._text.pop(session_id, {})
+        for text in reversed(list(bucket.values())):
+            if text.strip():
+                return text.strip()
+        return ""
+
+    def forget(self, session_id: str) -> None:
+        self._text.pop(session_id, None)
+
+    def _trim(self, bucket: dict[str, str]) -> None:
+        while len(bucket) > self._max_messages:
+            bucket.pop(next(iter(bucket)), None)
+
+
 class RoomService:
     """Owns room state for one wrapper machine and emits its frames."""
 
@@ -47,6 +98,7 @@ class RoomService:
         self._dispatcher = RoomDispatcher(
             self.store, MachineRoomHost(machine), on_state=self._on_member_state)
         self._templates: dict[str, Room] = {}
+        self._turns = RoomTurnCollector()
 
     # ---- transport -----------------------------------------------------
     async def _send(self, frame) -> None:
@@ -162,6 +214,10 @@ class RoomService:
             return await self._error(cmd, str(exc))
 
     # ---- turn results --------------------------------------------------
+    def observe_frame(self, session_id: str, frame: Any) -> Optional[str]:
+        """Feed one session frame; return the final text at a turn terminal."""
+        return self._turns.observe(session_id, frame)
+
     def member_for_session(self, session_id: str) -> Optional[tuple[str, str]]:
         """Map a live session back to (room_id, member_id), if a room owns it."""
         for room in self.store.list_rooms():
