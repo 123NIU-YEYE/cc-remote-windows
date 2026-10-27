@@ -9,6 +9,7 @@ See ``docs/collaboration-rooms.md`` for the full design and the wire contract.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -16,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional, Protocol
 
 ROOM_LIMIT = 200
 MEMBER_LIMIT = 8
@@ -387,3 +388,256 @@ class RoomStore:
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+# ---- dispatch -------------------------------------------------------------
+#
+# A room never executes anything itself: it resolves who was addressed and asks
+# the host (the wrapper) to run that member's own session. Keeping the boundary
+# at an async interface makes the routing testable without spawning engines.
+
+MEMBER_IDLE = "idle"
+MEMBER_RUNNING = "running"
+MEMBER_QUEUED = "queued"
+MEMBER_DONE = "done"
+MEMBER_FAILED = "failed"
+
+DEFAULT_MAX_PARALLEL = 2
+CONTEXT_HEADER = "[房间 {name} · 目录 {cwd}]"
+
+
+@dataclass
+class MemberRuntime:
+    """Live (non-persisted) dispatch state for one member of one room."""
+
+    member_id: str
+    session_id: Optional[str] = None
+    state: str = MEMBER_IDLE
+    queued: int = 0
+    started_at: Optional[float] = None
+    error: Optional[str] = None
+    # True while this member holds a room-level parallelism permit.
+    holding_permit: bool = False
+
+    def as_dict(self) -> dict:
+        return {
+            "member_id": self.member_id,
+            "session_id": self.session_id,
+            "state": self.state,
+            "queued": self.queued,
+            "started_at": self.started_at,
+            "error": self.error,
+        }
+
+
+class RoomHost(Protocol):
+    """What a room needs from the wrapper. Implemented by the session pool."""
+
+    async def ensure_session(self, room: Room, member: RoomMember) -> str:
+        """Return the wire session id for this member, creating it if needed."""
+
+    async def dispatch_query(
+        self, session_id: str, text: str, *, msg_id: str,
+        delivery: str,
+    ) -> None:
+        """Deliver one turn to a session (``queue`` keeps it behind a running turn)."""
+
+    async def steer_session(self, session_id: str, text: str) -> None:
+        """Add an instruction to that session's running turn."""
+
+    async def cancel_session(self, session_id: str) -> None:
+        """Interrupt that session's running turn."""
+
+
+class RoomDispatcher:
+    """Turn a room message into per-member turns, and their results back in."""
+
+    def __init__(self, store: RoomStore, host: RoomHost, *,
+                 max_parallel: int = DEFAULT_MAX_PARALLEL):
+        self._store = store
+        self._host = host
+        self._max_parallel = max(1, int(max_parallel))
+        self._semaphore = asyncio.Semaphore(self._max_parallel)
+        self._runtime: dict[str, dict[str, MemberRuntime]] = {}
+        self._tasks: set[asyncio.Task] = set()
+
+    # ---- inspection ----------------------------------------------------
+    def runtime(self, room_id: str) -> list[MemberRuntime]:
+        """Current per-member dispatch state, in the room's member order."""
+        room = self._store.get(room_id)
+        if room is None:
+            return []
+        states = self._runtime.setdefault(room_id, {})
+        return [states.setdefault(member.member_id,
+                                 MemberRuntime(member_id=member.member_id))
+                for member in room.members]
+
+    # ---- commands ------------------------------------------------------
+    async def post(self, room_id: str, text: str, *,
+                   delivery: str = "queue") -> RoomMessage:
+        """Record a user message and start one turn per addressed member."""
+        room = self._store.get(room_id)
+        if room is None:
+            raise RoomError("unknown room")
+        body = _bounded_text(text.strip())
+        if not body:
+            raise RoomError("message must not be empty")
+        return await self._record_and_dispatch(
+            room_id, body, parse_mentions(body, room.members), delivery)
+
+    async def post_to_member(self, room_id: str, member_id: str, text: str, *,
+                             delivery: str = "queue") -> RoomMessage:
+        """Dispatch to exactly one member, bypassing mention parsing.
+
+        Needed by the "steer while idle" fallback: re-deriving a mention from the
+        label would fan out to every member sharing that engine segment.
+        """
+        _state, member = self._require(room_id, member_id)
+        body = _bounded_text(text.strip())
+        if not body:
+            raise RoomError("message must not be empty")
+        return await self._record_and_dispatch(
+            room_id, body, [member.member_id], delivery)
+
+    async def _record_and_dispatch(self, room_id: str, body: str,
+                                   mentions: list[str],
+                                   delivery: str) -> RoomMessage:
+        room = self._store.get(room_id)
+        if room is None:
+            raise RoomError("unknown room")
+        message = RoomMessage(
+            msg_id=_new_id("msg"), ts=time.time(), author_kind="user",
+            author_label="你", text=body, mentions=list(mentions),
+        )
+        self._store.append_message(room_id, message)
+        for member_id in mentions:
+            member = room.member(member_id)
+            if member is None:      # member removed between parse and dispatch
+                continue
+            state = self._state(room_id, member_id)
+            state.queued += 1
+            if state.state == MEMBER_IDLE:
+                state.state = MEMBER_QUEUED
+            self._spawn(self._dispatch(room, member, message, delivery))
+        return message
+
+    async def steer(self, room_id: str, member_id: str, text: str) -> None:
+        state, member = self._require(room_id, member_id)
+        body = text.strip()
+        if not body:
+            raise RoomError("steer text must not be empty")
+        session_id = state.session_id or member.session_id
+        if state.state not in {MEMBER_RUNNING, MEMBER_QUEUED} or not session_id:
+            # Nothing is running (or nothing has run yet): steer degenerates to a
+            # queued follow-up, which is what the UI's "引导" button means here.
+            await self.post_to_member(room_id, member_id, body, delivery="queue")
+            return
+        await self._host.steer_session(session_id, body)
+
+    async def cancel(self, room_id: str, member_id: str) -> None:
+        state, member = self._require(room_id, member_id)
+        session_id = state.session_id or member.session_id
+        if session_id:
+            await self._host.cancel_session(session_id)
+
+    # ---- turn results --------------------------------------------------
+    async def on_turn_terminal(self, room_id: str, member_id: str, text: str,
+                               *, ok: bool = True) -> Optional[RoomMessage]:
+        """Collect one member's finished turn into the room timeline."""
+        room = self._store.get(room_id)
+        if room is None:
+            return None
+        member = room.member(member_id)
+        if member is None:
+            return None
+        state = self._state(room_id, member_id)
+        state.state = MEMBER_DONE if ok else MEMBER_FAILED
+        state.started_at = None
+        state.error = None if ok else "turn failed"
+        self._release(state)
+
+        body = _bounded_text((text or "").strip())
+        if not body and ok:
+            return None
+        message = RoomMessage(
+            msg_id=_new_id("msg"), ts=time.time(), author_kind="member",
+            author_label=member.label, text=body or "（本轮没有产出文本）",
+            state=MEMBER_DONE if ok else MEMBER_FAILED,
+        )
+        self._store.append_message(room_id, message)
+        return message
+
+    # ---- waiting (tests / graceful shutdown) ---------------------------
+    async def wait_idle(self, room_id: Optional[str] = None) -> None:
+        """Await in-flight dispatch tasks (sends, not the turns themselves)."""
+        if room_id is not None:
+            for state in self._runtime.get(room_id, {}).values():
+                state.queued = 0
+        while self._tasks:
+            pending = [task for task in self._tasks if not task.done()]
+            if not pending:
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    # ---- internals -----------------------------------------------------
+    def _state(self, room_id: str, member_id: str) -> MemberRuntime:
+        states = self._runtime.setdefault(room_id, {})
+        state = states.get(member_id)
+        if state is None:
+            state = MemberRuntime(member_id=member_id)
+            states[member_id] = state
+        return state
+
+    def _require(self, room_id: str, member_id: str) -> tuple[MemberRuntime, RoomMember]:
+        room = self._store.get(room_id)
+        if room is None:
+            raise RoomError("unknown room")
+        member = room.member(member_id)
+        if member is None:
+            raise RoomError("unknown member")
+        return self._state(room_id, member_id), member
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _release(self, state: MemberRuntime) -> None:
+        if state.holding_permit:
+            state.holding_permit = False
+            self._semaphore.release()
+
+    async def _dispatch(self, room: Room, member: RoomMember,
+                        message: RoomMessage, delivery: str) -> None:
+        state = self._state(room.room_id, member.member_id)
+        try:
+            # The permit bounds concurrently RUNNING turns (the real resource:
+            # each member turn is another agent process), not just sends.
+            await self._semaphore.acquire()
+            state.holding_permit = True
+
+            session_id = state.session_id or member.session_id
+            if not session_id:
+                session_id = await self._host.ensure_session(room, member)
+                self._store.bind_session(room.room_id, member.member_id, session_id)
+            state.session_id = session_id
+
+            state.state = MEMBER_RUNNING
+            state.started_at = time.time()
+            state.queued = max(0, state.queued - 1)
+            prompt = f"{CONTEXT_HEADER.format(name=room.name, cwd=room.cwd)}\n{message.text}"
+            await self._host.dispatch_query(
+                session_id, prompt, msg_id=message.msg_id, delivery=delivery)
+        except asyncio.CancelledError:
+            self._release(state)
+            raise
+        except Exception as exc:  # noqa: BLE001 - one member must not sink the room
+            state.state = MEMBER_FAILED
+            state.error = f"{type(exc).__name__}: {exc}"
+            state.started_at = None
+            state.queued = max(0, state.queued - 1)
+            self._release(state)
+            self._store.append_message(room.room_id, RoomMessage(
+                msg_id=_new_id("msg"), ts=time.time(), author_kind="member",
+                author_label=member.label,
+                text=f"派发失败：{state.error}", state=MEMBER_FAILED,
+            ))
