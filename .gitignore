@@ -43,3 +43,6 @@ _*.json
 cf-local-*.txt
 cloudflared-url.txt
 cf-local-url.txt
+
+# Headless smoke-test screenshots
+_shot-*.png
