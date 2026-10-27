@@ -28,6 +28,12 @@ export interface RoomsViewProps {
   onSelectRoom: (roomId: string) => void;
   onCreateRoom: (name: string, cwd: string, members: RoomMemberDraft[]) => void;
   onPostMessage: (roomId: string, text: string) => void;
+  /** 引导: append an instruction to that member's running turn. */
+  onSteer: (roomId: string, memberId: string, text: string) => void;
+  /** Interrupt that member's running turn. */
+  onCancel: (roomId: string, memberId: string) => void;
+  /** 跳转会话: leave the room and open the member's own session. */
+  onOpenSession: (member: RoomMemberView) => void;
   onRefresh: () => void;
 }
 
@@ -78,25 +84,79 @@ function RoomCard({
   );
 }
 
-function MemberRow({ member }: { member: RoomMemberView }) {
+function MemberRow({
+  member, roomId, onSteer, onCancel, onOpenSession,
+}: {
+  member: RoomMemberView;
+  roomId: string;
+  onSteer: (roomId: string, memberId: string, text: string) => void;
+  onCancel: (roomId: string, memberId: string) => void;
+  onOpenSession: (member: RoomMemberView) => void;
+}) {
+  const [steering, setSteering] = useState(false);
+  const [steerText, setSteerText] = useState("");
+  const running = member.state === "running" || member.state === "queued";
   const label = member.state === "running" ? "处理中"
     : member.state === "queued" ? "排队中"
       : member.state === "failed" ? "失败"
         : member.state === "done" ? "已完成" : "空闲";
+
+  const submitSteer = () => {
+    const text = steerText.trim();
+    if (!text) return;
+    onSteer(roomId, member.member_id, text);
+    setSteerText("");
+    setSteering(false);
+  };
+
   return (
-    <div className="rooms-member-row" data-state={member.state ?? "idle"}>
-      <span className={`rooms-avatar rooms-avatar-${member.engine}`}>
-        {memberInitial(member)}
-      </span>
-      <span className="rooms-member-label">{member.label}</span>
-      <span className="rooms-member-state">{label}</span>
-      <Clock member={member} />
-      {member.queued ? <span className="rooms-member-queue">队列 · {member.queued}</span> : null}
-      {member.error ? <span className="rooms-member-error">{member.error}</span> : null}
+    <div className="rooms-member" data-state={member.state ?? "idle"}>
+      <div className="rooms-member-row">
+        <span className={`rooms-avatar rooms-avatar-${member.engine}`}>
+          {memberInitial(member)}
+        </span>
+        <span className="rooms-member-label">{member.label}</span>
+        <span className="rooms-member-state">{label}</span>
+        <Clock member={member} />
+        {member.queued ? <span className="rooms-member-queue">队列 · {member.queued}</span> : null}
+        {member.error ? <span className="rooms-member-error">{member.error}</span> : null}
+        <span className="rooms-member-actions">
+          <button type="button" onClick={() => setSteering((value) => !value)}>
+            引导
+          </button>
+          {running && (
+            <button type="button" onClick={() => onCancel(roomId, member.member_id)}>
+              取消
+            </button>
+          )}
+          {member.session_id && (
+            <button type="button" onClick={() => onOpenSession(member)}>
+              跳转会话 ↗
+            </button>
+          )}
+        </span>
+      </div>
+      {steering && (
+        <div className="rooms-steer">
+          <input
+            className="rooms-input"
+            autoFocus
+            placeholder={`引导 ${member.label} 当前任务…（Enter 发送）`}
+            value={steerText}
+            onChange={(event) => setSteerText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                submitSteer();
+              }
+              if (event.key === "Escape") setSteering(false);
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }
-
 function NewRoomForm({ defaultCwd, onSubmit }: {
   defaultCwd: string;
   onSubmit: (name: string, cwd: string, members: RoomMemberDraft[]) => void;
@@ -145,7 +205,8 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 }
 
 export function RoomsView({
-  rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage, onRefresh,
+  rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
+  onSteer, onCancel, onOpenSession, onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
@@ -244,7 +305,9 @@ export function RoomsView({
 
             <div className="rooms-members-bar">
               {active.members.map((member) => (
-                <MemberRow key={member.member_id} member={member} />
+                <MemberRow key={member.member_id} member={member}
+                  roomId={active.room_id} onSteer={onSteer}
+                  onCancel={onCancel} onOpenSession={onOpenSession} />
               ))}
             </div>
 
