@@ -672,3 +672,109 @@
   font-size: 11px;
   font-family: var(--mono, monospace);
 }
+/* Handing one message to another member: the "advice -> execution" path. */
+.rooms-msg-handoff {
+  margin-left: auto;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill, 999px);
+  background: transparent;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms var(--ease, ease);
+}
+
+.rooms-msg:hover .rooms-msg-handoff {
+  opacity: 1;
+}
+
+.rooms-msg-handoff:hover {
+  border-color: var(--accent);
+  color: var(--accent-ink);
+}
+
+.rooms-handoff {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--divider);
+}
+
+.rooms-handoff-hint {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.rooms-handoff .rooms-chip {
+  cursor: pointer;
+  background: var(--surface);
+}
+/* Manual quoting: tick any entries and they travel with the next message. */
+.rooms-msg-quote {
+  margin-left: auto;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill, 999px);
+  background: transparent;
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms var(--ease, ease);
+}
+
+.rooms-msg:hover .rooms-msg-quote,
+.rooms-msg-quote.is-on {
+  opacity: 1;
+}
+
+.rooms-msg-quote.is-on {
+  border-color: var(--accent);
+  background: var(--accent-weak);
+  color: var(--accent-ink);
+}
+
+/* Keep the 转交 button adjacent rather than pushed to the far edge twice. */
+.rooms-msg .rooms-msg-handoff {
+  margin-left: 6px;
+}
+
+.rooms-msg.is-quoted {
+  outline: 1px solid var(--accent-line);
+  outline-offset: 2px;
+}
+
+.rooms-quotebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--divider);
+  background: var(--accent-weak);
+  color: var(--accent-ink);
+  font-size: 12px;
+}
+
+.rooms-quotebar-hint {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.rooms-quotebar-clear {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-pill, 999px);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}

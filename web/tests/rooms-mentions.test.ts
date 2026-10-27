@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 
 import {
-  handleFor, initialOf, labelSegments, mentionAt, mentionCandidates,
+  handleFor, handoffText, initialOf, labelSegments, mentionAt, mentionCandidates,
 } from "../src/rooms-mentions.ts";
 import type { RoomMemberView } from "../src/rooms-state.ts";
 
@@ -44,5 +44,16 @@ assert.deepEqual(mentionAt("hi @Codex 你好", 9), { start: 3, query: "Codex" })
 assert.equal(mentionAt("@Claude 已发送", 9), null, "a finished mention is not a fragment");
 assert.equal(mentionAt("mail@example.com", 16), null, "mid-word @ is not a mention");
 assert.equal(mentionAt("no at sign", 10), null);
+
+// Handing one message to another member quotes it verbatim under a clear ask.
+const handed = handoffText("Claude · iris", "建议：先加集成测试", "Codex");
+assert.ok(handed.startsWith("@Codex 请根据下面这条内容继续："), handed);
+assert.ok(handed.includes("【Claude · iris】"));
+assert.ok(handed.endsWith("建议：先加集成测试"));
+assert.equal(handed.split("\n").length, 4, "handle line, blank line, author, body");
+
+// A very long entry is clipped so the handoff stays an instruction.
+const long = handoffText("Claude · iris", "x".repeat(4000), "Codex", 100);
+assert.ok(long.includes("x".repeat(100) + "…"));
 
 console.log("rooms-mentions.test.ts OK");
