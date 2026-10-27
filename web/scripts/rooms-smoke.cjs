@@ -117,6 +117,29 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
     console.log("last message:", (await bubbles.last().innerText()).replace(/\s+/g, " ").trim().slice(0, 120));
   }
 
+  // Typing "@" must offer the room's agents, and picking one must insert it.
+  let mentionOk = false;
+  const composer = page.locator(".rooms-textarea");
+  if (cardCount > 0 && (await composer.count()) > 0) {
+    await composer.click();
+    await composer.pressSequentially("@", { delay: 40 });
+    const picker = page.locator(".rooms-mention");
+    await picker.first().waitFor({ timeout: 8000 }).catch(() => {});
+    const optionCount = await picker.count();
+    const optionLabels = optionCount ? await picker.allInnerTexts() : [];
+    console.log("@ options:", optionCount, optionLabels.slice(0, 4).map((t) => t.replace(/\s+/g, " ").trim()));
+    await page.screenshot({ path: OUT.replace(".png", "-mention.png") });
+    if (optionCount > 0) {
+      await picker.first().click();
+      await page.waitForTimeout(300);
+      const value = await composer.inputValue();
+      console.log("composer after pick:", JSON.stringify(value));
+      mentionOk = /^@\S+/.test(value);
+      await composer.fill("");
+    }
+  }
+  console.log("mention picker works:", mentionOk);
+
   await page.screenshot({ path: OUT });
   await page.evaluate(() => { document.documentElement.dataset.theme = "dark"; });
   await page.waitForTimeout(800);
@@ -131,7 +154,8 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   // "Failed to load resource" duplicates the response log above, which already
   // filters the viewer noise; counting it twice would hide a real signal.
   const relevantErrors = errors.filter((line) => !line.includes("Failed to load resource"));
-  const ok = cardCount > 0 && bubbleCount > 0 && relevantErrors.length === 0 && relevantFailures.length === 0;
+  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk
+    && relevantErrors.length === 0 && relevantFailures.length === 0;
   console.log(ok ? "RESULT: PASS" : "RESULT: FAIL");
   await browser.close();
   process.exit(ok ? 0 : 1);

@@ -6,12 +6,13 @@
  * comes back into this timeline. The component is presentation-only: every
  * mutation goes through a prop so the socket stays in App.
  */
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 
 import {
   filterRooms, roomOrder, runningMembers, runningSeconds,
   type RoomMemberView, type RoomView, type RoomsState,
 } from "../rooms-state";
+import { mentionAt, mentionCandidates } from "../rooms-mentions";
 import "./RoomsView.css";
 
 export interface RoomMemberDraft {
@@ -347,10 +348,41 @@ export function RoomsView({
   const [draft, setDraft] = useState("");
   const [composing, setComposing] = useState(false);
   const [inviting, setInviting] = useState(false);
+  const insertMention = (option: { insert: string }) => {
+    if (!mentionQuery) return;
+    const caret = composerRef.current?.selectionStart ?? draft.length;
+    const head = draft.slice(0, mentionQuery.start);
+    const tail = draft.slice(caret);
+    const next = `${head}@${option.insert} ${tail}`;
+    setDraft(next);
+    setMentionQuery(null);
+    // Put the caret after the inserted mention and the space that follows it.
+    const position = head.length + option.insert.length + 2;
+    requestAnimationFrame(() => {
+      const element = composerRef.current;
+      if (!element) return;
+      element.focus();
+      element.setSelectionRange(position, position);
+    });
+  };
 
   const ordered = useMemo(() => roomOrder(rooms), [rooms]);
   const listed = useMemo(() => filterRooms(rooms, query), [rooms, query]);
   const active = activeRoomId ? rooms[activeRoomId] : undefined;
+
+  const [mentionQuery, setMentionQuery] = useState<{ start: number; query: string } | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const mentionOptions = useMemo(
+    () => (mentionQuery && active ? mentionCandidates(active.members, mentionQuery.query) : []),
+    [mentionQuery, active],
+  );
+  const mentionOpen = mentionQuery !== null && active !== undefined;
+
+  const updateMention = (value: string, caret: number) => {
+    setMentionIndex(0);
+    setMentionQuery(mentionAt(value, caret));
+  };
 
   const send = () => {
     const text = draft.trim();
@@ -477,12 +509,72 @@ export function RoomsView({
             </div>
 
             <div className="rooms-composer">
+              {mentionOpen && (
+                <div className="rooms-mentions" role="listbox" aria-label="选择成员">
+                  <div className="rooms-mentions-head">@ 谁</div>
+                  {mentionOptions.map((option, index) => (
+                    <button
+                      key={option.insert}
+                      type="button"
+                      role="option"
+                      aria-selected={index === mentionIndex}
+                      className={`rooms-mention${index === mentionIndex ? " is-active" : ""}`}
+                      onMouseEnter={() => setMentionIndex(index)}
+                      onMouseDown={(event) => {
+                        // mousedown, not click: the textarea would blur first.
+                        event.preventDefault();
+                        insertMention(option);
+                      }}
+                    >
+                      {option.engine
+                        ? <span className={`rooms-avatar rooms-avatar-${option.engine}`}>{option.initial}</span>
+                        : <span className="rooms-avatar rooms-avatar-dsh">全</span>}
+                      <span className="rooms-mention-label">{option.label}</span>
+                      <span className="rooms-mention-insert">@{option.insert}</span>
+                    </button>
+                  ))}
+                  {mentionOptions.length === 0 && (
+                    <div className="rooms-empty">没有匹配的成员</div>
+                  )}
+                </div>
+              )}
               <textarea
+                ref={composerRef}
                 className="rooms-textarea"
-                placeholder="发消息，或 @ 某个 Agent…（Ctrl+Enter 发送）"
+                placeholder="发消息，或输入 @ 选择 Agent…（Ctrl+Enter 发送）"
                 value={draft}
-                onChange={(event) => setDraft(event.target.value)}
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  updateMention(event.target.value, event.target.selectionStart ?? 0);
+                }}
+                onClick={(event) => {
+                  const target = event.currentTarget;
+                  updateMention(target.value, target.selectionStart ?? 0);
+                }}
+                onBlur={() => setMentionQuery(null)}
                 onKeyDown={(event) => {
+                  if (mentionOpen) {
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      setMentionIndex((value) => (value + 1) % mentionOptions.length);
+                      return;
+                    }
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      setMentionIndex((value) => (value - 1 + mentionOptions.length) % mentionOptions.length);
+                      return;
+                    }
+                    if (event.key === "Enter" || event.key === "Tab") {
+                      event.preventDefault();
+                      if (mentionOptions[mentionIndex]) insertMention(mentionOptions[mentionIndex]);
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setMentionQuery(null);
+                      return;
+                    }
+                  }
                   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
                     event.preventDefault();
                     send();
