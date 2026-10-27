@@ -30,3 +30,16 @@ harmony/*.p12
 harmony/*.p7b
 harmony/*.cer
 harmony/*.csr
+
+# Windows port: local dependency tree and diagnostics
+.pydeps/
+*.log.err
+cloudflared-linux-amd64
+ccremote-v81.tar.gz
+
+# One-off diagnostics and scratch output from the porting session
+_*.py
+_*.json
+cf-local-*.txt
+cloudflared-url.txt
+cf-local-url.txt

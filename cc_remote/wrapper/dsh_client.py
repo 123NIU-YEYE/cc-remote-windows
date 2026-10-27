@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import AsyncIterator
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -25,6 +26,7 @@ import httpx
 from websockets.asyncio.client import connect
 
 from cc_remote.log import logger
+from cc_remote.wrapper.os_compat import private_file_ok
 
 TESTED_DSH_VERSION = "0.2.1-rc.2"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
@@ -119,11 +121,14 @@ class DshConnection:
     @classmethod
     def load(cls, path: Path) -> DshConnection:
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            # O_NOFOLLOW/O_NONBLOCK are POSIX-only; the Windows shim maps them
+            # to 0 and the regular-file/size checks below still apply.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            fd = os.open(path, flags)
             with os.fdopen(fd, "rb") as stream:
                 info = os.fstat(stream.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                        or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 8192):
+                if (not stat.S_ISREG(info.st_mode) or not private_file_ok(info)
+                        or info.st_size > 8192):
                     raise ValueError
                 data = json.loads(stream.read(8193))
             if not isinstance(data, dict) or set(data) != {"schema", "origin", "token"} or data["schema"] != 1:

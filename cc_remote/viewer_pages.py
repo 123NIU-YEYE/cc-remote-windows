@@ -6,7 +6,7 @@ the publication's FD-based resource checks on the device owning that file.
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import hashlib
 import json
 import os

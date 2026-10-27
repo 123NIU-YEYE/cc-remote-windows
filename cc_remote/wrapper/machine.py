@@ -216,8 +216,26 @@ from cc_remote.wrapper.codex_daemon import (
     CodexProfileDaemonUnavailable,
 )
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
-from cc_remote.claude_broker import BrokerClient, BrokerClientError
-from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+# The Claude PTY broker is a Unix-only subsystem (Unix sockets, fcntl, termios).
+# It is opt-in behind `experimental_claude_broker` (default off) and unrelated to
+# DSH/Codex, so import it opportunistically: on Windows the rest of the Wrapper
+# must still start and serve DSH sessions.
+try:  # pragma: no cover - exercised on Unix
+    from cc_remote.claude_broker import BrokerClient, BrokerClientError
+    from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+
+    CLAUDE_BROKER_AVAILABLE = True
+except ImportError:  # pragma: no cover - Windows
+    CLAUDE_BROKER_AVAILABLE = False
+    BrokerClient = None  # type: ignore[assignment]
+    ClaudeBrokerHandle = None  # type: ignore[assignment]
+
+    class BrokerClientError(RuntimeError):  # type: ignore[no-redef]
+        """Placeholder so broker-only ``except`` clauses still import."""
+
+# These history parsers are plain transcript utilities, not part of the PTY
+# broker: the Claude transcript watcher uses them on every platform, so they
+# must never be stubbed out just because the broker is unavailable.
 from cc_remote.wrapper.claude_broker_history import (
     MAX_PARTIAL_LINE,
     claude_broker_tail_state,
@@ -2221,13 +2239,17 @@ class WrapperMachine:
         except CodexProcessClockStoreError:
             self._codex_process_clocks = None
             log.exception("Codex process-clock store unavailable")
-        self._claude_broker = BrokerClient(
-            getattr(cfg, "claude_broker_socket", None))
+        # The PTY broker is Unix-only; on Windows the import was skipped, so
+        # there is no client to construct and no broker to enable.
+        self._claude_broker = (
+            BrokerClient(getattr(cfg, "claude_broker_socket", None))
+            if CLAUDE_BROKER_AVAILABLE else None
+        )
         # Claude's official SDK/CLI does not expose a supported multi-writer
         # control plane. Keep the PTY broker code available for development,
         # but never discover or adopt it in the customer path by default.
         self._claude_broker_enabled = bool(getattr(
-            cfg, "experimental_claude_broker", False))
+            cfg, "experimental_claude_broker", False)) and CLAUDE_BROKER_AVAILABLE
         self._claude_rate_limit_lock = asyncio.Lock()
         self._claude_rate_limit_emit_lock = asyncio.Lock()
         legacy_claude_root = str(
@@ -2733,6 +2755,7 @@ class WrapperMachine:
                 log.warning(
                     "Codex profile state migration is incomplete",
                     error_type=type(exc).__name__,
+                    error=str(exc),
                 )
         if transition is not None and self._codex_profile_migration_ok:
             try:
@@ -14564,6 +14587,10 @@ class WrapperMachine:
                 log.warning(
                     "history index read failed", session_id=sid,
                     error=str(exc),
+                    trace=" | ".join(
+                        line.strip() for line in
+                        __import__("traceback").format_exc().splitlines()[-6:]
+                    )[:900],
                 )
         if (
             is_codex_hist
@@ -15676,6 +15703,10 @@ class WrapperMachine:
                     log.warning(
                         "history index write failed", session_id=sid,
                         error=str(exc),
+                        trace=" | ".join(
+                            line.strip() for line in
+                            __import__("traceback").format_exc().splitlines()[-6:]
+                        )[:900],
                     )
         if source_snapshot_stable is False:
             # The translator did not observe one coherent source snapshot. It
@@ -37046,6 +37077,7 @@ class WrapperMachine:
                 "required Codex profile daemon unavailable",
                 profile_id=codex_profile.id if codex_profile else None,
                 error_type=type(e).__name__,
+                error=str(e),
             )
             await reject(
                 ERR_CC_CRASH,

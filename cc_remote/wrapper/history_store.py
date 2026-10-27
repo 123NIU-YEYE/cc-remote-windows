@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -183,6 +184,19 @@ def _historical_turn_failure(value: Any) -> str:
     return _GENERIC_HISTORY_TURN_FAILURE
 
 
+def _sqlite_int(value: int) -> int:
+    """Fold a filesystem identity into SQLite's signed 64-bit INTEGER range.
+
+    Windows reports a 64-bit volume serial as ``st_dev`` and can report a file
+    index as ``st_ino``; either may exceed ``2**63 - 1``, and SQLite refuses to
+    bind such a value at all ("Python int too large to convert to SQLite
+    INTEGER"), which aborted every history-index read and write. These numbers
+    only fingerprint a cache entry, so folding them deterministically is safe:
+    the fingerprint also carries the path, size, mtime and content hashes.
+    """
+    return int(value) & (2**63 - 1)
+
+
 @dataclass(frozen=True)
 class HistorySourceFingerprint:
     """Identity of the exact transcript snapshot used to build a page."""
@@ -211,10 +225,10 @@ class HistorySourceFingerprint:
                 digest.update(tail)
         return cls(
             path=resolved,
-            device=int(stat.st_dev),
-            inode=int(stat.st_ino),
+            device=_sqlite_int(stat.st_dev),
+            inode=_sqlite_int(stat.st_ino),
             size=int(stat.st_size),
-            mtime_ns=int(stat.st_mtime_ns),
+            mtime_ns=_sqlite_int(stat.st_mtime_ns),
             head_sha256=hashlib.sha256(head).hexdigest(),
             tail_sha256=hashlib.sha256(tail).hexdigest(),
             sample_sha256=digest.hexdigest(),
@@ -413,9 +427,29 @@ class MaterializedTurnDetail:
 
 
 def _event_ms(value: Any) -> int | None:
-    if not isinstance(value, (int, float)):
+    """Normalise a wire timestamp to whole milliseconds.
+
+    Sources disagree on the unit: the protocol sends seconds, some rollouts and
+    the Codex app-server send milliseconds, and proto-style records send
+    nanoseconds. Scaling "whatever we got" by 1000 therefore overflowed SQLite's
+    64-bit INTEGER (``int too large to convert to SQLite INTEGER``) and aborted
+    every index write. Normalise by magnitude first, then clamp so a future unit
+    change degrades to a saturated value instead of failing the whole page.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
-    return round(float(value) * 1000)
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    if number >= 1e17:          # nanoseconds
+        number /= 1e6
+    elif number >= 1e14:        # microseconds
+        number /= 1e3
+    elif number >= 1e11:        # already milliseconds
+        pass
+    else:                       # seconds
+        number *= 1e3
+    return min(int(round(number)), 2**63 - 1)
 
 
 def group_history_events(

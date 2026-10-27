@@ -19,7 +19,7 @@ checkpoint boundary.  Empty directories are not representable in Git trees.
 from __future__ import annotations
 
 import copy
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import hashlib
 import json
 import os

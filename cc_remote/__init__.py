@@ -6,3 +6,11 @@ Two independent links:
 """
 
 __version__ = "4.0.29"
+
+# Define the POSIX-only ``os`` attributes that Windows lacks before any wrapper
+# module reads them. No-op on Unix. See cc_remote.wrapper.os_compat.
+from cc_remote.wrapper.os_compat import install_windows_shims as _install_windows_shims
+
+_install_windows_shims()
+del _install_windows_shims
+

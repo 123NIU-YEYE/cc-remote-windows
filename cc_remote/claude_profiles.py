@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 from typing import Any, Iterator
 
 
@@ -617,11 +618,14 @@ class ClaudeProfileTopologyStore:
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
             path.chmod(0o600)
-            directory_fd = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            # POSIX allows opening a directory to fsync the rename; Windows
+            # raises PermissionError for it, and has no directory fsync at all.
+            if sys.platform != "win32":
+                directory_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -635,8 +639,9 @@ class ClaudeProfileTopologyStore:
             self.pending_path.unlink()
         except FileNotFoundError:
             return
-        directory_fd = os.open(self.pending_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if sys.platform != "win32":
+            directory_fd = os.open(self.pending_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
