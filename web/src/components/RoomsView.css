@@ -505,3 +505,64 @@
     max-height: 40vh;
   }
 }
+
+/* Room card: the open affordance and the rename/delete tools live side by side so
+   the whole card is not one giant button (nested buttons are invalid HTML). */
+.rooms-card-open,
+.rooms-card-body {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+}
+
+.rooms-card-open {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.rooms-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.rooms-card-tools {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 120ms var(--ease, ease);
+}
+
+.rooms-card:hover .rooms-card-tools,
+.rooms-card.is-active .rooms-card-tools {
+  opacity: 1;
+}
+
+.rooms-card-tools button {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill, 999px);
+  background: var(--surface);
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.rooms-card-tools button:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.rooms-rename {
+  padding: 4px 6px;
+  font-size: 12px;
+}

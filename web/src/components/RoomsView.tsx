@@ -34,6 +34,8 @@ export interface RoomsViewProps {
   onCancel: (roomId: string, memberId: string) => void;
   /** 跳转会话: leave the room and open the member's own session. */
   onOpenSession: (member: RoomMemberView) => void;
+  onRenameRoom: (roomId: string, name: string) => void;
+  onDeleteRoom: (roomId: string) => void;
   onRefresh: () => void;
 }
 
@@ -50,40 +52,83 @@ function Clock({ member }: { member: RoomMemberView }) {
 }
 
 function RoomCard({
-  room, active, onSelect,
-}: { room: RoomView; active: boolean; onSelect: () => void }) {
+  room, active, onSelect, onRename, onDelete,
+}: {
+  room: RoomView;
+  active: boolean;
+  onSelect: () => void;
+  onRename: (name: string) => void;
+  onDelete: () => void;
+}) {
+  const [renaming, setRenaming] = useState(false);
+  const [draftName, setDraftName] = useState(room.name);
   const busy = runningMembers(room).length;
+
+  const commitRename = () => {
+    const name = draftName.trim();
+    if (name && name !== room.name) onRename(name);
+    setRenaming(false);
+  };
+
   return (
-    <button
-      type="button"
-      className={`rooms-card${active ? " is-active" : ""}`}
-      onClick={onSelect}
-    >
+    <div className={`rooms-card${active ? " is-active" : ""}`}>
       <div className="rooms-card-head">
-        <span className="rooms-card-name">{room.name}</span>
-        {active && <span className="rooms-card-current">当前</span>}
-        {busy > 0 && <span className="rooms-card-busy">{busy} 个处理中</span>}
-      </div>
-      <div className="rooms-card-path">{room.cwd}</div>
-      <div className="rooms-card-members">
-        {room.members.map((member) => (
-          <span
-            key={member.member_id}
-            className={`rooms-avatar rooms-avatar-${member.engine}`}
-            title={member.label}
-            data-state={member.state ?? "idle"}
-          >
-            {memberInitial(member)}
-          </span>
-        ))}
-        {typeof room.message_count === "number" && room.message_count > 0 && (
-          <span className="rooms-card-count">{room.message_count} 条</span>
+        {renaming ? (
+          <input
+            className="rooms-input rooms-rename"
+            autoFocus
+            value={draftName}
+            onChange={(event) => setDraftName(event.target.value)}
+            onBlur={commitRename}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") commitRename();
+              if (event.key === "Escape") {
+                setDraftName(room.name);
+                setRenaming(false);
+              }
+            }}
+          />
+        ) : (
+          <button type="button" className="rooms-card-open" onClick={onSelect}>
+            <span className="rooms-card-name">{room.name}</span>
+            {active && <span className="rooms-card-current">当前</span>}
+            {busy > 0 && <span className="rooms-card-busy">{busy} 个处理中</span>}
+          </button>
         )}
+        <span className="rooms-card-tools">
+          <button type="button" title="重命名" onClick={() => setRenaming(true)}>改名</button>
+          <button
+            type="button"
+            title="删除房间（成员会话会保留）"
+            onClick={() => {
+              if (window.confirm(`删除房间「${room.name}」？成员的会话会保留。`)) onDelete();
+            }}
+          >
+            删除
+          </button>
+        </span>
       </div>
-    </button>
+      <button type="button" className="rooms-card-body" onClick={onSelect}>
+        <span className="rooms-card-path">{room.cwd}</span>
+        <span className="rooms-card-members">
+          {room.members.map((member) => (
+            <span
+              key={member.member_id}
+              className={`rooms-avatar rooms-avatar-${member.engine}`}
+              title={member.label}
+              data-state={member.state ?? "idle"}
+            >
+              {memberInitial(member)}
+            </span>
+          ))}
+          {typeof room.message_count === "number" && room.message_count > 0 && (
+            <span className="rooms-card-count">{room.message_count} 条</span>
+          )}
+        </span>
+      </button>
+    </div>
   );
 }
-
 function MemberRow({
   member, roomId, onSteer, onCancel, onOpenSession,
 }: {
@@ -206,7 +251,7 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 
 export function RoomsView({
   rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
-  onSteer, onCancel, onOpenSession, onRefresh,
+  onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState("");
@@ -243,6 +288,8 @@ export function RoomsView({
               room={room}
               active={room.room_id === activeRoomId}
               onSelect={() => onSelectRoom(room.room_id)}
+              onRename={(name) => onRenameRoom(room.room_id, name)}
+              onDelete={() => onDeleteRoom(room.room_id)}
             />
           ))}
           {listed.length === 0 && (
