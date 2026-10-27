@@ -10,9 +10,10 @@ import { useMemo, useRef, useState } from "react";
 
 import {
   filterRooms, roomOrder, runningMembers, runningSeconds,
-  type RoomMemberView, type RoomView, type RoomsState,
+  type RoomMemberView, type RoomMessageView, type RoomView, type RoomsState,
 } from "../rooms-state";
-import { mentionAt, mentionCandidates } from "../rooms-mentions";
+import { handleFor, handoffText, mentionAt, mentionCandidates } from "../rooms-mentions";
+import { quoteSummary, quoteText, toQuoteEntry } from "../rooms-quote";
 import "./RoomsView.css";
 
 export interface RoomMemberDraft {
@@ -348,6 +349,9 @@ export function RoomsView({
   const [draft, setDraft] = useState("");
   const [composing, setComposing] = useState(false);
   const [inviting, setInviting] = useState(false);
+  const [handoffFor, setHandoffFor] = useState<string | null>(null);
+  // Ticked timeline entries travel with the next message as an explicit quote.
+  const [quoted, setQuoted] = useState<Record<string, true>>({});
   const insertMention = (option: { insert: string }) => {
     if (!mentionQuery) return;
     const caret = composerRef.current?.selectionStart ?? draft.length;
@@ -369,6 +373,9 @@ export function RoomsView({
   const ordered = useMemo(() => roomOrder(rooms), [rooms]);
   const listed = useMemo(() => filterRooms(rooms, query), [rooms, query]);
   const active = activeRoomId ? rooms[activeRoomId] : undefined;
+  const quotedCount = active
+    ? active.messages.filter((message) => quoted[message.msg_id]).length
+    : 0;
 
   const [mentionQuery, setMentionQuery] = useState<{ start: number; query: string } | null>(null);
   const [mentionIndex, setMentionIndex] = useState(0);
@@ -384,11 +391,25 @@ export function RoomsView({
     setMentionQuery(mentionAt(value, caret));
   };
 
+  const handoff = (message: RoomMessageView, member: RoomMemberView) => {
+    if (!active) return;
+    // Quote verbatim: the receiving member has its own session, so this is the
+    // "one advises, the other acts" path and it must be explicit.
+    onPostMessage(active.room_id, handoffText(
+      message.author_label, message.text, handleFor(member, active.members)));
+    setHandoffFor(null);
+  };
+
   const send = () => {
     const text = draft.trim();
     if (!text || !active) return;
-    onPostMessage(active.room_id, text);
+    // Ticked entries are quoted verbatim; with none ticked this is just the ask.
+    const entries = active.messages
+      .filter((message) => quoted[message.msg_id])
+      .map((message) => toQuoteEntry(message));
+    onPostMessage(active.room_id, quoteText(entries, text));
     setDraft("");
+    setQuoted({});
   };
 
   return (
@@ -481,7 +502,7 @@ export function RoomsView({
               {active.messages.map((message) => (
                 <div
                   key={message.msg_id}
-                  className={`rooms-msg rooms-msg-${message.author_kind}`}
+                  className={`rooms-msg rooms-msg-${message.author_kind}${quoted[message.msg_id] ? " is-quoted" : ""}`}
                 >
                   <div className="rooms-msg-meta">
                     <span className="rooms-msg-author">{message.author_label}</span>
@@ -489,8 +510,45 @@ export function RoomsView({
                       {new Date(message.ts * 1000).toLocaleTimeString()}
                     </span>
                     {message.state === "failed" && <span className="rooms-badge-fail">失败</span>}
+                    <button
+                      type="button"
+                      className={`rooms-msg-quote${quoted[message.msg_id] ? " is-on" : ""}`}
+                      title="把这条作为引用附在下一条消息上"
+                      onClick={() => setQuoted((prev) => {
+                        const next = { ...prev };
+                        if (next[message.msg_id]) delete next[message.msg_id];
+                        else next[message.msg_id] = true;
+                        return next;
+                      })}
+                    >
+                      引用
+                    </button>
+                    <button
+                      type="button"
+                      className="rooms-msg-handoff"
+                      title="把这条内容交给另一个成员继续"
+                      onClick={() => setHandoffFor(
+                        handoffFor === message.msg_id ? null : message.msg_id)}
+                    >
+                      转交
+                    </button>
                   </div>
                   <div className="rooms-msg-text">{message.text}</div>
+                  {handoffFor === message.msg_id && (
+                    <div className="rooms-handoff">
+                      <span className="rooms-handoff-hint">交给</span>
+                      {active.members.map((member) => (
+                        <button
+                          key={member.member_id}
+                          type="button"
+                          className={`rooms-chip rooms-chip-${member.engine}`}
+                          onClick={() => handoff(message, member)}
+                        >
+                          {member.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))}
               {active.messages.length === 0 && (
@@ -508,6 +566,16 @@ export function RoomsView({
               ))}
             </div>
 
+            {quotedCount > 0 && (
+              <div className="rooms-quotebar">
+                <span className="rooms-quotebar-label">{quoteSummary(quotedCount)}</span>
+                <span className="rooms-quotebar-hint">发送时会原文附在消息里</span>
+                <button type="button" className="rooms-quotebar-clear"
+                  onClick={() => setQuoted({})}>
+                  清空
+                </button>
+              </div>
+            )}
             <div className="rooms-composer">
               {mentionOpen && (
                 <div className="rooms-mentions" role="listbox" aria-label="选择成员">

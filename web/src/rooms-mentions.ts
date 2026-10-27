@@ -83,3 +83,21 @@ export function mentionAt(value: string, caret: number): { start: number; query:
   if (!match) return null;
   return { start: before.length - match[2].length - 1, query: match[2] };
 }
+
+/**
+ * The message sent when one message is handed to another member.
+ *
+ * The quote is verbatim: the receiving member has its own session and would
+ * otherwise only know what the room transcript decided to include. Long entries
+ * are clipped — a handoff is an instruction, not an archive.
+ */
+export function handoffText(
+  authorLabel: string,
+  text: string,
+  handle: string,
+  limit = 1500,
+): string {
+  const body = text.trim();
+  const quoted = body.length > limit ? `${body.slice(0, limit)}…` : body;
+  return `@${handle} 请根据下面这条内容继续：\n\n【${authorLabel}】\n${quoted}`;
+}

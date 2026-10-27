@@ -117,6 +117,47 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
     console.log("last message:", (await bubbles.last().innerText()).replace(/\s+/g, " ").trim().slice(0, 120));
   }
 
+  // Manual quoting: tick entries, see the bar, clear it. Composing the actual
+  // text is covered by rooms-quote.test.ts; sending here would add noise to the
+  // room the user is working in.
+  let quoteOk = false;
+  if (bubbleCount > 0) {
+    const lastBubble = bubbles.last();
+    await lastBubble.hover();
+    await lastBubble.locator(".rooms-msg-quote").click();
+    const bar = page.locator(".rooms-quotebar");
+    await bar.waitFor({ timeout: 5000 }).catch(() => {});
+    const barText = (await bar.count()) ? (await bar.innerText()).replace(/\s+/g, " ").trim() : "";
+    console.log("quote bar:", JSON.stringify(barText));
+    if (barText.includes("引用 1 条")) {
+      await page.screenshot({ path: OUT.replace(".png", "-quote.png") });
+      await page.locator(".rooms-quotebar-clear").click();
+      await page.waitForTimeout(200);
+      quoteOk = (await page.locator(".rooms-quotebar").count()) === 0;
+    }
+  }
+  console.log("quote bar works:", quoteOk);
+
+  // Handing one message to another member is the advice -> execution path.
+  // Only the picker is exercised here: choosing a member would dispatch a real
+  // turn (and spend tokens) just to prove a click works.
+  let handoffOk = false;
+  if (bubbleCount > 0) {
+    const lastBubble = bubbles.last();
+    await lastBubble.hover();
+    await lastBubble.locator(".rooms-msg-handoff").click();
+    const picker = lastBubble.locator(".rooms-handoff");
+    await picker.waitFor({ timeout: 5000 }).catch(() => {});
+    const chips = picker.locator(".rooms-chip");
+    const chipCount = await chips.count();
+    console.log("handoff targets:", chipCount,
+      chipCount ? (await chips.allInnerTexts()).map((t) => t.trim()) : []);
+    handoffOk = chipCount > 0;
+    await page.screenshot({ path: OUT.replace(".png", "-handoff.png") });
+    await lastBubble.locator(".rooms-msg-handoff").click();  // close again
+  }
+  console.log("handoff picker works:", handoffOk);
+
   // Typing "@" must offer the room's agents, and picking one must insert it.
   let mentionOk = false;
   const composer = page.locator(".rooms-textarea");
@@ -154,7 +195,7 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   // "Failed to load resource" duplicates the response log above, which already
   // filters the viewer noise; counting it twice would hide a real signal.
   const relevantErrors = errors.filter((line) => !line.includes("Failed to load resource"));
-  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk
+  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk
     && relevantErrors.length === 0 && relevantFailures.length === 0;
   console.log(ok ? "RESULT: PASS" : "RESULT: FAIL");
   await browser.close();

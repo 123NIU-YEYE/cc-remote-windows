@@ -25,6 +25,13 @@ MEMBER_LIMIT = 8
 MESSAGE_LIMIT = 500
 NAME_LIMIT = 200
 TEXT_LIMIT = 32_000
+# How many recent room entries accompany a dispatch. Members have separate
+# sessions, so without this one member cannot act on another's advice; 0 disables
+# the shared transcript and members then see only the request itself.
+DEFAULT_CONTEXT_DEPTH = max(0, min(20, int(os.environ.get("CC_REMOTE_ROOM_CONTEXT_DEPTH", "6"))))
+# One transcript entry is clipped so a long reply cannot crowd out the ask.
+CONTEXT_ENTRY_LIMIT = 2000
+
 CWD_LIMIT = 4096
 
 # "@全体" style broadcasts. Kept explicit so an agent named "全体" would still
@@ -136,6 +143,9 @@ class Room:
     messages: list[RoomMessage] = field(default_factory=list)
     created_at: float = 0.0
     updated_at: float = 0.0
+    # Recent room entries included with each dispatch, so one member can act on
+    # another member's advice. 0 means members only see the request.
+    context_depth: int = DEFAULT_CONTEXT_DEPTH
 
     def member(self, member_id: str) -> Optional[RoomMember]:
         for item in self.members:
@@ -152,6 +162,7 @@ class Room:
             "messages": [message.as_dict() for message in self.messages],
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "context_depth": self.context_depth,
         }
 
     @classmethod
@@ -166,6 +177,8 @@ class Room:
                       for item in (payload.get("messages") or [])][-MESSAGE_LIMIT:],
             created_at=float(payload.get("created_at") or 0.0),
             updated_at=float(payload.get("updated_at") or 0.0),
+            context_depth=max(0, min(20, int(payload.get("context_depth",
+                                                         DEFAULT_CONTEXT_DEPTH) or 0))),
         )
 
 
@@ -665,6 +678,32 @@ class RoomDispatcher:
         except Exception:  # noqa: BLE001 - observers must not break dispatch
             pass
 
+    def _prompt(self, room: Room, member: RoomMember, message: RoomMessage) -> str:
+        """Compose the turn text: room header, recent shared transcript, the ask.
+
+        Members keep separate sessions, so this transcript is the only way one
+        member can act on another's advice. Only entries *before* the current
+        message are included, and the depth is bounded, because every entry is
+        paid for again on each dispatch.
+        """
+        lines = [CONTEXT_HEADER.format(name=room.name, cwd=room.cwd)]
+        depth = max(0, min(20, room.context_depth))
+        if depth:
+            index = next((i for i, item in enumerate(room.messages)
+                          if item.msg_id == message.msg_id), len(room.messages))
+            history = room.messages[max(0, index - depth):index]
+            if history:
+                lines.append("[房间近期记录]")
+                for item in history:
+                    who = "你" if item.author_kind == "user" else item.author_label
+                    text = item.text.strip()
+                    if len(text) > CONTEXT_ENTRY_LIMIT:
+                        text = text[:CONTEXT_ENTRY_LIMIT] + "…"
+                    lines.append(f"{who}: {text}")
+                lines.append("[本次请求]")
+        lines.append(message.text)
+        return "\n".join(lines)
+
     async def _notify(self, room_id: str, state: "MemberRuntime") -> None:
         callback = self._on_state
         if callback is None:
@@ -705,7 +744,7 @@ class RoomDispatcher:
             state.started_at = time.time()
             state.queued = max(0, state.queued - 1)
             await self._notify(room.room_id, state)
-            prompt = f"{CONTEXT_HEADER.format(name=room.name, cwd=room.cwd)}\n{message.text}"
+            prompt = self._prompt(room, member, message)
             await self._host.dispatch_query(
                 session_id, prompt, msg_id=message.msg_id, delivery=delivery)
         except asyncio.CancelledError:

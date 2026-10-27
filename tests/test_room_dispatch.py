@@ -234,3 +234,75 @@ def test_unknown_room_and_member_are_rejected(tmp_path):
             await dispatcher.post(room.room_id, "   ")
 
     asyncio.run(scenario())
+
+
+def test_member_sees_another_members_advice(tmp_path):
+    """The whole point of a room: the second agent can act on the first's advice."""
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 给个建议，只回一句。")
+        await dispatcher.wait_idle()
+        await dispatcher.on_turn_terminal(
+            room.room_id, "m-claude", "建议：先加集成测试，再改接口。")
+        await dispatcher.post(room.room_id, "@nyx 按上面的建议执行。")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+
+    codex_prompt = [text for session, text, *_ in host.queries if session == "s-m-codex"][0]
+    assert "[房间近期记录]" in codex_prompt
+    assert "Claude · iris: 建议：先加集成测试，再改接口。" in codex_prompt
+    assert "[本次请求]" in codex_prompt
+    assert codex_prompt.rstrip().endswith("按上面的建议执行。")
+
+
+def test_transcript_excludes_the_current_message(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 第一句")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    prompt = host.queries[0][1]
+    body = prompt.split("[本次请求]")[-1] if "[本次请求]" in prompt else prompt
+    assert body.count("第一句") == 1, "the ask must not also appear as history"
+
+
+def test_transcript_respects_depth(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+    store.update(room.room_id, name=None)  # no-op, keeps the room object
+    room.context_depth = 2
+
+    async def scenario():
+        for index in range(4):
+            await dispatcher.post(room.room_id, f"@Claude 第{index}句")
+            await dispatcher.wait_idle()
+            # Each dispatch holds a concurrency permit until its turn terminal,
+            # so a loop must finish the turn or the third dispatch would wait.
+            await dispatcher.on_turn_terminal(room.room_id, "m-claude", f"答{index}")
+
+    asyncio.run(scenario())
+    last = [text for session, text, *_ in host.queries if session == "s-m-claude"][-1]
+    # Only the two entries before the current one are included.
+    assert "第0句" not in last
+    assert "第1句" not in last
+    assert "第2句" in last
+
+
+def test_context_can_be_disabled(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+    room.context_depth = 0
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 第一句")
+        await dispatcher.wait_idle()
+        await dispatcher.on_turn_terminal(room.room_id, "m-claude", "回答")
+        await dispatcher.post(room.room_id, "@nyx 第二句")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    codex_prompt = [text for session, text, *_ in host.queries if session == "s-m-codex"][0]
+    assert "[房间近期记录]" not in codex_prompt
+    assert "回答" not in codex_prompt
