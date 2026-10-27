@@ -352,6 +352,21 @@ export interface SessionInfo {
 }
 export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine; space?: Space }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine; space?: Space }
+// ---- collaboration rooms (mirrors cc_remote/protocol.py) ------------------
+export interface RoomMemberSpec { member_id: string; label: string; engine?: Engine; profile_id?: string | null; is_default?: boolean }
+export interface ListRooms extends Base { type: "list_rooms" }
+export interface GetRoom extends Base { type: "get_room"; room_id: string; before?: number | null; limit?: number }
+export interface CreateRoom extends Base { type: "create_room"; name: string; cwd: string; members: RoomMemberSpec[] }
+export interface UpdateRoom extends Base { type: "update_room"; room_id: string; name?: string | null; members?: RoomMemberSpec[] | null }
+export interface DeleteRoom extends Base { type: "delete_room"; room_id: string }
+export interface PostRoomMessage extends Base { type: "post_room_message"; room_id: string; text: string; delivery?: "immediate" | "queue" }
+export interface SteerRoomMember extends Base { type: "steer_room_member"; cmd_id: string; client_id: string; room_id: string; member_id: string; text: string }
+export interface CancelRoomMember extends Base { type: "cancel_room_member"; room_id: string; member_id: string }
+export interface RoomState extends Base { type: "room_state"; room_id: string; member_id: string; session_id?: string | null; state?: "idle" | "queued" | "running" | "done" | "failed"; queued?: number; started_at?: number | null; error?: string | null }
+export interface RoomList extends Base { type: "room_list"; request_id?: string | null; rooms?: Record<string, unknown>[] }
+export interface RoomSnapshot extends Base { type: "room_snapshot"; request_id?: string | null; room?: Record<string, unknown>; states?: Record<string, unknown>[] }
+export interface RoomMessageEvent extends Base { type: "room_message"; room_id: string; message?: Record<string, unknown> }
+export interface RoomInvalidated extends Base { type: "room_invalidated"; room_id: string }
 export interface NewSession extends Base {
   type: "new_session";
   dsh_permission?: string | null;
@@ -754,7 +769,7 @@ export interface CodexContext extends Base {
   error: string | null;
 }
 
-export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
+export type ServerEvent =SessionArtifacts | FilesListed | CodexContext
   | TurnFileChangesPage
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | AutoCompact | Fast | CollaborationMode | BtwOpened | BtwSync | BtwClosed | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | AgentDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | DshState | DshCommandResult | DshReadResult | DshDownloadChunk | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserSync | AskUserClosed | GoalState | CompletionState | StatusReport | RateLimitResetResult | Notice | RateLimitUpdate | RollbackResult
@@ -762,7 +777,8 @@ export type ServerEvent = SessionArtifacts | FilesListed | CodexContext
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
-  | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
+  | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello
+  | RoomState | RoomList | RoomSnapshot | RoomMessageEvent | RoomInvalidated;
 
 export const PROTOCOL_VERSION = 81;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;

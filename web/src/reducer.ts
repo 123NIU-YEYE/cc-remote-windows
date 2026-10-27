@@ -6936,6 +6936,14 @@ function reduceEvent(
         // unlocks the composer and queued/pending sends.
         rt.pendingQuestion = null;
       });
+    // Collaboration rooms. The room surface lands next; until then these keep
+    // the mirror honest and let the wire types flow through the reducer.
+    case "room_list":
+    case "room_snapshot":
+    case "room_message":
+    case "room_state":
+    case "room_invalidated":
+      return state;
     case "pong":
     case "command_ack":
     case "queued_query_detail":
