@@ -1316,6 +1316,143 @@ class SessionActivity(_Base):
     state: State
 
 
+# ---- collaboration rooms --------------------------------------------------
+#
+# A room binds one working directory to a set of agent members. The wrapper
+# records the timeline and dispatches each @mention to that member's OWN session,
+# so execution, models, permissions and usage stay with the existing machinery.
+# See docs/collaboration-rooms.md.
+
+
+class RoomMemberSpec(BaseModel):
+    """A participating agent. Not a session: sessions are bound lazily."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    member_id: WireId
+    label: str = Field(min_length=1, max_length=200)   # "Claude · iris"
+    engine: Engine = "claude"
+    profile_id: Optional[WireId] = None
+    is_default: bool = False
+
+
+class ListRooms(_Command):
+    """client -> wrapper: every room this machine knows, newest activity first."""
+
+    type: Literal["list_rooms"] = "list_rooms"
+
+
+class GetRoom(_Command):
+    """client -> wrapper: one room's snapshot, timeline paginated backwards."""
+
+    type: Literal["get_room"] = "get_room"
+    room_id: WireId
+    before: Optional[float] = None
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class CreateRoom(_Command):
+    type: Literal["create_room"] = "create_room"
+    name: str = Field(min_length=1, max_length=200)
+    cwd: str = Field(min_length=1, max_length=4096)
+    members: list[RoomMemberSpec] = Field(min_length=1, max_length=8)
+
+
+class UpdateRoom(_Command):
+    """Rename a room and/or replace its member list.
+
+    Members that survive the edit keep their bound session, so an edit never
+    silently forks a conversation.
+    """
+
+    type: Literal["update_room"] = "update_room"
+    room_id: WireId
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    members: Optional[list[RoomMemberSpec]] = Field(
+        default=None, min_length=1, max_length=8)
+
+
+class DeleteRoom(_Command):
+    """Remove a room. Member sessions are left untouched: they are the user's."""
+
+    type: Literal["delete_room"] = "delete_room"
+    room_id: WireId
+
+
+class PostRoomMessage(_Command):
+    """Speak into a room. Addressed members each start a turn in their session."""
+
+    type: Literal["post_room_message"] = "post_room_message"
+    room_id: WireId
+    text: str = Field(min_length=1, max_length=32_000)
+    # "queue" (default) keeps a member's new turn behind its running one.
+    delivery: Literal["immediate", "queue"] = "queue"
+
+
+class SteerRoomMember(_Command):
+    """Append an instruction to one member's running turn ("引导")."""
+
+    type: Literal["steer_room_member"] = "steer_room_member"
+    cmd_id: WireId
+    client_id: WireId
+    room_id: WireId
+    member_id: WireId
+    text: str = Field(min_length=1, max_length=32_000)
+
+
+class CancelRoomMember(_Command):
+    """Interrupt one member's running turn."""
+
+    type: Literal["cancel_room_member"] = "cancel_room_member"
+    room_id: WireId
+    member_id: WireId
+
+
+class RoomState(_Base):
+    """wrapper -> client: one member's live dispatch state."""
+
+    type: Literal["room_state"] = "room_state"
+    room_id: WireId
+    member_id: WireId
+    session_id: Optional[WireId] = None
+    state: Literal["idle", "queued", "running", "done", "failed"] = "idle"
+    queued: int = Field(default=0, ge=0, le=1000)
+    started_at: Optional[float] = None
+    error: Optional[str] = Field(default=None, max_length=2000)
+
+
+class RoomList(_Base):
+    """wrapper -> client: the room sidebar. Entries are room.as_dict() shapes."""
+
+    type: Literal["room_list"] = "room_list"
+    request_id: Optional[WireId] = None
+    rooms: list[dict] = Field(default_factory=list, max_length=200)
+
+
+class RoomSnapshot(_Base):
+    """wrapper -> client: first paint and reconnect restore for one room."""
+
+    type: Literal["room_snapshot"] = "room_snapshot"
+    request_id: Optional[WireId] = None
+    room: dict = Field(default_factory=dict)
+    states: list[dict] = Field(default_factory=list, max_length=8)
+
+
+class RoomMessageEvent(_Base):
+    """wrapper -> client: one timeline entry appended (user or member result)."""
+
+    type: Literal["room_message"] = "room_message"
+    room_id: WireId
+    message: dict = Field(default_factory=dict)
+
+
+class RoomInvalidated(_Base):
+    """wrapper -> client: drop cached room state and re-request a snapshot."""
+
+    type: Literal["room_invalidated"] = "room_invalidated"
+    room_id: WireId
+
+
 class SwitchSession(_Command):
     """client -> wrapper: resume a different existing session. `engine` tells the
     wrapper which backend to resume it with (codex threads resume differently)."""
@@ -3338,6 +3475,19 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "acknowledge_completion": AcknowledgeCompletion,
     "completion_state": CompletionState,
     "session_list": SessionList,
+    "list_rooms": ListRooms,
+    "get_room": GetRoom,
+    "create_room": CreateRoom,
+    "update_room": UpdateRoom,
+    "delete_room": DeleteRoom,
+    "post_room_message": PostRoomMessage,
+    "steer_room_member": SteerRoomMember,
+    "cancel_room_member": CancelRoomMember,
+    "room_state": RoomState,
+    "room_list": RoomList,
+    "room_snapshot": RoomSnapshot,
+    "room_message": RoomMessageEvent,
+    "room_invalidated": RoomInvalidated,
     "session_list_invalidated": SessionListInvalidated,
     "session_activity": SessionActivity,
     "session_focus": SessionFocus,
