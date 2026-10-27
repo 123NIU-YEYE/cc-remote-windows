@@ -1606,6 +1606,13 @@ export class RelayWs {
     });
   }
 
+  sendUpdateRoomCwd(roomId: string, cwd: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "update_room", room_id: roomId, cwd,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
   sendUpdateRoomMembers(
     roomId: string,
     members: { member_id: string; label: string; engine?: string; profile_id?: string | null }[],

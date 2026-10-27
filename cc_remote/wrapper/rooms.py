@@ -177,6 +177,24 @@ def _bounded_text(value: str, limit: int = TEXT_LIMIT) -> str:
     return value if len(value) <= limit else value[:limit]
 
 
+def _clean_error(text: str) -> str:
+    """Strip internal exception-class prefixes from user-facing text.
+
+    ``state.error`` is built as "TypeName: message", and the engine adds its own
+    "_SpawnFailure: " prefix inside that message; neither helps the person in the
+    room, so peel them off.
+    """
+    cleaned = (text or "").strip()
+    for _ in range(3):
+        head, sep, tail = cleaned.partition(": ")
+        if not sep or not head or " " in head:
+            break
+        if "Error" in head or "Failure" in head or head.startswith("_"):
+            cleaned = tail.strip()
+            continue
+        break
+    return cleaned
+
 def parse_mentions(
     text: str, members: Iterable[RoomMember],
 ) -> list[str]:
@@ -261,6 +279,7 @@ class RoomStore:
         return room
 
     def update(self, room_id: str, *, name: Optional[str] = None,
+               cwd: Optional[str] = None,
                members: Optional[Iterable[RoomMember]] = None) -> Room:
         with self._lock:
             room = self._rooms.get(room_id)
@@ -271,6 +290,11 @@ class RoomStore:
                 if not candidate:
                     raise RoomError("room name must not be empty")
                 room.name = candidate
+            if cwd is not None:
+                candidate = _bounded_text(cwd.strip(), CWD_LIMIT)
+                if not candidate:
+                    raise RoomError("room cwd must not be empty")
+                room.cwd = candidate
             if members is not None:
                 # Keep existing session bindings for members that survive the edit.
                 previous = {member.member_id: member for member in room.members}
@@ -476,7 +500,8 @@ class RoomDispatcher:
 
     def __init__(self, store: RoomStore, host: RoomHost, *,
                  max_parallel: int = DEFAULT_MAX_PARALLEL,
-                 on_state: Optional[Callable[[str, "MemberRuntime"], Any]] = None):
+                 on_state: Optional[Callable[[str, "MemberRuntime"], Any]] = None,
+                 on_message: Optional[Callable[[str, "RoomMessage"], Any]] = None):
         self._store = store
         self._host = host
         self._max_parallel = max(1, int(max_parallel))
@@ -486,6 +511,10 @@ class RoomDispatcher:
         # Called on every member state transition so the service layer can push
         # a RoomState frame without the dispatcher knowing about the transport.
         self._on_state = on_state
+        # Failure entries are written here, not by the caller, so they need the
+        # same outbound notification as a terminal result or the client never
+        # learns about them.
+        self._on_message = on_message
 
     # ---- inspection ----------------------------------------------------
     def runtime(self, room_id: str) -> list[MemberRuntime]:
@@ -625,6 +654,17 @@ class RoomDispatcher:
             raise RoomError("unknown member")
         return self._state(room_id, member_id), member
 
+    async def _notify_message(self, room_id: str, message: "RoomMessage") -> None:
+        callback = self._on_message
+        if callback is None:
+            return
+        try:
+            result = callback(room_id, message)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - observers must not break dispatch
+            pass
+
     async def _notify(self, room_id: str, state: "MemberRuntime") -> None:
         callback = self._on_state
         if callback is None:
@@ -678,8 +718,10 @@ class RoomDispatcher:
             state.queued = max(0, state.queued - 1)
             self._release(state)
             await self._notify(room.room_id, state)
-            self._store.append_message(room.room_id, RoomMessage(
+            failure = RoomMessage(
                 msg_id=_new_id("msg"), ts=time.time(), author_kind="member",
                 author_label=member.label,
-                text=f"派发失败：{state.error}", state=MEMBER_FAILED,
-            ))
+                text=f"派发失败：{_clean_error(state.error)}", state=MEMBER_FAILED,
+            )
+            self._store.append_message(room.room_id, failure)
+            await self._notify_message(room.room_id, failure)

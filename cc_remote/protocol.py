@@ -1368,6 +1368,10 @@ class UpdateRoom(_Command):
     type: Literal["update_room"] = "update_room"
     room_id: WireId
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    # Changing the directory re-targets where future member sessions start; the
+    # sessions already bound to the room keep their own cwd.
+    cwd: Optional[str] = Field(default=None, min_length=1, max_length=4096)
+
     members: Optional[list[RoomMemberSpec]] = Field(
         default=None, min_length=1, max_length=8)
 

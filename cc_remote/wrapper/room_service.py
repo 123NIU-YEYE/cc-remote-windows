@@ -105,6 +105,13 @@ class RoomTurnCollector:
             bucket.pop(next(iter(bucket)), None)
 
 
+def _cwd_exists(cwd: str) -> bool:
+    """A room whose directory is missing can never dispatch, so refuse it early."""
+    try:
+        return Path(cwd).expanduser().is_dir()
+    except OSError:
+        return False
+
 class RoomService:
     """Owns room state for one wrapper machine and emits its frames."""
 
@@ -112,7 +119,9 @@ class RoomService:
         self._machine = machine
         self.store = RoomStore(state_dir)
         self._dispatcher = RoomDispatcher(
-            self.store, MachineRoomHost(machine), on_state=self._on_member_state)
+            self.store, MachineRoomHost(machine),
+            on_state=self._on_member_state,
+            on_message=self._on_member_message)
         self._templates: dict[str, Room] = {}
         self._turns = RoomTurnCollector()
 
@@ -126,6 +135,11 @@ class RoomService:
             request_id=getattr(cmd, "cmd_id", None),
             to=getattr(cmd, "client_id", None),
         ))
+
+    async def _on_member_message(self, room_id: str, message) -> None:
+        """A dispatcher-written entry (a failed dispatch) must reach the client."""
+        await self._send(protocol.RoomMessageEvent(
+            room_id=room_id, message=message.as_dict()))
 
     async def _on_member_state(self, room_id: str, state) -> None:
         await self._send(protocol.RoomState(
@@ -175,6 +189,8 @@ class RoomService:
 
     # ---- mutations -----------------------------------------------------
     async def on_create_room(self, cmd) -> None:
+        if not _cwd_exists(cmd.cwd):
+            return await self._error(cmd, f"目录不存在：{cmd.cwd}")
         try:
             room = self.store.create(
                 cmd.name, cmd.cwd, [_spec_to_member(spec) for spec in cmd.members])
@@ -191,7 +207,10 @@ class RoomService:
         members = (None if cmd.members is None
                    else [_spec_to_member(spec) for spec in cmd.members])
         try:
-            room = self.store.update(cmd.room_id, name=cmd.name, members=members)
+            if cmd.cwd is not None and not _cwd_exists(cmd.cwd):
+                return await self._error(cmd, f"目录不存在：{cmd.cwd}")
+            room = self.store.update(
+                cmd.room_id, name=cmd.name, cwd=cmd.cwd, members=members)
         except RoomError as exc:
             return await self._error(cmd, str(exc))
         await self.on_list_rooms(cmd)

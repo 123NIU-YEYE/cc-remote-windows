@@ -6052,6 +6052,7 @@ export default function App() {
               onRenameRoom={(roomId, name) => wsRef.current?.sendRenameRoom(roomId, name)}
               onDeleteRoom={(roomId) => wsRef.current?.sendDeleteRoom(roomId)}
               onUpdateMembers={(roomId, members) => wsRef.current?.sendUpdateRoomMembers(roomId, members)}
+              onChangeCwd={(roomId, cwd) => wsRef.current?.sendUpdateRoomCwd(roomId, cwd)}
               onOpenSession={(member) => {
                 if (!member.session_id) return;
                 setRoomsOpen(false);

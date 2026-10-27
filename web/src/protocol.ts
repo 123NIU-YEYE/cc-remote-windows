@@ -357,7 +357,7 @@ export interface RoomMemberSpec { member_id: string; label: string; engine?: Eng
 export interface ListRooms extends Base { type: "list_rooms" }
 export interface GetRoom extends Base { type: "get_room"; room_id: string; before?: number | null; limit?: number }
 export interface CreateRoom extends Base { type: "create_room"; name: string; cwd: string; members: RoomMemberSpec[] }
-export interface UpdateRoom extends Base { type: "update_room"; room_id: string; name?: string | null; members?: RoomMemberSpec[] | null }
+export interface UpdateRoom extends Base { type: "update_room"; room_id: string; name?: string | null; cwd?: string | null; members?: RoomMemberSpec[] | null }
 export interface DeleteRoom extends Base { type: "delete_room"; room_id: string }
 export interface PostRoomMessage extends Base { type: "post_room_message"; room_id: string; text: string; delivery?: "immediate" | "queue" }
 export interface SteerRoomMember extends Base { type: "steer_room_member"; cmd_id: string; client_id: string; room_id: string; member_id: string; text: string }

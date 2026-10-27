@@ -97,6 +97,9 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   console.log("room frames:", roomFrames.slice(-12));
   console.log("outbound room requests:", log.filter((e) => e.startsWith("out:") && e.includes("room")));
 
+  // The list can arrive a beat after the frame; wait for the first card rather
+  // than counting immediately.
+  await page.waitForSelector(".rooms-card", { timeout: 20000 }).catch(() => {});
   const cards = page.locator(".rooms-card");
   const cardCount = await cards.count();
   console.log("rooms overlay mounted:", (await page.locator(".rooms-overlay").count()) > 0);
