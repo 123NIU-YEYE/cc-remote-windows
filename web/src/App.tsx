@@ -6049,6 +6049,8 @@ export default function App() {
               onPostMessage={(roomId, text) => wsRef.current?.sendPostRoomMessage(roomId, text)}
               onSteer={(roomId, memberId, text) => wsRef.current?.sendSteerRoomMember(roomId, memberId, text)}
               onCancel={(roomId, memberId) => wsRef.current?.sendCancelRoomMember(roomId, memberId)}
+              onRenameRoom={(roomId, name) => wsRef.current?.sendRenameRoom(roomId, name)}
+              onDeleteRoom={(roomId) => wsRef.current?.sendDeleteRoom(roomId)}
               onOpenSession={(member) => {
                 if (!member.session_id) return;
                 setRoomsOpen(false);

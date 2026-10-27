@@ -1599,6 +1599,20 @@ export class RelayWs {
     });
   }
 
+  sendRenameRoom(roomId: string, name: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "update_room", room_id: roomId, name,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendDeleteRoom(roomId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "delete_room", room_id: roomId,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
   sendCreateRoom(
     name: string, cwd: string,
     members: { member_id: string; label: string; engine?: string; profile_id?: string | null }[],
