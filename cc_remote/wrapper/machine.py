@@ -2825,9 +2825,14 @@ class WrapperMachine:
         self.viewer_pages.blocked_engines.add(engine)
         if not ready:
             return False
-        if transition is not None:
+        # The preview store is a stub on platforms where the viewer channel is
+        # disabled (Windows), so the migration API may be absent entirely; that
+        # is not a migration failure worth warning about every start.
+        migrate = getattr(
+            self.viewer_pages.store, "migrate_profile_sessions", None)
+        if transition is not None and migrate is not None:
             try:
-                self.viewer_pages.store.migrate_profile_sessions(
+                migrate(
                     engine, transition.wire_session_id,
                     profile_revision=transition.revision)
             except Exception as exc:

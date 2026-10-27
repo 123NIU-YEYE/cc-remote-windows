@@ -9,6 +9,13 @@ import sys
 import time
 from os import PathLike
 
+# Captured at import time, before install_windows_shims() replaces them. The
+# pread/pwrite fallbacks below must never look these up on ``os`` again: on
+# Windows the attribute *is* the shim, so a fresh lookup recursed forever
+# (surfacing as "preview capability store unavailable ... RecursionError").
+_NATIVE_PREAD = getattr(os, "pread", None)
+_NATIVE_PWRITE = getattr(os, "pwrite", None)
+
 
 def current_uid() -> int:
     """Return the Unix uid, or the stable Windows ``st_uid`` placeholder."""
@@ -153,7 +160,9 @@ def pread(fd: int, length: int, offset: int) -> bytes:
     Callers only use this on descriptors they exclusively own for the
     duration of the call, so relocating the file position is safe.
     """
-    native_pread = getattr(os, "pread", None)
+    # ``os.pread`` may already be this shim (install_windows_shims replaces it),
+    # so only trust the captured native function, never a fresh attribute lookup.
+    native_pread = _NATIVE_PREAD
     if native_pread is not None:
         return native_pread(fd, length, offset)
     saved = os.lseek(fd, 0, os.SEEK_CUR)
@@ -166,7 +175,7 @@ def pread(fd: int, length: int, offset: int) -> bytes:
 
 def pwrite(fd: int, data: bytes, offset: int) -> int:
     """Positioned write, backed by lseek+write where the platform lacks pwrite."""
-    native_pwrite = getattr(os, "pwrite", None)
+    native_pwrite = _NATIVE_PWRITE
     if native_pwrite is not None:
         return native_pwrite(fd, data, offset)
     saved = os.lseek(fd, 0, os.SEEK_CUR)
