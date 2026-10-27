@@ -9,7 +9,7 @@ never makes a submitted or uncertain command eligible for another mutation.
 from __future__ import annotations
 
 import copy
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import json
 import math
 import os

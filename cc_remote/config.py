@@ -17,7 +17,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from cc_remote.claude_broker.paths import default_socket_path
+# The Claude PTY broker is Unix-only (Unix sockets). Import its default socket
+# path opportunistically so configuration keeps loading on Windows, where the
+# broker is unavailable and its setting is never used.
+try:  # pragma: no cover - exercised on Unix
+    from cc_remote.claude_broker.paths import default_socket_path
+except ImportError:  # pragma: no cover - Windows
+    def default_socket_path() -> str:  # type: ignore[misc]
+        """No broker socket exists on this platform."""
+        return ""
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
 

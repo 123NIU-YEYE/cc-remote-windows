@@ -10,7 +10,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4

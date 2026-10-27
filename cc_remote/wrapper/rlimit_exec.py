@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-import resource
+from cc_remote.wrapper import resource_compat as resource  # Windows rlimit shim
 import sys
 
 

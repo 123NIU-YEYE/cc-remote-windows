@@ -34,8 +34,14 @@ def _utf8_prefix(value: str, max_bytes: int) -> str:
 
 
 def _session_file(state_dir: Path, cc_cwd: str) -> Path:
-    safe = cc_cwd.replace("/", "_").strip("_") or "root"
+    # A Windows cwd carries a drive letter and backslashes. Embedding it raw
+    # made the right-hand part absolute, so pathlib discarded the state
+    # directory ("C:\\Users\\x.json" instead of "<state>/sessions/..."), and ':'
+    # is not even a legal filename character. Keep one safe flat name per cwd.
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", cc_cwd).strip("_") or "root"
     if len(safe.encode("utf-8")) > 200:
+        # Fall back to a hash so the many long paths that collapse onto the same
+        # prefix stay distinct.
         safe = (_utf8_prefix(safe, 80) + "-"
                 + hashlib.sha256(cc_cwd.encode()).hexdigest()[:24])
     return state_dir / "sessions" / f"{safe}.json"

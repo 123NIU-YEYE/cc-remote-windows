@@ -7,7 +7,7 @@ and deliberately avoids importing settings, credentials, schemas or plugin code.
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import hashlib
 import json
 import os

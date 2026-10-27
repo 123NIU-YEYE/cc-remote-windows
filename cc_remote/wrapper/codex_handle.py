@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable, Optional
 from cc_remote import __version__
 from cc_remote.log import logger
 from cc_remote.wrapper.token_usage import CodexUsageTracker
+from cc_remote.wrapper.os_compat import kill_process_tree
 from cc_remote.wrapper.btw_history import CodexBtwCompletions
 from cc_remote.protocol import (
     MAX_SAFE_WIRE_INTEGER,
@@ -4537,7 +4538,14 @@ class CodexHandle:
                     if process_group is not None:
                         os.killpg(process_group, sig)
                     elif proc.returncode is None:
-                        (proc.kill() if force else proc.terminate())
+                        if os.name == "nt":
+                            # Windows: terminate the tree, not just the direct
+                            # child. The app-server's node helpers inherit the
+                            # thread-writer locks and would otherwise survive,
+                            # blocking the next resume of the same session.
+                            kill_process_tree(proc.pid)
+                        else:
+                            (proc.kill() if force else proc.terminate())
                 except ProcessLookupError:
                     pass
                 except Exception as exc:

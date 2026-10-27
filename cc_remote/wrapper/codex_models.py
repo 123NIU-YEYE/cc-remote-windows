@@ -26,6 +26,7 @@ from typing import Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
+from cc_remote.wrapper.os_compat import kill_process_tree
 from cc_remote.wrapper.codex_runtime import (
     codex_env as _codex_env,
     resolve_codex_bin as _resolve_codex_bin,
@@ -175,7 +176,13 @@ async def _rpc_model_list(codex_home: str | None = None) -> list[dict]:
         if proc.stdin is not None:
             proc.stdin.close()
         try:
-            proc.terminate()
+            if os.name == "nt":
+                # Windows: the app-server spawns node helpers that outlive a
+                # plain terminate() and keep the thread locks this probe only
+                # borrowed, so reap the whole tree.
+                kill_process_tree(proc.pid)
+            else:
+                proc.terminate()
         except ProcessLookupError:
             pass
         try:

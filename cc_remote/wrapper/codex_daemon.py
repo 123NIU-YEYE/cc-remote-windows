@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import re
-import resource
+from cc_remote.wrapper import resource_compat as resource  # Windows rlimit shim
 import signal
 import shutil
 import stat

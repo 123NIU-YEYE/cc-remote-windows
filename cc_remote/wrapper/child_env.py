@@ -158,6 +158,18 @@ def claude_profile_child_env(
             config_dir, isolate_account_env=isolate_account_env)
         if override is not None:
             result["CLAUDE_CONFIG_DIR"] = override
+    # Claude Code honours the operator's own gateway from ~/.claude/settings.json
+    # (ANTHROPIC_BASE_URL), which takes precedence over any inherited value. That
+    # endpoint is reachable directly but times out through the local proxy, so the
+    # Claude child must NOT inherit the wrapper's proxy variables — an explicit
+    # blank overrides inheritance, and NO_PROXY covers anything that still
+    # consults them.
+    result["NO_PROXY"] = "api.rvcompute.com,localhost,127.0.0.1,::1"
+    result["no_proxy"] = result["NO_PROXY"]
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy",
+                "NODE_USE_ENV_PROXY"):
+        result[key] = ""
     return result
 
 

@@ -1,6 +1,6 @@
 """Private, endpoint-scoped tab identities; no transcript or credentials."""
 
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import hashlib
 import json
 import os

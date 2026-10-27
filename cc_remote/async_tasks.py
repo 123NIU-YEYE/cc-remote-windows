@@ -10,7 +10,7 @@ import argparse
 import asyncio
 import base64
 from contextlib import suppress
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import json
 import os
 from pathlib import Path
