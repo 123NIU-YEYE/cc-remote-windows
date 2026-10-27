@@ -9,6 +9,7 @@ queue is drained on disconnect to avoid double-delivery on reconnect.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import urlsplit
@@ -21,6 +22,31 @@ from cc_remote.log import logger
 from cc_remote.protocol import ProtocolError, deserialize, serialize
 
 log = logger("cc_remote.wrapper.transport")
+
+# Keepalive tuning. The library defaults (20s ping, 20s pong timeout) assume a
+# healthy path; a relay reached through a proxy and a tunnel needs more slack,
+# otherwise a latency spike tears the connection down and the UI stalls.
+_DEFAULT_PING_INTERVAL = 30.0
+_DEFAULT_PING_TIMEOUT = 90.0
+
+
+def _ws_ping_interval() -> float | None:
+    raw = os.environ.get("CC_REMOTE_WS_PING_INTERVAL", "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_PING_INTERVAL
+    except ValueError:
+        value = _DEFAULT_PING_INTERVAL
+    return value if value > 0 else None
+
+
+def _ws_ping_timeout() -> float | None:
+    raw = os.environ.get("CC_REMOTE_WS_PING_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_PING_TIMEOUT
+    except ValueError:
+        value = _DEFAULT_PING_TIMEOUT
+    return value if value > 0 else None
+
 
 
 class _ByteQueue:
@@ -146,6 +172,15 @@ class WrapperTransport:
                     # websockets 16 otherwise consults macOS system settings,
                     # which may select an unavailable SOCKS proxy.
                     "max_queue": 4,
+                    # The library default (20s/20s) is too tight for a relay
+                    # reached through a proxy and a tunnel: a single latency
+                    # spike makes the client give up with
+                    # "sent 1011 (internal error) keepalive ping timeout",
+                    # which the UI shows as a stalled turn. Ping less often and
+                    # allow a much longer pong wait; a truly dead link is still
+                    # detected, just more patiently.
+                    "ping_interval": _ws_ping_interval(),
+                    "ping_timeout": _ws_ping_timeout(),
                 }
                 target = urlsplit(self.url)
                 proxies = getproxies_environment()

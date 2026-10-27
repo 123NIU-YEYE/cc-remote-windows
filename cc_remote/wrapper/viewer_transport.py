@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -35,6 +36,14 @@ class ViewerTransport:
         return {**(self.home_pages.sites() if self.home_pages else {}), **manual}
 
     async def run(self) -> None:
+        # The viewer channel serves file previews. It is unsupported on Windows
+        # (it relies on directory descriptors and Unix-socket semantics), where
+        # every attempt fails and the retry loop merely floods the log and opens
+        # a doomed WebSocket once a minute. Allow it to be switched off.
+        if os.environ.get("CC_REMOTE_VIEWER_CHANNEL", "").strip().lower() in {
+                "off", "0", "false", "no", "disabled"}:
+            log.info("viewer channel disabled by CC_REMOTE_VIEWER_CHANNEL")
+            return
         backoff = 1
         while True:
             try:
