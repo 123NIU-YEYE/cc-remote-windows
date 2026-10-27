@@ -198,3 +198,39 @@ def test_steer_room_member_uses_member_session(tmp_path):
     asyncio.run(scenario())
     assert machine.steers and machine.steers[0].sid == "wire-1"
     assert machine.steers[0].prompt == "顺便看下测试覆盖"
+
+
+def test_rebinding_follows_the_real_session_id(tmp_path):
+    """A fresh session is keyed by a temp id until the engine reveals its own.
+
+    Without following that rename a member's terminal can never be attributed,
+    so the room would show "running" forever.
+    """
+    machine, service = _service(tmp_path)
+    _create(service)
+    room_id = service.store.list_rooms()[0].room_id
+
+    async def scenario():
+        await service.on_post(protocol.PostRoomMessage(
+            cmd_id="c11", room_id=room_id, text="@Claude 开始"))
+        await service._dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    assert service.store.get(room_id).member("m1").session_id == "wire-1"
+    assert service.member_for_session("wire-1") == (room_id, "m1")
+
+    service.rebind_session("wire-1", "real-9")
+
+    assert service.store.get(room_id).member("m1").session_id == "real-9"
+    assert service.member_for_session("real-9") == (room_id, "m1")
+    assert service.member_for_session("wire-1") is None
+    assert service._dispatcher.runtime(room_id)[0].session_id == "real-9"
+
+
+def test_rebinding_is_idempotent_and_ignores_empty_ids(tmp_path):
+    machine, service = _service(tmp_path)
+    _create(service)
+    room_id = service.store.list_rooms()[0].room_id
+    service.rebind_session("", "real-9")
+    service.rebind_session("wire-1", "wire-1")
+    assert service.store.get(room_id).member("m1").session_id is None
