@@ -1,0 +1,20 @@
+feat(rooms): at-mention picker for the room composer
+
+Typing @ in a room composer now lists the room's agents instead of requiring the
+name to be typed from memory, which was the only way before and is awkward
+because the display label ("Claude · iris") cannot be typed as one token anyway.
+
+- web/src/rooms-mentions.ts (pure, unit-tested) picks the shortest handle that
+  addresses exactly one member (the engine name, falling back to the agent name
+  when two members share an engine), always offers 全体, filters case-
+  insensitively, and finds the "@fragment" under the caret so a mid-word "@"
+  (mail@example.com) is not treated as a mention.
+- RoomsView: the picker sits above the composer; ArrowUp/Down move, Enter/Tab
+  insert, Escape dismisses, and the caret lands after the inserted mention.
+  mousedown is used for selection so the textarea does not blur first.
+- The browser smoke test types "@", asserts the options, asserts that picking one
+  inserts the mention, and fails if the picker stops working.
+
+Tests: rooms-mentions.test.ts covers handle selection, filtering, the broadcast
+entry and fragment detection. Browser run: 3 options (Claude, Codex, 全体),
+picking the first inserts a mention, RESULT: PASS.
