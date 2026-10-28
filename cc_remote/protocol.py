@@ -1333,6 +1333,10 @@ class RoomMemberSpec(BaseModel):
     label: str = Field(min_length=1, max_length=200)   # "Claude · iris"
     engine: Engine = "claude"
     profile_id: Optional[WireId] = None
+    # Bind an existing session instead of creating one. Required for DSH (its
+    # runtime only adopts a native session) and allowed for any engine, which
+    # lets a member continue an existing conversation.
+    session_id: Optional[WireId] = None
     is_default: bool = False
 
 

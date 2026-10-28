@@ -254,14 +254,21 @@ function InviteRow({ onInvite, onCancel }: {
 }) {
   const [engine, setEngine] = useState<RoomMemberDraft["engine"]>("claude");
   const [name, setName] = useState("");
+  const [sessionId, setSessionId] = useState("");
+  // DSH cannot be spawned from a directory: its runtime only adopts an existing
+  // native session, so a DSH member has to name the session it drives.
+  const needsSession = engine === "dsh";
 
   const submit = () => {
     const suffix = name.trim() || "new";
+    const bound = sessionId.trim();
+    if (needsSession && !bound) return;
     onInvite({
       // The id only has to be unique inside this room.
       member_id: `${engine}-${suffix}-${Date.now().toString(36)}`,
       label: `${ENGINE_LABELS[engine]} · ${suffix}`,
       engine,
+      ...(bound ? { session_id: bound } : {}),
     });
   };
 
@@ -287,7 +294,22 @@ function InviteRow({ onInvite, onCancel }: {
           if (event.key === "Escape") onCancel();
         }}
       />
-      <button type="button" className="rooms-primary" onClick={submit}>邀请</button>
+      {needsSession && (
+        <input
+          className="rooms-input"
+          placeholder="DSH 会话 ID（如 dsh@abc123）"
+          value={sessionId}
+          onChange={(event) => setSessionId(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") { event.preventDefault(); submit(); }
+            if (event.key === "Escape") onCancel();
+          }}
+        />
+      )}
+      <button type="button" className="rooms-primary" onClick={submit}
+        disabled={needsSession && !sessionId.trim()}>
+        邀请
+      </button>
     </div>
   );
 }

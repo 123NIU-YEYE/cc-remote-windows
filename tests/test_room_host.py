@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from cc_remote import protocol
-from cc_remote.wrapper.room_host import MachineRoomHost
+from cc_remote.wrapper.room_host import MachineRoomHost, RoomHostError
 from cc_remote.wrapper.rooms import Room, RoomMember
 
 
@@ -113,3 +115,42 @@ def test_adapter_exposes_the_room_host_surface():
     host = MachineRoomHost(FakeMachine())
     for name in ("ensure_session", "dispatch_query", "steer_session", "cancel_session"):
         assert callable(getattr(host, name)), name
+
+
+def test_dsh_member_fails_with_a_readable_message():
+    """DSH sessions cannot be created from a directory: say so, do not assert.
+
+    The wrapper's DSH runtime only adopts an existing native session, and _spawn
+    has no dsh branch (it would fail an internal claude-profile assertion with an
+    empty message, which is what the user saw in the room timeline).
+    """
+    machine = FakeMachine()
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="d1", label="DSH · nyy", engine="dsh")
+
+    with pytest.raises(RoomHostError) as info:
+        asyncio.run(host.ensure_session(_room(), member))
+
+    message = str(info.value)
+    assert "DSH" in message
+    assert "已存在的会话" in message
+    assert machine.spawned == [], "must not reach _spawn for an unspawnable engine"
+
+
+def test_claude_and_codex_members_still_spawn():
+    for engine in ("claude", "codex"):
+        machine = FakeMachine()
+        host = MachineRoomHost(machine)
+        member = RoomMember(member_id="m", label="Agent", engine=engine)
+        assert asyncio.run(host.ensure_session(_room(), member)) == "wire-1"
+        assert machine.spawned[0][1]["engine"] == engine
+
+def test_member_with_a_bound_session_skips_spawn():
+    """A pre-bound member (the only way a DSH member works) is used as-is."""
+    machine = FakeMachine()
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="d1", label="DSH · nyy", engine="dsh",
+                        session_id="dsh@abc123")
+
+    assert asyncio.run(host.ensure_session(_room(), member)) == "dsh@abc123"
+    assert machine.spawned == []

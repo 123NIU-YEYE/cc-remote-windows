@@ -353,7 +353,7 @@ export interface SessionInfo {
 export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine; space?: Space }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine; space?: Space }
 // ---- collaboration rooms (mirrors cc_remote/protocol.py) ------------------
-export interface RoomMemberSpec { member_id: string; label: string; engine?: Engine; profile_id?: string | null; is_default?: boolean }
+export interface RoomMemberSpec { member_id: string; label: string; engine?: Engine; profile_id?: string | null; session_id?: string | null; is_default?: boolean }
 export interface ListRooms extends Base { type: "list_rooms" }
 export interface GetRoom extends Base { type: "get_room"; room_id: string; before?: number | null; limit?: number }
 export interface CreateRoom extends Base { type: "create_room"; name: string; cwd: string; members: RoomMemberSpec[] }
