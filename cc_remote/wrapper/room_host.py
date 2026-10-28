@@ -61,6 +61,12 @@ class MachineRoomHost:
                 created = await self._spawn_for(room, member, engine, resume_id=None)
                 if created:
                     return created
+            elif engine == "dsh":
+                # DSH cannot spawn, but a native session the desktop app knows can
+                # be adopted: _dsh._ctx() reads its history and registers a context.
+                # Without this the residency check above rejects every DSH member,
+                # which is exactly what it did on the first live run.
+                return await self._adopt_dsh(member)
             raise RoomHostError(
                 f"「{member.label}」绑定的会话已失效，请重新绑定或移除该成员")
 
@@ -79,6 +85,22 @@ class MachineRoomHost:
         if not created:
             raise RoomHostError(f"无法为「{member.label}」创建会话")
         return created
+
+    async def _adopt_dsh(self, member: RoomMember) -> str:
+        """Take over an existing native DSH session so it can be dispatched.
+
+        DSH has no spawn path: its runtime only adopts native sessions, and the
+        context is what makes the session addressable at all.
+        """
+        try:
+            ctx = await self._machine._dsh._ctx(member.session_id)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the room
+            raise RoomHostError(
+                f"「{member.label}」绑定的 DSH 会话无法接管：{exc}") from exc
+        session_id = self._machine._ctx_wire_sid(ctx) or member.session_id
+        if not self._is_resident(session_id):
+            raise RoomHostError(f"「{member.label}」的 DSH 会话没有被接管")
+        return session_id
 
     def _is_resident(self, session_id: str) -> bool:
         """True when the wrapper still holds a live context for this id."""
