@@ -6053,6 +6053,9 @@ export default function App() {
               onDeleteRoom={(roomId) => wsRef.current?.sendDeleteRoom(roomId)}
               onUpdateMembers={(roomId, members) => wsRef.current?.sendUpdateRoomMembers(roomId, members)}
               onChangeCwd={(roomId, cwd) => wsRef.current?.sendUpdateRoomCwd(roomId, cwd)}
+              onApprovePlan={(roomId, member) => wsRef.current?.sendApproveRoomPlan(roomId, member)}
+              onDiscardPlan={(roomId) => wsRef.current?.sendDiscardRoomPlan(roomId)}
+              onSetFlow={(roomId, on) => wsRef.current?.sendSetRoomFlow(roomId, on)}
               onOpenSession={(member) => {
                 if (!member.session_id) return;
                 setRoomsOpen(false);

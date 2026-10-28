@@ -41,6 +41,10 @@ export interface RoomsViewProps {
   onUpdateMembers: (roomId: string, members: RoomMemberDraft[]) => void;
   /** Re-target the room's working directory. */
   onChangeCwd: (roomId: string, cwd: string) => void;
+  /** Human approval of a plan: the only path that starts execution. */
+  onApprovePlan: (roomId: string, executorMember: string) => void;
+  onDiscardPlan: (roomId: string) => void;
+  onSetFlow: (roomId: string, adviseExecute: boolean) => void;
   onDeleteRoom: (roomId: string) => void;
   onRefresh: () => void;
 }
@@ -261,6 +265,80 @@ function PlanCard({ plan }: { plan: RoomPlanView }) {
   );
 }
 
+/** The advise→execute boundary: the human approves, nothing else dispatches. */
+function PlanFlowBar({ room, onApprove, onDiscard, onSetFlow }: {
+  room: RoomView;
+  onApprove: (executorMember: string) => void;
+  onDiscard: () => void;
+  onSetFlow: (adviseExecute: boolean) => void;
+}) {
+  const plan = room.planState;
+  const phase = plan?.phase ?? "idle";
+  const [executor, setExecutor] = useState("");
+  const others = room.members.filter((member) => member.member_id !== plan?.author_member);
+  const effective = executor || others[0]?.member_id || room.members[0]?.member_id || "";
+
+  if (phase === "planning") {
+    return (
+      <div className="rooms-flow is-planning">
+        <span>顾问正在整理计划…（它的回复会变成可执行步骤）</span>
+        <button type="button" onClick={() => onSetFlow(false)}>退出流程</button>
+      </div>
+    );
+  }
+
+  if (phase === "awaiting_execute") {
+    return (
+      <div className="rooms-flow is-awaiting">
+        <div className="rooms-flow-head">
+          <span>计划待你确认 · {plan?.steps?.length ?? 0} 步</span>
+          <span className="rooms-flow-hint">点「执行」后才会派给执行方</span>
+        </div>
+        <div className="rooms-flow-actions">
+          <select
+            className="rooms-input rooms-flow-select"
+            value={effective}
+            onChange={(event) => setExecutor(event.target.value)}
+          >
+            {room.members.map((member) => (
+              <option key={member.member_id} value={member.member_id}>
+                {member.label}{member.member_id === plan?.author_member ? "（顾问）" : ""}
+              </option>
+            ))}
+          </select>
+          <button type="button" className="rooms-primary"
+            onClick={() => effective && onApprove(effective)}>
+            执行
+          </button>
+          <button type="button" onClick={onDiscard}>丢弃计划</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase === "executing") {
+    const owner = room.members.find((m) => m.member_id === plan?.executor_member);
+    return (
+      <div className="rooms-flow is-executing">
+        <span>计划执行中 · 由 {owner?.label ?? "执行方"} 执行</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rooms-flow rooms-flow-off">
+      <span>
+        {room.advise_execute
+          ? "「顾问 → 执行」模式 — 只 @ 一个成员时，它会先给计划"
+          : "自由讨论模式 — 谁被 @ 谁回答"}
+      </span>
+      <button type="button" onClick={() => onSetFlow(!room.advise_execute)}>
+        {room.advise_execute ? "退出流程" : "切换到「顾问 → 执行」"}
+      </button>
+    </div>
+  );
+}
+
 function toDrafts(members: RoomMemberView[]): RoomMemberDraft[] {
   return members.map((member) => ({
     member_id: member.member_id,
@@ -391,7 +469,7 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 export function RoomsView({
   rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
   onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onUpdateMembers,
-  onChangeCwd,
+  onChangeCwd, onApprovePlan, onDiscardPlan, onSetFlow,
   onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
@@ -616,6 +694,10 @@ export function RoomsView({
               ))}
             </div>
 
+            <PlanFlowBar room={active}
+              onApprove={(member) => onApprovePlan(active.room_id, member)}
+              onDiscard={() => onDiscardPlan(active.room_id)}
+              onSetFlow={(on) => onSetFlow(active.room_id, on)} />
             {quotedCount > 0 && (
               <div className="rooms-quotebar">
                 <span className="rooms-quotebar-label">{quoteSummary(quotedCount)}</span>

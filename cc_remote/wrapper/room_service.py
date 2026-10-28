@@ -15,6 +15,7 @@ from typing import Any, Optional
 from cc_remote import protocol
 from cc_remote.log import logger
 from cc_remote.wrapper.room_host import MachineRoomHost
+from cc_remote.wrapper.room_flow import PlanStateError, discard
 from cc_remote.wrapper.rooms import (
     MESSAGE_LIMIT,
     Room,
@@ -125,7 +126,8 @@ class RoomService:
         self._dispatcher = RoomDispatcher(
             self.store, MachineRoomHost(machine),
             on_state=self._on_member_state,
-            on_message=self._on_member_message)
+            on_message=self._on_member_message,
+            on_plan=self._on_plan_state)
         self._templates: dict[str, Room] = {}
         self._turns = RoomTurnCollector()
 
@@ -283,6 +285,55 @@ class RoomService:
                     await self._on_member_state(room_id, state)
                 except Exception:  # noqa: BLE001 - presentation only
                     pass
+
+    # ---- plan / execute -------------------------------------------------
+    async def _on_plan_state(self, room_id: str, plan) -> None:
+        await self._send(self._plan_frame(room_id, plan))
+
+    @staticmethod
+    def _plan_frame(room_id: str, plan) -> protocol.RoomPlanState:
+        return protocol.RoomPlanState(
+            room_id=room_id,
+            phase=plan.phase,
+            author_member=plan.author_member,
+            source_msg_id=plan.source_msg_id,
+            summary=plan.summary,
+            steps=[step.as_dict() for step in plan.steps],
+            executor_member=plan.executor_member,
+        )
+
+    async def on_approve_plan(self, cmd) -> None:
+        try:
+            room = await self._dispatcher.approve_plan(
+                cmd.room_id, cmd.executor_member)
+        except RoomError as exc:
+            return await self._error(cmd, str(exc))
+        await self.on_get_room(protocol.GetRoom(
+            cmd_id=getattr(cmd, "cmd_id", None), room_id=room.room_id))
+
+    async def on_discard_plan(self, cmd) -> None:
+        try:
+            room = await self._dispatcher.discard_plan(cmd.room_id)
+        except RoomError as exc:
+            return await self._error(cmd, str(exc))
+        await self.on_get_room(protocol.GetRoom(
+            cmd_id=getattr(cmd, "cmd_id", None), room_id=room.room_id))
+
+    async def on_set_flow(self, cmd) -> None:
+        room = self.store.get(cmd.room_id)
+        if room is None:
+            return await self._error(cmd, "房间不存在")
+        room.advise_execute = bool(cmd.advise_execute)
+        if not room.advise_execute:
+            # Leaving advise mode must not strand a pending approval.
+            try:
+                room.plan_state = discard(room.plan_state)
+            except PlanStateError:
+                pass
+        self.store.save(room.room_id)
+        await self._send(self._plan_frame(room.room_id, room.plan_state))
+        await self.on_get_room(protocol.GetRoom(
+            cmd_id=getattr(cmd, "cmd_id", None), room_id=room.room_id))
 
     # ---- turn results --------------------------------------------------    # ---- turn results --------------------------------------------------
     def observe_frame(self, session_id: str, frame: Any) -> Optional[str]:

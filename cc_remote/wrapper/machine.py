@@ -12214,6 +12214,15 @@ class WrapperMachine:
     async def _handle_delete_room(self, cmd):
         await self.room_service.on_delete_room(cmd)
 
+    async def _handle_approve_room_plan(self, cmd):
+        await self.room_service.on_approve_plan(cmd)
+
+    async def _handle_discard_room_plan(self, cmd):
+        await self.room_service.on_discard_plan(cmd)
+
+    async def _handle_set_room_flow(self, cmd):
+        await self.room_service.on_set_flow(cmd)
+
     async def _handle_post_room_message(self, cmd):
         await self.room_service.on_post(cmd)
 

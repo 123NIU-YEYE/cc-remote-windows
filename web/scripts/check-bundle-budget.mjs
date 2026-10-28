@@ -60,7 +60,10 @@ const MAX_ENTRY_BYTES = 537 * 1024;
 // enters the session reducer or its surfaces. The fold costs ~2 KiB of startup;
 // the rooms UI itself, its styles and the markdown-free list stay in a lazy
 // chunk, so entry size, request count and the gzip cap move by ~2 KiB only.
-const MAX_INITIAL_BYTES = 962 * 1024;
+// The advise→execute phase banner and its approval controls add <1 KiB of
+// startup JS (the plan card itself already existed). No new dependency; the
+// gzip cap and request count stay unchanged.
+const MAX_INITIAL_BYTES = 966 * 1024;
 // Cross-thread provenance, scoped navigation and receipts add <2 KiB gzip.
 // The history reader and link UI load on demand; other caps stay unchanged.
 // DSH engine routing/defaults and native return-receipt boundaries add <1 KiB

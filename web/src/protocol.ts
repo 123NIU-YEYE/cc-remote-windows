@@ -367,6 +367,10 @@ export interface RoomList extends Base { type: "room_list"; request_id?: string 
 export interface RoomSnapshot extends Base { type: "room_snapshot"; request_id?: string | null; room?: Record<string, unknown>; states?: Record<string, unknown>[] }
 export interface RoomMessageEvent extends Base { type: "room_message"; room_id: string; message?: Record<string, unknown> }
 export interface RoomInvalidated extends Base { type: "room_invalidated"; room_id: string }
+export interface ApproveRoomPlan extends Base { type: "approve_room_plan"; cmd_id: string; client_id: string; room_id: string; executor_member: string }
+export interface DiscardRoomPlan extends Base { type: "discard_room_plan"; cmd_id: string; client_id: string; room_id: string }
+export interface SetRoomFlow extends Base { type: "set_room_flow"; cmd_id: string; client_id: string; room_id: string; advise_execute?: boolean }
+export interface RoomPlanState extends Base { type: "room_plan_state"; room_id: string; phase?: "idle" | "planning" | "awaiting_execute" | "executing"; author_member?: string | null; source_msg_id?: string | null; summary?: string; steps?: Record<string, unknown>[]; executor_member?: string | null }
 export interface NewSession extends Base {
   type: "new_session";
   dsh_permission?: string | null;
@@ -778,7 +782,8 @@ export type ServerEvent =SessionArtifacts | FilesListed | CodexContext
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | BackgroundProcessSync | TurnPlan | TurnDiff | TurnFileChanges | TurnBinding
   | TurnUsage | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello
-  | RoomState | RoomList | RoomSnapshot | RoomMessageEvent | RoomInvalidated;
+  | RoomState | RoomList | RoomSnapshot | RoomMessageEvent | RoomInvalidated
+  | RoomPlanState;
 
 export const PROTOCOL_VERSION = 81;
 export const MIN_AUTO_COMPACT_TOKENS = 100_000;
