@@ -24,9 +24,15 @@ class FakeMachine:
         self.steers: list[protocol.Steer] = []
         self.interrupts: list[protocol.Interrupt] = []
         self.next_sid = "wire-1"
+        # Session ids the fake wrapper still holds; used by residency checks.
+        self.resident: set[str] = set()
+
+    def _ctx_for(self, sid):
+        return object() if sid in self.resident else None
 
     async def _spawn(self, resume_id, **kwargs):
         self.spawned.append((resume_id, kwargs))
+        self.resident.add(self.next_sid)
         return FakeCtx(self.next_sid)
 
     def _ctx_wire_sid(self, ctx):
@@ -60,7 +66,8 @@ def test_ensure_session_passes_room_directory_and_engine():
     assert resume_id is None                      # a room member resumes nothing
     assert kwargs["cwd"] == room.cwd
     assert kwargs["engine"] == "claude"
-    assert kwargs["raise_on_failure"] is True
+    # _spawn_for handles failure itself so it can resume-or-report clearly.
+    assert kwargs["raise_on_failure"] is False
 
 
 def test_dispatch_query_targets_the_member_session():
@@ -151,6 +158,7 @@ def test_member_with_a_bound_session_skips_spawn():
     host = MachineRoomHost(machine)
     member = RoomMember(member_id="d1", label="DSH · nyy", engine="dsh",
                         session_id="dsh@abc123")
+    machine.resident.add("dsh@abc123")
 
     assert asyncio.run(host.ensure_session(_room(), member)) == "dsh@abc123"
     assert machine.spawned == []
@@ -176,3 +184,68 @@ def test_omitted_model_keeps_the_engine_default():
     _resume, kwargs = machine.spawned[0]
     assert kwargs["model"] is None
     assert kwargs["effort"] is None
+
+def test_stale_bound_session_is_resumed():
+    """A binding that outlived its session must resume, not hang forever.
+
+    Reusing a dead session id only produced an Error frame, so the member stayed
+    at "处理中" and no turn terminal ever arrived.
+    """
+    machine = FakeMachine()
+    machine.next_sid = "wire-new"
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="m1", label="Claude · iris", engine="claude",
+                        session_id="wire-dead")
+
+    # "wire-dead" is not in machine.resident, so it is stale.
+    session_id = asyncio.run(host.ensure_session(_room(), member))
+
+    assert session_id == "wire-new"
+    resume_id, kwargs = machine.spawned[0]
+    assert resume_id == "wire-dead", "the old conversation should be resumed"
+    assert kwargs["engine"] == "claude"
+
+
+def test_stale_dsh_binding_is_reported_not_hung():
+    """DSH cannot resume, so the failure has to be explicit."""
+    machine = FakeMachine()
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="d1", label="DSH · nyy", engine="dsh",
+                        session_id="dsh@gone")
+
+    with pytest.raises(RoomHostError) as info:
+        asyncio.run(host.ensure_session(_room(), member))
+
+    assert "已失效" in str(info.value)
+    assert machine.spawned == []
+
+
+def test_resident_binding_is_reused_without_spawning():
+    machine = FakeMachine()
+    machine.resident.add("wire-live")
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="m1", label="Claude · iris", engine="claude",
+                        session_id="wire-live")
+
+    assert asyncio.run(host.ensure_session(_room(), member)) == "wire-live"
+    assert machine.spawned == []
+
+def test_unresumable_binding_falls_back_to_a_fresh_session():
+    """If resume fails the session is truly gone; keep the member usable."""
+    machine = FakeMachine()
+    machine.next_sid = "wire-fresh"
+
+    async def failing_resume(resume_id, **kwargs):
+        machine.spawned.append((resume_id, kwargs))
+        if resume_id is not None:
+            return None          # resume failed: session no longer exists
+        machine.resident.add(machine.next_sid)
+        return FakeCtx(machine.next_sid)
+
+    machine._spawn = failing_resume
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="m1", label="Claude · iris", engine="claude",
+                        session_id="wire-dead")
+
+    assert asyncio.run(host.ensure_session(_room(), member)) == "wire-fresh"
+    assert [entry[0] for entry in machine.spawned] == ["wire-dead", None]

@@ -63,7 +63,8 @@ import {
 const NewChatView = lazy(() => import("./components/NewChatView").then(m => ({ default: m.NewChatView })));
 const QuestionSheet = lazy(() => import("./components/QuestionSheet").then(
   m => ({ default: m.QuestionSheet })));
-const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
+const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
+
 // The rooms surface is a separate chunk: it must not join the initial bundle.
 const RoomsView = lazy(() => import("./components/RoomsView").then(
   ({ RoomsView: View }) => ({ default: View }),
@@ -492,7 +493,8 @@ export default function App() {
     enabled: false, expires_at: null,
   });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
-  const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+  const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+
   // Collaboration rooms live in App-local state: a room is not a session, so it
   // deliberately stays out of the session reducer and its surfaces.
   const [rooms, setRooms] = useState<RoomsState>({});
@@ -514,6 +516,16 @@ export default function App() {
     profiles: PermissionProfileInfo[];
   } | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
+
+  const roomDshSessions = useMemo(
+    () => state.sessions
+      .filter((session) => session.engine === "dsh")
+      .map((session) => ({
+        session_id: session.session_id,
+        label: session.summary || session.first_prompt || session.session_id,
+      })),
+    [state.sessions],
+  );
   const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
   const [, bumpInlineImageRevision] = useReducer((value: number) => value + 1, 0);
   const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
@@ -6053,6 +6065,7 @@ export default function App() {
               onDeleteRoom={(roomId) => wsRef.current?.sendDeleteRoom(roomId)}
               onUpdateMembers={(roomId, members) => wsRef.current?.sendUpdateRoomMembers(roomId, members)}
               onChangeCwd={(roomId, cwd) => wsRef.current?.sendUpdateRoomCwd(roomId, cwd)}
+              dshSessions={roomDshSessions}
               onApprovePlan={(roomId, member) => wsRef.current?.sendApproveRoomPlan(roomId, member)}
               onDiscardPlan={(roomId) => wsRef.current?.sendDiscardRoomPlan(roomId)}
               onSetFlow={(roomId, on) => wsRef.current?.sendSetRoomFlow(roomId, on)}

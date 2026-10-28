@@ -41,6 +41,8 @@ export interface RoomsViewProps {
   onUpdateMembers: (roomId: string, members: RoomMemberDraft[]) => void;
   /** Re-target the room's working directory. */
   onChangeCwd: (roomId: string, cwd: string) => void;
+  /** Existing DSH sessions the invite form can bind to (DSH cannot be spawned). */
+  dshSessions: { session_id: string; label: string }[];
   /** Human approval of a plan: the only path that starts execution. */
   onApprovePlan: (roomId: string, executorMember: string) => void;
   onDiscardPlan: (roomId: string) => void;
@@ -353,9 +355,10 @@ const ENGINE_LABELS: Record<RoomMemberDraft["engine"], string> = {
   dsh: "DSH",
 };
 
-function InviteRow({ onInvite, onCancel }: {
+function InviteRow({ onInvite, onCancel, dshSessions }: {
   onInvite: (draft: RoomMemberDraft) => void;
   onCancel: () => void;
+  dshSessions: { session_id: string; label: string }[];
 }) {
   const [engine, setEngine] = useState<RoomMemberDraft["engine"]>("claude");
   const [name, setName] = useState("");
@@ -399,7 +402,21 @@ function InviteRow({ onInvite, onCancel }: {
           if (event.key === "Escape") onCancel();
         }}
       />
-      {needsSession && (
+      {needsSession && (dshSessions.length > 0 ? (
+        // DSH cannot be spawned: pick the native session this member drives.
+        <select
+          className="rooms-input"
+          value={sessionId}
+          onChange={(event) => setSessionId(event.target.value)}
+        >
+          <option value="">选择已有 DSH 会话…</option>
+          {dshSessions.map((session) => (
+            <option key={session.session_id} value={session.session_id}>
+              {session.label}
+            </option>
+          ))}
+        </select>
+      ) : (
         <input
           className="rooms-input"
           placeholder="DSH 会话 ID（如 dsh@abc123）"
@@ -410,7 +427,7 @@ function InviteRow({ onInvite, onCancel }: {
             if (event.key === "Escape") onCancel();
           }}
         />
-      )}
+      ))}
       <button type="button" className="rooms-primary" onClick={submit}
         disabled={needsSession && !sessionId.trim()}>
         邀请
@@ -469,7 +486,7 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 export function RoomsView({
   rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
   onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onUpdateMembers,
-  onChangeCwd, onApprovePlan, onDiscardPlan, onSetFlow,
+  dshSessions, onChangeCwd, onApprovePlan, onDiscardPlan, onSetFlow,
   onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
@@ -618,6 +635,7 @@ export function RoomsView({
             </header>
             {inviting && (
               <InviteRow
+                dshSessions={dshSessions}
                 onCancel={() => setInviting(false)}
                 onInvite={(draft) => {
                   onUpdateMembers(active.room_id, toDrafts([...active.members, draft]));

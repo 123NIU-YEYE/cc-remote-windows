@@ -1030,9 +1030,13 @@ class RoomDispatcher:
             await self._semaphore.acquire()
             state.holding_permit = True
 
-            session_id = state.session_id or member.session_id
-            if not session_id:
-                session_id = await self._host.ensure_session(room, member)
+            # Always go through ensure_session: it returns immediately when the
+            # bound session is still resident, and otherwise resumes or reports a
+            # clear failure. Reusing a stored id blindly is what left members at
+            # "处理中" forever after a wrapper restart, because a query against a
+            # dead session only emits an Error frame and never reaches a terminal.
+            session_id = await self._host.ensure_session(room, member)
+            if session_id != member.session_id:
                 self._store.bind_session(room.room_id, member.member_id, session_id)
             state.session_id = session_id
 
@@ -1060,9 +1064,8 @@ class RoomDispatcher:
                 if self._retry_delay:
                     await asyncio.sleep(self._retry_delay)
                 try:
-                    session_id = state.session_id or member.session_id
-                    if not session_id:
-                        session_id = await self._host.ensure_session(room, member)
+                    session_id = await self._host.ensure_session(room, member)
+                    if session_id != member.session_id:
                         self._store.bind_session(
                             room.room_id, member.member_id, session_id)
                     state.session_id = session_id
