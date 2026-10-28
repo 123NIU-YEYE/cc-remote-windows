@@ -10,7 +10,10 @@ import uuid
 from typing import Any, Optional
 
 from cc_remote import protocol
+from cc_remote.log import logger
 from cc_remote.wrapper.rooms import Room, RoomMember
+
+log = logger("cc_remote.wrapper.room_host")
 
 # Rooms have no browser client behind them. Session events are broadcast to every
 # client, so a fixed synthetic id keeps reliable-command bookkeeping happy
@@ -32,17 +35,39 @@ class MachineRoomHost:
         self._machine = machine
 
     async def ensure_session(self, room: Room, member: RoomMember) -> str:
+        engine = (member.engine or "claude").lower()
+
         # A member may already name the session it drives. That is the only way a
         # DSH member can work, and it lets any member adopt an existing
         # conversation instead of starting a blank one.
         if member.session_id:
-            return member.session_id
+            if self._is_resident(member.session_id):
+                return member.session_id
+            # The binding outlived its session (wrapper restarted, session evicted,
+            # or it belonged to an older process). Reusing the id blindly left the
+            # member "处理中" forever, because a rejected query only emits an Error
+            # frame and never reaches a turn terminal.
+            if engine in self.SPAWNABLE_ENGINES:
+                resumed = await self._spawn_for(room, member, engine,
+                                                resume_id=member.session_id)
+                if resumed:
+                    return resumed
+                # Resume failed: the session is genuinely gone. Falling back to a
+                # fresh one keeps the member usable; the room timeline still holds
+                # the earlier turns, so the loss is visible rather than silent.
+                log.warning("room member session could not be resumed",
+                            member_id=member.member_id,
+                            session_id=member.session_id)
+                created = await self._spawn_for(room, member, engine, resume_id=None)
+                if created:
+                    return created
+            raise RoomHostError(
+                f"「{member.label}」绑定的会话已失效，请重新绑定或移除该成员")
 
         # DSH is not spawnable: its runtime only adopts an existing native session
         # (see DshRuntime._ctx), and _spawn has no dsh branch, so passing "dsh"
         # there fails an internal claude-profile assertion with an empty message
         # (which surfaced in the room as "失败 AssertionError:").
-        engine = (member.engine or "claude").lower()
         if engine not in self.SPAWNABLE_ENGINES:
             raise RoomHostError(
                 f"无法为「{member.label}」新建 {engine.upper()} 会话："
@@ -50,8 +75,22 @@ class MachineRoomHost:
                 "（房间只能自动创建 Claude / Codex 会话）"
             )
 
+        created = await self._spawn_for(room, member, engine, resume_id=None)
+        if not created:
+            raise RoomHostError(f"无法为「{member.label}」创建会话")
+        return created
+
+    def _is_resident(self, session_id: str) -> bool:
+        """True when the wrapper still holds a live context for this id."""
+        try:
+            return self._machine._ctx_for(session_id) is not None
+        except Exception:  # noqa: BLE001 - an unknown id is simply not resident
+            return False
+
+    async def _spawn_for(self, room: Room, member: RoomMember, engine: str,
+                         *, resume_id: Optional[str]) -> Optional[str]:
         ctx = await self._machine._spawn(
-            None,
+            resume_id,
             cwd=room.cwd,
             engine=engine,
             claude_profile_id=(member.profile_id if engine == "claude" else None),
@@ -61,14 +100,12 @@ class MachineRoomHost:
             model=member.model,
             effort=member.effort,
             space="code",
-            raise_on_failure=True,
+            raise_on_failure=False,
         )
         if ctx is None:
-            raise RoomHostError(f"无法为「{member.label}」创建会话")
+            return None
         session_id = self._machine._ctx_wire_sid(ctx)
-        if not session_id:
-            raise RoomHostError(f"「{member.label}」的会话没有可用的编号")
-        return session_id
+        return session_id or None
 
     async def dispatch_query(self, session_id: str, text: str, *,
                              msg_id: str, delivery: str) -> None:

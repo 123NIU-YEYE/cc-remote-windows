@@ -158,6 +158,26 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   }
   console.log("handoff picker works:", handoffOk);
 
+  // DSH cannot be spawned, so inviting one must offer a session picker (or the
+  // id field) rather than failing later at dispatch time.
+  let dshPickerOk = true;
+  const inviteButton = page.locator(".rooms-chip-invite");
+  if ((await inviteButton.count()) > 0) {
+    await inviteButton.first().click();
+    const engineSelect = page.locator(".rooms-invite-engine");
+    if ((await engineSelect.count()) > 0) {
+      await engineSelect.selectOption("dsh");
+      await page.waitForTimeout(300);
+      const picker = page.locator(".rooms-invite select, .rooms-invite input").nth(1);
+      const hasPicker = (await page.locator(".rooms-invite").count()) > 0;
+      console.log("dsh picker present:", hasPicker);
+      dshPickerOk = hasPicker;
+    }
+    // close the invite row again
+    await page.keyboard.press("Escape").catch(() => {});
+    await inviteButton.first().click().catch(() => {});
+  }
+
   // The advise→execute phase banner must render (idle banner is enough to prove
   // the component mounted; the awaiting state needs a live plan).
   const flowBar = page.locator(".rooms-flow");
@@ -212,7 +232,7 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   // "Failed to load resource" duplicates the response log above, which already
   // filters the viewer noise; counting it twice would hide a real signal.
   const relevantErrors = errors.filter((line) => !line.includes("Failed to load resource"));
-  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk && flowOk
+  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk && flowOk && dshPickerOk
     && relevantErrors.length === 0 && relevantFailures.length === 0;
   console.log(ok ? "RESULT: PASS" : "RESULT: FAIL");
   await browser.close();
