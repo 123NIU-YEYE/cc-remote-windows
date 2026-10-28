@@ -10,6 +10,21 @@ from cc_remote.wrapper.room_host import MachineRoomHost, RoomHostError
 from cc_remote.wrapper.rooms import Room, RoomMember
 
 
+class FakeDsh:
+    """Stands in for DshRuntime: adopting registers a context."""
+
+    def __init__(self, machine: "FakeMachine") -> None:
+        self.machine = machine
+        self.adoptable: set[str] = set()
+
+    async def _ctx(self, sid):
+        if sid in self.adoptable:
+            ctx = FakeCtx(sid)
+            self.machine.sessions[sid] = ctx
+            self.machine.resident.add(sid)
+            return ctx
+        raise RuntimeError("会话不存在")
+
 class FakeCtx:
     def __init__(self, sid: str) -> None:
         self.sid = sid
@@ -26,6 +41,9 @@ class FakeMachine:
         self.next_sid = "wire-1"
         # Session ids the fake wrapper still holds; used by residency checks.
         self.resident: set[str] = set()
+        # Claude/Codex live here; DSH adoption is simulated by FakeDsh.
+        self.sessions: dict[str, object] = {}
+        self._dsh = FakeDsh(self)
 
     def _ctx_for(self, sid):
         return object() if sid in self.resident else None
@@ -206,8 +224,24 @@ def test_stale_bound_session_is_resumed():
     assert kwargs["engine"] == "claude"
 
 
-def test_stale_dsh_binding_is_reported_not_hung():
-    """DSH cannot resume, so the failure has to be explicit."""
+def test_dsh_binding_is_adopted_not_spawned():
+    """DSH has no spawn path: a known native session is taken over instead.
+
+    The first live run failed here because a residency check rejected every DSH
+    member, so adoption has to be the fallback rather than an error.
+    """
+    machine = FakeMachine()
+    machine._dsh.adoptable.add("dsh@session-abc")
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="d1", label="DSH · nyy", engine="dsh",
+                        session_id="dsh@session-abc")
+
+    assert asyncio.run(host.ensure_session(_room(), member)) == "dsh@session-abc"
+    assert machine.spawned == [], "DSH must never go through _spawn"
+    assert "dsh@session-abc" in machine.resident, "adoption registers the context"
+
+
+def test_unknown_dsh_session_reports_a_clear_failure():
     machine = FakeMachine()
     host = MachineRoomHost(machine)
     member = RoomMember(member_id="d1", label="DSH · nyy", engine="dsh",
@@ -216,7 +250,7 @@ def test_stale_dsh_binding_is_reported_not_hung():
     with pytest.raises(RoomHostError) as info:
         asyncio.run(host.ensure_session(_room(), member))
 
-    assert "已失效" in str(info.value)
+    assert "无法接管" in str(info.value)
     assert machine.spawned == []
 
 
