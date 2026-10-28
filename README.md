@@ -12,6 +12,7 @@
 | Wrapper 支持平台 | Windows 10/11 · Linux · macOS |
 | 引擎 | DSH（桌面版）· Codex CLI · Claude Code |
 | 中继 | 自建 VPS（Caddy）或 Cloudflare 隧道 |
+| 本分支新增 | **协作房间**（多 Agent）· Windows 平台适配 · DSH 桌面版配对 |
 
 ---
 
@@ -34,7 +35,7 @@
 
 - **中继只负责转发**，不碰模型 API。模型登录、API Key、网关地址全部留在本机。
 - **Wrapper 与中继必须同协议版本**（当前 v81）。跨版本会在握手后被 `4406 protocol upgrade required` 踢掉。
-- 中继可以部署在 VPS，也可以用 Cloudflare 隧道从本机暴露，见 [§5](#5-中继部署)。
+- 中继可以部署在 VPS，也可以用 Cloudflare 隧道从本机暴露，见 [§6](#6-中继部署)。
 
 ---
 
@@ -180,7 +181,108 @@ DSH 桌面版的 API 只绑回环，且 **launch token 每次启动新生成、�
 
 ---
 
-## 4. 服务器端（中继）
+## 4. 协作房间（多 Agent）
+
+这个分支新增的**协作**面板：一个房间把**工作目录**和**若干 Agent 成员**绑在一起，
+你在房间里用 `@` 派活，每个成员在**自己独立的会话**里干活，结果回到房间时间线。
+
+```
+房间「重构认证」 · cwd=D:\proj
+  ├── Claude · iris   (engine=claude, model=claude-opus-5-5)
+  ├── Codex · nyx     (engine=codex)
+  └── DSH · nyy       (engine=dsh, 必须绑定已有会话)
+
+你: @Claude 给个测试计划
+     └─→ 派发到 Claude 自己的会话，回合结束把结论写回房间
+你: @nyx 按上面的计划执行
+     └─→ 派发到 Codex 自己的会话
+```
+
+**为什么成员是"独立会话"**：这样模型、权限、用量、计划模式全部复用现成机制，
+还能点「跳转会话 ↗」看完整过程；房间崩了也不影响会话本身。
+
+### 4.1 能做什么
+
+| 操作 | 位置 | 说明 |
+|---|---|---|
+| 新建 / 改名 / 删除房间 | 左侧卡片 | 删除**不会**删掉成员会话 |
+| 改工作目录 | 卡片「目录」 | 只影响之后新开成员会话 |
+| 邀请 / 移除成员 | 右上 `+ 邀请` | 至少保留一个成员 |
+| `@` 选择成员 | 输入框打字 `@` | 过滤、方向键选择、Enter 插入 |
+| 引用若干条消息 | 消息上「引用」 | 发送时作为 `[引用]` 块附上 |
+| 单条转交 | 消息上「转交」 | 一键"引用 + 派发给某个成员" |
+| 引导 / 取消 | 成员行 | 追加指令到运行中回合 / 中断该回合 |
+| 跳转会话 | 成员行 | 打开该成员自己的完整会话 |
+
+### 4.2 `@` 句柄规则
+
+展示名 `Claude · iris` **含空格，无法作为一个 `@` token 输入**，所以按分段匹配：
+
+| 展示名 | 可用句柄 |
+|---|---|
+| `Claude · iris` | `@Claude`、`@iris` |
+| `Codex · nyx` | `@Codex`、`@nyx` |
+
+- 大小写不敏感
+- 句柄重名时**全部命中**（两个 Claude 时 `@Claude` 派给两个，用 `@iris` 精确指定）
+- `@全体` / `@all` 广播
+- 正文里的 `@media` 这类**忽略不报错**
+
+### 4.3 上下文预算
+
+成员会话彼此独立，所以"它能看到什么"是要设计的事：
+
+| 机制 | 行为 |
+|---|---|
+| 自动上下文 | 默认带最近 **6** 条房间记录（`CC_REMOTE_ROOM_CONTEXT_DEPTH`） |
+| 字符预算 | 按 `CC_REMOTE_ROOM_CONTEXT_BUDGET`（默认 6000）**从新到旧**装填 |
+| 引用去重 | 你手动引用过的条目**不再**进自动上下文（不付两次钱） |
+| 有引用时降级 | 存在手动引用 → 自动深度降到 **2** |
+
+### 4.4 结构化回复（计划卡片）
+
+成员可以在回答末尾附一个受控 JSON 块，房间把它渲染成卡片：
+
+````
+```cc-plan
+{"summary": "一句话结论", "steps": ["步骤"], "risks": ["风险"], "needs": ["待确认"]}
+```
+````
+
+解析成功 → 时间线出现 **结论 / 编号步骤 / 风险 / 待确认** 卡片；
+解析失败 → **原样显示文字，不报错也不重试**（格式失误不该浪费一个回合）。
+
+### 4.5 成员级模型
+
+每个成员可单独设 `model` / `effort`：顾问用强模型、执行用快模型。省略则用引擎默认。
+
+### 4.6 失败与恢复
+
+- **不重试**：目录不存在、会话未绑定、会话失效 —— 这类重试只会刷屏
+- **重试 1 次**：连接类、超时类
+- **状态持久化**：成员状态写入 `~/.cc-remote/rooms.json`。重启后曾处于
+  `running` 的成员恢复为 `idle` 并标注「重启时该回合已中断」，会话绑定保留
+
+### 4.7 DSH 成员的限制
+
+**DSH 无法从目录新建会话** —— 它的运行时只能**接管已存在的原生会话**。
+所以 DSH 成员必须在邀请时填写会话 ID（形如 `dsh@<原生id>`）。
+不填会得到明确提示，而不是一个空 `AssertionError`。
+
+### 4.8 已知限制
+
+| 项 | 状态 |
+|---|---|
+| 右栏成员详情（工具流、token） | 未做；点「跳转会话」看完整过程 |
+| 计划步骤一键指派 | 未做（协议已支持计划数据） |
+| `advise_execute` 自动流转 | 未做（设计见 `docs/collaboration-rooms-optimization.md`） |
+
+设计文档：[`docs/collaboration-rooms.md`](docs/collaboration-rooms.md) ·
+优化方案：[`docs/collaboration-rooms-optimization.md`](docs/collaboration-rooms-optimization.md)
+
+---
+
+## 5. 服务器端（中继）
 
 中继跑在能对外提供 HTTPS 的机器上。核心是让 `/healthz` 返回**与 Wrapper 相同的 protocol**：
 
@@ -219,11 +321,11 @@ ALLOW_INSECURE_HTTP=1                 # 仅明文 HTTP 部署时为 1
 
 ---
 
-## 5. 中继部署
+## 6. 中继部署
 
 ### 方案 A：VPS + Caddy（推荐，域名固定）
 
-见 [§4](#4-服务器端中继)。Caddy 占 80/443 反代到 `127.0.0.1:8765`，relay 只绑回环。
+见 [§5](#5-服务器端中继)。Caddy 占 80/443 反代到 `127.0.0.1:8765`，relay 只绑回环。
 记得在云控制台的**安全组**放行 80/443 —— 默认往往只放行 22。
 
 ### 方案 B：本机 relay + Cloudflare 隧道（无 VPS）
@@ -240,7 +342,7 @@ cloudflared tunnel --url http://127.0.0.1:8765
 
 ---
 
-## 6. Windows 适配做了什么
+## 7. Windows 适配做了什么
 
 | 层 | 问题 | 处理 |
 |---|---|---|
@@ -261,7 +363,7 @@ cloudflared tunnel --url http://127.0.0.1:8765
 
 ---
 
-## 7. 故障排查
+## 8. 故障排查
 
 日志在 `wrapper.log.err`（JSON Lines，每行一条）。
 
@@ -282,7 +384,7 @@ cloudflared tunnel --url http://127.0.0.1:8765
 
 ---
 
-## 8. 安全
+## 9. 安全
 
 - **`.env` 绝不入库**（已在 `.gitignore`）。里面有 `WRAPPER_TOKEN`、`LOGIN_PASSWORD`、`SESSION_SECRET`。
 - `LOGIN_PASSWORD` 至少 16 位；`SESSION_SECRET` / `WRAPPER_TOKEN` 用 `openssl rand -hex 32` 生成。
@@ -292,7 +394,7 @@ cloudflared tunnel --url http://127.0.0.1:8765
 
 ---
 
-## 9. 已知限制
+## 10. 已知限制
 
 | 项 | 状态 |
 |---|---|
@@ -301,10 +403,14 @@ cloudflared tunnel --url http://127.0.0.1:8765
 | **Codex 共享 daemon** | 仅 Unix；Windows 用 stdio 回退（`CC_REMOTE_CODEX_DAEMON=off`） |
 | **自建网关 + 代理** | 若你的 Claude 网关需要走代理才通，需改 `child_env.py` 的代理策略 |
 | **UAC / 服务安装** | 非管理员账户下无法安装 Clash 服务或开启 TUN |
+| **协作：DSH 成员** | 不能从目录新建会话，必须绑定已存在的 `dsh@<id>`（见 §4.7） |
+| **协作：成员互相不可见** | 各成员会话独立；只靠房间自动上下文与手动引用来传递 |
+| **协作：房间内无工具流** | 右栏详情未做，点「跳转会话」看完整过程 |
+| **协作：无自动流转** | `advise_execute`（顾问出计划 → 执行方动手）尚未实现 |
 
 ---
 
-## 10. 目录速览
+## 11. 目录速览
 
 ```
 cc_remote/
@@ -319,16 +425,27 @@ cc_remote/
     claude_external.py    Claude 进程归属扫描（含 Windows 快照）
     dsh_desktop.py        ★ DSH 桌面版配对文件校验
     dsh_pair.py           配对 CLI（含 --desktop）
-  protocol.py             Wire protocol（v81）
+    rooms.py              ★ 协作房间：存储、mention 解析、派发、状态持久化
+    room_service.py       ★ 房间命令 → 协议帧
+    room_host.py          ★ 房间能力 → 会话池（spawn / query / steer / interrupt）
+    room_plan.py          ★ cc-plan 结构化回复解析
+    room_retry.py         ★ 派发失败分类（可重试 vs 永久）
+  protocol.py             Wire protocol（v81，含协作房间命令与事件）
 integrations/dsh/
   cc-remote.mjs           只读元数据端点
   cc-remote-desktop-url.mjs  ★ 导出桌面版 origin + token
 scripts/
   run-wrapper.ps1         ★ Windows 启动器（自动重配对 + 代理策略）
   pair-desktop.ps1        ★ 桌面版配对
-web/                      前端（Vue + Vite）
-docs/                     上游文档
-deploy/                   中继部署脚本与 systemd / Caddy 模板
+web/                      前端（React 19 + Vite）
+  src/rooms-state.ts      ★ 房间状态的纯函数投影
+  src/rooms-mentions.ts   ★ @ 句柄与转交文案
+  src/rooms-quote.ts      ★ 多选引用
+  src/components/RoomsView.tsx  ★ 协作面板
+  scripts/rooms-smoke.cjs ★ 无头浏览器冒烟（协作面板）
+docs/
+  collaboration-rooms.md              ★ 协作设计（协议与语义）
+  collaboration-rooms-optimization.md ★ 优化方案（分层与优先级）
 ```
 
 ★ = 本分支新增或重写。

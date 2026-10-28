@@ -158,6 +158,15 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   }
   console.log("handoff picker works:", handoffOk);
 
+  // A structured reply must render as a card, not as raw JSON.
+  const planCards = page.locator(".rooms-plan");
+  const planCount = await planCards.count();
+  console.log("plan cards:", planCount);
+  if (planCount > 0) {
+    console.log("first plan:", (await planCards.first().innerText()).replace(/\s+/g, " ").trim().slice(0, 100));
+    await page.screenshot({ path: OUT.replace(".png", "-plan.png") });
+  }
+
   // Typing "@" must offer the room's agents, and picking one must insert it.
   let mentionOk = false;
   const composer = page.locator(".rooms-textarea");
