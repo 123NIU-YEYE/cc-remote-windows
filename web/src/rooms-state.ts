@@ -54,6 +54,25 @@ export interface RoomView {
   updated_at?: number;
   /** Total timeline length, so the sidebar can show "N 条" while sending only one. */
   message_count?: number;
+  /** advise→execute: whether addressing one member starts a planning phase. */
+  advise_execute?: boolean;
+  /** The pending plan and its phase, when the room is in advise mode. */
+  planState?: RoomPlanStateView;
+}
+
+export interface RoomPlanStepView {
+  step_id: string;
+  text: string;
+  status: string;
+  owner?: string | null;
+}
+
+export interface RoomPlanStateView {
+  phase: "idle" | "planning" | "awaiting_execute" | "executing";
+  summary?: string;
+  author_member?: string | null;
+  steps?: RoomPlanStepView[];
+  executor_member?: string | null;
 }
 
 export type RoomsState = Record<string, RoomView>;
@@ -169,6 +188,9 @@ function normalizeRoom(raw: unknown, previous?: RoomView): RoomView | null {
     created_at: asNumber(record.created_at),
     updated_at: asNumber(record.updated_at),
     message_count: asNumber(record.message_count, messages.length),
+    advise_execute: record.advise_execute === true,
+    // A snapshot may not carry a plan phase; keep whatever we already had.
+    planState: previous?.planState,
   };
 }
 
@@ -234,6 +256,43 @@ export function applyRoomEvent(rooms: RoomsState, msg: ServerEvent): RoomsState 
         }
         : member);
       return { ...rooms, [roomId]: { ...room, members } };
+    }
+    case "room_plan_state": {
+      const roomId = asString(msg.room_id);
+      const room = rooms[roomId];
+      if (!room) return rooms;
+      const phase = msg.phase;
+      const steps: RoomPlanStepView[] = [];
+      if (Array.isArray(msg.steps)) {
+        for (const raw of msg.steps) {
+          const record = asRecord(raw);
+          if (!record) continue;
+          const stepId = asString(record.step_id);
+          if (!stepId) continue;
+          steps.push({
+            step_id: stepId,
+            text: asString(record.text),
+            status: asString(record.status, "pending"),
+            owner: typeof record.owner === "string" ? record.owner : null,
+          });
+        }
+      }
+      return {
+        ...rooms,
+        [roomId]: {
+          ...room,
+          planState: {
+            phase: (phase === "planning" || phase === "awaiting_execute"
+              || phase === "executing") ? phase : "idle",
+            summary: asString(msg.summary),
+            author_member: typeof msg.author_member === "string"
+              ? msg.author_member : null,
+            steps,
+            executor_member: typeof msg.executor_member === "string"
+              ? msg.executor_member : null,
+          },
+        },
+      };
     }
     case "room_invalidated": {
       const roomId = asString(msg.room_id);

@@ -1613,6 +1613,27 @@ export class RelayWs {
     });
   }
 
+  sendApproveRoomPlan(roomId: string, executorMember: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "approve_room_plan", room_id: roomId,
+      executor_member: executorMember, ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendDiscardRoomPlan(roomId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "discard_room_plan", room_id: roomId,
+      ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendSetRoomFlow(roomId: string, adviseExecute: boolean): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "set_room_flow", room_id: roomId,
+      advise_execute: adviseExecute, ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
   sendUpdateRoomMembers(
     roomId: string,
     members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null }[],

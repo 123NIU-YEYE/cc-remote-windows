@@ -828,3 +828,88 @@
   border-radius: 4px;
   background: var(--divider);
 }
+/* advise→execute: the phase banner and the approval boundary. */
+.rooms-flow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--divider);
+  font-size: 12px;
+  color: var(--dim);
+  background: var(--raised);
+}
+
+.rooms-flow.is-planning {
+  color: var(--warn);
+  background: var(--warn-weak);
+}
+
+.rooms-flow.is-awaiting {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  color: var(--accent-ink);
+  background: var(--accent-weak);
+  border-top-color: var(--accent-line);
+}
+
+.rooms-flow.is-executing {
+  color: var(--ok);
+  background: var(--ok-weak);
+}
+
+.rooms-flow-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.rooms-flow-hint {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.rooms-flow-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.rooms-flow-select {
+  width: auto;
+  min-width: 160px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.rooms-flow-actions button {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill, 999px);
+  background: var(--surface);
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.rooms-flow-actions .rooms-primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+
+.rooms-flow > button {
+  margin-left: auto;
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill, 999px);
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}

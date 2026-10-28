@@ -6941,6 +6941,7 @@ function reduceEvent(
     case "room_list":
     case "room_snapshot":
     case "room_message":
+    case "room_plan_state":
     case "room_state":
     case "room_invalidated":
       return state;

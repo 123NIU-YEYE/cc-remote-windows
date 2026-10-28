@@ -20,8 +20,25 @@ from pathlib import Path
 import inspect
 from typing import Any, Callable, Iterable, Optional, Protocol
 
+from cc_remote.wrapper.room_flow import (
+    PHASE_EXECUTING,
+    PHASE_IDLE,
+    PHASE_PLANNING,
+    PlanState,
+    PlanStateError,
+    advisor_prompt,
+    approve,
+    begin_planning,
+    discard,
+    mark_step,
+    plan_prompt,
+    record_plan,
+)
 from cc_remote.wrapper.room_plan import extract_plan, plan_instruction
 from cc_remote.wrapper.room_retry import should_retry
+from cc_remote.log import logger
+
+log = logger("cc_remote.wrapper.rooms")
 
 ROOM_LIMIT = 200
 MEMBER_LIMIT = 8
@@ -174,6 +191,12 @@ class Room:
     context_depth: int = DEFAULT_CONTEXT_DEPTH
     # Ask members to close with a cc-plan block so replies render as cards.
     plan_requests: bool = True
+    # Explicit plan/execute phase. Kept on the room (not in memory) so a restart
+    # cannot silently approve a plan the human never saw.
+    plan_state: PlanState = field(default_factory=PlanState)
+    # When true, addressing one member makes it the advisor: its reply becomes a
+    # plan the human must approve before the executor is dispatched.
+    advise_execute: bool = False
 
     def member(self, member_id: str) -> Optional[RoomMember]:
         for item in self.members:
@@ -192,6 +215,8 @@ class Room:
             "updated_at": self.updated_at,
             "context_depth": self.context_depth,
             "plan_requests": self.plan_requests,
+            "plan_state": self.plan_state.as_dict(),
+            "advise_execute": self.advise_execute,
         }
 
     @classmethod
@@ -209,6 +234,8 @@ class Room:
             context_depth=max(0, min(20, int(payload.get("context_depth",
                                                          DEFAULT_CONTEXT_DEPTH) or 0))),
             plan_requests=bool(payload.get("plan_requests", True)),
+            plan_state=PlanState.from_dict(payload.get("plan_state")),
+            advise_execute=bool(payload.get("advise_execute")),
         )
 
 
@@ -379,6 +406,20 @@ class RoomStore:
                     if old is not None and member.session_id is None:
                         member.session_id = old.session_id
                 room.members = validated
+            room.updated_at = time.time()
+            self._persist()
+        return room
+
+    def save(self, room_id: str) -> Room:
+        """Persist a room whose fields were changed in place.
+
+        Used for the plan state machine, which mutates room.plan_state directly
+        rather than going through update()'s name/cwd/members contract.
+        """
+        with self._lock:
+            room = self._rooms.get(room_id)
+            if room is None:
+                raise RoomError("unknown room")
             room.updated_at = time.time()
             self._persist()
         return room
@@ -613,6 +654,7 @@ class RoomDispatcher:
                  max_parallel: int = DEFAULT_MAX_PARALLEL,
                  on_state: Optional[Callable[[str, "MemberRuntime"], Any]] = None,
                  on_message: Optional[Callable[[str, "RoomMessage"], Any]] = None,
+                 on_plan: Optional[Callable[[str, Any], Any]] = None,
                  retry_delay: float = RETRY_DELAY_SECONDS):
         self._store = store
         self._host = host
@@ -627,6 +669,8 @@ class RoomDispatcher:
         # same outbound notification as a terminal result or the client never
         # learns about them.
         self._on_message = on_message
+        # Called when the plan/execute phase changes.
+        self._on_plan = on_plan
         self._retry_delay = max(0.0, float(retry_delay))
         self._restore_runtime()
 
@@ -709,6 +753,15 @@ class RoomDispatcher:
             author_label="你", text=body, mentions=list(mentions),
         )
         self._store.append_message(room_id, message)
+        # A room in advise mode starts a planning phase when a single member is
+        # addressed: that member is the advisor, and its reply becomes a plan the
+        # human must approve before anyone executes.
+        if (room.advise_execute and len(mentions) == 1
+                and room.plan_state.phase == PHASE_IDLE):
+            room.plan_state = begin_planning(room.plan_state, mentions[0])
+            room.plan_state.source_msg_id = message.msg_id
+            self._store.save(room_id)
+            await self._notify_plan(room_id)
         for member_id in mentions:
             member = room.member(member_id)
             if member is None:      # member removed between parse and dispatch
@@ -771,7 +824,70 @@ class RoomDispatcher:
             plan=plan.as_dict() if plan is not None else None,
         )
         self._store.append_message(room_id, message)
+        # Feed the plan/execute state machine: only a reply from the advisor, while
+        # planning, can produce an approvable plan. Everything else is ignored so a
+        # member that happens to emit a cc-plan block cannot hijack the phase.
+        await self._advance_plan(room, member, message, ok=ok)
         return message
+
+    async def _advance_plan(self, room: Room, member: RoomMember,
+                            message: RoomMessage, *, ok: bool) -> None:
+        plan_state = room.plan_state
+        if plan_state.phase != PHASE_PLANNING:
+            return
+        if plan_state.author_member and member.member_id != plan_state.author_member:
+            return
+        steps = list((message.plan or {}).get("steps") or [])
+        summary = str((message.plan or {}).get("summary") or "")
+        if not ok or not steps:
+            # No usable steps: leave planning rather than waiting for an approval
+            # that could never execute anything.
+            room.plan_state = discard(plan_state)
+            await self._notify_plan(room.room_id)
+            return
+        try:
+            room.plan_state = record_plan(
+                plan_state, summary=summary, steps=steps, msg_id=message.msg_id)
+        except PlanStateError:
+            return
+        room.plan_state.author_member = member.member_id
+        log.info("room plan awaiting approval", room_id=room.room_id,
+                 steps=len(room.plan_state.steps))
+        await self._notify_plan(room.room_id)
+
+    async def approve_plan(self, room_id: str, executor_member: str) -> Room:
+        """Human clicked 执行: dispatch the approved steps to one executor."""
+        room = self._store.get(room_id)
+        if room is None:
+            raise RoomError("unknown room")
+        if room.member(executor_member) is None:
+            raise RoomError("unknown member")
+        try:
+            approve(room.plan_state, executor_member)
+        except PlanStateError as exc:
+            raise RoomError(str(exc)) from exc
+        room.plan_state.approved_at = time.time()
+        prompt = plan_prompt(room.plan_state)
+        self._store.update(room_id)
+        await self._notify_plan(room_id)
+        # One dispatch carrying the whole plan: the executor works through the
+        # steps in its own session, which keeps the ordering intact.
+        message = await self._record_and_dispatch(
+            room_id, prompt, [executor_member], "queue")
+        return room
+
+    async def discard_plan(self, room_id: str) -> Room:
+        room = self._store.get(room_id)
+        if room is None:
+            raise RoomError("unknown room")
+        try:
+            room.plan_state = discard(room.plan_state)
+        except PlanStateError as exc:
+            raise RoomError(str(exc)) from exc
+        self._store.update(room_id)
+        await self._notify_plan(room_id)
+        return room
+
 
     # ---- waiting (tests / graceful shutdown) ---------------------------
     async def wait_idle(self, room_id: Optional[str] = None) -> None:
@@ -856,10 +972,31 @@ class RoomDispatcher:
         # Ask for the structured block so the timeline can render a card. Kept
         # short: it is paid for on every dispatch, and a member that ignores it
         # still produces a usable prose answer.
+        # An advisor is told to plan and not to act; that instruction is what the
+        # state machine relies on to get executable steps.
+        if room.plan_state.phase == PHASE_PLANNING:
+            lines.append(advisor_prompt())
         instruction = plan_instruction(room.plan_requests)
         if instruction:
             lines.append(instruction)
         return "\n".join(lines)
+
+    async def _notify_plan(self, room_id: str) -> None:
+        """Push the current phase so the UI can show (or hide) 执行.
+
+        Driven by a callback so the dispatcher still does not know about the
+        transport.
+        """
+        room = self._store.get(room_id)
+        callback = self._on_plan
+        if room is None or callback is None:
+            return
+        try:
+            result = callback(room_id, room.plan_state)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:  # noqa: BLE001 - observers must not break dispatch
+            pass
 
     async def _notify(self, room_id: str, state: "MemberRuntime") -> None:
         self._persist_runtime()

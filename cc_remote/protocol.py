@@ -1420,6 +1420,52 @@ class CancelRoomMember(_Command):
     member_id: WireId
 
 
+class ApproveRoomPlan(_Command):
+    """client -> wrapper: the human approved the plan; dispatch it to one member.
+
+    Only legal while the room is awaiting approval. This is the single place
+    that starts execution, so an executor can never be dispatched by a model.'
+    """
+
+    type: Literal["approve_room_plan"] = "approve_room_plan"
+    cmd_id: WireId
+    client_id: WireId
+    room_id: WireId
+    executor_member: WireId
+
+
+class DiscardRoomPlan(_Command):
+    """client -> wrapper: drop the pending plan."""
+
+    type: Literal["discard_room_plan"] = "discard_room_plan"
+    cmd_id: WireId
+    client_id: WireId
+    room_id: WireId
+
+
+class SetRoomFlow(_Command):
+    """client -> wrapper: switch a room between free chat and advise→execute."""
+
+    type: Literal["set_room_flow"] = "set_room_flow"
+    cmd_id: WireId
+    client_id: WireId
+    room_id: WireId
+    advise_execute: bool = True
+
+
+class RoomPlanState(_Base):
+    """wrapper -> client: the plan and its phase, so the UI can show 执行."""
+
+    type: Literal["room_plan_state"] = "room_plan_state"
+    room_id: WireId
+    phase: Literal["idle", "planning", "awaiting_execute", "executing"] = "idle"
+    author_member: Optional[WireId] = None
+    source_msg_id: Optional[WireId] = None
+    summary: str = ""
+    steps: list[dict] = Field(default_factory=list, max_length=12)
+    executor_member: Optional[WireId] = None
+
+
 class RoomState(_Base):
     """wrapper -> client: one member's live dispatch state."""
 
@@ -3500,6 +3546,10 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "room_snapshot": RoomSnapshot,
     "room_message": RoomMessageEvent,
     "room_invalidated": RoomInvalidated,
+    "approve_room_plan": ApproveRoomPlan,
+    "discard_room_plan": DiscardRoomPlan,
+    "set_room_flow": SetRoomFlow,
+    "room_plan_state": RoomPlanState,
     "session_list_invalidated": SessionListInvalidated,
     "session_activity": SessionActivity,
     "session_focus": SessionFocus,
