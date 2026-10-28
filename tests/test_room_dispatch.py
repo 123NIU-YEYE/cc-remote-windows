@@ -7,6 +7,7 @@ import pytest
 
 from cc_remote.wrapper.rooms import (
     MEMBER_DONE,
+    MEMBER_IDLE,
     MEMBER_FAILED,
     MEMBER_QUEUED,
     MEMBER_RUNNING,
@@ -382,3 +383,41 @@ def test_context_budget_is_respected(tmp_path):
     assert len(history) < CONTEXT_BUDGET + 400, len(history)
     assert "第5条" in history, "newest content is kept"
     assert "第0条" not in history, "oldest content is dropped when over budget"
+
+# ---- L3.2 runtime persistence -------------------------------------------
+
+def test_runtime_state_survives_a_restart(tmp_path):
+    """A member mid-turn at shutdown must not reappear as "running" forever."""
+    store, room, host, dispatcher = _room(tmp_path)
+    # No gate: the dispatch completes (state = running, waiting for a terminal),
+    # which is exactly the "wrapper died mid-turn" snapshot we want to persist.
+    async def start_turn():
+        await dispatcher.post(room.room_id, "@Claude 开始")
+        await dispatcher.wait_idle()
+
+    asyncio.run(start_turn())
+    assert dispatcher.runtime(room.room_id)[0].state == MEMBER_RUNNING
+
+    # A new dispatcher over the same directory = a wrapper restart.
+    revived = RoomDispatcher(RoomStore(tmp_path), host)
+    state = revived.runtime(room.room_id)[0]
+    assert state.session_id == "s-m-claude", "the session binding is kept"
+    assert state.state == MEMBER_IDLE
+    assert state.error == "重启时该回合已中断"
+    assert state.started_at is None
+    assert state.holding_permit is False, "no permit leaks across a restart"
+
+
+def test_runtime_snapshot_is_persisted_for_done_members(tmp_path):
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 给个结论")
+        await dispatcher.wait_idle()
+        await dispatcher.on_turn_terminal(room.room_id, "m-claude", "结论")
+
+    asyncio.run(scenario())
+    revived = RoomDispatcher(RoomStore(tmp_path), host)
+    states = {state.member_id: state for state in revived.runtime(room.room_id)}
+    assert states["m-claude"].state == MEMBER_DONE
+    assert states["m-claude"].session_id == "s-m-claude"

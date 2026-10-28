@@ -314,6 +314,7 @@ class RoomStore:
         self._path = self._dir / "rooms.json"
         self._lock = threading.RLock()
         self._rooms: dict[str, Room] = {}
+        self._runtime: dict[str, dict[str, Any]] = {}
         self._load()
 
     # ---- read ----------------------------------------------------------
@@ -415,6 +416,28 @@ class RoomStore:
             self._persist()
         return room
 
+    # ---- dispatch runtime (survives a restart) --------------------------
+    def save_runtime(self, runtime: dict[str, dict[str, Any]]) -> None:
+        """Persist per-member dispatch state next to the rooms themselves.
+
+        Without this the UI lies after a restart: a member that was mid-turn is
+        shown as idle while its session is still running.
+        """
+        snapshot = {
+            room_id: {member_id: state.as_dict()
+                      for member_id, state in states.items()}
+            for room_id, states in runtime.items()
+        }
+        with self._lock:
+            self._runtime = snapshot
+            self._persist()
+
+    def load_runtime(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return {room_id: {member_id: dict(state)
+                              for member_id, state in states.items()}
+                    for room_id, states in self._runtime.items()}
+
     def rebind_session(self, old_key: str, session_id: str) -> list[str]:
         """Follow a session that got its real id after the first turn.
 
@@ -488,10 +511,20 @@ class RoomStore:
                 continue
             rooms[room.room_id] = room
         self._rooms = rooms
+        runtime = payload.get("runtime")
+        self._runtime = ({room_id: {member_id: dict(state)
+                                   for member_id, state in states.items()}
+                           for room_id, states in runtime.items()
+                           if isinstance(states, dict)}
+                          if isinstance(runtime, dict) else {})
 
     def _persist(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
-        payload = {"version": 1, "rooms": [room.as_dict() for room in self._rooms.values()]}
+        payload = {
+            "version": 1,
+            "rooms": [room.as_dict() for room in self._rooms.values()],
+            "runtime": getattr(self, "_runtime", {}),
+        }
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         temporary = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -591,7 +624,38 @@ class RoomDispatcher:
         # learns about them.
         self._on_message = on_message
         self._retry_delay = max(0.0, float(retry_delay))
+        self._restore_runtime()
 
+    def _restore_runtime(self) -> None:
+        """Rehydrate persisted state, correcting a stale "running" flag.
+
+        A member that was mid-turn when the wrapper stopped is not running now:
+        the process it dispatched to is gone. Marking those idle with a note is
+        honest; leaving them "running" would show a spinner forever.
+        """
+        for room_id, states in self._store.load_runtime().items():
+            room_states = self._runtime.setdefault(room_id, {})
+            for member_id, snapshot in states.items():
+                state = MemberRuntime(
+                    member_id=member_id,
+                    session_id=snapshot.get("session_id"),
+                    state=str(snapshot.get("state") or MEMBER_IDLE),
+                    queued=0,
+                )
+                if state.state in {MEMBER_RUNNING, MEMBER_QUEUED}:
+                    state.state = MEMBER_IDLE
+                    state.error = "重启时该回合已中断"
+                    state.started_at = None
+                room_states[member_id] = state
+
+    def _persist_runtime(self) -> None:
+        try:
+            self._store.save_runtime(self._runtime)
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            log.warning("room runtime state not persisted",
+                        error_type=type(exc).__name__)
+
+    # ---- inspection ----------------------------------------------------
     # ---- inspection ----------------------------------------------------
     def runtime(self, room_id: str) -> list[MemberRuntime]:
         """Current per-member dispatch state, in the room's member order."""
@@ -794,6 +858,7 @@ class RoomDispatcher:
         return "\n".join(lines)
 
     async def _notify(self, room_id: str, state: "MemberRuntime") -> None:
+        self._persist_runtime()
         callback = self._on_state
         if callback is None:
             return
