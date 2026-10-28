@@ -486,6 +486,10 @@ class RoomStore:
                 engine=engine,
                 profile_id=member.profile_id,
                 session_id=member.session_id,
+                # Validation rebuilds the member; forgetting these silently dropped
+                # a member's model/effort between create_room and the stored room.
+                model=member.model,
+                effort=member.effort,
                 is_default=member.is_default,
             ))
         return result

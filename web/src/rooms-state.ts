@@ -20,6 +20,9 @@ export interface RoomMemberView {
   queued?: number;
   started_at?: number | null;
   error?: string | null;
+  /** Per-member engine controls (empty = engine default). */
+  model?: string | null;
+  effort?: string | null;
 }
 
 export interface RoomMessageView {
@@ -30,6 +33,15 @@ export interface RoomMessageView {
   text: string;
   mentions: string[];
   state?: string;
+  /** Structured card data a member emitted as a cc-plan block. */
+  plan?: RoomPlanView;
+}
+
+export interface RoomPlanView {
+  summary: string;
+  steps: string[];
+  risks: string[];
+  needs: string[];
 }
 
 export interface RoomView {
@@ -83,7 +95,26 @@ function normalizeMember(raw: unknown): RoomMemberView | null {
     queued: asNumber(record.queued, 0),
     started_at: typeof record.started_at === "number" ? record.started_at : null,
     error: typeof record.error === "string" ? record.error : null,
+    model: typeof record.model === "string" ? record.model : null,
+    effort: typeof record.effort === "string" ? record.effort : null,
   };
+}
+
+function normalizePlan(value: unknown): RoomPlanView | undefined {
+  const record = asRecord(value);
+  if (!record) return undefined;
+  const list = (items: unknown): string[] => Array.isArray(items)
+    ? items.filter((item): item is string => typeof item === "string" && item.trim() !== "")
+    : [];
+  const plan: RoomPlanView = {
+    summary: asString(record.summary),
+    steps: list(record.steps),
+    risks: list(record.risks),
+    needs: list(record.needs),
+  };
+  return plan.summary || plan.steps.length || plan.risks.length || plan.needs.length
+    ? plan
+    : undefined;
 }
 
 function normalizeMessage(raw: unknown): RoomMessageView | null {
@@ -101,6 +132,7 @@ function normalizeMessage(raw: unknown): RoomMessageView | null {
       ? record.mentions.filter((item): item is string => typeof item === "string")
       : [],
     state: typeof record.state === "string" ? record.state : undefined,
+    plan: normalizePlan(record.plan),
   };
 }
 
