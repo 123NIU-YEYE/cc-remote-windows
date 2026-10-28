@@ -56,6 +56,10 @@ class MachineRoomHost:
             engine=engine,
             claude_profile_id=(member.profile_id if engine == "claude" else None),
             codex_profile_id=(member.profile_id if engine == "codex" else None),
+            # Per-member controls: advice can run on a strong model while
+            # execution runs on a cheap one. _spawn already accepts both.
+            model=member.model,
+            effort=member.effort,
             space="code",
             raise_on_failure=True,
         )

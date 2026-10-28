@@ -1337,6 +1337,10 @@ class RoomMemberSpec(BaseModel):
     # runtime only adopts a native session) and allowed for any engine, which
     # lets a member continue an existing conversation.
     session_id: Optional[WireId] = None
+    # Per-member engine controls; omitted means the engine default. Advice can run
+    # on a strong model while execution runs on a cheaper one.
+    model: Optional[str] = Field(default=None, max_length=200)
+    effort: Optional[str] = Field(default=None, max_length=40)
     is_default: bool = False
 
 
