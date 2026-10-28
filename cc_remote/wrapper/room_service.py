@@ -36,6 +36,8 @@ def _spec_to_member(spec: protocol.RoomMemberSpec) -> RoomMember:
         profile_id=spec.profile_id,
         # A pre-bound session is how a DSH member can work at all.
         session_id=spec.session_id,
+        model=spec.model,
+        effort=spec.effort,
         is_default=spec.is_default,
     )
 

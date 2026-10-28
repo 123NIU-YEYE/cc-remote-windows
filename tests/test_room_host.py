@@ -154,3 +154,25 @@ def test_member_with_a_bound_session_skips_spawn():
 
     assert asyncio.run(host.ensure_session(_room(), member)) == "dsh@abc123"
     assert machine.spawned == []
+
+def test_member_model_and_effort_reach_spawn():
+    """Per-member controls must reach _spawn, which already supports them."""
+    machine = FakeMachine()
+    host = MachineRoomHost(machine)
+    member = RoomMember(member_id="m1", label="Claude · iris", engine="claude",
+                        model="claude-opus-5-5", effort="high")
+
+    asyncio.run(host.ensure_session(_room(), member))
+
+    _resume, kwargs = machine.spawned[0]
+    assert kwargs["model"] == "claude-opus-5-5"
+    assert kwargs["effort"] == "high"
+
+
+def test_omitted_model_keeps_the_engine_default():
+    machine = FakeMachine()
+    host = MachineRoomHost(machine)
+    asyncio.run(host.ensure_session(_room(), _room().members[0]))
+    _resume, kwargs = machine.spawned[0]
+    assert kwargs["model"] is None
+    assert kwargs["effort"] is None

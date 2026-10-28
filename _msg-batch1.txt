@@ -1,0 +1,34 @@
+feat(rooms): structured replies, per-member models, retry, context budget
+
+First batch of docs/collaboration-rooms-optimization.md.
+
+L1.1 structured replies (cc_remote/wrapper/room_plan.py)
+- A member may close its answer with a fenced cc-plan block; the room lifts
+  summary/steps/risks/needs into card data (RoomMessage.plan) and shows the
+  prose. The parser never raises: a malformed block leaves the text untouched
+  and is not retried, because a formatting mistake must not cost a turn.
+- Room.plan_requests (default on) adds a two-line instruction to the prompt.
+
+L4.2 context budget
+- Entries the user quoted explicitly are skipped: they are already in the ask, so
+  paying for them twice is waste.
+- The automatic transcript is now filled newest-first under CONTEXT_BUDGET
+  (6000 chars, CC_REMOTE_ROOM_CONTEXT_BUDGET) instead of by entry count only.
+- When explicit quotes are present the automatic depth drops to 2.
+
+L4.1 per-member model/effort
+- RoomMember gains model/effort, forwarded through RoomMemberSpec and
+  _spec_to_member into _spawn (which already accepted both), so advice can run on
+  a strong model while execution runs on a cheap one.
+
+L3.3 failure retry (cc_remote/wrapper/room_retry.py)
+- Permanent conditions (missing directory, unbound DSH member, invalid session)
+  are never retried; connection-ish ones are retried exactly once after a pause.
+- The dispatcher's failure handling moved into finally: previously a failure
+  raised while handling a failure left the member at "running" forever with no
+  timeline entry. That is the bug behind "空 AssertionError" style reports, and
+  the finally block makes the record and the permit release unconditional.
+
+Retry delay is injectable so tests do not race a real 2s sleep.
+Tests: 94 pass, 3 skipped (12 plan, 6 retry, 11 host, 18 dispatch incl. budget,
+dedupe and failure-visibility assertions).

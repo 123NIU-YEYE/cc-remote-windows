@@ -54,7 +54,10 @@ def _room(tmp_path, max_parallel=2):
         RoomMember(member_id="m-codex", label="Codex · nyx", engine="codex"),
     ])
     host = FakeHost()
-    dispatcher = RoomDispatcher(store, host, max_parallel=max_parallel)
+    # No retry pause in tests: a real 2s wait would race wait_idle() and make
+    # the failure assertions flaky.
+    dispatcher = RoomDispatcher(store, host, max_parallel=max_parallel,
+                                retry_delay=0.0)
     return store, room, host, dispatcher
 
 
@@ -254,7 +257,10 @@ def test_member_sees_another_members_advice(tmp_path):
     assert "[房间近期记录]" in codex_prompt
     assert "Claude · iris: 建议：先加集成测试，再改接口。" in codex_prompt
     assert "[本次请求]" in codex_prompt
-    assert codex_prompt.rstrip().endswith("按上面的建议执行。")
+    # The ask is followed by the cc-plan instruction, so assert containment and
+    # that the ask is the last piece of user content, not the last line overall.
+    assert "按上面的建议执行。" in codex_prompt
+    assert codex_prompt.index("按上面的建议执行。") < codex_prompt.index("cc-plan")
 
 
 def test_transcript_excludes_the_current_message(tmp_path):
@@ -305,4 +311,74 @@ def test_context_can_be_disabled(tmp_path):
     asyncio.run(scenario())
     codex_prompt = [text for session, text, *_ in host.queries if session == "s-m-codex"][0]
     assert "[房间近期记录]" not in codex_prompt
-    assert "回答" not in codex_prompt
+    # The previous member reply must not leak in. Check for the transcript label
+    # rather than the bare word: the cc-plan instruction also contains it.
+    assert "Claude · iris:" not in codex_prompt
+
+# ---- L4.2 context budget -------------------------------------------------
+
+def test_quoted_entry_is_not_repeated_automatically(tmp_path):
+    """Paying for the same text twice is waste: the quote already carries it."""
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        await dispatcher.post(room.room_id, "@Claude 给建议")
+        await dispatcher.wait_idle()
+        await dispatcher.on_turn_terminal(room.room_id, "m-claude", "建议：先加集成测试")
+        await dispatcher.post(
+            room.room_id,
+            "[引用]\n【Claude · iris】\n建议：先加集成测试\n\n[本次请求]\n@nyx 照着做")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    prompt = [text for session, text, *_ in host.queries if session == "s-m-codex"][0]
+    assert prompt.count("建议：先加集成测试") == 1, prompt
+    # The earlier user turn is still legitimate context, so the transcript block
+    # may exist; what must not happen is the quoted body appearing in it as well.
+    history = prompt.split("[房间近期记录]")[-1].split("[本次请求]")[0]
+    assert "建议：先加集成测试" not in history, history
+
+
+def test_automatic_depth_drops_when_the_user_quotes(tmp_path):
+    """With explicit quotes, a smaller automatic transcript is enough."""
+    store, room, host, dispatcher = _room(tmp_path)
+
+    async def scenario():
+        for index in range(4):
+            await dispatcher.post(room.room_id, f"@Claude 第{index}句")
+            await dispatcher.wait_idle()
+            await dispatcher.on_turn_terminal(room.room_id, "m-claude", f"答{index}")
+        await dispatcher.post(
+            room.room_id,
+            "[引用]\n【Claude · iris】\n答1\n\n[本次请求]\n@nyx 接着来")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    prompt = [text for session, text, *_ in host.queries if session == "s-m-codex"][0]
+    history = prompt.split("[房间近期记录]")[-1].split("[本次请求]")[0]
+    included = [line for line in history.splitlines() if line.startswith(("你:", "Claude"))]
+    assert len(included) <= 2, history
+    assert "答1" not in history, "the quoted entry must be skipped"
+
+
+def test_context_budget_is_respected(tmp_path):
+    """A very long history is filled newest-first up to the character budget."""
+    store, room, host, dispatcher = _room(tmp_path)
+    room.context_depth = 20
+
+    async def scenario():
+        for index in range(6):
+            big = f"第{index}条" + "x" * 3000
+            await dispatcher.post(room.room_id, f"@Claude {big}")
+            await dispatcher.wait_idle()
+            await dispatcher.on_turn_terminal(room.room_id, "m-claude", f"答{index}")
+        await dispatcher.post(room.room_id, "@nyx 收尾")
+        await dispatcher.wait_idle()
+
+    asyncio.run(scenario())
+    from cc_remote.wrapper.rooms import CONTEXT_BUDGET
+    prompt = [text for session, text, *_ in host.queries if session == "s-m-codex"][0]
+    history = prompt.split("[房间近期记录]")[-1].split("[本次请求]")[0]
+    assert len(history) < CONTEXT_BUDGET + 400, len(history)
+    assert "第5条" in history, "newest content is kept"
+    assert "第0条" not in history, "oldest content is dropped when over budget"
