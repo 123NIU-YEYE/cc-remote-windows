@@ -158,6 +158,14 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   }
   console.log("handoff picker works:", handoffOk);
 
+  // The advise→execute phase banner must render (idle banner is enough to prove
+  // the component mounted; the awaiting state needs a live plan).
+  const flowBar = page.locator(".rooms-flow");
+  const flowCount = await flowBar.count();
+  console.log("flow bar:", flowCount,
+    flowCount ? (await flowBar.first().innerText()).replace(/\s+/g, " ").trim().slice(0, 80) : "");
+  const flowOk = flowCount > 0;
+
   // A structured reply must render as a card, not as raw JSON.
   const planCards = page.locator(".rooms-plan");
   const planCount = await planCards.count();
@@ -204,7 +212,7 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   // "Failed to load resource" duplicates the response log above, which already
   // filters the viewer noise; counting it twice would hide a real signal.
   const relevantErrors = errors.filter((line) => !line.includes("Failed to load resource"));
-  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk
+  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk && flowOk
     && relevantErrors.length === 0 && relevantFailures.length === 0;
   console.log(ok ? "RESULT: PASS" : "RESULT: FAIL");
   await browser.close();
