@@ -117,4 +117,53 @@ assert.deepEqual(filterRooms(two, "release").map((r) => r.room_id), ["b"], "matc
 assert.deepEqual(filterRooms(two, "架构").map((r) => r.room_id), ["a"], "matches name");
 assert.deepEqual(filterRooms(two, "  ").map((r) => r.room_id), ["b", "a"], "blank query lists all");
 
+// ---- structured card data (L1.1) ---------------------------------------
+rooms = applyRoomEvent(rooms, {
+  ...base, type: "room_snapshot", request_id: "r3",
+  room: {
+    ...ROOM,
+    room_id: "room-plan",
+    messages: [{
+      msg_id: "msg-plan", ts: 20, author_kind: "member", author_label: "Claude · iris",
+      text: "建议如下。", mentions: [], state: "done",
+      plan: { summary: "先加集成测试", steps: ["补 fixture", "覆盖主流程"],
+              risks: ["用例不稳定"], needs: ["确认目录"] },
+    }],
+    message_count: 1,
+  },
+  states: [],
+} as never)!;
+const plan = rooms["room-plan"].messages[0].plan!;
+assert.equal(plan.summary, "先加集成测试");
+assert.deepEqual(plan.steps, ["补 fixture", "覆盖主流程"]);
+assert.deepEqual(plan.risks, ["用例不稳定"]);
+assert.deepEqual(plan.needs, ["确认目录"]);
+
+// An empty or malformed plan is dropped rather than rendered as an empty card.
+rooms = applyRoomEvent(rooms, {
+  ...base, type: "room_snapshot", request_id: "r4",
+  room: {
+    ...ROOM,
+    room_id: "room-noplan",
+    messages: [{ msg_id: "msg-noplan", ts: 21, author_kind: "member",
+                 author_label: "Codex · nyx", text: "普通回答", mentions: [], state: "done",
+                 plan: { summary: "", steps: [], risks: [], needs: [] } }],
+    message_count: 1,
+  },
+  states: [],
+} as never)!;
+assert.equal(rooms["room-noplan"].messages[0].plan, undefined);
+
+// Member model/effort survive a snapshot.
+rooms = applyRoomEvent(rooms, {
+  ...base, type: "room_snapshot", request_id: "r5",
+  room: { ...ROOM, room_id: "room-model", members: [
+    { member_id: "m-claude", label: "Claude · iris", engine: "claude",
+      model: "claude-opus-5-5", effort: "high" },
+  ] },
+  states: [],
+} as never)!;
+assert.equal(rooms["room-model"].members[0].model, "claude-opus-5-5");
+assert.equal(rooms["room-model"].members[0].effort, "high");
+
 console.log("rooms-state.test.ts OK");

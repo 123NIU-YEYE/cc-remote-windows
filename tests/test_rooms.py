@@ -165,3 +165,24 @@ def test_mention_unknown_and_plain_text_ignored():
 
 def test_mention_deduplicates():
     assert parse_mentions("@iris @iris @nyx", _members()) == ["m-claude", "m-codex"]
+
+
+def test_member_model_and_effort_survive_create(store, tmp_path):
+    """Validation rebuilds members; the controls must not be dropped there.
+
+    This is what a live run caught: create_room accepted model/effort, and the
+    stored room came back with both None because _validate_members rebuilt the
+    member without them.
+    """
+    room = store.create("room", "~/x", [
+        RoomMember(member_id="m1", label="Claude · iris", engine="claude",
+                   model="claude-opus-5-5", effort="high"),
+    ])
+    member = store.get(room.room_id).member("m1")
+    assert member.model == "claude-opus-5-5"
+    assert member.effort == "high"
+
+    # And through a reload, i.e. the persisted JSON carries them too.
+    again = RoomStore(tmp_path).get(room.room_id).member("m1")
+    assert again.model == "claude-opus-5-5"
+    assert again.effort == "high"

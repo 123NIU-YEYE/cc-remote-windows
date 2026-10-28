@@ -10,7 +10,7 @@ import { useMemo, useRef, useState } from "react";
 
 import {
   filterRooms, roomOrder, runningMembers, runningSeconds,
-  type RoomMemberView, type RoomMessageView, type RoomView, type RoomsState,
+  type RoomMemberView, type RoomMessageView, type RoomPlanView, type RoomView, type RoomsState,
 } from "../rooms-state";
 import { handleFor, handoffText, mentionAt, mentionCandidates } from "../rooms-mentions";
 import { quoteSummary, quoteText, toQuoteEntry } from "../rooms-quote";
@@ -193,6 +193,7 @@ function MemberRow({
           {memberInitial(member)}
         </span>
         <span className="rooms-member-label">{member.label}</span>
+        {member.model && <span className="rooms-member-model">{member.model}</span>}
         <span className="rooms-member-state">{label}</span>
         <Clock member={member} />
         {member.queued ? <span className="rooms-member-queue">队列 · {member.queued}</span> : null}
@@ -234,6 +235,32 @@ function MemberRow({
     </div>
   );
 }
+/** Structured card a member produced with a cc-plan block. */
+function PlanCard({ plan }: { plan: RoomPlanView }) {
+  return (
+    <div className="rooms-plan">
+      {plan.summary && <div className="rooms-plan-summary">{plan.summary}</div>}
+      {plan.steps.length > 0 && (
+        <ol className="rooms-plan-list rooms-plan-steps">
+          {plan.steps.map((step, index) => <li key={index}>{step}</li>)}
+        </ol>
+      )}
+      {plan.risks.length > 0 && (
+        <div className="rooms-plan-group">
+          <span className="rooms-plan-label">风险</span>
+          <ul className="rooms-plan-list">{plan.risks.map((item, i) => <li key={i}>{item}</li>)}</ul>
+        </div>
+      )}
+      {plan.needs.length > 0 && (
+        <div className="rooms-plan-group">
+          <span className="rooms-plan-label">待确认</span>
+          <ul className="rooms-plan-list">{plan.needs.map((item, i) => <li key={i}>{item}</li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function toDrafts(members: RoomMemberView[]): RoomMemberDraft[] {
   return members.map((member) => ({
     member_id: member.member_id,
@@ -556,6 +583,7 @@ export function RoomsView({
                     </button>
                   </div>
                   <div className="rooms-msg-text">{message.text}</div>
+                  {message.plan && <PlanCard plan={message.plan} />}
                   {handoffFor === message.msg_id && (
                     <div className="rooms-handoff">
                       <span className="rooms-handoff-hint">交给</span>
