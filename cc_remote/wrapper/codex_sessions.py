@@ -160,10 +160,169 @@ async def list_codex_sessions(
             seen_cursors.add(next_cursor)
             cursor = next_cursor
 
+    # Codex's own thread/list is lossy: on this machine it exposes 41 of the 89
+    # rows in state_5.sqlite, while older conversations still have their rollout
+    # transcript on disk. Without this merge those sessions are simply absent from
+    # the sidebar, which reads as "my old conversations are gone".
+    by_id.update(_rollout_only_sessions(
+        codex_home if codex_home is not None else _default_codex_home(),
+        known=set(by_id),
+    ))
+
     return sorted(
         by_id.values(), key=lambda item: _updated_sort_key(item.get("last_modified")),
         reverse=True,
     )
+
+
+_ROLLOUT_ID_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+_ROLLOUT_SCAN_LIMIT = 400
+_ROLLOUT_HEAD_BYTES = 262144
+
+
+def _default_codex_home() -> Path:
+    home = os.environ.get("CODEX_HOME")
+    return Path(home) if home else Path.home() / ".codex"
+
+
+def _rollout_session_id(path: Path) -> Optional[str]:
+    """The session id embedded in a rollout filename.
+
+    ``rollout-2026-08-04T19-36-05-019fcc8f-37ac-...jsonl`` carries two ids when a
+    thread was forked (``..._<child>``); the first one is the thread id.
+    """
+    match = _ROLLOUT_ID_RE.search(path.stem)
+    return match.group(1) if match else None
+
+
+def _read_rollout_head(
+        path: Path) -> tuple[Optional[str], Optional[str], Optional[str], bool]:
+    """Best-effort (cwd, first user prompt, git branch, is_subagent) from the head.
+
+    Subagent rollouts are real transcripts but must never become sidebar rows: the
+    app-server hides them for the same reason, and re-adding them would bury the
+    user's own conversations under every child thread a Codex task spawned.
+    """
+    cwd: Optional[str] = None
+    prompt: Optional[str] = None
+    branch: Optional[str] = None
+    subagent = False
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_ROLLOUT_HEAD_BYTES)
+    except OSError:
+        return None, None, None, False
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith(b"{"):
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        payload = entry.get("payload") if isinstance(entry, dict) else None
+        record = payload if isinstance(payload, dict) else entry
+        if not isinstance(record, dict):
+            continue
+        if record.get("thread_source") == "subagent":
+            subagent = True
+        source = record.get("source")
+        if isinstance(source, dict) and "subagent" in source:
+            subagent = True
+        if not cwd:
+            candidate = record.get("cwd") or record.get("working_directory")
+            if isinstance(candidate, str) and candidate:
+                cwd = _bounded_text(candidate, 4096)
+        if not branch:
+            git = record.get("git")
+            candidate = record.get("git_branch") or record.get("branch")
+            if not candidate and isinstance(git, dict):
+                candidate = git.get("branch")
+            if isinstance(candidate, str) and candidate:
+                branch = _bounded_text(candidate, 500)
+        if prompt is None and record.get("type") == "message" and record.get("role") == "user":
+            text = record.get("content")
+            if isinstance(text, list):
+                parts = [
+                    part.get("text") for part in text
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                ]
+                text = "\n".join(parts)
+            prompt = _usable_prompt(text)
+        if cwd and prompt is not None and branch and subagent:
+            break
+    return cwd, prompt, branch, subagent
+
+
+# Injected context blocks that are not the user's request.
+_ENV_PREFIXES = (
+    "<environment_context>", "<user_instructions>", "<permissions",
+    "<skills", "<INSTRUCTIONS", "# AGENTS.md",
+)
+
+
+def _usable_prompt(value: Any) -> Optional[str]:
+    """Reject injected context so a card shows the real request, not boilerplate."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.startswith(_ENV_PREFIXES):
+        return None
+    return _bounded_text(text, 2000)
+
+
+
+def _rollout_only_sessions(
+    codex_home: str | os.PathLike[str] | Path,
+    *,
+    known: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Conversations with a transcript on disk but absent from thread/list.
+
+    Bounded by mtime so a machine with thousands of rollouts stays cheap: only the
+    newest ``_ROLLOUT_SCAN_LIMIT`` files are considered, and only their head is read.
+    """
+    root = Path(codex_home) / "sessions"
+    if not root.is_dir():
+        return {}
+    try:
+        candidates = sorted(
+            root.rglob("rollout-*.jsonl"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )[:_ROLLOUT_SCAN_LIMIT]
+    except OSError:
+        return {}
+
+    found: dict[str, dict[str, Any]] = {}
+    for path in candidates:
+        session_id = _rollout_session_id(path)
+        if not session_id or session_id in known or session_id in found:
+            continue
+        if not _SAFE_SESSION_ID.fullmatch(session_id):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        cwd, prompt, branch, subagent = _read_rollout_head(path)
+        if subagent:
+            # Child threads belong to their parent conversation, exactly as the
+            # app-server treats them: listing them would flood the sidebar.
+            continue
+        found[session_id] = {
+            "session_id": session_id,
+            "summary": prompt,
+            "first_prompt": prompt,
+            "cwd": cwd,
+            "last_modified": str(int(mtime)),
+            "git_branch": branch,
+            "forked_from_id": None,
+            "status": None,
+            "tag": None,
+        }
+    return found
 
 
 def _normalize_thread(thread: Any, *, archived: bool) -> Optional[dict[str, Any]]:
