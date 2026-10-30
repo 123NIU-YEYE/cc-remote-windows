@@ -17,7 +17,13 @@
 const { chromium } = require("playwright");
 const path = require("path");
 
-const BASE = process.env.CC_REMOTE_BASE || "https://armed-further-households-because.trycloudflare.com";
+// Point this at your own relay. Required, so no deployment address is baked into
+// the repository; pass it as CC_REMOTE_BASE=https://your-relay.example
+const BASE = process.env.CC_REMOTE_BASE || "";
+if (!BASE) {
+  console.error("set CC_REMOTE_BASE to your relay URL, e.g. CC_REMOTE_BASE=https://relay.example");
+  process.exit(2);
+}
 const PASSWORD = process.argv[2] || "";
 const OUT = path.resolve(__dirname, "_shot-rooms.png");
 
