@@ -166,4 +166,21 @@ rooms = applyRoomEvent(rooms, {
 assert.equal(rooms["room-model"].members[0].model, "claude-opus-5-5");
 assert.equal(rooms["room-model"].members[0].effort, "high");
 
+// ---- per-member model/effort (rooms UI) --------------------------------
+rooms = applyRoomEvent(rooms, {
+  ...base, type: "room_snapshot", request_id: "r6",
+  room: { ...ROOM, room_id: "room-controls", members: [
+    { member_id: "m1", label: "Claude · iris", engine: "claude",
+      model: "claude-opus-5-5", effort: "high" },
+    { member_id: "m2", label: "Codex · nyx", engine: "codex" },
+  ] },
+  states: [],
+} as never)!;
+assert.equal(rooms["room-controls"].members[0].model, "claude-opus-5-5");
+assert.equal(rooms["room-controls"].members[0].effort, "high");
+// A member with no override must stay null, not "" — "" would render as a
+// concrete choice and be sent back as one.
+assert.equal(rooms["room-controls"].members[1].model, null);
+assert.equal(rooms["room-controls"].members[1].effort, null);
+
 console.log("rooms-state.test.ts OK");

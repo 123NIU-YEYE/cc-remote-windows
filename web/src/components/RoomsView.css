@@ -913,3 +913,43 @@
   font-size: 11px;
   cursor: pointer;
 }
+
+/* Per-member model + effort controls. */
+.rooms-model-picker {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.rooms-model-select,
+.rooms-effort-select {
+  max-width: 150px;
+  padding: 1px 4px;
+  border: 1px solid var(--divider);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--dim);
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.rooms-effort-select {
+  max-width: 96px;
+}
+
+.rooms-model-select:disabled,
+.rooms-effort-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.rooms-invite-model {
+  display: flex;
+  gap: 6px;
+}
+
+.rooms-invite-model .rooms-input {
+  flex: 1;
+  min-width: 0;
+}
