@@ -1636,7 +1636,7 @@ export class RelayWs {
 
   sendUpdateRoomMembers(
     roomId: string,
-    members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null }[],
+    members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null; model?: string | null; effort?: string | null; is_default?: boolean }[],
   ): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "update_room", room_id: roomId, members,
@@ -1653,7 +1653,7 @@ export class RelayWs {
 
   sendCreateRoom(
     name: string, cwd: string,
-    members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null }[],
+    members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null; model?: string | null; effort?: string | null; is_default?: boolean }[],
   ): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "create_room", name, cwd, members,

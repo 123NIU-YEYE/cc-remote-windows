@@ -20,6 +20,11 @@ export interface RoomMemberDraft {
   member_id: string;
   label: string;
   engine: "claude" | "codex" | "dsh";
+  // Preserved across edits: dropping these would silently unbind a member's
+  // conversation and reset its model whenever a room was renamed.
+  session_id?: string | null;
+  model?: string | null;
+  effort?: string | null;
 }
 
 export interface RoomsViewProps {
@@ -43,6 +48,8 @@ export interface RoomsViewProps {
   onChangeCwd: (roomId: string, cwd: string) => void;
   /** Existing DSH sessions the invite form can bind to (DSH cannot be spawned). */
   dshSessions: { session_id: string; label: string }[];
+  /** Native model catalog per engine, so a member picks model + effort. */
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
   /** Human approval of a plan: the only path that starts execution. */
   onApprovePlan: (roomId: string, executorMember: string) => void;
   onDiscardPlan: (roomId: string) => void;
@@ -168,13 +175,15 @@ function RoomCard({
   );
 }
 function MemberRow({
-  member, roomId, onSteer, onCancel, onOpenSession,
+  member, roomId, onSteer, onCancel, onOpenSession, catalog, onConfigure,
 }: {
   member: RoomMemberView;
   roomId: string;
   onSteer: (roomId: string, memberId: string, text: string) => void;
   onCancel: (roomId: string, memberId: string) => void;
   onOpenSession: (member: RoomMemberView) => void;
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
+  onConfigure: (memberId: string, patch: { model: string | null; effort: string | null }) => void;
 }) {
   const [steering, setSteering] = useState(false);
   const [steerText, setSteerText] = useState("");
@@ -199,7 +208,11 @@ function MemberRow({
           {memberInitial(member)}
         </span>
         <span className="rooms-member-label">{member.label}</span>
-        {member.model && <span className="rooms-member-model">{member.model}</span>}
+        <MemberModelPicker
+          member={member}
+          catalog={catalog}
+          disabled={running}
+          onChange={(patch) => onConfigure(member.member_id, patch)} />
         <span className="rooms-member-state">{label}</span>
         <Clock member={member} />
         {member.queued ? <span className="rooms-member-queue">队列 · {member.queued}</span> : null}
@@ -341,11 +354,103 @@ function PlanFlowBar({ room, onApprove, onDiscard, onSetFlow }: {
   );
 }
 
+/** Model + effort for one member. Empty means "engine default". */
+/**
+ * Catalog rows for an engine.
+ *
+ * state.catalog is keyed by modelCatalogScopeKey, so entries look like "codex",
+ * "codex\0<profile>" or "claude\0<profile>\0<cwd>". Matching on the leading
+ * segment is what makes the room pickers find anything at all.
+ */
+type CatalogModelRow = { id: string; display_name: string; efforts: string[]; is_default?: boolean };
+function modelsForEngine(
+  catalog: Record<string, CatalogModelRow[]>,
+  engine: string,
+): CatalogModelRow[] {
+  const direct = catalog[engine];
+  if (direct && direct.length) return direct;
+  for (const [key, value] of Object.entries(catalog)) {
+    if (!value || !value.length) continue;
+    if (key === engine || key.startsWith(`${engine}\u0000`) || key.startsWith(`${engine}\x00`)) {
+      return value;
+    }
+  }
+  return [];
+}
+
+
+function MemberModelPicker({ member, catalog, disabled, onChange }: {
+  member: RoomMemberView;
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
+  disabled: boolean;
+  onChange: (patch: { model: string | null; effort: string | null }) => void;
+}) {
+  const models = modelsForEngine(catalog, member.engine ?? "claude");
+  if (models.length === 0) return null;
+  const current = models.find((model) => model.id === member.model);
+  // Only offer efforts the chosen model declares: the wire accepts any string, so
+  // a bogus level would only fail later inside the model API.
+  // With no explicit model the member runs the engine default, so offer the
+  // default model's efforts (or the union) instead of hiding the control.
+  const efforts = current?.efforts?.length
+    ? current.efforts
+    : (models.find((model) => model.is_default)?.efforts?.length
+      ? models.find((model) => model.is_default)!.efforts
+      : Array.from(new Set(models.flatMap((model) => model.efforts ?? []))));
+  const value = member.model || "";
+  const effort = member.effort || "";
+  return (
+    <span className="rooms-model-picker">
+      <select
+        className="rooms-model-select"
+        aria-label={`${member.label} 的模型`}
+        value={value}
+        disabled={disabled}
+        title={disabled ? "该成员正在运行，结束后可改" : "选择该成员使用的模型"}
+        onChange={(event) => {
+          const id = event.target.value;
+          const next = models.find((model) => model.id === id);
+          // A different model may not support the old effort.
+          const keep = next?.efforts?.includes(effort) ? effort : null;
+          onChange({ model: id || null, effort: keep });
+        }}
+      >
+        <option value="">默认模型</option>
+        {models.map((model) => (
+          <option key={model.id} value={model.id}>{model.display_name || model.id}</option>
+        ))}
+      </select>
+      {efforts.length > 0 && (
+        <select
+          className="rooms-effort-select"
+          aria-label={`${member.label} 的强度`}
+          value={effort}
+          disabled={disabled}
+          title={disabled ? "该成员正在运行，结束后可改" : "选择推理强度"}
+          onChange={(event) => onChange({
+      model: member.model ?? null,
+            effort: event.target.value || null,
+          })}
+        >
+          <option value="">默认强度</option>
+          {efforts.map((level) => (
+            <option key={level} value={level}>{level}</option>
+          ))}
+        </select>
+      )}
+    </span>
+  );
+}
+
+
 function toDrafts(members: RoomMemberView[]): RoomMemberDraft[] {
   return members.map((member) => ({
     member_id: member.member_id,
     label: member.label,
     engine: member.engine as RoomMemberDraft["engine"],
+      session_id: member.session_id ?? null,
+      model: member.model ?? null,
+      effort: member.effort ?? null,
   }));
 }
 
@@ -355,14 +460,19 @@ const ENGINE_LABELS: Record<RoomMemberDraft["engine"], string> = {
   dsh: "DSH",
 };
 
-function InviteRow({ onInvite, onCancel, dshSessions }: {
+function InviteRow({ onInvite, onCancel, dshSessions, catalog }: {
   onInvite: (draft: RoomMemberDraft) => void;
   onCancel: () => void;
   dshSessions: { session_id: string; label: string }[];
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
 }) {
   const [engine, setEngine] = useState<RoomMemberDraft["engine"]>("claude");
   const [name, setName] = useState("");
   const [sessionId, setSessionId] = useState("");
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
+  const models = modelsForEngine(catalog, engine);
+  const efforts = models.find((item) => item.id === model)?.efforts ?? [];
   // DSH cannot be spawned from a directory: its runtime only adopts an existing
   // native session, so a DSH member has to name the session it drives.
   const needsSession = engine === "dsh";
@@ -377,6 +487,8 @@ function InviteRow({ onInvite, onCancel, dshSessions }: {
       label: `${ENGINE_LABELS[engine]} · ${suffix}`,
       engine,
       ...(bound ? { session_id: bound } : {}),
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
     });
   };
 
@@ -402,6 +514,40 @@ function InviteRow({ onInvite, onCancel, dshSessions }: {
           if (event.key === "Escape") onCancel();
         }}
       />
+      {models.length > 0 && (
+        <div className="rooms-invite-model">
+          <select
+            className="rooms-input"
+            aria-label="模型"
+            value={model}
+            onChange={(event) => {
+              const id = event.target.value;
+              setModel(id);
+              // Drop an effort the newly chosen model does not declare.
+              const next = models.find((item) => item.id === id);
+              if (!next?.efforts?.includes(effort)) setEffort("");
+            }}
+          >
+            <option value="">默认模型</option>
+            {models.map((item) => (
+              <option key={item.id} value={item.id}>{item.display_name || item.id}</option>
+            ))}
+          </select>
+          {efforts.length > 0 && (
+            <select
+              className="rooms-input"
+              aria-label="强度"
+              value={effort}
+              onChange={(event) => setEffort(event.target.value)}
+            >
+              <option value="">默认强度</option>
+              {efforts.map((level) => (
+                <option key={level} value={level}>{level}</option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
       {needsSession && (dshSessions.length > 0 ? (
         // DSH cannot be spawned: pick the native session this member drives.
         <select
@@ -486,7 +632,7 @@ function NewRoomForm({ defaultCwd, onSubmit }: {
 export function RoomsView({
   rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
   onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onUpdateMembers,
-  dshSessions, onChangeCwd, onApprovePlan, onDiscardPlan, onSetFlow,
+  dshSessions, catalog, onChangeCwd, onApprovePlan, onDiscardPlan, onSetFlow,
   onRefresh,
 }: RoomsViewProps) {
   const [query, setQuery] = useState("");
@@ -636,6 +782,7 @@ export function RoomsView({
             {inviting && (
               <InviteRow
                 dshSessions={dshSessions}
+                catalog={catalog}
                 onCancel={() => setInviting(false)}
                 onInvite={(draft) => {
                   onUpdateMembers(active.room_id, toDrafts([...active.members, draft]));
@@ -708,7 +855,9 @@ export function RoomsView({
               {active.members.map((member) => (
                 <MemberRow key={member.member_id} member={member}
                   roomId={active.room_id} onSteer={onSteer}
-                  onCancel={onCancel} onOpenSession={onOpenSession} />
+                  onCancel={onCancel} onOpenSession={onOpenSession}
+                         catalog={catalog}
+                         onConfigure={(memberId, patch) => onUpdateMembers(active.room_id, toDrafts(active.members).map((draft) => draft.member_id === memberId ? { ...draft, ...patch } : draft))} />
               ))}
             </div>
 

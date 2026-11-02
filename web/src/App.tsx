@@ -6001,6 +6001,12 @@ export default function App() {
               const next = !roomsOpen;
               setRoomsOpen(next);
               if (next) wsRef.current?.sendListRooms();
+              // A room member picks its own model, so the catalog has to be loaded
+              // for the engines a room can host rather than only for the open chat.
+              if (next) {
+                wsRef.current?.sendGetModels("claude");
+                wsRef.current?.sendGetModels("codex");
+              }
             }}
             aria-label="协作房间" title="协作房间">
             协作
@@ -6066,6 +6072,7 @@ export default function App() {
               onUpdateMembers={(roomId, members) => wsRef.current?.sendUpdateRoomMembers(roomId, members)}
               onChangeCwd={(roomId, cwd) => wsRef.current?.sendUpdateRoomCwd(roomId, cwd)}
               dshSessions={roomDshSessions}
+              catalog={state.catalog}
               onApprovePlan={(roomId, member) => wsRef.current?.sendApproveRoomPlan(roomId, member)}
               onDiscardPlan={(roomId) => wsRef.current?.sendDiscardRoomPlan(roomId)}
               onSetFlow={(roomId, on) => wsRef.current?.sendSetRoomFlow(roomId, on)}

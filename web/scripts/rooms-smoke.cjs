@@ -184,6 +184,33 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
     await inviteButton.first().click().catch(() => {});
   }
 
+  // Every member row must expose its own model/strength controls.
+  const modelSelects = page.locator(".rooms-model-select");
+  const effortSelects = page.locator(".rooms-effort-select");
+  // The catalog is fetched over the socket after the panel opens, so wait for it
+  // instead of sampling immediately and racing the response.
+  await modelSelects.first().waitFor({ timeout: 8000 }).catch(() => {});
+  const modelCount = await modelSelects.count();
+  const effortCount = await effortSelects.count();
+  console.log("model selects:", modelCount, "effort selects:", effortCount);
+  let modelPickOk = modelCount > 0;
+  if (modelCount > 0) {
+    const options = await modelSelects.first().locator("option").allInnerTexts();
+    console.log("first model options:", options.slice(0, 4).join(" | "));
+    // Changing the model must round-trip through update_room without breaking.
+    const before = await modelSelects.first().inputValue();
+    const values = await modelSelects.first().locator("option").evaluateAll(
+      (nodes) => nodes.map((node) => node.value).filter(Boolean));
+    const target = values[0] || "";
+    if (target && target !== before) {
+      await modelSelects.first().selectOption(target);
+      await page.waitForTimeout(800);
+      const after = await page.locator(".rooms-model-select").first().inputValue();
+      console.log("model change:", before || "(default)", "->", after);
+      modelPickOk = after === target;
+    }
+  }
+
   // The advise→execute phase banner must render (idle banner is enough to prove
   // the component mounted; the awaiting state needs a live plan).
   const flowBar = page.locator(".rooms-flow");
@@ -238,7 +265,7 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
   // "Failed to load resource" duplicates the response log above, which already
   // filters the viewer noise; counting it twice would hide a real signal.
   const relevantErrors = errors.filter((line) => !line.includes("Failed to load resource"));
-  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk && flowOk && dshPickerOk
+  const ok = cardCount > 0 && bubbleCount > 0 && mentionOk && handoffOk && quoteOk && flowOk && dshPickerOk && modelPickOk
     && relevantErrors.length === 0 && relevantFailures.length === 0;
   console.log(ok ? "RESULT: PASS" : "RESULT: FAIL");
   await browser.close();
