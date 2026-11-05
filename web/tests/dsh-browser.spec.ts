@@ -241,6 +241,24 @@ async function chooseEngine(page: Page, engine: string) {
   await expect(page.getByRole("menu", { name: "会话引擎" })).toHaveCount(0);
 }
 
+test("native session information preserves DSH identity and never starts a turn", async ({ page, isMobile }, info) => {
+  const relay = await openDsh(page);
+  if (isMobile) await page.getByRole("button", { name: "更多设置", exact: true }).click();
+  await page.getByRole("button", { name: "会话信息与本地续接", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "会话信息与本地续接", exact: true });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("textbox", { name: "原生会话 ID", exact: true })).toHaveValue("native-session");
+  await expect(dialog.getByRole("textbox", { name: "原工作目录", exact: true })).toHaveValue("/tmp/dsh-test");
+  await expect(dialog.getByRole("button", { name: "复制会话 ID", exact: true })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "复制续接命令", exact: true })).toHaveCount(0);
+  expect(await dialog.evaluate(node => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: info.outputPath("native-continuation.png"), animations: "disabled" });
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("button", { name: isMobile ? "更多设置" : "会话信息与本地续接", exact: true })).toBeFocused();
+  expect(relay.commands.some(command => ["query", "new_session", "steer", "takeover"].includes(String(command.type)))).toBe(false);
+});
+
 test("Deferred login form opens and enters the existing session without starting a task", async ({ page }) => {
   const relay = await mockDshRelay(page);
   await page.route("**/api/session", route => route.fulfill({ status: 401 }));

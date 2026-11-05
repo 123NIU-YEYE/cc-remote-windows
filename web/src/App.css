@@ -662,3 +662,7 @@
 .dsh-command-result.error, .dsh-command-result.unknown { color: var(--warn); }
 .dsh-plan-state { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; color: var(--accent); font-size: 12px; }
 .cmd:disabled { cursor: default; opacity: .6; }
+
+.session-info-trigger { cursor:pointer; text-align:left; max-width:100%; border:0; background:none; padding:0; }
+.session-info-trigger:hover { color:var(--accent); }
+.session-info-trigger:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:4px; }

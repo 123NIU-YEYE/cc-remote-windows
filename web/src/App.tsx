@@ -70,7 +70,7 @@ const RoomsView = lazy(() => import("./components/RoomsView").then(
   ({ RoomsView: View }) => ({ default: View }),
 ));
 import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
-import { TerminalControl } from "./components/TerminalControl";
+const TerminalControl = lazy(() => import("./components/TerminalControl").then(m => ({ default: m.TerminalControl })));
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { deviceVersionNotice } from "./device-version";
 import { EngineSelector } from "./components/EngineSelector";
@@ -325,6 +325,7 @@ const AgentDetailController = lazy(() => import("./components/AgentDetailControl
 ));
 const DesktopDshPanel = lazy(() => import("./components/DesktopDshPanel").then(m => ({ default: m.DesktopDshPanel })));
 const DshPanel = lazy(() => import("./components/DshPanel"));
+const SessionContinuationSheet = lazy(() => import("./components/SessionContinuationSheet"));
 const DshConnectionNotice = lazy(() => import("./components/DshCommandFeedback").then(m => ({ default: m.DshConnectionNotice })));
 const SessionsSidebar = lazy(() => import("./components/SessionsSidebar").then(
   ({ SessionsSidebar: Sidebar }) => ({ default: Sidebar }),
@@ -558,6 +559,8 @@ export default function App() {
   const [dshApi] = useState(() => lazyDshApi(() => wsRef.current));
   const [desktopDshMounted, setDesktopDshMounted] = useState(false);
   const [desktopDshOpen, setDesktopDshOpen] = useState(false);
+  const [continuationOpen, setContinuationOpen] = useState(false);
+  const continuationTrigger = useRef<HTMLButtonElement>(null);
   const [dshPanel, setDshPanel] = useState<{ sid: string; scope: string; selection: DshPanelSelection } | null>(null);
   const [permissionProfileRequests, setPermissionProfileRequests] =
     useState<Record<string, string>>({});
@@ -1234,6 +1237,11 @@ export default function App() {
     ?? (rt.ccSessionId
       ? nativeProfileSessionId(rt.ccSessionId)
       : rt.ccSessionId);
+  const continuationAccount = focusedEngine === "dsh" ? "当前已配对桌面账号"
+    : (focusedEngine === "codex" ? state.codexProfiles : state.claudeProfiles)
+      .find(profile => profile.id === focusedAccountProfileId)?.label
+      ?? (focusedAccountProfileId ? `账号 ${focusedAccountProfileId}（名称待同步）` : "默认账号");
+  useEffect(() => setContinuationOpen(false), [machineId, focusedSid, space]);
   const focusedCatalog = catalogForEngineProfile(
     state.catalog, focusedEngine, focusedAccountProfileId,
     space === "code" ? focusedSession?.cwd || currentCwd : undefined);
@@ -6006,7 +6014,12 @@ export default function App() {
                 </span>
               )}
             </div>
-            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>
+            {space === "code" && focusedNativeSessionId ? <button ref={continuationTrigger}
+              className="sub session-info-trigger" type="button" aria-haspopup="dialog"
+              aria-label="会话信息与本地续接" title="查看完整会话 ID、工作目录与控制权"
+              onClick={(event) => { continuationTrigger.current = event.currentTarget; setContinuationOpen(true); }}>
+              {`session ${shortSessionId(focusedEngine, focusedNativeSessionId)}`}
+            </button> : <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>}
           </div>
           <button className={`rooms-entry${roomsOpen ? " is-on" : ""}`}
             onClick={() => {
@@ -6026,6 +6039,7 @@ export default function App() {
             <span className="hstat-label">{dshConnectionError ? "同步中" : effectiveState}</span></span>
           {space === "code" && focusedSid && !state.newChat
               && !archivedBrowse && focusedEngine !== "dsh" && (
+            <Suspense fallback={<span className="terminal-control-trigger" role="status" aria-label="终端状态同步中"><Icon name="term" size={18} /></span>}>
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -6033,6 +6047,7 @@ export default function App() {
               legacyTakeoverPending={rt.takeoverPending}
               legacyMessage={rt.takeoverMessage}
               onTakeover={() => wsRef.current?.sendTakeover(focusedSid)} />
+            </Suspense>
           )}
           <button className={`device-trigger${activeDeviceOnline ? " online" : ""}`}
             onClick={() => setDeviceSheetOpen(true)} aria-label="设备中心"
@@ -6057,6 +6072,10 @@ export default function App() {
             onNotificationMode={updateNotificationMode}
             onOpenDshTools={engine === "dsh" && focusedSid ? () => setDshPanel({ sid: focusedSid, scope: activeScopeKey, selection: { kind: "subagents" } }) : undefined}
             onOpenUsageActivity={openUsageActivity}
+            onOpenSessionInfo={space === "code" && focusedNativeSessionId ? (trigger) => {
+              continuationTrigger.current = trigger;
+              setContinuationOpen(true);
+            } : undefined}
             onOpenBtw={btwPanelKey && !archivedBrowse ? () => openBtw() : undefined}
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
@@ -6064,6 +6083,14 @@ export default function App() {
             onLogout={() => void logout()}
           /></Suspense>
         </header>
+        {continuationOpen && space === "code" && <Suspense fallback={null}>
+          <SessionContinuationSheet key={`${machineId}:${focusedSid}`} engine={focusedEngine}
+            sessionId={focusedNativeSessionId ?? null} cwd={focusedSession?.cwd || currentCwd || null}
+            machine={activeDevice?.label ?? machineId} account={continuationAccount}
+            control={rt.control} connected={state.connState === "connected" && state.wrapperOnline && !rt.replaying && rt.syncReady}
+            busy={effectiveState !== "idle"} archived={archivedBrowse} dshConnected={!!rt.dsh?.connected}
+            onClose={() => setContinuationOpen(false)} trigger={continuationTrigger} />
+        </Suspense>}
         {desktopDshMounted && <Suspense fallback={null}>
           <DesktopDshPanel visible={desktopDshOpen && engine === "dsh"} />
         </Suspense>}
