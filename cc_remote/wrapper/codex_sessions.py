@@ -1303,7 +1303,7 @@ def _rollout_path(
 
 def _read_meta(path: str) -> Optional[dict]:
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             line = f.readline(MAX_META_RECORD_BYTES + 1)
             if len(line.encode("utf-8", "surrogatepass")) > MAX_META_RECORD_BYTES:
                 return None
