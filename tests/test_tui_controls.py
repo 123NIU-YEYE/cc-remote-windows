@@ -397,7 +397,7 @@ def test_claude_model_fallback_matches_web_curated_choices():
     from pathlib import Path
     from cc_remote.tui_settings import CLAUDE_MODELS
 
-    web = Path("web/src/data.ts").read_text()
+    web = Path("web/src/data.ts").read_text(encoding="utf-8")
     table = web.split("export const MODELS:", 1)[1].split("];")[0]
     assert all(f'id: "{model}"' in table for model in CLAUDE_MODELS)
 

@@ -81,7 +81,7 @@ def test_live_scripts_require_an_explicit_main_entrypoint():
     live_scripts = sorted((ROOT / "scripts" / "live").glob("test_*_live.py"))
     assert live_scripts
     for path in live_scripts:
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         guards = [node for node in tree.body if _is_main_guard(node)]
         assert len(guards) == 1, f"{path.name} must have one __main__ guard"
         assert _contains_asyncio_run(guards[0])
@@ -96,8 +96,8 @@ def test_live_scripts_require_an_explicit_main_entrypoint():
 
 
 def test_repository_deployment_contract_is_the_agent_entrypoint():
-    agents = (ROOT / "AGENTS.md").read_text()
-    deploy_readme = (ROOT / "deploy" / "README.md").read_text()
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
     normalized = " ".join(deploy_readme.split())
 
     assert "[`deploy/README.md`](deploy/README.md)" in agents
@@ -120,7 +120,7 @@ def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
         ROOT / "deploy" / "env.wrapper.example",
     ]
     for path in public_files:
-        source = path.read_text()
+        source = path.read_text(encoding="utf-8")
         assert "claude-remote" not in source
         assert "CC_REMOTE_CLAUDE_BROKER_SOCKET" not in source
     assert not (ROOT / "scripts" / "claude-remote").exists()
@@ -144,7 +144,7 @@ def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
     transaction = ROOT / "deploy" / "setup_transaction.sh"
     subprocess.run(["bash", "-n", str(script)], check=True)
     subprocess.run(["bash", "-n", str(transaction)], check=True)
-    source = script.read_text()
+    source = script.read_text(encoding="utf-8")
 
     validate = source.index('caddy validate --config "$CADDY_CANDIDATE"')
     backup = source.index('cp -a "$CADDYFILE" "$CADDY_BACKUP"')
@@ -228,7 +228,7 @@ def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
 
 
 def test_insecure_caddy_template_is_explicit_http_without_tls_headers():
-    source = (ROOT / "deploy" / "Caddyfile.insecure").read_text()
+    source = (ROOT / "deploy" / "Caddyfile.insecure").read_text(encoding="utf-8")
     assert "http://cc-remote.example.com {" in source
     assert "ws://cc-remote.example.com" in source
     assert "reverse_proxy 127.0.0.1:8765" in source
@@ -238,15 +238,15 @@ def test_insecure_caddy_template_is_explicit_http_without_tls_headers():
 
 
 def test_deploy_examples_configure_insecure_flag_on_both_sides():
-    relay = (ROOT / "deploy" / "env.relay.example").read_text()
-    wrapper = (ROOT / "deploy" / "env.wrapper.example").read_text()
+    relay = (ROOT / "deploy" / "env.relay.example").read_text(encoding="utf-8")
+    wrapper = (ROOT / "deploy" / "env.wrapper.example").read_text(encoding="utf-8")
     assert "ALLOW_INSECURE_HTTP=0" in relay
     assert "ALLOW_INSECURE_HTTP=0" in wrapper
     assert "ALLOW_PRIVATE_ORIGINS=0" in relay
 
 
 def test_setup_does_not_make_network_service_owner_of_root_executed_code():
-    source = (ROOT / "deploy" / "setup-vps.sh").read_text()
+    source = (ROOT / "deploy" / "setup-vps.sh").read_text(encoding="utf-8")
     assert 'chown -R root:ccremote "$PREVIOUS_RELEASE"' in source
     assert 'chown -R root:ccremote "$NEW_RELEASE_DIR"' in source
     assert 'chown root:ccremote "$ENV_FILE"' in source
@@ -260,7 +260,7 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert '--python "$PYTHON_RUNTIME"' in source
     assert "--exclude='./runtimes'" in source
     assert "--exclude='./state'" in source
-    transaction_source = (ROOT / "deploy" / "setup_transaction.sh").read_text()
+    transaction_source = (ROOT / "deploy" / "setup_transaction.sh").read_text(encoding="utf-8")
     assert "rollback_release" in transaction_source
     assert "rollback_deployment" in transaction_source
     assert 'cp -a "$CADDY_BACKUP" "$CADDYFILE"' in transaction_source
@@ -275,7 +275,7 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert 'requirements-relay.lock' in source
     assert "apt-get install -y" in source and "gnupg" in source
     assert "command -v gpg" in source
-    lock = (ROOT / "requirements-relay.lock").read_text()
+    lock = (ROOT / "requirements-relay.lock").read_text(encoding="utf-8")
     assert "--hash=sha256:" in lock
     assert "cryptography==" in lock
     assert "Python 3.10 or newer is required" in source
@@ -342,7 +342,7 @@ def test_release_snapshot_restores_versioned_claude_control_state(tmp_path):
 
     assert controls.read_bytes() == original
     assert stat.S_IMODE(controls.stat().st_mode) == 0o600
-    manifest = json.loads((snapshot / "manifest.json").read_text())
+    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["version"] == 3
     assert manifest["wrapper_state"]["files"][controls.name]["exists"] is True
 
@@ -393,7 +393,7 @@ def test_release_snapshot_rejects_boolean_manifest_version(tmp_path):
     snapshot = tmp_path / "snapshot"
     create_snapshot(snapshot, roots)
     manifest_path = snapshot / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["version"] = True
     manifest_path.write_text(json.dumps(manifest))
 
@@ -524,7 +524,7 @@ atomic_install_file "$2" "$3" root root 0644
 
     assert result.returncode != 0
     if destination_exists:
-        assert destination.read_text() == "original config"
+        assert destination.read_text(encoding="utf-8") == "original config"
     else:
         assert not destination.exists()
     assert not list(tmp_path.glob(".installed.cc-remote.*"))
@@ -550,7 +550,7 @@ def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
         check=True,
     )
 
-    assert destination.read_text() == "complete new config"
+    assert destination.read_text(encoding="utf-8") == "complete new config"
     assert destination.stat().st_mode & 0o777 == 0o640
     assert not list(tmp_path.glob(".installed.cc-remote.*"))
 
@@ -667,7 +667,7 @@ false  # injected relay readiness failure after the complete release switch
     if activation != "readiness-failure":
         # Execute the real setup tail so registration must finish successfully
         # before the transaction commits; no system package/service setup runs.
-        setup_tail = (ROOT / "deploy/setup-vps.sh").read_text().split(
+        setup_tail = (ROOT / "deploy/setup-vps.sh").read_text(encoding="utf-8").split(
             'echo "==> waiting for relay readiness"', 1)[1]
         harness = harness.replace(
             "false  # injected relay readiness failure after the complete release switch",
@@ -691,7 +691,7 @@ false  # injected relay readiness failure after the complete release switch
     )
 
     if activation.startswith("registration-"):
-        arguments = cli_log.read_text().splitlines()
+        arguments = cli_log.read_text(encoding="utf-8").splitlines()
         assert arguments == [
             str(new_release / "deploy/install_cli.py"),
             "--root", str(appdir), "--destination", str(appdir / "cc-remote"),
@@ -702,24 +702,24 @@ false  # injected relay readiness failure after the complete release switch
     if activation.endswith("success"):
         assert result.returncode == 0, result.stderr
         assert current.resolve() == new_release.resolve()
-        assert caddyfile.read_text() == "new caddy"
-        assert unit.read_text() == "new unit"
+        assert caddyfile.read_text(encoding="utf-8") == "new caddy"
+        assert unit.read_text(encoding="utf-8") == "new unit"
         assert not systemctl_log.exists()
         return
     assert result.returncode != 0
     assert current.resolve() == old_release.resolve()
     for relative in ("cc_remote", "web/dist", ".venv"):
-        assert (old_release / relative / "marker").read_text() == "old"
+        assert (old_release / relative / "marker").read_text(encoding="utf-8") == "old"
     assert not new_release.exists()
-    assert caddyfile.read_text() == "old caddy"
-    assert unit.read_text() == "old unit"
-    calls = systemctl_log.read_text().splitlines()
+    assert caddyfile.read_text(encoding="utf-8") == "old caddy"
+    assert unit.read_text(encoding="utf-8") == "old unit"
+    calls = systemctl_log.read_text(encoding="utf-8").splitlines()
     assert calls == [
         "daemon-reload",
         "restart caddy",
         "restart cc-remote-relay",
     ]
-    curl_call = (tmp_path / "curl.log").read_text()
+    curl_call = (tmp_path / "curl.log").read_text(encoding="utf-8")
     assert "--max-time 2" in curl_call
     assert "http://127.0.0.1:8765/healthz" in curl_call
     assert "previous relay passed /healthz" in result.stderr
@@ -755,7 +755,7 @@ def test_relay_retention_setup_failure_keeps_the_prepared_release(tmp_path, fail
     python.parent.mkdir(parents=True)
     python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
     python.chmod(0o755)
-    setup = (ROOT / 'deploy/setup-vps.sh').read_text()
+    setup = (ROOT / 'deploy/setup-vps.sh').read_text(encoding="utf-8")
     initial_state = setup[setup.index('NEW_RELEASE_DIR=""'):setup.index('[ -r "$SOURCE_DIR/deploy/setup_transaction.sh"')]
     stop = setup.index('echo "==> Caddy config')
     begin = setup[setup.rindex('if (( MANAGED_RELEASE )); then', 0, stop):stop]
@@ -778,13 +778,13 @@ trap cleanup EXIT
                              str(ROOT / 'deploy/setup_transaction.sh'), str(appdir)],
                             text=True, capture_output=True)
     assert result.returncode != 0
-    ledger = json.loads((appdir / '.release-generations.json').read_text())
+    ledger = json.loads((appdir / '.release-generations.json').read_text(encoding="utf-8"))
     [row] = ledger['generations']
     assert row['phase'] == ledger['phase'] == 'prepared'
     assert row['release'] == str(new) and row['artifacts'] == {}
     assert Path(row['backup']).is_dir()
     assert new.is_dir() and (appdir / 'current').resolve() == old
-    assert (appdir / 'relay.service').read_text() == 'original service\n'
+    assert (appdir / 'relay.service').read_text(encoding="utf-8") == 'original service\n'
     assert 'retaining staged release for transaction inspection' in result.stderr
 
 
@@ -851,11 +851,11 @@ false
 
 def test_web_build_manifest_matches_both_protocol_implementations():
     manifest = json.loads(
-        (ROOT / "web" / "public" / "cc-remote-build.json").read_text())
+        (ROOT / "web" / "public" / "cc-remote-build.json").read_text(encoding="utf-8"))
     from cc_remote import __version__
     from cc_remote.protocol import PROTOCOL_VERSION
 
-    ts = (ROOT / "web" / "src" / "protocol.ts").read_text()
+    ts = (ROOT / "web" / "src" / "protocol.ts").read_text(encoding="utf-8")
     match = re.search(r"PROTOCOL_VERSION\s*=\s*(\d+)", ts)
     assert match
     assert manifest["protocol"] == PROTOCOL_VERSION == int(match.group(1))
@@ -884,24 +884,24 @@ def test_deploy_protocol_validation_reads_backend_and_manifest(tmp_path):
 
 
 def test_setup_protocol_gate_has_no_release_specific_literal():
-    source = (ROOT / "deploy" / "setup-vps.sh").read_text()
+    source = (ROOT / "deploy" / "setup-vps.sh").read_text(encoding="utf-8")
     assert "validate_protocol_bundle.py" in source
     assert "web build protocol is not v" not in source
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
 def test_release_docs_and_examples_describe_one_atomic_layout():
-    deploy_readme = (ROOT / "deploy" / "README.md").read_text()
-    readme = (ROOT / "README.md").read_text()
-    readme_en = (ROOT / "README_en.md").read_text()
-    claude = (ROOT / "CLAUDE.md").read_text()
-    wrapper_env = (ROOT / "deploy" / "env.wrapper.example").read_text()
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_en = (ROOT / "README_en.md").read_text(encoding="utf-8")
+    claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+    wrapper_env = (ROOT / "deploy" / "env.wrapper.example").read_text(encoding="utf-8")
     wrapper_plist = (
         ROOT / "deploy" / "com.muggle.cc-remote.wrapper.plist.in"
-    ).read_text()
-    wrapper_installer = (ROOT / "deploy" / "install-wrapper.sh").read_text()
-    relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
-    unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
+    ).read_text(encoding="utf-8")
+    wrapper_installer = (ROOT / "deploy" / "install-wrapper.sh").read_text(encoding="utf-8")
+    relay_env = (ROOT / "deploy" / "env.relay.example").read_text(encoding="utf-8")
+    unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text(encoding="utf-8")
 
     assert f"Protocol v{PROTOCOL_VERSION}" in deploy_readme
     assert "both engines' Work ownership backfills" in deploy_readme
@@ -959,7 +959,7 @@ def test_release_docs_and_examples_describe_one_atomic_layout():
 
 def test_example_wrapper_buffer_can_hold_one_maximum_websocket_frame():
     values = {}
-    for line in (ROOT / ".env.example").read_text().splitlines():
+    for line in (ROOT / ".env.example").read_text(encoding="utf-8").splitlines():
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
             values[key] = value
@@ -1100,7 +1100,7 @@ def test_caddy_managed_block_rejects_ambiguous_existing_config(current):
 
 
 def test_relay_service_is_read_only_but_can_read_static_files():
-    source = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
+    source = (ROOT / "deploy" / "cc-remote-relay.service").read_text(encoding="utf-8")
     assert "NoNewPrivileges=true" in source
     assert "PrivateTmp=true" in source
     assert "ProtectSystem=strict" in source
@@ -1111,7 +1111,7 @@ def test_relay_service_is_read_only_but_can_read_static_files():
 
 
 def test_caddy_site_sets_browser_security_headers():
-    source = (ROOT / "deploy" / "Caddyfile").read_text()
+    source = (ROOT / "deploy" / "Caddyfile").read_text(encoding="utf-8")
     for header in (
         "Strict-Transport-Security",
         "Content-Security-Policy",
@@ -1129,7 +1129,7 @@ def test_caddy_site_sets_browser_security_headers():
 
 @pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
 def test_html_preview_runner_has_a_narrow_isolated_policy(template):
-    source = (ROOT / "deploy" / template).read_text()
+    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
     assert (
         "not path /html-preview-runner.html /html-preview-runner.js"
         in source
@@ -1148,10 +1148,10 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
     assert "frame-ancestors 'self'" in preview
     assert 'X-Frame-Options "SAMEORIGIN"' in preview
 
-    runner = (ROOT / "web" / "public" / "html-preview-runner.html").read_text()
+    runner = (ROOT / "web" / "public" / "html-preview-runner.html").read_text(encoding="utf-8")
     bootstrap = (
         ROOT / "web" / "public" / "html-preview-runner.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
     assert '<script src="/html-preview-runner.js" defer></script>' in runner
     assert "<script>" not in runner
     assert "void parent.document" in bootstrap
@@ -1162,7 +1162,7 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
 
 @pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
 def test_caddy_blob_policy_is_limited_to_image_and_audio_previews(template):
-    source = (ROOT / "deploy" / template).read_text()
+    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
     match = re.search(r'Content-Security-Policy "([^"]+)"', source)
     assert match is not None
     directives = {
@@ -1181,7 +1181,7 @@ def test_caddy_blob_policy_is_limited_to_image_and_audio_previews(template):
 
 @pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
 def test_caddy_github_image_allowlist_does_not_relax_other_capabilities(template):
-    source = (ROOT / "deploy" / template).read_text()
+    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
     policies = re.findall(r'Content-Security-Policy "([^"]+)"', source)
     assert len(policies) == 2
     application, preview = (

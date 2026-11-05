@@ -67,7 +67,7 @@ def test_truncated_upload_names_keep_distinct_copies(tmp_path):
     assert len(rows) == 2 and len({row["path"] for row in rows}) == 2
     for row in rows:
         assert len(Path(row["path"]).name.encode("utf-8")) <= 255
-        assert Path(row["path"]).read_text() == row["name"]
+        assert Path(row["path"]).read_text(encoding="utf-8") == row["name"]
 
 
 @pytest.mark.parametrize("name", [
@@ -950,7 +950,7 @@ async def test_claude_steering_upload_outlives_its_temporary_prompt_files(tmp_pa
         assert rows == []  # The optional copy must not block delivery to the SDK.
         return
     row = rows[0]
-    assert row["name"] == "notes.txt" and Path(row["path"]).read_text() == "hi"
+    assert row["name"] == "notes.txt" and Path(row["path"]).read_text(encoding="utf-8") == "hi"
 
 
 @pytest.mark.asyncio

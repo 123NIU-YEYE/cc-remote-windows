@@ -12,7 +12,7 @@ from cc_remote.tui_keys import KeyConfig
 @pytest.mark.parametrize("name", ["tui.md", "tui_zh.md"])
 def test_guide_key_examples_have_no_binding_conflicts(name):
     root = Path(__file__).resolve().parents[1]
-    source = (root / "docs" / name).read_text()
+    source = (root / "docs" / name).read_text(encoding="utf-8")
     examples = re.findall(r"```toml\n(.*?)\n```", source, re.DOTALL)
     assert examples
     for example in examples:
@@ -25,7 +25,7 @@ def test_guide_key_examples_have_no_binding_conflicts(name):
 )
 def test_readme_points_to_the_current_session_tree(readme, guide):
     root = Path(__file__).resolve().parents[1]
-    source = (root / readme).read_text()
+    source = (root / readme).read_text(encoding="utf-8")
     assert f"(docs/{guide})" in source
     assert (root / "docs" / guide).is_file()
     assert "Space e" in source
