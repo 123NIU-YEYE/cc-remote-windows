@@ -34,6 +34,7 @@ from cc_remote.wrapper.process_scan import (
     ProcessIdentity,
     process_identity,
     process_owner_uid,
+    process_command_environment_value,
 )
 
 log = logger("cc_remote.wrapper.codex_daemon")
@@ -376,10 +377,31 @@ def _managed_daemon_process_identity(
     proxy look current.
     """
     home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
-    pid = _managed_pid(home / "app-server-daemon" / "app-server.pid")
+    pid_path = home / "app-server-daemon" / (
+        "daemon.pid" if sys.platform == "win32" else "app-server.pid")
+    pid = _managed_pid(pid_path)
     if pid is None or process_owner_uid(pid) != os.getuid():
         return None
-    return process_identity(pid)
+    identity = process_identity(pid)
+    if sys.platform == "win32" and identity is not None:
+        # Native Windows state uses FILETIME, rather than Linux start ticks.
+        # Bind the PID record to the exact account and process generation.
+        try:
+            with pid_path.open("rb") as stream:
+                raw = stream.read(_PID_RECORD_MAX + 1)
+            if len(raw) > _PID_RECORD_MAX:
+                return None
+            record = json.loads(raw)
+            started = int(record["processStartTime"]) // 10000 - 11644473600000
+            complete, args, configured_home = process_command_environment_value(
+                identity, "CODEX_HOME")
+            actual_home = Path(configured_home or Path.home() / ".codex").resolve()
+            if (abs(started - identity.start_ticks) > 1 or not complete or not args
+                    or b"app-server" not in args or actual_home != home):
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    return identity
 
 
 def _protected_socket_directory(uid: int) -> Path:
@@ -398,11 +420,19 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
     address = Path(path)
     parent = address.parent
     parent_info = parent.lstat()
-    if (not address.is_absolute() or str(parent.resolve()) != str(parent)
+    if (not address.is_absolute()
+            or os.path.normcase(str(parent.resolve())) != os.path.normcase(str(parent))
             or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != uid
-            or parent_info.st_mode & 0o022):
+            or (sys.platform != "win32" and parent_info.st_mode & 0o022)):
         raise ValueError("Codex socket parent is not private to its owner")
     info = address.lstat()
+    if sys.platform == "win32":
+        # Windows AF_UNIX endpoints are a specific reparse type, not S_IFSOCK.
+        # Python need not implement AF_UNIX: the official raw proxy owns I/O.
+        if (getattr(info, "st_reparse_tag", None) != 0x80000023
+                or _managed_daemon_process_identity(parent.parent) is None):
+            raise ValueError("Codex Windows socket has no matching native owner")
+        return info.st_dev, info.st_ino, info.st_ctime_ns
     if stat.S_ISLNK(info.st_mode):
         directory = _protected_socket_directory(uid)
         target = directory / hashlib.sha256(os.fsencode(address)).hexdigest()
@@ -871,7 +901,7 @@ class CodexDaemonManager:
         """Check both official commands, caching by executable identity."""
         if self.mode == "off":
             return False
-        if os.name == "nt":
+        if os.name == "nt" and self.websocket_url:
             if _windows_ws_target(self.websocket_url) is None:
                 return False
             identity = _daemon_identity(
@@ -885,7 +915,7 @@ class CodexDaemonManager:
             if not capable:
                 self.invalidate()
             return capable
-        if os.name != "posix":
+        if os.name not in {"posix", "nt"}:
             return False
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._capability_identity:
@@ -1013,7 +1043,7 @@ class CodexDaemonManager:
         """Start and remotely enable the daemon, or return ``None`` for stdio."""
         if self.mode == "off":
             return None
-        if os.name == "nt":
+        if os.name == "nt" and self.websocket_url:
             return await self._ensure_windows_ws_started(codex_bin, env)
         codex_home = os.path.realpath(os.path.expanduser(
             env.get("CODEX_HOME") or "~/.codex"

@@ -70,7 +70,9 @@ async def probe_config(socket_path: str) -> None:
         raise RuntimeError("Codex daemon changed during configuration check")
 
 
-async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> None:
+async def probe_proxy(
+    binary: str, env: dict[str, str], socket_path: str, *, read_config: bool = False,
+) -> None:
     """Initialize through the official raw WebSocket proxy, without a thread."""
     process = await asyncio.create_subprocess_exec(
         binary, "app-server", "proxy", "--sock", socket_path,
@@ -100,6 +102,7 @@ async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> Non
             await flush()
             fragments = bytearray()
             messages = 0
+            expected_id = 1
             while messages < 32:
                 chunk = await process.stdout.read(64 * 1024)
                 if not chunk:
@@ -123,11 +126,18 @@ async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> Non
                         messages += 1
                         response = json.loads(fragments)
                         fragments.clear()
-                        if not isinstance(response, dict) or response.get("id") != 1:
+                        if not isinstance(response, dict) or response.get("id") != expected_id:
                             continue
                         if "error" in response or not isinstance(response.get("result"), dict):
                             raise RuntimeError("Codex proxy rejected initialization")
-                        protocol.send_text(b'{"method":"initialized"}')
+                        if expected_id == 1:
+                            protocol.send_text(b'{"method":"initialized"}')
+                            if read_config:
+                                expected_id = 2
+                                protocol.send_text(b'{"id":2,"method":"config/read","params":{"includeLayers":false}}')
+                                continue
+                        elif not isinstance(response["result"].get("config"), dict):
+                            raise RuntimeError("Codex live configuration response is invalid")
                         protocol.send_close()
                         await flush()
                         return
@@ -141,7 +151,10 @@ async def probe_proxy(binary: str, env: dict[str, str], socket_path: str) -> Non
         except TimeoutError:
             # Only this short-lived, thread-free probe is terminated.
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                if os.name == "nt":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             await process.wait()

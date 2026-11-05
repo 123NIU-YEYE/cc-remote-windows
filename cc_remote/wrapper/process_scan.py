@@ -481,6 +481,16 @@ def process_owner_uid(pid: int, *, proc_root: str = "/proc") -> int | None:
         return os.stat(str(Path(proc_root) / str(pid))).st_uid
     except OSError:
         pass
+    if sys.platform == "win32" and proc_root == "/proc":
+        psutil = _windows_psutil()
+        if psutil is None:
+            return None
+        try:
+            if psutil.Process(pid).username().casefold() == psutil.Process().username().casefold():
+                return os.getuid()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return None
     if sys.platform != "darwin" or proc_root != "/proc":
         return None
     metadata = _darwin_bsd_snapshot(pid)
