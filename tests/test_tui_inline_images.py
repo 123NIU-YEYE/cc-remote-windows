@@ -231,7 +231,10 @@ async def test_folded_history_and_modal_remove_pixels(monkeypatch):
         await pilot.pause(0.15)
         assert not viewport.pictures
         await pilot.press("escape")
-        await pilot.pause()
+        for _ in range(100):
+            if viewport.pictures:
+                break
+            await pilot.pause(0.01)
         assert viewport.pictures
         view.blocks.clear()
         view.version += 1

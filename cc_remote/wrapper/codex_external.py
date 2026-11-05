@@ -759,6 +759,51 @@ def _darwin_writable_rollout_holders(
     return scan
 
 
+def _windows_writable_rollout_holders(paths, own_processes, snapshot=None) -> HolderScan:
+    from cc_remote.wrapper.process_scan import process_owner_uid, windows_process_snapshot
+    from cc_remote.wrapper.windows_files import writable_file_holders
+
+    snapshot = snapshot or windows_process_snapshot(names={
+        "codex.exe", "codex-native.exe", "codex",
+    })
+    rows, complete = snapshot
+    own = set(own_processes)
+    selected = {}
+    metadata = {}
+    for identity, parent, tty, args in rows:
+        if identity in own:
+            continue
+        names = {arg.replace(b"\\", b"/").rsplit(b"/", 1)[-1].lower() for arg in args[:2]}
+        codex = bool(names.intersection({b"codex", b"codex.exe", b"codex-native.exe", b"codex.js"}))
+        # Conversation writers are the official CLI/app-server (including an
+        # npm launcher's native child), not arbitrary desktop processes. Renderer and crash
+        # helper handles cannot establish native session ownership.
+        if not codex or any(arg.startswith(b"--type=") for arg in args):
+            continue
+        owner = process_owner_uid(identity.pid)
+        if owner != os.getuid():
+            if codex:
+                complete = False
+            continue
+        if identity.start_ticks <= 0:
+            complete = False
+            continue
+        selected[identity.pid] = identity
+        metadata[identity] = (parent, tty, args)
+    holders, file_scan_complete = writable_file_holders(paths, selected)
+    passive = {sid: set() for sid in paths}
+    private = {sid: set() for sid in paths}
+    for sid, identities in holders.items():
+        for identity in identities:
+            _parent, _tty, args = metadata[identity]
+            if _is_passive_app_server(Path(), 0, args):
+                passive[sid].add(identity)
+                if not _is_managed_shared_app_server(args):
+                    private[sid].add(identity)
+    return HolderScan(holders, complete and file_scan_complete, passive_holders=passive,
+                      private_holders=private, darwin_snapshot=snapshot)
+
+
 def writable_rollout_holders(
     paths: Mapping[str, str],
     own_processes: Iterable[ProcessIdentity] = (),
@@ -773,6 +818,8 @@ def writable_rollout_holders(
     renamed paths cannot create false negatives.  PID start ticks are checked
     before and after the FD walk to reject PID/FD reuse races.
     """
+    if sys.platform == "win32" and proc_root == "/proc":
+        return _windows_writable_rollout_holders(paths, own_processes, darwin_snapshot)
     if sys.platform == "darwin" and proc_root == "/proc":
         return _darwin_writable_rollout_holders(
             paths, own_processes, process_snapshot=darwin_snapshot)

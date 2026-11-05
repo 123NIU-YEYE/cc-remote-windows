@@ -54,6 +54,11 @@ A model-message round trip is a separate acceptance check requiring permission
 to spend tokens. Use an isolated session and verify its native ID and actual
 messages in both clients. Transport acceptance alone does not claim that test.
 
+Wrapper ownership checks on Windows use the native kernel handle table, file
+identity and granted write access. They distinguish read-only readers, managed
+daemon generations and private app-server writers. Missing process or handle
+visibility keeps a session read-only; the check never takes over a terminal.
+
 ## Return to the default App
 
 Exit the shared App normally and use the original official launcher. No global
