@@ -150,7 +150,7 @@ async def test_clipboard_helper_output_exit_timeout_and_cancellation(
 ):
     assert (
         await cb.read_command([sys.executable, "-c", "print('ok')"], 10)
-        == b"ok\n"
+        == ("ok" + __import__("os").linesep).encode()
     )
     with pytest.raises(ValueError, match="size limit"):
         await cb.read_command([sys.executable, "-c", "print('x' * 10000)"], 100)

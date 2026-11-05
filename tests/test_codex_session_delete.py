@@ -2100,3 +2100,9 @@ def test_delete_rejects_active_shared_cli_turn(monkeypatch):
         assert machine.sessions[ctx.key] is ctx
 
     asyncio.run(run())
+
+
+@pytest.fixture(autouse=True)
+def _shared_transport_test_mode(monkeypatch):
+    """These tests replace native transports and exercise shared ownership."""
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")

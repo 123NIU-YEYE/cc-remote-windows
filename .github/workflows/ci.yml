@@ -14,9 +14,23 @@ concurrency:
 
 jobs:
   python:
-    name: Python
+    name: Python (${{ matrix.os }})
     needs: web
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: .venv/bin/python
+          - os: windows-2025
+            python: .venv/Scripts/python.exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
     permissions:
       contents: read
     steps:
@@ -32,17 +46,24 @@ jobs:
         run: |
           uv venv --python 3.13 .venv
           uv pip sync \
-            --python .venv/bin/python \
+            --python ${{ matrix.python }} \
             --require-hashes --only-binary=:all: --no-binary=http-ece \
             requirements.lock
-          uv pip install --python .venv/bin/python -r requirements-dev.txt
+          uv pip install --python ${{ matrix.python }} -r requirements-dev.txt
       - name: Restore built Web client
         uses: actions/download-artifact@v4
         with:
           name: ci-web-dist
           path: web/dist
       - name: Run pytest
-        run: .venv/bin/python -m pytest
+        run: ${{ matrix.python }} -m pytest --junitxml=test-results.xml
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ matrix.os }}
+          path: test-results.xml
+          if-no-files-found: ignore
 
   web:
     name: Web build

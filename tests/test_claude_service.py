@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import tempfile
 import sys
+import socket
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from cc_remote.claude_service.server import Service
 
 
 def test_private_socket_registration_and_explicit_override(tmp_path, monkeypatch):
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("persistent Claude service registration requires native Unix transport")
     from cc_remote.config import WrapperConfig, _claude_service_socket, wrapper_config
 
     monkeypatch.setenv("CC_REMOTE_STATE_DIR", str(tmp_path))
@@ -70,6 +73,8 @@ class FakeClient:
 
 @contextlib.asynccontextmanager
 async def environment():
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("persistent Claude service transport requires native AF_UNIX")
     # Darwin sockaddr_un is short; pytest's normal temp hierarchy exceeds it.
     with tempfile.TemporaryDirectory(prefix="cc-sdk-", dir="/tmp") as root:
         directory = Path(root)
@@ -719,6 +724,8 @@ def test_machine_recovers_background_followup_without_a_new_human_completion():
 
 
 def test_real_controller_process_exit_leaves_service_and_accepted_work_alive():
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("persistent Claude service transport requires native AF_UNIX")
     from cc_remote.claude_service.client import Connection
 
     service_code = """

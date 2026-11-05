@@ -14,7 +14,7 @@ from cc_remote.attachments import (
 
 def read_attachment(path: str, *, image: bool = False) -> dict:
     source = Path(path).expanduser()
-    fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK)
+    fd = os.open(source, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise ValueError("An attachment must be a regular file")

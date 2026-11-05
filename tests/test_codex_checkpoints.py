@@ -373,6 +373,8 @@ def test_finish_accepts_commit_with_unchanged_untracked_baseline(tmp_path, empty
 
 @pytest.mark.parametrize("change", ["content", "delete", "new", "permission", "symlink", "stage"])
 def test_finish_rejects_commit_with_changed_untracked_baseline(tmp_path, change):
+    if sys.platform == "win32" and change == "permission":
+        pytest.skip("Windows has no distinct POSIX 0644/0600 permission state")
     root = _repo(tmp_path, {"tracked.txt": "base\n"})
     leftover = root / "leftover.txt"
     leftover.write_text("unchanged\n")

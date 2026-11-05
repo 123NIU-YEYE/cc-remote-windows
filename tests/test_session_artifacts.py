@@ -2,6 +2,7 @@
 import base64
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -28,7 +29,8 @@ def test_artifact_upload_survives_reopen_and_has_isolated_identity(tmp_path):
     rows, _, more = reopened.page("session-a")
     assert len(rows) == 1 and not more
     assert Path(rows[0]["path"]).read_bytes() == b"keep me"
-    assert Path(rows[0]["path"]).stat().st_mode & 0o777 == 0o600
+    from tests.platform_capabilities import assert_private
+    assert_private(Path(rows[0]["path"]))
     assert reopened.page("session-b")[0] == []
     assert reopened.get("session-b", rows[0]["id"]) is None
     assert public_entry(rows[0])["available"] is True
@@ -88,6 +90,8 @@ def test_long_name_replay_reuses_existing_legacy_copy(tmp_path):
     identity = f"upload:msg:0:{name}"
     digest = hashlib.sha256(f"session\0{identity}".encode()).hexdigest()
     legacy = store.root / f"{digest}-{name[:160]}"
+    from tests.platform_capabilities import require_path
+    require_path(legacy)
     legacy.write_bytes(b"hello")
     store.add("session", identity, name, str(legacy), "upload", turn_id="msg")
     store.uploads("session", "msg", [{"filename": name, "data": "aGVsbG8="}])
@@ -160,8 +164,8 @@ def test_artifact_discovery_only_follows_explicit_local_destinations():
     [例子](/example.md)
     ```
     visualize{"path":"/output/page.html"}'''
-    assert local_links(text, "/workspace") == [
-        "/project/a b.py", "/workspace/docs/report.md", "/tmp/report.pdf", "/output/page.html"]
+    assert local_links(text, "/workspace") == native_paths([
+        "/project/a b.py", "/workspace/docs/report.md", "/tmp/report.pdf", "/output/page.html"])
 
 
 def test_artifact_discovery_handles_directory_and_separate_delivery_names():
@@ -173,11 +177,11 @@ def test_artifact_discovery_handles_directory_and_separate_delivery_names():
 
 其他源码：`not-delivered.py`。
 """
-    assert local_links(text, "/workspace") == [
+    assert local_links(text, "/workspace") == native_paths([
         "/tmp/diagrams/runtime-layers.png",
         "/tmp/diagrams/delivery-flow.png",
         "/tmp/diagrams/qwen-call.png",
-    ]
+    ])
     table = """Files are in `./output/`:
 
 | File | Description |
@@ -185,8 +189,8 @@ def test_artifact_discovery_handles_directory_and_separate_delivery_names():
 | `报告 中文.pdf` | Report |
 | `chart.svg` | Diagram |
 """
-    assert local_links(table, "/workspace") == [
-        "/workspace/output/报告 中文.pdf", "/workspace/output/chart.svg"]
+    assert local_links(table, "/workspace") == native_paths([
+        "/workspace/output/报告 中文.pdf", "/workspace/output/chart.svg"])
 
 
 @pytest.mark.parametrize("outer_pipes", ["both", "neither", "leading", "trailing", "mixed"])
@@ -221,21 +225,21 @@ def test_artifact_directory_table_only_discovers_filename_cell(table, outer_pipe
     expected = ["/tmp/output/report.pdf"]
     if "`chart.svg`" in table:
         expected.append("/tmp/output/chart.svg")
-    assert local_links(text, "/workspace") == expected
+    assert local_links(text, "/workspace") == native_paths(expected)
 
 
 def test_artifact_directory_table_without_unique_filename_column_is_not_delivery():
     for header in ("Description | Status", "File | Filename"):
         text = f"Files in `/tmp/output/`:\n\n| {header} |\n|---|---|\n" \
                "| From `config.yaml` | `API.call` |"
-        assert local_links(text, "/workspace") == []
+        assert local_links(text, "/workspace") == native_paths([])
 
 
 def test_artifact_directory_table_requires_a_matching_separator():
     for separator in ("| : | : |", "|---|", "|---|---|---|", "| arbitrary | text |"):
         text = f"Files in `/tmp/output/`:\n| File | Description |\n{separator}\n" \
                "| `report.pdf` | From `config.yaml` |"
-        assert local_links(text, "/workspace") == []
+        assert local_links(text, "/workspace") == native_paths([])
 
 
 def test_artifact_table_columns_reset_between_directories():
@@ -249,7 +253,7 @@ Files in `/tmp/two/`:
 |---|---|
 | `second.pdf` | From `other.yaml` |
 """
-    assert local_links(text, "/workspace") == ["/tmp/one/first.pdf", "/tmp/two/second.pdf"]
+    assert local_links(text, "/workspace") == native_paths(["/tmp/one/first.pdf", "/tmp/two/second.pdf"])
 
 
 def test_artifact_pipe_separated_prose_does_not_extend_directory_context():
@@ -259,13 +263,13 @@ def test_artifact_pipe_separated_prose_does_not_extend_directory_context():
 Choose debug | release; use `./config.yaml` as input.
 - `not-delivered.pdf`
 """
-    assert local_links(text, "/workspace") == [
-        "/tmp/output/report.pdf", "/workspace/config.yaml"]
+    assert local_links(text, "/workspace") == native_paths([
+        "/tmp/output/report.pdf", "/workspace/config.yaml"])
 
 
 def test_artifact_single_column_table_can_omit_body_and_delimiter_pipes():
     text = "Files in `/tmp/output/`:\n| File |\n---\n`report.pdf`\n`chart.svg`"
-    assert local_links(text, "/workspace") == ["/tmp/output/report.pdf", "/tmp/output/chart.svg"]
+    assert local_links(text, "/workspace") == native_paths(["/tmp/output/report.pdf", "/tmp/output/chart.svg"])
 
 
 @pytest.mark.parametrize("boundary", ["", "# Other files", "> Another topic", "- Another list"])
@@ -277,7 +281,7 @@ File | Description
 {boundary}
 - `not-delivered.pdf`
 """
-    assert local_links(text, "/workspace") == ["/tmp/output/report.pdf"]
+    assert local_links(text, "/workspace") == native_paths(["/tmp/output/report.pdf"])
 
 
 @pytest.mark.parametrize("directory,expected", [
@@ -291,18 +295,18 @@ File | Description
 ])
 def test_artifact_directory_introduction_does_not_require_trailing_slash(directory, expected):
     text = f"Files are in `{directory}`:\n\n- `report.pdf`\n- `chart.svg`"
-    assert local_links(text, "/workspace") == [
-        f"{expected}/report.pdf", f"{expected}/chart.svg"]
+    assert local_links(text, "/workspace") == native_paths([
+        f"{expected}/report.pdf", f"{expected}/chart.svg"])
     table = f"文件在 `{directory}`：\n\n| 文件 | 说明 |\n|---|---|\n| `report.pdf` | 报告 |"
-    assert local_links(table, "/workspace") == [f"{expected}/report.pdf"]
+    assert local_links(table, "/workspace") == native_paths([f"{expected}/report.pdf"])
 
 
 def test_artifact_directory_introduction_does_not_reinterpret_files_or_commands():
-    assert local_links("Read `/tmp/report.pdf`:\n- `unrelated.png`", "/workspace") == [
-        "/tmp/report.pdf"]
-    assert local_links("Run `ls /tmp/output`:\n- `unrelated.png`", "/workspace") == []
-    assert local_links("In `/tmp/one` or `/tmp/two`:\n- `unrelated.png`", "/workspace") == []
-    assert local_links("Example `identifier`:\n- `unrelated.png`", "/workspace") == []
+    assert local_links("Read `/tmp/report.pdf`:\n- `unrelated.png`", "/workspace") == native_paths([
+        "/tmp/report.pdf"])
+    assert local_links("Run `ls /tmp/output`:\n- `unrelated.png`", "/workspace") == native_paths([])
+    assert local_links("In `/tmp/one` or `/tmp/two`:\n- `unrelated.png`", "/workspace") == native_paths([])
+    assert local_links("Example `identifier`:\n- `unrelated.png`", "/workspace") == native_paths([])
 
 
 def test_artifact_inline_paths_are_explicit_and_do_not_reinterpret_link_labels():
@@ -311,9 +315,9 @@ def test_artifact_inline_paths_are_explicit_and_do_not_reinterpret_link_labels()
 `https://example.com/a.png` `//server/a.png` `cat /tmp/read.png`
 `/tmp/*.png` `result.png` `API.call` `$OUTPUT/result.png`
 """
-    assert local_links(text, "/workspace") == [
+    assert local_links(text, "/workspace") == native_paths([
         "/workspace/actual.png", "/tmp/my diagram.png",
-        "/workspace/output/report.pdf", "/workspace/docs/notes.md"]
+        "/workspace/output/report.pdf", "/workspace/docs/notes.md"])
 
 
 @pytest.mark.parametrize("separator", [
@@ -326,7 +330,7 @@ def test_artifact_directory_context_does_not_escape_its_file_list(separator):
 {separator}
 - `unrelated.png`
 """
-    assert local_links(text, "/workspace") == ["/tmp/diagrams/first.png"]
+    assert local_links(text, "/workspace") == native_paths(["/tmp/diagrams/first.png"])
 
 
 def test_artifact_inline_discovery_skips_closed_and_unclosed_code_examples():
@@ -340,15 +344,15 @@ Actual file: `/tmp/actual.png`
 ~~~md
 `/tmp/unclosed.png`
 """
-    assert local_links(text, "/workspace") == ["/tmp/actual.png"]
+    assert local_links(text, "/workspace") == native_paths(["/tmp/actual.png"])
 
 
 def test_artifact_inline_discovery_is_bounded_and_deduplicated():
     text = "\n".join(f"`/tmp/result-{i}.png`" for i in range(300))
     paths = local_links(text, "/workspace")
     assert len(paths) == 128
-    assert paths[-1] == "/tmp/result-127.png"
-    assert local_links("[result](/tmp/a.png) `/tmp/a.png`", "/workspace") == ["/tmp/a.png"]
+    assert paths[-1] == os.path.abspath("/tmp/result-127.png")
+    assert local_links("[result](/tmp/a.png) `/tmp/a.png`", "/workspace") == native_paths(["/tmp/a.png"])
 
 
 @pytest.mark.asyncio
@@ -974,3 +978,14 @@ async def test_dsh_uses_native_provenance_and_repairs_only_legacy_session_refere
     service.store.native_outputs(scope, [], ctx.cwd)  # bounded metadata must retain older verified files
     assert {r["name"] for r in service.store.page(scope)[0]} == {"notes.md", "output.png"}
     await runtime.close()
+
+
+def native_paths(paths):
+    """Expected filesystem paths use the host drive and separator spelling."""
+    return [os.path.abspath(path) for path in paths]
+
+
+def test_native_file_uri_and_drive_path_resolve_to_same_delivered_file(tmp_path):
+    target = tmp_path / "report file.md"
+    text = f"[native](<{target}>) [uri]({target.as_uri()})"
+    assert local_links(text, str(tmp_path)) == [str(target)]

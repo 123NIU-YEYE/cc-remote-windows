@@ -210,7 +210,7 @@ def _pipe_from_open_logs(pid: int, bundle_id: str) -> Path | None:
         inspected += 1
         if inspected > 8:
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
         try:
             info = os.fstat(fd)
             if (
@@ -238,8 +238,19 @@ def _manifest_hash(entry: dict) -> str:
 
 
 def _runtime_fingerprint(node: Path) -> str:
-    info = node.stat()
-    return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
+    with node.open("rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 256 * 1024 * 1024:
+            raise ValueError("invalid App tools runtime")
+        digest = hashlib.sha256()
+        remaining = info.st_size + 1
+        while remaining and (chunk := stream.read(min(remaining, 1024 * 1024))):
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if remaining != 1:
+            raise ValueError("App tools runtime changed during inspection")
+    return (f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:"
+            f"{info.st_ctime_ns}:{digest.hexdigest()}")
 
 
 def discover(profile: Path, app: Path, expected_manifest: str | None = None) -> dict:

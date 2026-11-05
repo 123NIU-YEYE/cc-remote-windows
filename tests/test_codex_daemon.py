@@ -5,6 +5,7 @@ import sys
 import asyncio
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import signal
@@ -40,6 +41,7 @@ _REAL_ENSURE_MANAGED_DAEMON_NOFILE = (
 @pytest.fixture(autouse=True)
 def _stub_managed_daemon_nofile_verification(monkeypatch):
     """Lifecycle unit tests do not own a real detached daemon PID."""
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")
     monkeypatch.setattr(
         daemon_module,
         "_ensure_managed_daemon_nofile",
@@ -271,9 +273,14 @@ def test_managed_daemon_identity_uses_same_user_pid_and_start_token(
         monkeypatch, tmp_path):
     daemon_root = tmp_path / "app-server-daemon"
     daemon_root.mkdir()
-    (daemon_root / "app-server.pid").write_text(
-        '{"pid":4321}', encoding="utf-8")
     identity = ProcessIdentity(4321, 987654)
+    monkeypatch.setattr(daemon_module, "process_command_environment_value",
+                        lambda *_args: (True, (b"codex", b"app-server"), str(tmp_path)))
+    name, record = ("app-server.pid", {"pid": 4321})
+    if sys.platform == "win32":
+        name = "daemon.pid"
+        record["processStartTime"] = (identity.start_ticks + 11644473600000) * 10000
+    (daemon_root / name).write_text(json.dumps(record), encoding="utf-8")
     monkeypatch.setattr(
         daemon_module, "process_owner_uid", lambda _pid: os.getuid())
     monkeypatch.setattr(
@@ -292,6 +299,8 @@ def test_managed_daemon_identity_uses_same_user_pid_and_start_token(
 
 @pytest.fixture(params=[False, True], ids=["socket", "native-alias"])
 def standalone_listener(request, monkeypatch):
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("standalone Unix socket transport requires native AF_UNIX")
     # Keep the path below macOS's Unix socket length limit.
     with (tempfile.TemporaryDirectory(prefix="cc-sock-", dir="/tmp") as root,
           tempfile.TemporaryDirectory(prefix="ca-", dir="/tmp") as protected):
@@ -438,7 +447,7 @@ def test_real_manager_standalone_connect_and_restart_fences(
         monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
         monkeypatch.setattr(
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None, raising=False)
         spawned = []
 
         async def spawn(*argv, **_kwargs):
@@ -487,7 +496,7 @@ def test_unavailable_pid_is_not_reported_as_a_confirmed_restart(
         manager._managed_identity_required = True
         nonce = b"0123456789abcdef"
         monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None, raising=False)
         monkeypatch.setattr(
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         spawned = []
@@ -1555,7 +1564,7 @@ def test_proxy_connect_retries_if_daemon_changes_during_initialize(monkeypatch):
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None, raising=False)
         handle = CodexHandle(_Cfg(), daemon_manager=manager)
         handle.model = "gpt-test"
         handle.effort = None
@@ -1637,7 +1646,7 @@ def test_proxy_connect_rebinds_resume_if_daemon_changes_after_thread_read(
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None, raising=False)
         handle = CodexHandle(_Cfg(), daemon_manager=manager)
         resume_calls = []
 
@@ -1710,7 +1719,7 @@ def test_proxy_connect_resumes_created_thread_if_sticky_settings_disconnect(
             handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None, raising=False)
         handle = CodexHandle(_Cfg(), daemon_manager=manager)
         handle.model = "gpt-test"
         start_calls = 0
@@ -2213,7 +2222,7 @@ def test_oversized_http_resume_keeps_shared_affinity_and_thread_local_provider(
             handle_module, "_resolve_codex_bin", lambda: "/managed/codex")
         monkeypatch.setattr(
             handle_module.asyncio, "create_subprocess_exec", spawn)
-        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None, raising=False)
         handle = CodexHandle(_Cfg(), daemon_manager=manager)
         resume_params = []
 

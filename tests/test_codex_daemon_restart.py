@@ -239,7 +239,7 @@ def test_profile_restart_passes_codex_home_only_to_official_command(
     )
 
     assert observed["argv"] == [
-        "/opt/codex", "app-server", "daemon", "restart"]
+        os.path.realpath("/opt/codex"), "app-server", "daemon", "restart"]
     assert observed["env"]["CODEX_HOME"] == str(codex_home.resolve())
     assert read_restart_state(
         restart_state_path(tmp_path, profile_id="stack")

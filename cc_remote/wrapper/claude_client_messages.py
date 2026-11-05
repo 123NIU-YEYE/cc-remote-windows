@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 import re
 import stat
@@ -113,11 +114,15 @@ class ClaudeClientMessageStore:
             not stat.S_ISREG(info.st_mode)
             or stat.S_ISLNK(info.st_mode)
             or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or (sys.platform != "win32" and stat.S_IMODE(info.st_mode) & 0o077)
             or info.st_size > _MAX_FILE_BYTES
         ):
             raise ClaudeClientMessageStoreError(
                 "Claude client-message store is not a private bounded file")
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(path, private=True):
+                raise ClaudeClientMessageStoreError("Claude client-message store is not private")
         signature = self._file_signature(info)
         cached = self._cache.get(session_id)
         if cached is not None and cached.file_signature == signature:
@@ -235,8 +240,12 @@ class ClaudeClientMessageStore:
         source: _SourceIdentity,
         aliases: OrderedDict[str, str],
     ) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.directory, 0o700)
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(self.directory)
+        else:
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.directory, 0o700)
         payload = json.dumps(
             {
                 "version": _STORE_VERSION,
@@ -272,11 +281,12 @@ class ClaudeClientMessageStore:
                 raise
             os.replace(temporary, path)
             os.chmod(path, 0o600)
-            directory_fd = os.open(self.directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            if sys.platform != "win32":
+                directory_fd = os.open(self.directory, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             info = path.lstat()
             self._cache[session_id] = _CachedRecord(
                 file_signature=self._file_signature(info),

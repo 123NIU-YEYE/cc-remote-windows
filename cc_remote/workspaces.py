@@ -2016,6 +2016,10 @@ class WorkRegistry:
 
     @staticmethod
     def _mkdir_private(path: Path) -> None:
+        if os.name == "nt":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(path)
+            return
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.chmod(0o700)
 

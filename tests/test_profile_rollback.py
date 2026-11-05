@@ -8,6 +8,7 @@ import tarfile
 
 import pytest
 
+
 from cc_remote.claude_profiles import ClaudeProfileTopologyStore
 from cc_remote.config import WrapperConfig
 from cc_remote.wrapper.claude_controls import ClaudeControlStore
@@ -18,6 +19,7 @@ from cc_remote.wrapper import codex_checkpoints
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.viewer_pages import PageRef, PageScope
 from deploy import work_registry_snapshot as snapshots
+
 
 
 STATE_FILES = {

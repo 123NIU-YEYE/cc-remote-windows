@@ -5,7 +5,12 @@ import argparse
 import sys
 
 from cc_remote import __version__
-from cc_remote.update import UpdateError, update
+
+
+def update(**options):
+    # Keep unrelated local commands usable without Unix release-manager imports.
+    from cc_remote.update import update as run_update
+    return run_update(**options)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -32,6 +37,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "messages":
         from cc_remote.session_messages import main as message_main
         return message_main(args.message_args)
+    if sys.platform == "win32":
+        print("ERROR: managed Release updates require the Unix installer; Windows uses its existing launcher.", file=sys.stderr)
+        return 1
+    from cc_remote.update import UpdateError
     try:
         return update(
             role=args.role, target_version=args.target_version, check=args.check,

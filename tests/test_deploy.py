@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import closing
 import configparser
 import json
 import os
@@ -110,6 +111,7 @@ def test_repository_deployment_contract_is_the_agent_entrypoint():
     assert "stable PIDs without restart loops" in normalized
 
 
+@pytest.mark.skipif(os.name == "nt", reason="native Unix shell/permission deployment contract")
 def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
     public_files = [
         ROOT / "README.md",
@@ -302,12 +304,12 @@ def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
     writer.commit()
     writer.close()
     claude_root.mkdir()
-    with sqlite3.connect(claude_root / "registry.sqlite3") as database:
+    with closing(sqlite3.connect(claude_root / "registry.sqlite3")) as database, database:
         database.execute("CREATE TABLE created_after_snapshot (value INTEGER)")
 
     restore_snapshot(snapshot)
 
-    with sqlite3.connect(codex_database) as restored:
+    with closing(sqlite3.connect(codex_database)) as restored, restored:
         assert restored.execute("SELECT value FROM marker").fetchall() == [
             ("before",),
         ]
@@ -363,6 +365,7 @@ def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
     assert not controls.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="native Unix shell/permission deployment contract")
 def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
     roots = {
         "claude": tmp_path / "claude-work",
@@ -527,6 +530,7 @@ atomic_install_file "$2" "$3" root root 0644
     assert not list(tmp_path.glob(".installed.cc-remote.*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="native Unix shell/permission deployment contract")
 def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
     source = tmp_path / "candidate"
     destination = tmp_path / "installed"
@@ -551,6 +555,7 @@ def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
     assert not list(tmp_path.glob(".installed.cc-remote.*"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="native Unix shell/permission deployment contract")
 def test_release_permissions_remove_inherited_group_write_and_other_access(
     tmp_path,
 ):
@@ -1129,7 +1134,7 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
         "not path /html-preview-runner.html /html-preview-runner.js"
         in source
     )
-    assert "not path /html-preview-runner.html /html-preview-runner.js /__cc_viewer/bridge/*" in source
+    assert "not path /html-preview-runner.html /html-preview-runner.js /dsh/* /__cc_viewer/bridge/*" in source
     assert (
         "@html_preview path /html-preview-runner.html /html-preview-runner.js"
         in source

@@ -174,7 +174,6 @@ const OUT = path.resolve(__dirname, "_shot-rooms.png");
     if ((await engineSelect.count()) > 0) {
       await engineSelect.selectOption("dsh");
       await page.waitForTimeout(300);
-      const picker = page.locator(".rooms-invite select, .rooms-invite input").nth(1);
       const hasPicker = (await page.locator(".rooms-invite").count()) > 0;
       console.log("dsh picker present:", hasPicker);
       dshPickerOk = hasPicker;

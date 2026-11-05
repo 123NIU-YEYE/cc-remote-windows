@@ -441,6 +441,11 @@ async def test_streaming_collapsed_groups_preserves_every_reader_frame(
     async with app.run_test(size=(70, 26)) as pilot:
         await pilot.pause()
         reader = app.query_one(Transcript)
+        for _ in range(50):
+            if not reader.follow_layout_pending:
+                break
+            await pilot.pause(0.01)
+        assert not reader.follow_layout_pending
         reader.move_cursor((10, 0))
         app.query_one(Composer).focus()
         reader.scroll_to(

@@ -64,7 +64,19 @@ async def page_api(relay, claims, payload):
         # paths are checked on resource devices; the parent is NOT presumed to
         # be the producer of an SSH-created artifact.
         candidates = {}
+        drive_references = set()
         for path in paths:
+            # These are hints forwarded to enrolled resource devices, never
+            # paths opened on the relay. Preserve Windows drive spelling;
+            # reject UNC, drive-relative, traversal and alternate data streams.
+            if (len(path) >= 3 and path[0].isascii() and path[0].isalpha()
+                    and path[1] == ":" and path[2] in {"/", "\\"}):
+                parts = path[3:].replace("\\", "/").split("/")
+                if (":" not in path[2:] and not any(p in {".", ".."} for p in parts)
+                        and Path(path).suffix.lower() in {".html", ".htm"}):
+                    candidates[path] = path
+                    drive_references.add(path)
+                continue
             if path.startswith("http://"):
                 # Hints only. Each device must prove its own socket/process;
                 # the relay never resolves DNS or requests the URL.
@@ -85,7 +97,7 @@ async def page_api(relay, claims, payload):
 
         async def locate(mid, peer):
             eligible = [absolute for raw, absolute in candidates.items()
-                        if raw.startswith(("/", "http://")) or mid == parent_id]
+                        if raw.startswith(("/", "http://")) or raw in drive_references or mid == parent_id]
             if not eligible:
                 return []
             values = await peer.metadata("locate", {"paths": list(dict.fromkeys(eligible))})
@@ -100,7 +112,8 @@ async def page_api(relay, claims, payload):
         additions = []
         for raw, absolute in candidates.items():
             matches = [v for v in found if v["reference"] == absolute
-                       and (raw.startswith(("/", "http://")) or v["machine_id"] == parent_id)]
+                       and (raw.startswith(("/", "http://")) or raw in drive_references
+                            or v["machine_id"] == parent_id)]
             if len(matches) != 1:
                 continue
             value = matches[0]

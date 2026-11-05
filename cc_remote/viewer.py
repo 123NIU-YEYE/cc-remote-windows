@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 from urllib.parse import unquote, urlsplit
 
@@ -150,14 +151,19 @@ class ViewerSite(BaseModel):
 def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
                max_bytes=64 * 1024) -> dict[str, ViewerSite]:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return {}
     with os.fdopen(fd, "rb") as source:
         info = os.fstat(source.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > max_bytes):
+                or (sys.platform != "win32" and info.st_mode & 0o077)
+                or info.st_nlink != 1 or info.st_size > max_bytes):
             raise ValueError("Viewer registry must be a private, bounded regular file")
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(path, private=True):
+                raise ValueError("Viewer registry must be private")
         raw = source.read(max_bytes + 1)
     data = json.loads(raw)
     if (not isinstance(data, dict) or set(data) != {"sites"}
@@ -173,12 +179,16 @@ def load_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES,
 def edit_sites(path: Path, *, model=ViewerSite, limit=MAX_SITES, max_bytes=64 * 1024):
     """Serialize local registrations; readers only ever see a complete snapshot."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    lock_fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), 0o600)
     with os.fdopen(lock_fd, "r+b") as lock:
         info = os.fstat(lock.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077 or info.st_nlink != 1):
+                or (sys.platform != "win32" and info.st_mode & 0o077) or info.st_nlink != 1):
             raise ValueError("invalid Viewer registry lock")
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(str(path) + ".lock", private=True):
+                raise ValueError("invalid Viewer registry lock")
         fcntl.flock(lock, fcntl.LOCK_EX)
         sites = load_sites(path, model=model, limit=limit, max_bytes=max_bytes)
         before = {key: site.model_dump() for key, site in sites.items()}
@@ -217,7 +227,7 @@ def open_resource(site: ViewerSite, raw_path: str):
             raise PermissionError("publication root changed")
         parts = path.lstrip("/").split("/")
         for index, part in enumerate(parts):
-            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
             if index < len(parts) - 1:
                 flags |= os.O_DIRECTORY
             child = os.open(part, flags, dir_fd=fd)

@@ -75,8 +75,13 @@ def _load_device_config() -> dict[str, str]:
     path = device_config_path()
     if not path.exists():
         return {}
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        info = path.lstat()
+        private = stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and owned_path(path, private=True)
+    else:
+        private = not stat.S_IMODE(path.stat().st_mode) & 0o077
+    if not private:
         raise ValueError(
             f"device credential file must not be accessible by group/others: {path}")
     try:

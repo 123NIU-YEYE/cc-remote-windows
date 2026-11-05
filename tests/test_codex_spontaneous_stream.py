@@ -3546,3 +3546,9 @@ def test_spontaneous_overflow_preserves_authoritative_success_terminal():
         assert repairs == [ctx.session_id]
 
     asyncio.run(run())
+
+
+@pytest.fixture(autouse=True)
+def _shared_transport_test_mode(monkeypatch):
+    """These tests replace native transports and exercise shared ownership."""
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")

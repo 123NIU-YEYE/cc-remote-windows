@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import plistlib
 import tempfile
+import sys
 
 import pytest
 from websockets.asyncio.client import connect
@@ -14,6 +15,9 @@ from websockets.asyncio.server import unix_serve
 from cc_remote import codex_desktop as launcher
 from cc_remote.wrapper import codex_daemon
 from cc_remote.wrapper.process_scan import ProcessIdentity
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32",
+                               reason="macOS bundle/Unix bridge launcher; Windows has a separate helper")
 
 
 def upgrade(port=1234, extra="", path="/rpc", host=None):

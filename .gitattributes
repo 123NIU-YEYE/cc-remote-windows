@@ -1,1 +1,5 @@
 *.sh text eol=lf
+*.py text eol=lf
+scripts/cc-remote text eol=lf
+scripts/cc-remote-tui text eol=lf
+experiments/claude-remote text eol=lf

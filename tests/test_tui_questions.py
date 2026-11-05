@@ -80,6 +80,11 @@ async def test_question_arrival_and_answer_frames_preserve_viewport(
     async with app.run_test(size=(80, 28)) as pilot:
         await pilot.pause()
         r = app.query_one(Transcript)
+        for _ in range(50):
+            if not r.follow_layout_pending:
+                break
+            await pilot.pause(0.01)
+        assert not r.follow_layout_pending
         # Keep cursor in an old message, including while the draft is focused.
         r.move_cursor((10, 0))
         app.query_one(Composer).focus()
@@ -100,7 +105,7 @@ async def test_question_arrival_and_answer_frames_preserve_viewport(
         await pilot.pause()
         assert "Working step" in r.text
         assert observed
-        assert all(y == (end if bottom else 12) for y, end in observed)
+        assert all(y == (end if bottom else 12) for y, end in observed), observed
         observed.clear()
         app.action_answer()
         await pilot.pause()

@@ -7,6 +7,7 @@ reported explicitly instead of inventing a before-image from today's file.
 from __future__ import annotations
 
 import difflib
+from contextlib import contextmanager
 from collections import OrderedDict
 import hashlib
 import json
@@ -507,8 +508,14 @@ class TurnChangeArchive:
             db.execute("CREATE TABLE IF NOT EXISTS turn_change_files (sid TEXT, turn_id TEXT, revision TEXT, position INTEGER, path TEXT, summary TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(sid,turn_id,revision,position), UNIQUE(sid,turn_id,revision,path))")
         self.path.chmod(0o600)
 
+    @contextmanager
     def _connect(self):
-        return sqlite3.connect(self.path, timeout=5)
+        connection = sqlite3.connect(self.path, timeout=5)
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def put(self, sid: str, turn_id: str, payload: dict, *, final: bool = False) -> None:
         encoded = json.dumps(payload, ensure_ascii=True)

@@ -122,9 +122,14 @@ async def test_selection_at_bottom_follows_without_clearing_selection():
     app = WorkspaceApp(c, connect=False)
     async with app.run_test() as pilot:
         reader = app.query_one(Transcript)
+        for _ in range(50):
+            if not reader.follow_layout_pending:
+                break
+            await pilot.pause(0.01)
+        assert not reader.follow_layout_pending
         app.stop_following()
         reader.selection = Selection((95, 0), (95, 4))
-        reader.scroll_end(animate=False, force=True)
+        reader.scroll_end(animate=False, force=True, immediate=True)
         reader.on_mouse_up()
         await pilot.pause()
         assert view.follow and reader.selected_text == "line"

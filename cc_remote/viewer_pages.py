@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 from typing import Callable, Literal
 
@@ -84,9 +85,9 @@ def locate_pages(registry: Path, paths: list[str], *, include_ambiguous=False) -
     sites = load_sites(registry)
     result = []
     for raw in paths:
-        if (not isinstance(raw, str) or len(raw) > 4096 or not raw.startswith("/")
-                or raw.startswith("//") or Path(raw).suffix.lower() not in {".html", ".htm"}
-                or any(p in {"..", "."} for p in raw.split("/"))):
+        if (not isinstance(raw, str) or len(raw) > 4096 or not Path(raw).is_absolute()
+                or raw.startswith(("//", "\\\\")) or Path(raw).suffix.lower() not in {".html", ".htm"}
+                or any(p in {"..", "."} for p in raw.replace("\\", "/").split("/"))):
             continue
         matches = []
         for site in sites.values():
@@ -118,15 +119,19 @@ class ViewerPageStore:
 
     def _read(self):
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
         except FileNotFoundError:
             return {}
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_nlink != 1
+                    or (sys.platform != "win32" and info.st_mode & 0o077) or info.st_nlink != 1
                     or info.st_size > MAX_STORE_BYTES):
                 raise ValueError("invalid page store")
+            if sys.platform == "win32":
+                from cc_remote.windows_privacy import owned_path
+                if not owned_path(self.path, private=True) or not owned_path(self.path.parent, private=True):
+                    raise ValueError("invalid page store")
             data = json.loads(stream.read(MAX_STORE_BYTES + 1))
         if (not isinstance(data, dict)
                 or len(data) - (_PROFILE_REVISIONS in data) > MAX_SCOPES):
@@ -147,13 +152,21 @@ class ViewerPageStore:
 
     @contextmanager
     def _edit(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(self.path.parent)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), 0o600)
         with os.fdopen(fd, "rb") as lock:
             info = os.fstat(lock.fileno())
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                    or info.st_mode & 0o077 or info.st_nlink != 1):
+                    or (sys.platform != "win32" and info.st_mode & 0o077) or info.st_nlink != 1):
                 raise ValueError("invalid page store lock")
+            if sys.platform == "win32":
+                from cc_remote.windows_privacy import owned_path
+                if not owned_path(str(self.path) + ".lock", private=True):
+                    raise ValueError("invalid page store lock")
             fcntl.flock(lock, fcntl.LOCK_EX)
             data = self._read()
             before = json.dumps(data, ensure_ascii=False)

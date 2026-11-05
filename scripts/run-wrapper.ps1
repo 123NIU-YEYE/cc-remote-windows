@@ -8,7 +8,23 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath (Join-Path $Root ".env") -PathType Leaf)) {
     throw "Missing .env. Copy .env.example and configure this machine first."
 }
-Set-Location -LiteralPath $Root
+$SourceRoot = $Root
+$ActiveFile = Join-Path $Root ".runtime\active-wrapper.json"
+if (Test-Path -LiteralPath $ActiveFile -PathType Leaf) {
+    $Activation = Get-Content -LiteralPath $ActiveFile -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($Activation.schema -ne 1 -or -not ($Activation.source -is [string]) -or
+        [System.IO.Path]::IsPathRooted($Activation.source)) {
+        throw "Invalid Wrapper activation record."
+    }
+    $Candidate = [System.IO.Path]::GetFullPath((Join-Path $Root $Activation.source))
+    $ReleasePrefix = [System.IO.Path]::GetFullPath((Join-Path $Root ".runtime\releases")) + "\"
+    if (-not $Candidate.StartsWith($ReleasePrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath (Join-Path $Candidate "cc_remote\wrapper\__main__.py") -PathType Leaf)) {
+        throw "Activated Wrapper source is outside the release directory or incomplete."
+    }
+    $SourceRoot = $Candidate
+}
+Set-Location -LiteralPath $SourceRoot
 
 # The desktop exports a new port/token on restart. Refresh only a stale pairing.
 $StateFile = Join-Path $env:USERPROFILE ".dsh\cc-remote-desktop.json"

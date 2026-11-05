@@ -61,6 +61,11 @@ async def test_one_row_above_bottom_is_not_bottom():
     async with app.run_test() as pilot:
         await pilot.pause()
         reader = app.query_one(Transcript)
+        for _ in range(50):
+            if not reader.follow_layout_pending:
+                break
+            await pilot.pause(0.01)
+        assert not reader.follow_layout_pending
         reader.scroll_to(y=reader.max_scroll_y - 1,
                          animate=False, immediate=True)
         top = reader.scroll_y

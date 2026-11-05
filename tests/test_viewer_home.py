@@ -40,7 +40,8 @@ def test_home_pages_are_on_demand_private_and_survive_restart(home_pages):
     assert site.root == str(project)
     assert "root" not in value["publication"] and "home" not in value["publication"]
     assert not registry.exists()  # Not a global publication/list entry.
-    assert pages.path.stat().st_mode & 0o777 == 0o600
+    from tests.platform_capabilities import assert_private
+    assert_private(pages.path)
     restarted = HomePages(pages.path, home=pages.home)
     assert verify_page(restarted.sites()[site.id], "/web/index.html")["entry"] == "/web/index.html"
     stream, _, _ = open_resource(site, "/assets/part.stl")
@@ -121,7 +122,7 @@ def test_existing_publications_win_and_ambiguity_is_preserved(publication, tmp_p
 ])
 def test_python_static_adapter_requires_exact_argv(argv, expected):
     found = static.python_static_root(argv, Path("/home/demo"), 8773)
-    assert (str(found) if found else None) == expected
+    assert (str(found) if found else None) == (str(Path(expected)) if expected else None)
 
 
 def test_static_url_needs_own_address_listener_and_process(monkeypatch):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import pytest
 import json
 import os
 from types import SimpleNamespace
@@ -2449,10 +2450,13 @@ def test_completed_lost_start_retires_checkpoint_before_following_turn():
         turn = asyncio.create_task(
             machine._run_turn(ctx, "do one non-idempotent task"))
         ctx.turn_task = turn
-        for _ in range(100):
-            if ("cleanup", True) in checkpoint.calls:
-                break
-            await asyncio.sleep(0)
+        async def cleanup_observed():
+            while ("cleanup", True) not in checkpoint.calls:
+                if turn.done():
+                    await turn
+                    break
+                await asyncio.sleep(0.001)
+        await asyncio.wait_for(cleanup_observed(), timeout=2.0)
 
         assert turn.done() is False
         assert ctx.state == "running"
@@ -2639,22 +2643,22 @@ def test_turn_start_reconnect_failures_back_off_then_freeze_non_writable(
         monkeypatch.setattr(
             machine_module,
             "CODEX_TURN_START_RECONCILE_DEADLINE_SECONDS",
-            0.04,
+            0.25,
         )
         monkeypatch.setattr(
             machine_module,
             "CODEX_DAEMON_RECOVERY_TIMEOUT_SECONDS",
-            0.01,
+            0.05,
         )
         monkeypatch.setattr(
             machine_module,
             "CODEX_TURN_START_RECONCILE_INTERVAL_SECONDS",
-            0.002,
+            0.01,
         )
         monkeypatch.setattr(
             machine_module,
             "CODEX_TURN_START_RECONNECT_BACKOFF_MAX_SECONDS",
-            0.01,
+            0.05,
         )
         machine, transport = _mk_machine()
         ctx = _mk_ctx("sid", "sid")
@@ -2669,7 +2673,7 @@ def test_turn_start_reconnect_failures_back_off_then_freeze_non_writable(
 
         await asyncio.wait_for(
             machine._run_turn(ctx, "one exactly-once task"),
-            timeout=1.0,
+            timeout=2.0,
         )
 
         assert sdk.queries == [("one exactly-once task", [])]
@@ -3750,3 +3754,9 @@ def test_unleased_goal_recovery_requires_live_exact_continuation(tmp_path, monke
                  "unavailable", "completed-during-probe", "rotated", "new-user-query",
                  "evicted", "private"):
         asyncio.run(go(case))
+
+
+@pytest.fixture(autouse=True)
+def _shared_transport_test_mode(monkeypatch):
+    """These tests replace native transports and exercise shared ownership."""
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")

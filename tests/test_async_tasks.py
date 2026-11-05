@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import socket as native_socket
 import tempfile
 from types import SimpleNamespace
 from uuid import uuid4
@@ -51,6 +52,8 @@ def start(store, *, sid=None, code="print('done')", request_id=None, **kwargs):
 @asynccontextmanager
 async def daemon(store, *, delivery="ok", reject_exec=False, thread_state="idle", thread_path=None,
                  turn_status="completed"):
+    if not hasattr(native_socket, "AF_UNIX"):
+        pytest.skip("fake task daemon exercises native AF_UNIX transport")
     root = store.home / "app-server-control"
     root.mkdir(exist_ok=True)
     socket = root / "app-server-control.sock"
@@ -199,8 +202,13 @@ def test_submission_idempotency_limits_and_private_state(store):
         start(store)
     with pytest.raises(ValueError, match="eight"):
         start(store)
-    assert store.root.stat().st_mode & 0o077 == 0
-    assert store.path.stat().st_mode & 0o077 == 0
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        assert owned_path(store.root, private=True)
+        assert owned_path(store.path, private=True)
+    else:
+        assert store.root.stat().st_mode & 0o077 == 0
+        assert store.path.stat().st_mode & 0o077 == 0
 
 
 @pytest.mark.parametrize("changes", [{"argv": []}, {"argv": ["bad\0command"]}, {"cwd": "relative"},
@@ -897,6 +905,8 @@ def test_real_stdio_mcp_protocol_and_native_call_metadata(store, metadata_format
 
 @pytest.mark.parametrize("alias", [False, True])
 def test_production_socket_transport_uses_only_owned_existing_daemon(monkeypatch, alias):
+    if not hasattr(native_socket, "AF_UNIX"):
+        pytest.skip("native Unix socket fixture is unavailable in this Python runtime")
     from cc_remote.wrapper import codex_daemon
 
     async def run():

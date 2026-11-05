@@ -88,7 +88,7 @@ def test_publication_stays_specific_and_hides_private_paths(publication):
         ViewerSite.model_validate({**site.model_dump(), "paths": ["/"]})
     with pytest.raises(ValueError):
         ViewerSite.model_validate({**site.model_dump(), "script_origins": ["https://evil.example"]})
-    registry.chmod(0o644)
+    __import__("tests.platform_capabilities", fromlist=["make_public"]).make_public(registry)
     with pytest.raises(ValueError):
         load_sites(registry)
 
@@ -111,6 +111,8 @@ def test_symlinks_hardlinks_and_root_replacement_fail_closed(publication, tmp_pa
 
 
 def test_file_descriptor_is_pinned_after_open(publication):
+    if __import__("os").name == "nt":
+        pytest.skip("Windows refuses replacement of an open file; Unix FD rename contract")
     site, _ = publication
     stream, info, mime = open_resource(site, "/viewer/app.js")
     assert stat.S_ISREG(info.st_mode)
@@ -263,7 +265,7 @@ def test_page_store_persists_deduplicates_and_scopes(tmp_path):
 def test_page_store_rejects_insecure_and_oversized_state(tmp_path):
     path = tmp_path / "pages.json"
     path.write_text("{}")
-    path.chmod(0o644)
+    __import__("tests.platform_capabilities", fromlist=["make_public"]).make_public(path)
     scope = PageScope(sid="session", engine="codex", space="code")
     with pytest.raises(ValueError):
         ViewerPageStore(path).list(scope)

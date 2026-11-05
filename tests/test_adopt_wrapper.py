@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("pwd", reason="systemd Wrapper adoption is a Unix installation contract")
+
 from deploy import adopt_wrapper
 
 

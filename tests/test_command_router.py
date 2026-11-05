@@ -17,6 +17,17 @@ from tests.test_multisession import _mk_machine
 
 
 EXPECTED_COMMAND_HANDLERS = {
+    "list_rooms": "_handle_list_rooms",
+    "get_room": "_handle_get_room",
+    "create_room": "_handle_create_room",
+    "update_room": "_handle_update_room",
+    "delete_room": "_handle_delete_room",
+    "post_room_message": "_handle_post_room_message",
+    "approve_room_plan": "_handle_approve_room_plan",
+    "discard_room_plan": "_handle_discard_room_plan",
+    "set_room_flow": "_handle_set_room_flow",
+    "steer_room_member": "_handle_steer_room_member",
+    "cancel_room_member": "_handle_cancel_room_member",
     "query": "_handle_query",
     "cancel_queued_query": "_handle_cancel_queued_query",
     "reorder_queued_queries": "_handle_reorder_queued_queries",

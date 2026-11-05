@@ -21,6 +21,11 @@ from cc_remote.wrapper import codex_readiness as readiness
 from deploy import check_codex_readiness as installer
 
 
+@pytest.fixture(autouse=True)
+def _native_daemon_test_mode(monkeypatch):
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")
+
+
 def lifecycle(home, **changes):
     return {
         "status": "running", "cliVersion": "0.154.0", "appServerVersion": "0.154.0",
@@ -80,6 +85,8 @@ def test_non_disruptive_first_start_reuses_official_lifecycle(tmp_path, monkeypa
 
 @pytest.fixture(params=[False, True], ids=["socket", "native-alias"])
 def account_socket(request, monkeypatch):
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("native Unix readiness fixtures require AF_UNIX")
     # macOS Unix paths are limited to 104 bytes; pytest's path can exceed that.
     with (tempfile.TemporaryDirectory(prefix="cc-readiness-", dir="/tmp") as directory,
           tempfile.TemporaryDirectory(prefix="ca-", dir="/tmp") as protected):
@@ -146,6 +153,8 @@ def test_profile_checks_endpoint_versions_and_real_handshake(
 
 @pytest.mark.parametrize("mode", ["success", "reject", "hang", "oversized", "eof"])
 def test_proxy_probe_only_initializes_and_reaps_child(tmp_path, monkeypatch, mode):
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("native Unix proxy executable fixture requires AF_UNIX")
     binary = tmp_path / "codex"
     messages = []
     pid_file = tmp_path / "pid"
@@ -206,11 +215,13 @@ while True:
         os.kill(int(pid_file.read_text()), 0)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_installer_rejects_previous_activation_dead_or_reused_pid(tmp_path, monkeypatch):
     before = time.time()
     readiness.write_report(tmp_path, [{"profile": "test", "status": "disabled"}])
     path = tmp_path / readiness.REPORT_NAME
-    assert path.stat().st_mode & 0o777 == 0o600
+    from tests.platform_capabilities import assert_private
+    assert_private(path)
     assert installer.read_receipt(path, readiness.SOURCE_ROOT, before)
     assert installer.read_receipt(path, tmp_path / "another-release", before) is None
     assert installer.read_receipt(path, readiness.SOURCE_ROOT, time.time() + 1) is None
@@ -218,6 +229,7 @@ def test_installer_rejects_previous_activation_dead_or_reused_pid(tmp_path, monk
     assert installer.read_receipt(path, readiness.SOURCE_ROOT, before) is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_installer_rejects_symlink_and_bounds_receipt(tmp_path):
     target = tmp_path / "target"
     target.write_text("x" * (64 * 1024 + 1))
@@ -229,6 +241,7 @@ def test_installer_rejects_symlink_and_bounds_receipt(tmp_path):
         installer.read_receipt(target, tmp_path, 0)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_installer_checks_listener_again_before_printing_ready(tmp_path, account_socket):
     home, path = account_socket
     row = {"profile": "account", "status": "ready", "socket": str(path),
@@ -282,6 +295,7 @@ def test_receipt_fences_physical_replacement_behind_native_alias(tmp_path, accou
 
 
 @pytest.mark.parametrize("kind", ["plist", "env-file", "state-dir"])
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_installer_uses_service_state_root_without_executing_config(tmp_path, kind, capsys):
     state = tmp_path / "custom state"
     before = time.time()
@@ -312,6 +326,7 @@ def test_install_report_keeps_cli_discovery_unverified_and_errors_separate(capsy
 
 
 @pytest.mark.parametrize("mode", ["ready", "deleted_cwd", "invalid", "hang", "swapped"])
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_live_config_probe_rejects_healthy_handshake_but_unusable_config(monkeypatch, mode):
     calls = []
     monkeypatch.setattr(readiness, "_TIMEOUT", 0.15 if mode == "hang" else 3)
@@ -352,6 +367,7 @@ def test_live_config_probe_rejects_healthy_handshake_but_unusable_config(monkeyp
 
 
 @pytest.mark.parametrize("wrong_user", [False, True])
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_live_installer_check_is_fresh_and_runs_only_as_service_owner(monkeypatch, wrong_user):
     calls = []
     async def probe(path):
@@ -367,6 +383,7 @@ def test_live_installer_check_is_fresh_and_runs_only_as_service_owner(monkeypatc
     assert "secret" not in json.dumps(report)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix Release installer/service-user contract")
 def test_missing_receipt_does_not_pass_acceptance(tmp_path, capsys):
     assert installer.main([
         "--home", str(tmp_path), "--release", str(tmp_path), "--after", "0", "--wait", "0",

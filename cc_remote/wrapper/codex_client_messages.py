@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 import time
 from uuid import uuid4
@@ -60,8 +61,8 @@ class CodexClientMessageAliases:
     ) -> bool:
         return (
             self.source_path == path
-            and self.source_device == device
-            and self.source_inode == inode
+            and self.source_device == (device & ((1 << 64) - 1))
+            and self.source_inode == (inode & ((1 << 64) - 1))
         )
 
     def resolve(
@@ -159,11 +160,15 @@ class CodexClientMessageStore:
             not stat.S_ISREG(info.st_mode)
             or stat.S_ISLNK(info.st_mode)
             or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o077
+            or (sys.platform != "win32" and stat.S_IMODE(info.st_mode) & 0o077)
             or info.st_size > _MAX_FILE_BYTES
         ):
             raise CodexClientMessageStoreError(
                 "Codex client-message store is not a private bounded file")
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(self.path, private=True):
+                raise CodexClientMessageStoreError("Codex client-message store is not private")
         try:
             raw_bytes = self.path.read_bytes()
             if len(raw_bytes) > _MAX_FILE_BYTES:
@@ -486,8 +491,12 @@ class CodexClientMessageStore:
                     "Codex client-message store exceeds size limit")
             payload = self._payload(records)
 
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.path.parent, 0o700)
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(self.path.parent)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.path.parent, 0o700)
         temporary = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{uuid4().hex}.tmp")
         try:

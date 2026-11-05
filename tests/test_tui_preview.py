@@ -100,6 +100,10 @@ async def test_real_image_widget_integrates_with_textual(monkeypatch):
     )
     async with app.run_test() as pilot:
         await pilot.pause()
+        for _ in range(100):
+            if len(app.query(HalfcellImage)):
+                break
+            await pilot.pause(0.01)
         assert len(app.query(HalfcellImage)) == 1
         assert app.query_one(TranscriptViewport).cache
         picture = app.query_one(HalfcellImage)

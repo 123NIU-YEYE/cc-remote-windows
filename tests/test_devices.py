@@ -302,7 +302,8 @@ def test_wrapper_config_rejects_group_readable_device_credentials(
         "wrapper_token": "t" * 64,
         "machine_id": "device-1234",
     }), encoding="utf-8")
-    os.chmod(path, 0o640)
+    from tests.platform_capabilities import make_public
+    make_public(path)
     monkeypatch.setenv("CC_REMOTE_DEVICE_CONFIG", str(path))
     monkeypatch.delenv("RELAY_URL", raising=False)
     with pytest.raises(ValueError, match="must not be accessible"):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+from pathlib import Path
 
 import asyncio
 import json
@@ -561,7 +562,7 @@ def test_codex_same_cwd_fork_inherits_model_and_permissions_once(monkeypatch):
             return {"thread": {"id": "forked-thread"}}
 
         async def profiles(cwd):
-            assert cwd == "/repo/component"
+            assert Path(cwd).resolve() == Path("/repo/component").resolve()
             return [{
                 "id": ":workspace", "description": None, "allowed": True,
             }]
@@ -1609,3 +1610,9 @@ def test_codex_worktree_message_fork_allows_completed_turn_while_parent_runs(mon
         assert prepared == [True]
 
     asyncio.run(run())
+
+
+@pytest.fixture(autouse=True)
+def _shared_transport_test_mode(monkeypatch):
+    """These tests replace native transports and exercise shared ownership."""
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")

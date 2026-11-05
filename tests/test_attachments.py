@@ -205,7 +205,8 @@ def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
         upload_dir = workspace / "uploads" / "work-message"
         assert (upload_dir / "00-note.txt").read_bytes() == b"x" * 8
         assert (upload_dir / "image-00.png").read_bytes().startswith(b"\x89PNG")
-        assert upload_dir.stat().st_mode & 0o777 == 0o700
+        from tests.platform_capabilities import assert_private
+        assert_private(upload_dir, 0o700)
         assert not (workspace.parent / "uploads").exists()
 
     asyncio.run(run())

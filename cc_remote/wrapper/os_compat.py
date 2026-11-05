@@ -274,6 +274,10 @@ def install_windows_shims() -> None:
             directory_fd_paths[handle] = resolved
 
     def _open_directory_tolerant(path, flags, mode=0o777, *, dir_fd=None):  # type: ignore[no-untyped-def]
+        # POSIX descriptor I/O is byte-exact. The Windows CRT otherwise
+        # translates CRLF and treats Ctrl-Z as EOF, corrupting hashes/images.
+        if not flags & os.O_TEXT:
+            flags |= os.O_BINARY
         base = _dir_base(dir_fd)
         resolved = os.path.join(base, os.fspath(path)) if base is not None else os.fspath(path)
         if not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT):
