@@ -14,13 +14,21 @@ async def test_wheel_arrives_at_bottom_after_initial_callback():
     app = WorkspaceApp(c, connect=False)
     async with app.run_test() as pilot:
         reader = app.query_one(Transcript)
+        for _ in range(50):
+            if not reader.follow_layout_pending:
+                break
+            await pilot.pause(0.01)
+        assert not reader.follow_layout_pending
         await pilot.press("k")
         reader.scroll_to(y=reader.max_scroll_y - 5, animate=False, immediate=True)
         reader.on_mouse_scroll_down()
         await pilot.pause()
         assert not view.follow  # Scroll animation has not reached its target.
         reader.scroll_end(animate=False, immediate=True)
-        await pilot.pause()
+        for _ in range(50):
+            if view.follow:
+                break
+            await pilot.pause(0.01)
         assert view.follow
         view.put(Block("new", "assistant", "new output\n" * 30))
         app.paint()

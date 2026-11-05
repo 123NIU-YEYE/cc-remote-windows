@@ -130,6 +130,11 @@ async def test_scroll_clips_images_and_never_covers_input(monkeypatch):
             await pilot.pause(0.01)
         assert viewport.cache and viewport.pictures
         picture = viewport.query_one(InlinePicture)
+        for _ in range(100):
+            if picture.region.area:
+                break
+            await pilot.pause(0.01)
+        assert picture.region.area
         region = app.screen.find_widget(picture).visible_region
         assert region.y >= viewport.region.y
         assert region.bottom <= viewport.region.bottom

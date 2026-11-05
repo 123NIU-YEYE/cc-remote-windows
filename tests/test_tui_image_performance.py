@@ -135,13 +135,24 @@ async def test_keyboard_pan_reaches_kitty_without_manual_render(monkeypatch):
         await app.push_screen(FilePreviewScreen(
             app.client, "s", PreviewRef("board.png", "image"), StableTGPImage,
         ))
+        await app.workers.wait_for_complete()
         await pilot.pause()
+        canvas = app.screen.query_one(ImageCanvas)
+        assert "zoom" in app.screen.local_actions
+        sent.clear()
         await pilot.press("z", "i")
-        await pilot.pause()
+        for _ in range(50):
+            if not canvas.pending and any(m.get("a") == "p" for m in sent):
+                break
+            await pilot.pause(0.01)
+        assert canvas.view.zoom > 1
         before = [m for m in sent if m.get("a") == "p"][-1]
         sent.clear()
         await pilot.press("j")
-        await pilot.pause()
+        for _ in range(50):
+            if any(m.get("a") == "p" for m in sent):
+                break
+            await pilot.pause(0.01)
         updates = [m for m in sent if m.get("a") == "p"]
         assert updates and updates[-1]["y"] > before["y"]
         assert not any("payload" in m for m in sent)
