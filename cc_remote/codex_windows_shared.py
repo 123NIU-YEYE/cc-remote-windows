@@ -229,9 +229,70 @@ def launch_app(home: Path, port: int, executable: Path) -> None:
     subprocess.Popen([str(executable)], env=environment, cwd=home)
 
 
+def app_acceptance(home: Path, port: int, executable: Path) -> dict:
+    """Read live process and TCP identities without starting or stopping clients."""
+    import psutil
+
+    result = {"state": "unavailable", "app_pids": [], "daemon_pid": None,
+              "bridge_pid": None, "connected_app_pids": []}
+    value = bridge_health(port)
+    if not value or not bridge_matches(value, home, port):
+        result["reason"] = "Selected account bridge is not verified"
+        return result
+    result.update(daemon_pid=value["daemon_pid"], bridge_pid=value["pid"])
+    candidates = []
+    owner = psutil.Process().username().casefold()
+    for process in psutil.process_iter(["exe", "username"]):
+        try:
+            if (not process.info["exe"] or not process.info["username"]
+                    or process.info["username"].casefold() != owner
+                    or Path(process.info["exe"]).resolve() != executable):
+                continue
+            identity = process_identity(process.pid)
+            if identity is None:
+                continue
+            result["app_pids"].append(process.pid)
+            complete, _argv, selected = process_command_environment_value(identity, "CODEX_HOME")
+            url_complete, _argv, url = process_command_environment_value(identity, "CODEX_APP_SERVER_WS_URL")
+            if (complete and selected and Path(selected).resolve() == home
+                    and url_complete and url == f"ws://127.0.0.1:{port}"):
+                candidates.append(identity)
+        except (psutil.Error, OSError):
+            continue
+    # Inspect both ends of an established connection, then revalidate the
+    # process generations and daemon. Environment/history alone is insufficient.
+    try:
+        connections = psutil.net_connections(kind="tcp")
+    except (psutil.Error, OSError):
+        result["reason"] = "Live TCP connection inspection is unavailable"
+        return result
+    for identity in candidates:
+        for connection in connections:
+            if (connection.pid != identity.pid or connection.status != psutil.CONN_ESTABLISHED
+                    or not connection.laddr or not connection.raddr
+                    or connection.laddr.ip != "127.0.0.1"
+                    or connection.raddr.ip != "127.0.0.1"
+                    or connection.raddr.port != port):
+                continue
+            reverse = any(peer.pid == value["pid"] and peer.status == psutil.CONN_ESTABLISHED
+                          and peer.laddr == connection.raddr and peer.raddr == connection.laddr
+                          for peer in connections)
+            if reverse and process_identity(identity.pid) == identity:
+                result["connected_app_pids"].append(identity.pid)
+                break
+    fresh = bridge_health(port)
+    if (result["connected_app_pids"] and fresh and bridge_matches(fresh, home, port)
+            and fresh["pid"] == value["pid"] and fresh["daemon_pid"] == value["daemon_pid"]):
+        result.update(state="verified", reason="App has a live connection to the selected native daemon bridge")
+    else:
+        result.update(state="awaiting_reopen" if result["app_pids"] else "not_running",
+                      reason="Use the shared launcher after the App is closed normally; existing work was preserved")
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["serve", "prepare", "app"])
+    parser.add_argument("action", choices=["serve", "prepare", "app", "check"])
     parser.add_argument("--home", type=Path)
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--app", type=Path)
@@ -250,6 +311,10 @@ def main() -> int:
         elif args.action == "prepare":
             ensure_bridge(home, args.port)
             print("Official native daemon bridge is ready; no App or model turn was started.")
+        elif args.action == "check" and args.app and args.app.is_file():
+            result = app_acceptance(home, args.port, args.app.resolve())
+            print(json.dumps(result))
+            return 0 if result["state"] == "verified" else 2
         elif args.app and args.app.is_file():
             launch_app(home, args.port, args.app.resolve())
         else:

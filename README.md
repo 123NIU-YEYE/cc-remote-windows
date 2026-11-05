@@ -166,6 +166,9 @@ DSH 桌面版的 API 只绑回环，且 **launch token 每次启动新生成、�
   本地桥接只把字节转发到同一原生 daemon，不另起一个私有 app-server。
 - 已运行的私有 App/CLI 不会自动迁移。桌面环境变量属于版本相关的内部行为，
   桥接握手通过不能替代 App 本身的连接验收；升级 App 后应重新验证。
+  用 `scripts/start-codex-shared-app.ps1 -Action check` 检查实际连接；
+  只有返回 `verified` 才通过 App 共享传输验收。详见
+  [Windows App 共享验收](docs/codex-desktop-windows.md)。
 
 ### 网页与本地会话的边界
 

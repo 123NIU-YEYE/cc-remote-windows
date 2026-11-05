@@ -1,4 +1,6 @@
-﻿# Launch the installed official Codex App against the same native daemon as
+﻿param([ValidateSet("app", "check")][string]$Action = "app")
+
+# Launch the installed official Codex App against the same native daemon as
 # ordinary `codex resume` and the Wrapper. Never stop an existing App.
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
@@ -11,9 +13,13 @@ $App = Join-Path $Package.InstallLocation $Relative
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "Missing project .venv." }
 Set-Location -LiteralPath $Root
 $ErrorActionPreference = "Continue"
-$Output = & $Python -m cc_remote.codex_windows_shared app --app $App 2>&1
+$Output = & $Python -m cc_remote.codex_windows_shared $Action --app $App 2>&1
 $Result = $LASTEXITCODE
 $ErrorActionPreference = "Stop"
+if ($Action -eq "check") {
+    $Output | Write-Output
+    exit $Result
+}
 if ($Result -ne 0) {
     Add-Type -AssemblyName System.Windows.Forms
     [void][System.Windows.Forms.MessageBox]::Show(
