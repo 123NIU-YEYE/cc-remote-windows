@@ -28,6 +28,7 @@ interface Props {
   onOpenDshTools?: () => void;
   onOpenArtifacts?: () => void;
   onOpenFiles?: () => void;
+  onOpenSessionInfo?: (trigger: HTMLButtonElement) => void;
   onLogout: () => void;
 }
 
@@ -57,6 +58,7 @@ export function HeaderMenu({
   onOpenBtw,
   onOpenViewer,
   onOpenFiles,
+  onOpenSessionInfo,
   onOpenArtifacts,
   onOpenDshTools,
   onLogout,
@@ -167,6 +169,15 @@ export function HeaderMenu({
             onPointerDown={(event) => event.stopPropagation()}>
             {page === "main" ? (
               <div className="header-menu-items">
+                {onOpenSessionInfo && <button type="button" className="header-menu-item"
+                  aria-label="会话信息与本地续接" onClick={() => {
+                    close();
+                    if (triggerRef.current) onOpenSessionInfo(triggerRef.current);
+                  }}>
+                  <Icon name="term" size={18} />
+                  <span><b>会话信息与本地续接</b><small>原生 ID、目录与控制权</small></span>
+                  <Icon name="chevron-right" size={16} />
+                </button>}
                 {engine === "dsh" && <button type="button" className="header-menu-item"
                   disabled aria-label="侧边聊天暂未开放" title={DSH_SIDECHAT_UNAVAILABLE}>
                   <SideChatIcon size={18} />
