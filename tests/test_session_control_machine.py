@@ -29,8 +29,10 @@ def test_control_revision_changes_only_when_public_value_changes():
             can_takeover=True,
         )
         assert changed.revision == 1
-        assert len(transport.sent) == 1
+        assert [event.type for event in transport.sent] == [
+            "session_control", "auto_compact"]
         assert isinstance(transport.sent[0], SessionControl)
+        assert transport.sent[1].mutable is False
 
         duplicate = await machine._set_session_control(
             ctx,
@@ -41,7 +43,7 @@ def test_control_revision_changes_only_when_public_value_changes():
             can_takeover=True,
         )
         assert duplicate.revision == 1
-        assert len(transport.sent) == 1
+        assert len(transport.sent) == 2
         assert machine._control_revision_epochs["sid"] == 1
 
     asyncio.run(go())
@@ -74,7 +76,9 @@ def test_control_revision_advances_when_same_sid_context_is_rebuilt():
             terminal_attached=False,
         )
         assert duplicate.revision == 2
-        assert len(transport.sent) == 1
+        assert [event.type for event in transport.sent] == [
+            "session_control", "auto_compact"]
+        assert transport.sent[1].mode == "inherit"
         assert machine._control_revision_epochs["sid"] == 2
 
     asyncio.run(go())
@@ -112,6 +116,7 @@ def test_external_cli_is_read_only_but_shared_codex_stays_writable():
             "engine": "codex",
             "external": True,
             "holders": {object()},
+            "scan_complete": True,
             "takeover_pending": False,
         }
         machine._watch["codex-sid"] = codex_watch
@@ -141,6 +146,7 @@ def test_interrupted_shared_codex_never_degrades_to_external_cli():
             "engine": "codex",
             "external": True,
             "holders": {object()},
+            "scan_complete": True,
             "takeover_pending": False,
         }
         machine._watch["codex-sid"] = watch
@@ -152,6 +158,44 @@ def test_interrupted_shared_codex_never_degrades_to_external_cli():
         assert control.terminal_attached is True
         assert control.can_takeover is False
         assert "连接断开" in (control.reason or "")
+        assert machine._is_external("codex-sid") is False
+
+    asyncio.run(go())
+
+
+def test_incomplete_shared_codex_scan_recovers_from_temporary_write_barrier():
+    async def go():
+        machine, _ = _mk_machine()
+
+        class Shared:
+            using_daemon_proxy = True
+
+        codex = _mk_ctx("codex-sid", "codex-sid")
+        codex.engine = "codex"
+        codex.space = "code"
+        codex.sdk = Shared()
+        machine.sessions[codex.key] = codex
+        watch = {
+            "engine": "codex",
+            "external": False,
+            "holders": set(),
+            "scan_complete": False,
+            "takeover_pending": False,
+        }
+        machine._watch["codex-sid"] = watch
+
+        unknown = await machine._sync_external_control(codex, watch)
+        assert unknown.control_mode == "external_cli"
+        assert unknown.write_state == "read_only"
+        assert unknown.can_takeover is False
+        assert "暂不可确认" in (unknown.reason or "")
+        assert machine._is_external("codex-sid") is True
+
+        watch["scan_complete"] = True
+        recovered = await machine._sync_external_control(codex, watch)
+        assert recovered.control_mode == "codex_shared"
+        assert recovered.write_state == "writable"
+        assert recovered.reason is None
         assert machine._is_external("codex-sid") is False
 
     asyncio.run(go())

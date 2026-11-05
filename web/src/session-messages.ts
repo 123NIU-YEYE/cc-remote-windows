@@ -1,0 +1,32 @@
+import type { SessionInfo } from "./protocol";
+
+const NATIVE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const LOCAL_REF = /^ccr:(claude|codex):([A-Za-z0-9][A-Za-z0-9._@-]{0,110})$/;
+
+export function localSessionReference(value: string): { engine: string; sid: string } | null {
+  const match = LOCAL_REF.exec(value);
+  return match && value.length <= 128 ? { engine: match[1], sid: match[2] } : null;
+}
+
+/** Native IDs stay within their account; explicit unified refs can identify
+ * another engine/account in this device's catalog. Never a different device. */
+export function resolveRelatedSession(
+  nativeId: string, currentSid: string | null, sessions: readonly SessionInfo[],
+): SessionInfo | undefined {
+  if (!currentSid) return undefined;
+  const local = localSessionReference(nativeId);
+  if (local) return sessions.find((session) => session.session_id === local.sid
+    && session.engine === local.engine && session.space !== "work" && session.session_id !== currentSid);
+  if (!NATIVE_ID.test(nativeId)) return undefined;
+  const separator = currentSid.indexOf("@");
+  const target = separator < 0 ? nativeId : `${currentSid.slice(0, separator)}@${nativeId}`;
+  if (target === currentSid) return undefined;
+  return sessions.find((session) => session.session_id === target
+    && session.engine === "codex" && session.space !== "work");
+}
+
+export function relatedSessionTitle(session: SessionInfo | undefined, nativeId: string): string {
+  const local = localSessionReference(nativeId);
+  return session?.summary || session?.first_prompt
+    || (local ? `${local.engine === "claude" ? "Claude" : "Codex"} · ${local.sid.split("@").at(-1)!.slice(0, 8)}` : nativeId.slice(0, 8));
+}

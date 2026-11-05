@@ -1,6 +1,5 @@
+import { hasHarmonyPush, enableHarmonyPush, disableHarmonyPush } from "./harmony-push.ts";
 import type { RemoteNotificationMode } from "./notification-mode";
-
-type PushConfig = { enabled: boolean; public_key: string };
 
 export interface PushBindingTarget {
   machineId: string;
@@ -15,7 +14,10 @@ export interface PushBindingSnapshot {
   bound: PushBindingTarget | null;
 }
 
-type PushBindingApply = (target: PushBindingTarget | null) => Promise<boolean>;
+// false preserves the previous binding; null means the adapter revoked it while
+// rolling back a failed mutation. Neither result commits the requested target.
+export type PushBindingResult = boolean | null;
+type PushBindingApply = (target: PushBindingTarget | null) => Promise<PushBindingResult>;
 type PushBindingListener = (snapshot: PushBindingSnapshot) => void;
 
 function sameTarget(
@@ -31,6 +33,7 @@ export class PushBindingCoordinator {
   private bound: PushBindingTarget | null = null;
   private state: PushBindingState = "off";
   private drain: Promise<void> | null = null;
+  private refresh = false;
   private listener: PushBindingListener | null = null;
 
   constructor(apply: PushBindingApply) {
@@ -59,8 +62,9 @@ export class PushBindingCoordinator {
       && (this.state === "remote" || this.state === "binding");
   }
 
-  async setTarget(target: PushBindingTarget | null): Promise<PushBindingSnapshot> {
+  async setTarget(target: PushBindingTarget | null, refresh = false): Promise<PushBindingSnapshot> {
     this.desired = target ? { ...target } : null;
+    this.refresh ||= refresh;
     if (!this.drain) {
       this.drain = this.run().finally(() => {
         this.drain = null;
@@ -78,18 +82,26 @@ export class PushBindingCoordinator {
   private async run(): Promise<void> {
     while (true) {
       const target = this.desired ? { ...this.desired } : null;
-      if (sameTarget(target, this.bound)) {
+      if (sameTarget(target, this.bound) && !this.refresh) {
         this.publish(target ? "remote" : "off");
         return;
       }
+      this.refresh = false;
       this.publish("binding");
-      const enabled = await this.apply(target);
+      let enabled: PushBindingResult = false;
+      try {
+        enabled = await this.apply(target);
+      } catch {
+        // A failed adapter must settle through the same path as a rejected
+        // binding, including any newer target queued while it was in flight.
+      }
       if (enabled) this.bound = target;
+      else if (enabled === null) this.bound = null;
 
       // A newer request arrived while the network mutation was in flight.
       // Continue from the actual binding that just completed; never publish the
       // stale target as the current machine.
-      if (!sameTarget(target, this.desired)) continue;
+      if (!sameTarget(target, this.desired) || this.refresh) continue;
       if (!target) {
         if (enabled) this.bound = null;
         this.publish("off");
@@ -105,92 +117,20 @@ export class PushBindingCoordinator {
   }
 }
 
-function applicationServerKey(value: string): Uint8Array<ArrayBuffer> {
-  const padded = value.replace(/-/g, "+").replace(/_/g, "/")
-    + "=".repeat((4 - value.length % 4) % 4);
-  const raw = atob(padded);
-  return Uint8Array.from(raw, (character) => character.charCodeAt(0));
-}
-
-async function config(): Promise<PushConfig | null> {
+export async function enableRemotePush(machineId: string, mode: RemoteNotificationMode = "generic"): Promise<PushBindingResult> {
   try {
-    const response = await fetch("/api/push-config", {
-      credentials: "same-origin", cache: "no-store",
-    });
-    if (!response.ok) return null;
-    const payload = await response.json() as Partial<PushConfig>;
-    return {
-      enabled: payload.enabled === true,
-      public_key: typeof payload.public_key === "string" ? payload.public_key : "",
-    };
-  } catch {
-    return null;
-  }
-}
-
-export async function enableRemotePush(
-  machineId: string,
-  mode: RemoteNotificationMode = "generic",
-): Promise<boolean> {
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return false;
-  const pushConfig = await config();
-  if (!pushConfig?.enabled || !pushConfig.public_key) return false;
-  try {
-    const registration = await navigator.serviceWorker.ready;
-    let subscription = await registration.pushManager.getSubscription();
-    subscription ??= await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: applicationServerKey(pushConfig.public_key),
-    });
-    const serialized = subscription.toJSON();
-    if (!serialized.endpoint || !serialized.keys?.p256dh || !serialized.keys.auth) {
-      return false;
-    }
-    const response = await fetch("/api/push/subscribe", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        machine_id: machineId,
-        notification_mode: mode,
-        endpoint: serialized.endpoint,
-        keys: serialized.keys,
-      }),
-    });
-    return response.ok;
+    if (hasHarmonyPush()) return await enableHarmonyPush(machineId, mode);
+    return await (await import("./web-push.ts")).enableRemotePush(machineId, mode);
   } catch {
     return false;
   }
 }
 
 export async function disableRemotePush(): Promise<boolean> {
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) return true;
-  let subscription: PushSubscription | null;
   try {
-    const registration = await navigator.serviceWorker.ready;
-    subscription = await registration.pushManager.getSubscription();
+    if (hasHarmonyPush()) return await disableHarmonyPush();
+    return await (await import("./web-push.ts")).disableRemotePush();
   } catch {
     return false;
   }
-  if (!subscription) return true;
-  let relayRemoved = false;
-  let browserRemoved = false;
-  try {
-    const response = await fetch("/api/push/unsubscribe", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ endpoint: subscription.endpoint }),
-    });
-    relayRemoved = response.ok;
-  } catch {
-    // Still invalidate the browser endpoint below. The push service will then
-    // return 404/410 to a stale relay row, which prunes it durably.
-  }
-  try {
-    browserRemoved = await subscription.unsubscribe();
-  } catch {
-    // A successful relay removal is already sufficient to stop delivery.
-  }
-  return relayRemoved || browserRemoved;
 }

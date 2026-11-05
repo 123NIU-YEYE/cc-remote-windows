@@ -14,12 +14,13 @@ import difflib
 import json
 import os
 import re
+import stat
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 from claude_agent_sdk.types import (
     AssistantMessage, ResultMessage, UserMessage, SystemMessage,
@@ -29,13 +30,23 @@ from claude_agent_sdk.types import (
     TaskNotificationMessage, HookEventMessage,
 )
 
+from cc_remote.wrapper.history_scan_cache import IncrementalJsonlProjection
+from cc_remote.wrapper.history_metrics import history_stage
 from cc_remote.claude_paths import claude_projects_dir
 from cc_remote.protocol import (
+    MAX_BACKGROUND_PROCESS_COMMAND_CHARS, MAX_BACKGROUND_PROCESS_ITEMS,
     AssistantMsgStart, Delta, ToolUse, ToolResult, AssistantMsgEnd,
-    ToolDelta, ProcessEvent, TurnPlan,
+    ToolDelta, ProcessEvent, BackgroundProcessItem, BackgroundProcessSync,
+    TurnPlan,
     TurnEnd, TurnResult, UserMsg,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
+from cc_remote.wrapper.claude_compaction import (
+    compact_completion_events, compact_metadata, manual_compact_prompt,
+)
+from cc_remote.wrapper.claude_model_fallback import FALLBACK_TOOL, model_fallback_event
+from cc_remote.wrapper.turn_changes import native_claude_diff
+from cc_remote.wrapper.token_usage import UsageLedger, native_usage
 
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -47,6 +58,8 @@ _MAX_TRANSCRIPT_MATCHES = 1000
 _MAX_TRANSCRIPT_RECORD_CHARS = 64 * 1024 * 1024
 _MAX_TIMESTAMP_ENTRIES = 200_000
 _MAX_TRANSCRIPT_CHAIN_ENTRIES = 200_000
+_MAX_DELAYED_RETRY_TAIL_ROWS = 4096
+_MAX_DELAYED_RETRY_TAIL_BYTES = 64 * 1024 * 1024
 _MAX_INTERNAL_USER_EVENTS = 10_000
 _MAX_SUBAGENT_FILES = 128
 _MAX_SUBAGENT_TOTAL_BYTES = 32 * 1024 * 1024
@@ -59,9 +72,18 @@ _MAX_DIFF_SOURCE_CHARS = 512 * 1024
 _MAX_DIFF_SOURCE_LINES = 4096
 _MAX_LIVE_TOOL_ITEMS = 4096
 _LIVE_TOOL_ITEMS_OMITTED_ID = "cc-remote-live-tools-omitted"
+_CLAUDE_IMAGE_READ_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".webp",
+})
 _SYNTHETIC_NO_RESPONSE_TEXT = "No response requested."
 _INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
 _SYNTHETIC_API_ERROR_PREFIX = "API Error:"
+_CLAUDE_AGENT_TASK_TYPES = frozenset({
+    # Current Claude Code / Agent SDK task types.
+    "local_agent", "local_workflow", "in_process_teammate",
+    # Older/alternate runtimes retained for source compatibility.
+    "agent", "subagent",
+})
 _DIFF_LINE_BREAK = re.compile(
     r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
@@ -81,6 +103,205 @@ def _short_text(value: Any, limit: int = 1024) -> str | None:
     text, _ = bounded_text(value, limit)
     text = " ".join(text.split())
     return text or None
+
+
+def _claude_image_read_path(name: Any, tool_input: Any) -> str | None:
+    """Recognize Claude's built-in binary image read before its result arrives.
+
+    SVG deliberately remains a normal text Read: Claude Code returns SVG source
+    rather than an image content block.  The binary formats below are the ones
+    which produce ``tool_result.content[].type=image`` in the transcript.
+    """
+    normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if normalized not in {"read", "readfile"} or not isinstance(tool_input, dict):
+        return None
+    path = tool_input.get("file_path") or tool_input.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or len(path) > 4096
+        or os.path.splitext(path)[1].lower() not in _CLAUDE_IMAGE_READ_SUFFIXES
+    ):
+        return None
+    return path
+
+
+def _claude_image_blocks(content: Any) -> list[dict[str, str]]:
+    """Extract only public base64 image blocks from one Claude tool result."""
+    blocks = (
+        [content]
+        if isinstance(content, dict) and content.get("type") == "image"
+        else content.get("content") if isinstance(content, dict)
+        else content
+    )
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    if not isinstance(blocks, list):
+        return []
+    images: list[dict[str, str]] = []
+    for block in blocks[:8]:
+        if not isinstance(block, dict) or block.get("type") != "image":
+            continue
+        image = _cc_img_block(block)
+        if (
+            image is not None
+            and isinstance(image.get("media_type"), str)
+            and isinstance(image.get("data"), str)
+        ):
+            images.append(image)
+    return images
+
+
+def _claude_history_tool_use_block(block: Any) -> bool:
+    return (
+        isinstance(block, dict)
+        and block.get("type") in {"tool_use", "server_tool_use"}
+    )
+
+
+def _claude_history_tool_result_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    block_type = block.get("type")
+    return bool(
+        block_type == "tool_result"
+        or (
+            isinstance(block_type, str)
+            and block_type.endswith("_tool_result")
+            and block.get("tool_use_id")
+        )
+    )
+
+
+def _claude_history_tool_result_error(block: dict[str, Any]) -> bool:
+    content = block.get("content")
+    content_type = content.get("type", "") if isinstance(content, dict) else ""
+    return bool(block.get("is_error")) or "error" in str(content_type).lower()
+
+
+def claude_history_image_id(tool_use_id: str, index: int = 0) -> str:
+    """Stable opaque id for an image returned by one native Claude tool call."""
+    digest = hashlib.sha256(
+        f"claude-tool-image\0{tool_use_id}\0{index}".encode(
+            "utf-8", "surrogatepass")
+    ).hexdigest()[:24]
+    return f"img-{digest}"
+
+
+@dataclass(frozen=True)
+class ClaudeHistoryImageAsset:
+    """Private transcript image body paired with its public process item."""
+
+    item_id: str
+    image_id: str
+    media_type: str
+    data: str
+
+
+def extract_claude_history_image_assets(
+    messages: Any,
+    *,
+    item_ids: set[str] | frozenset[str] | None = None,
+    max_assets: int = 64,
+) -> tuple[ClaudeHistoryImageAsset, ...]:
+    """Read only requested Claude ``Read`` image bodies from loaded history.
+
+    The ordinary history translator emits no base64.  This side channel is used
+    after pagination selected the visible turns, so a transcript containing many
+    old images cannot make one four-turn History request retain every body.
+    """
+    wanted = set(item_ids) if item_ids is not None else None
+    if max_assets <= 0 or wanted == set():
+        return ()
+    image_reads: dict[str, str] = {}
+    assets: list[ClaudeHistoryImageAsset] = []
+    for message in messages or ():
+        payload = getattr(message, "message", None)
+        if not isinstance(payload, dict):
+            continue
+        role = payload.get("role") or getattr(message, "type", None)
+        content = payload.get("content")
+        if not isinstance(content, list):
+            continue
+        if role not in {"assistant", "user"}:
+            continue
+        for block in content:
+            if _claude_history_tool_use_block(block):
+                raw_id = block.get("id")
+                if (
+                    not isinstance(raw_id, str)
+                    or not _SAFE_WIRE_ID.fullmatch(raw_id)
+                    or (wanted is not None and raw_id not in wanted)
+                ):
+                    continue
+                if _claude_image_read_path(
+                    block.get("name"), block.get("input")
+                ):
+                    image_reads[raw_id] = raw_id
+                continue
+            if not _claude_history_tool_result_block(block):
+                continue
+            raw_id = block.get("tool_use_id")
+            item_id = image_reads.pop(raw_id, None) if isinstance(raw_id, str) else None
+            if item_id is None or _claude_history_tool_result_error(block):
+                continue
+            images = _claude_image_blocks(block.get("content"))
+            if not images:
+                continue
+            image = images[0]
+            assets.append(ClaudeHistoryImageAsset(
+                item_id=item_id,
+                image_id=claude_history_image_id(item_id),
+                media_type=image["media_type"],
+                data=image["data"],
+            ))
+            if len(assets) >= max_assets:
+                return tuple(assets)
+    return tuple(assets)
+
+
+def _is_agent_task_type(value: Any) -> bool:
+    return isinstance(value, str) \
+        and value.lower() in _CLAUDE_AGENT_TASK_TYPES
+
+
+def replayed_user_message_id(message: Any) -> str | None:
+    """Return the native UUID for one top-level replayed human input.
+
+    ``--replay-user-messages`` is the only authoritative live bridge between a
+    browser Query and Claude's independently-generated transcript identity.
+    Tool-result user envelopes are part of the same turn and must never become
+    additional aliases for the optimistic browser row.
+    """
+    if (not isinstance(message, UserMessage) or message.parent_tool_use_id
+            or getattr(message, "_cc_synthetic_user", False)):
+        return None
+    origin = getattr(message, "origin", None)
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        # Streaming-input sessions replay autonomous task/channel/peer prompts
+        # through the same UserMessage class. Only a human/unattributed prompt
+        # can own the browser's optimistic row.
+        return None
+    if _is_interrupted_user_content(message.content):
+        # Claude replays its synthetic interrupt marker through the same
+        # UserMessage channel as a real browser prompt.  A replacement query
+        # can start before that late marker reaches the SDK reader; binding it
+        # would give the next optimistic row the preceding turn's UUID.
+        return None
+    raw_text = message.content if isinstance(message.content, str) else "".join(
+        block.text for block in message.content if isinstance(block, TextBlock))
+    if raw_text and _is_meta_user_text(raw_text):
+        return None
+    content = message.content if isinstance(message.content, list) else []
+    if any(isinstance(block, (ToolResultBlock, ServerToolResultBlock))
+           for block in content):
+        return None
+    native_id = message.uuid
+    return (
+        native_id
+        if isinstance(native_id, str) and _CLAUDE_MESSAGE_UUID.fullmatch(native_id)
+        else None
+    )
 
 
 _SENSITIVE_INPUT_MARKERS = (
@@ -203,6 +424,24 @@ def _tool_meta(name: str, tool_input: dict[str, Any], *, server_tool: bool = Fal
     return "tool", _short_text(tool_input.get("description"), 900) or raw_name, None
 
 
+def _public_tool_input(name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded public payload for one tool invocation.
+
+    Agent/Task ``prompt`` is delegated model context, not user-facing process
+    output.  Keep only the small presentation fields already used by the card;
+    an allowlist also fails closed when a future SDK adds new private fields.
+    """
+    if (name or "").lower() not in {"agent", "task"}:
+        value = _redact_sensitive_input(tool_input)
+        return value if isinstance(value, dict) else {}
+    public: dict[str, Any] = {}
+    for key in ("description", "subagent_type", "agent_type"):
+        value = _short_text(tool_input.get(key), 1000)
+        if value:
+            public[key] = value
+    return public
+
+
 def _tool_diff(name: str, tool_input: dict[str, Any], max_chars: int) -> tuple[str | None, bool]:
     """Build a bounded display diff only from the exact Edit/Write payload."""
     lower = (name or "").lower()
@@ -293,6 +532,17 @@ def _tool_diff(name: str, tool_input: dict[str, Any], max_chars: int) -> tuple[s
 
 def _safe_result_content(tool_name: str | None, content: Any) -> Any:
     """Keep MCP user-visible text while dropping opaque/private metadata."""
+    if (tool_name or "").lower() in {"agent", "task"}:
+        # Claude's Agent launch result contains an internal agent id, delegated
+        # prompt and temporary output-file path. None of those are part of the
+        # public cc-remote projection; the dedicated Agent detail endpoint owns
+        # the useful process and final text.
+        text = content if isinstance(content, str) else ""
+        return (
+            "协作代理已启动"
+            if "async agent launched" in text.lower()
+            else "协作代理已完成"
+        )
     if not (tool_name or "").lower().startswith("mcp__"):
         return content
     if isinstance(content, str) or content is None:
@@ -307,6 +557,28 @@ def _safe_result_content(tool_name: str | None, content: Any) -> Any:
         if block.get("type") == "text" and isinstance(block.get("text"), str):
             texts.append(block["text"])
     return "\n".join(texts) if texts else "MCP 调用已完成"
+
+
+def _safe_image_read_result_content(tool_name: str, content: Any) -> Any:
+    """Preserve diagnostics without ever projecting an image body as text."""
+    blocks = (
+        [content]
+        if isinstance(content, dict) and content.get("type") == "image"
+        else content.get("content") if isinstance(content, dict)
+        else content
+    )
+    if isinstance(blocks, dict):
+        blocks = [blocks]
+    if isinstance(blocks, list):
+        removed_image = False
+        filtered = []
+        for block in blocks[:64]:
+            if isinstance(block, dict) and block.get("type") == "image":
+                removed_image = True
+                continue
+            filtered.append(block)
+        return filtered or ("图片读取结果不可用" if removed_image else [])
+    return _safe_result_content(tool_name, content)
 
 
 def _assistant_text_channel(stop_reason: str | None, has_tool: bool,
@@ -345,16 +617,67 @@ def _task_progress(usage: Any, last_tool_name: str | None = None) -> str | None:
 
 
 def _agent_process_id(tool_id: str) -> str:
-    """Stable process row paired with one Claude Agent/Task tool call."""
-    return _wire_id(f"agent:{tool_id}", "agent")
+    """Stable public run id paired with one Claude Agent/Task tool call."""
+    digest = hashlib.sha256(
+        f"claude-agent\0{tool_id}".encode("utf-8", "surrogatepass")
+    ).hexdigest()[:24]
+    return f"agent-{digest}"
+
+
+def public_agent_run_id(tool_id: str) -> str:
+    """Public helper shared by live routing and source-backed detail lookup."""
+    return _agent_process_id(_wire_id(tool_id, "tool"))
+
+
+def claude_background_tasks(
+    message: object,
+) -> tuple[dict[str, str | bool], ...] | None:
+    """Return Claude's authoritative live-background-task level.
+
+    Claude Code documents ``background_tasks_changed.tasks`` as a full
+    replacement, not an edge stream.  ``None`` means this is not a valid level
+    event; an empty tuple is the meaningful authoritative empty set.  Ambient
+    runner bookkeeping is intentionally excluded from user-visible work.
+    """
+    if not (
+        isinstance(message, SystemMessage)
+        and message.subtype == "background_tasks_changed"
+    ):
+        return None
+    data = message.data if isinstance(message.data, dict) else {}
+    raw_tasks = data.get("tasks")
+    if not isinstance(raw_tasks, list):
+        return None
+    tasks: list[dict[str, str | bool]] = []
+    seen: set[str] = set()
+    for raw in raw_tasks:
+        if not isinstance(raw, dict) or raw.get("ambient") is True:
+            continue
+        raw_id = raw.get("task_id")
+        if not isinstance(raw_id, str) or not raw_id or raw_id in seen:
+            continue
+        seen.add(raw_id)
+        task: dict[str, str | bool] = {"task_id": raw_id}
+        task_type = raw.get("task_type")
+        if isinstance(task_type, str) and task_type:
+            task["task_type"] = task_type
+        description = raw.get("description")
+        if isinstance(description, str) and description:
+            task["description"] = description
+        tasks.append(task)
+    return tuple(tasks)
 
 
 class StreamTranslator:
     def __init__(self, tool_result_max: int, turn_id: str | None = None,
                  item_turns: dict[str, str] | None = None,
                  item_titles: dict[str, str] | None = None,
-                 item_meta: dict[str, tuple[str, str | None]] | None = None):
+                 item_meta: dict[str, tuple[str, str | None]] | None = None,
+                 item_commands: dict[str, str] | None = None,
+                 manual_compact: bool = False):
         self.tool_result_max = tool_result_max
+        self.manual_compact = manual_compact
+        self.compact_boundary_id: str | None = None
         self.turn_id = _wire_id(turn_id, "turn") if turn_id else None
         # These maps are optionally shared by every translator for one resident
         # session. Claude's queue is continuous across ResultMessage boundaries;
@@ -363,13 +686,17 @@ class StreamTranslator:
         self.item_turns = item_turns if item_turns is not None else {}
         self.item_titles = item_titles if item_titles is not None else {}
         self.item_meta = item_meta if item_meta is not None else {}
+        self.item_commands = (
+            item_commands if item_commands is not None else {})
         self._message_ids: dict[str, str] = {}
+        self._message_turn_id: str | None = None
         self._started_channels: set[str] = set()
         # Only the emitted prefix LENGTH is needed to deduplicate the assembled
         # AssistantMessage after streaming deltas.  Retaining and repeatedly
         # concatenating the complete text made long turns unbounded and O(n^2).
         self._emitted: dict[str, int] = {"thinking": 0, "text": 0}
         self._tool_diffs: dict[str, tuple[str, bool]] = {}
+        self._tool_paths: dict[str, str] = {}
         self._tool_names: dict[str, str] = {}
         self._tool_outputs: dict[str, str] = {}
         self._tool_delta_totals: dict[str, int] = {}
@@ -384,6 +711,11 @@ class StreamTranslator:
         self._tool_items: set[str] = set()
         self._finished_tool_items: set[str] = set()
         self._tool_items_truncated = False
+        # Claude exposes viewed images as a normal Read tool followed by an
+        # image-valued ToolResult. Project those calls through the existing
+        # engine-neutral view_image process instead of serializing base64 as
+        # ordinary tool output.
+        self._image_reads: dict[str, tuple[str, str | None]] = {}
         self._plan_item_id: str | None = None
         # stop_reason can be null even for Claude's true final text. Keep the
         # last top-level no-tool candidate until the authoritative successful
@@ -399,6 +731,19 @@ class StreamTranslator:
         # transcript UUID. Keep it separate from the browser's optimistic turn
         # id and from tool-result user envelopes.
         self._last_user_uuid: str | None = None
+        self._compaction_id: str | None = None
+        self._usage = UsageLedger()
+        self._usage_message: tuple[str, str | None] | None = None
+        self._usage_rebound = False
+
+    def rebind_turn(self, turn_id: str) -> None:
+        """Advance at a native input echo while retaining unfinished item owners."""
+        self._usage_rebound = True
+        self.turn_id = turn_id
+        self._ambiguous_final_mid = None
+        self._has_final_text = False
+        self._last_assistant_uuid = None
+        self._last_user_uuid = None
 
     def _remember_turn(self, item_id: str, parent_id: str | None = None) -> str | None:
         turn = (self.item_turns.get(item_id)
@@ -412,7 +757,16 @@ class StreamTranslator:
                 self.item_turns.pop(old, None)
                 self.item_titles.pop(old, None)
                 self.item_meta.pop(old, None)
+                self.item_commands.pop(old, None)
         return turn
+
+    def _background_for_turn(self, turn: str | None) -> bool | None:
+        """Mark an item restored from an older translator as detached work."""
+        return bool(
+            turn is not None
+            and self.turn_id is not None
+            and turn != self.turn_id
+        ) or None
 
     def _message_id(self, channel_key: str, suggested: str | None = None) -> str:
         current = self._message_ids.get(channel_key)
@@ -428,7 +782,10 @@ class StreamTranslator:
                         suggested: str | None = None) -> str:
         mid = self._message_id(channel_key, suggested)
         if channel_key not in self._started_channels:
-            events.append(AssistantMsgStart(message_id=mid, channel=channel))
+            if not self._started_channels:
+                self._message_turn_id = self.turn_id
+            events.append(AssistantMsgStart(
+                message_id=mid, turn_id=self._message_turn_id, channel=channel))
             self._started_channels.add(channel_key)
         return mid
 
@@ -440,16 +797,20 @@ class StreamTranslator:
         if not bounded:
             return
         mid = self._ensure_channel(events, channel_key, channel, suggested)
-        events.append(Delta(message_id=mid, text=bounded, channel=channel))
+        events.append(Delta(
+            message_id=mid, turn_id=self._message_turn_id,
+            text=bounded, channel=channel))
         self._emitted[channel_key] += len(bounded)
 
     def _finish_message(self, events: list, text_channel: str) -> None:
         if "thinking" in self._started_channels:
             events.append(AssistantMsgEnd(
-                message_id=self._message_ids["thinking"], channel="thinking"))
+                message_id=self._message_ids["thinking"],
+                turn_id=self._message_turn_id, channel="thinking"))
         if "text" in self._started_channels:
             events.append(AssistantMsgEnd(
-                message_id=self._message_ids["text"], channel=text_channel))
+                message_id=self._message_ids["text"],
+                turn_id=self._message_turn_id, channel=text_channel))
         self._message_ids.clear()
         self._started_channels.clear()
         self._emitted = {"thinking": 0, "text": 0}
@@ -468,7 +829,7 @@ class StreamTranslator:
             item_id=item_id, kind="agent", phase=phase, status=status,
             turn_id=self._remember_turn(item_id, tool_id), parent_id=tool_id,
             title=resolved_title, summary=summary, progress=progress,
-            duration_ms=duration_ms,
+            duration_ms=duration_ms, background=True,
         )
 
     def _emit_tool_use(self, events: list, block: ToolUseBlock | ServerToolUseBlock,
@@ -479,20 +840,51 @@ class StreamTranslator:
         if not self._admit_tool_item(tool_id, events):
             return
         parent = _wire_id(parent_id, "tool") if parent_id else None
+        tool_turn = self._remember_turn(tool_id, parent)
         redacted_input = _redact_sensitive_input(block.input)
-        safe_input = bounded_tool_input(redacted_input, self.tool_result_max)
+        public_input = _public_tool_input(block.name, block.input)
+        safe_input = bounded_tool_input(public_input, self.tool_result_max)
         category, title, server = _tool_meta(
             block.name, redacted_input, server_tool=server_tool)
+        image_path = _claude_image_read_path(block.name, block.input)
+        self._tool_names[tool_id] = block.name
+        if image_path is not None:
+            self._image_reads[tool_id] = (image_path, parent)
+            self.item_titles[tool_id] = "查看图片"
+            events.append(ProcessEvent(
+                item_id=tool_id,
+                kind="server_tool",
+                phase="start",
+                status="running",
+                turn_id=tool_turn,
+                parent_id=parent,
+                title="查看图片",
+                input={"file_path": image_path},
+                tool="view_image",
+                background=self._background_for_turn(tool_turn),
+            ))
+            return
         events.append(ToolUse(
-            message_id=message_id, tool_use_id=tool_id, tool=block.name,
+            message_id=message_id, tool_use_id=tool_id,
+            turn_id=tool_turn, tool=block.name,
             input=safe_input, category=category, title=title,
             parent_id=parent, server=server,
+            background=self._background_for_turn(tool_turn),
         ))
-        self._tool_names[tool_id] = block.name
         self.item_titles[tool_id] = title
-        self._remember_turn(tool_id, parent)
+        if category == "command":
+            command = safe_input.get("command") or safe_input.get("cmd")
+            if isinstance(command, str) and command:
+                safe_command, _ = bounded_text(
+                    command, MAX_BACKGROUND_PROCESS_COMMAND_CHARS)
+                if safe_command:
+                    self.item_commands[tool_id] = safe_command
         diff, was_truncated = _tool_diff(
             block.name, block.input, self.tool_result_max)
+        if block.name.lower() in {"edit", "write", "multiedit"}:
+            path = block.input.get("file_path") or block.input.get("path")
+            if isinstance(path, str) and len(path) <= 4096:
+                self._tool_paths[tool_id] = path
         if diff:
             self._tool_diffs[tool_id] = (diff, was_truncated)
 
@@ -530,7 +922,10 @@ class StreamTranslator:
 
     def _emit_tool_result(self, events: list, tool_use_id: Any, content: Any,
                           is_error: bool = False, summary: str | None = None,
-                          duration_ms: int | None = None) -> None:
+                          duration_ms: int | None = None,
+                          agent_terminal: bool | None = None,
+                          agent_status: str | None = None,
+                          native_result: dict | None = None) -> None:
         self._ambiguous_final_mid = None
         tool_id = _wire_id(tool_use_id, "tool")
         # Fail closed for a result whose ToolUse was omitted/never observed. In
@@ -541,23 +936,92 @@ class StreamTranslator:
                 or tool_id in self._finished_tool_items):
             return
         events.extend(self._flush_tool_deltas(tool_id))
+        image_read = self._image_reads.pop(tool_id, None)
+        if image_read is not None:
+            image_path, parent = image_read
+            tool_turn = self._remember_turn(tool_id, parent)
+            tool_name = self._tool_names.get(tool_id) or "Read"
+            status = "failed" if is_error else "succeeded"
+            if not is_error and _claude_image_blocks(content):
+                events.append(ProcessEvent(
+                    item_id=tool_id,
+                    kind="server_tool",
+                    phase="end",
+                    status=status,
+                    turn_id=tool_turn,
+                    parent_id=parent,
+                    title="查看图片",
+                    summary=summary,
+                    input={"file_path": image_path},
+                    tool="view_image",
+                    duration_ms=duration_ms,
+                    background=self._background_for_turn(tool_turn),
+                ))
+            else:
+                safe_content = _safe_image_read_result_content(
+                    tool_name, content)
+                output, was_truncated = bounded_text(
+                    safe_content, self.tool_result_max)
+                _category, fallback_title, _server = _tool_meta(
+                    tool_name, {"file_path": image_path})
+                events.append(ProcessEvent(
+                    item_id=tool_id,
+                    kind="server_tool",
+                    phase="end",
+                    status=status,
+                    turn_id=tool_turn,
+                    parent_id=parent,
+                    title=fallback_title,
+                    summary=summary,
+                    input={"file_path": image_path},
+                    output=output or None,
+                    tool=tool_name,
+                    duration_ms=duration_ms,
+                    truncated=was_truncated or None,
+                    background=self._background_for_turn(tool_turn),
+                ))
+            self._finish_tool_item(tool_id)
+            return
         content = _safe_result_content(self._tool_names.get(tool_id), content)
         text, was_truncated = bounded_text(content, self.tool_result_max)
         diff_info = self._tool_diffs.pop(tool_id, None)
-        diff = diff_info[0] if diff_info and not is_error else None
+        native_diff = (native_claude_diff(native_result, self._tool_paths.get(tool_id))
+                       if not is_error else None)
+        diff = native_diff or (diff_info[0] if diff_info and not is_error else None)
         truncated = bool(was_truncated or (diff_info and diff_info[1])) or None
+        is_agent = (self._tool_names.get(tool_id) or "").lower() in {
+            "agent", "task"}
+        result_status = (
+            "failed" if is_error else
+            agent_status if is_agent and agent_status else "succeeded"
+        )
+        tool_turn = self._remember_turn(tool_id)
         events.append(ToolResult(
-            tool_use_id=tool_id, content=text, is_error=bool(is_error),
-            truncated=truncated, status="failed" if is_error else "succeeded",
+            tool_use_id=tool_id, turn_id=tool_turn,
+            content=text, is_error=bool(is_error),
+            truncated=truncated, status=result_status,
             summary=summary, diff=diff,
+            diff_source="native" if native_diff else "fragment" if diff else None,
+            diff_truncated=False if native_diff else bool(diff_info and diff_info[1]),
+            background=self._background_for_turn(tool_turn),
         ))
-        if (self._tool_names.get(tool_id) or "").lower() in {"agent", "task"}:
+        if is_agent and agent_terminal is not False:
             events.append(self._agent_tool_event(
                 tool_id, phase="end",
-                status="failed" if is_error else "succeeded",
+                status=("failed" if is_error else agent_status or "succeeded"),
                 summary=summary, duration_ms=duration_ms,
             ))
+        elif is_agent:
+            events.append(self._agent_tool_event(
+                tool_id, phase="update", status=agent_status or "running",
+                summary=summary, duration_ms=duration_ms,
+            ))
+        self._finish_tool_item(tool_id)
+
+    def _finish_tool_item(self, tool_id: str) -> None:
+        self._tool_paths.pop(tool_id, None)
         self._finished_tool_items.add(tool_id)
+        self._image_reads.pop(tool_id, None)
         self._tool_outputs.pop(tool_id, None)
         self._tool_delta_totals.pop(tool_id, None)
         self._tool_last_progress.pop(tool_id, None)
@@ -618,7 +1082,11 @@ class StreamTranslator:
         self._tool_pending.pop(key, None)
         self._tool_last_emit[key] = now
         self._tool_delta_totals[tool_id] = total + len(pending)
-        events.append(ToolDelta(tool_use_id=tool_id, stream=stream, delta=pending))
+        tool_turn = self._remember_turn(tool_id)
+        events.append(ToolDelta(
+            tool_use_id=tool_id, turn_id=tool_turn,
+            stream=stream, delta=pending,
+            background=self._background_for_turn(tool_turn)))
         return events
 
     def _flush_tool_deltas(self, tool_id: str, except_stream: str | None = None) -> list:
@@ -632,14 +1100,33 @@ class StreamTranslator:
             remaining = max(0, self.tool_result_max - total)
             pending = pending[:min(remaining, _MAX_TOOL_DELTA_CHARS)]
             if pending:
+                tool_turn = self._remember_turn(tool_id)
                 events.append(ToolDelta(
-                    tool_use_id=tool_id, stream=key[1], delta=pending))
+                    tool_use_id=tool_id,
+                    turn_id=tool_turn,
+                    stream=key[1], delta=pending,
+                    background=self._background_for_turn(tool_turn)))
                 self._tool_delta_totals[tool_id] = total + len(pending)
         return events
 
     def _feed_stream_event(self, msg: StreamEvent) -> list:
         events: list = []
         ev = msg.event if isinstance(msg.event, dict) else {}
+        if not msg.parent_tool_use_id:
+            if ev.get("type") == "message_start":
+                message = ev.get("message")
+                if not isinstance(message, dict):
+                    self._usage_message = None
+                    return events
+                mid = message.get("id")
+                self._usage_message = (mid, self.turn_id) if isinstance(mid, str) else None
+                if self._usage_message:
+                    events.extend(self._usage.update(self.turn_id, mid,
+                        native_usage(message.get("usage"), "claude", output=False)))
+            elif ev.get("type") == "message_delta" and self._usage_message:
+                mid, owner = self._usage_message
+                events.extend(self._usage.update(owner, mid,
+                    native_usage(ev.get("usage"), "claude")))
         if ev.get("type") != "content_block_delta":
             return events
         delta = ev.get("delta") if isinstance(ev.get("delta"), dict) else {}
@@ -655,6 +1142,13 @@ class StreamTranslator:
 
     def _feed_assistant(self, msg: AssistantMessage) -> list:
         events: list = []
+        if not msg.parent_tool_use_id and msg.message_id:
+            owner = (self._usage_message[1] if self._usage_message
+                     and self._usage_message[0] == msg.message_id else self.turn_id)
+            # Assembled blocks repeat the message-start usage, including an
+            # output placeholder. Only message_delta/Result can supply output.
+            events.extend(self._usage.update(owner, msg.message_id,
+                native_usage(msg.usage, "claude", output=False)))
         if (isinstance(msg.uuid, str)
                 and _CLAUDE_MESSAGE_UUID.fullmatch(msg.uuid)):
             self._last_assistant_uuid = msg.uuid
@@ -733,10 +1227,9 @@ class StreamTranslator:
         content = msg.content if isinstance(msg.content, list) else []
         has_tool_result = any(isinstance(block, (
             ToolResultBlock, ServerToolResultBlock)) for block in content)
-        if (not msg.parent_tool_use_id and not has_tool_result
-                and isinstance(msg.uuid, str)
-                and _CLAUDE_MESSAGE_UUID.fullmatch(msg.uuid)):
-            self._last_user_uuid = msg.uuid
+        replayed_id = replayed_user_message_id(msg)
+        if replayed_id is not None:
+            self._last_user_uuid = replayed_id
         result_meta = msg.tool_use_result if isinstance(msg.tool_use_result, dict) else {}
         summary_bits = []
         for key, label in (("agentType", "代理"), ("status", "状态"),
@@ -756,10 +1249,22 @@ class StreamTranslator:
             self._ambiguous_final_mid = None
         for block in content:
             if isinstance(block, ToolResultBlock):
+                raw_status = result_meta.get("status")
+                async_launched = bool(result_meta.get("isAsync")) or (
+                    isinstance(raw_status, str)
+                    and raw_status.lower() == "async_launched"
+                )
+                mapped_status = _task_status(
+                    raw_status if isinstance(raw_status, str) else None)
+                if async_launched:
+                    mapped_status = "running"
                 self._emit_tool_result(
                     events, block.tool_use_id, block.content,
                     bool(block.is_error), summary=summary,
-                    duration_ms=duration_ms)
+                    duration_ms=duration_ms,
+                    agent_terminal=not async_launched,
+                    agent_status=mapped_status if mapped_status != "unknown" else None,
+                    native_result=result_meta)
             elif isinstance(block, ServerToolResultBlock):
                 self._emit_tool_result(events, block.tool_use_id, block.content)
         return events
@@ -850,10 +1355,28 @@ class StreamTranslator:
             task_id, ("task", None))
         parent = (_wire_id(parent_raw, "tool") if parent_raw
                   else remembered_parent)
-        kind = ("agent" if parent
-                else remembered_kind if remembered_kind in {"agent", "task"}
-                else "task")
-        item_id = _agent_process_id(parent) if parent else task_id
+        task_type = (
+            (msg.task_type or "").lower()
+            if isinstance(msg, TaskStartedMessage) else ""
+        )
+        parent_kind = (
+            self.item_meta.get(_agent_process_id(parent), (None, None))[0]
+            if parent else None
+        )
+        parent_tool = (self._tool_names.get(parent) or "").lower() \
+            if parent else ""
+        # A tool_use_id is only correlation. Bash(run_in_background=true)
+        # carries its Bash tool id in the exact same field as an Agent task.
+        # Promote only explicit Agent task types or a parent already proven to
+        # be an Agent/Task tool; otherwise keep the background job ordinary.
+        kind = "agent" if (
+            _is_agent_task_type(task_type)
+            or remembered_kind == "agent"
+            or parent_kind == "agent"
+            or parent_tool in {"agent", "task"}
+        ) else "task"
+        item_id = _agent_process_id(parent) \
+            if kind == "agent" and parent else task_id
         turn = self._remember_turn(item_id, parent)
         title = (getattr(msg, "description", None)
                  or self.item_titles.get(item_id)
@@ -863,16 +1386,17 @@ class StreamTranslator:
         self.item_titles[item_id] = title
         self.item_meta[task_id] = (kind, parent)
         self.item_meta[item_id] = (kind, parent)
+        command = self.item_commands.get(parent or "")
+        if command:
+            self.item_commands[task_id] = command
+            self.item_commands[item_id] = command
         if isinstance(msg, TaskStartedMessage):
-            if ((msg.task_type or "").lower() in {"agent", "subagent"}
-                    or parent):
-                kind = "agent"
-            self.item_meta[task_id] = (kind, parent)
-            self.item_meta[item_id] = (kind, parent)
             return [ProcessEvent(
                 item_id=item_id, kind=kind, phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.task_type, 1024),
+                command=command,
+                background=True,
             )]
         if isinstance(msg, TaskProgressMessage):
             return [ProcessEvent(
@@ -880,6 +1404,8 @@ class StreamTranslator:
                 phase="update", status="running", turn_id=turn,
                 parent_id=parent, title=title,
                 progress=_task_progress(msg.usage, msg.last_tool_name),
+                command=command,
+                background=True,
             )]
         if isinstance(msg, TaskUpdatedMessage):
             status = _task_status(msg.status)
@@ -892,16 +1418,111 @@ class StreamTranslator:
                 item_id=item_id, kind=kind, phase="end" if terminal else "update",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=patch_summary,
+                command=command,
+                background=True,
             )]
         if isinstance(msg, TaskNotificationMessage):
+            from cc_remote.wrapper.agent_returns import return_receipt
+
             status = _task_status(msg.status)
-            return [ProcessEvent(
+            event = ProcessEvent(
                 item_id=item_id, kind=kind, phase="end",
                 status=status, turn_id=turn, parent_id=parent, title=title,
                 summary=_short_text(msg.summary, 64 * 1024),
                 progress=_task_progress(msg.usage),
-            )]
+                command=command,
+                background=True,
+            )
+            return [event, return_receipt(event, f"claude:{task_id}",
+                                         item_id if kind == "agent" and parent else None)]
         return []
+
+    def _feed_background_tasks_changed(
+        self, msg: SystemMessage,
+    ) -> list[BackgroundProcessSync]:
+        tasks = claude_background_tasks(msg)
+        if tasks is None:
+            return []
+        items: list[BackgroundProcessItem] = []
+        for task in tasks[:MAX_BACKGROUND_PROCESS_ITEMS]:
+            task_id = _wire_id(task["task_id"], "task")
+            remembered_kind, parent = self.item_meta.get(
+                task_id, ("task", None))
+            task_type = task.get("task_type")
+            kind = "agent" if (
+                _is_agent_task_type(task_type)
+                or remembered_kind == "agent"
+            ) else "task"
+            item_id = (
+                _agent_process_id(parent)
+                if kind == "agent" and parent
+                else task_id
+            )
+            description = task.get("description")
+            title = (
+                description if isinstance(description, str) else None
+            ) or self.item_titles.get(item_id) \
+                or self.item_titles.get(task_id) \
+                or "后台任务"
+            title = _short_text(title, 1000) or "后台任务"
+            self.item_titles[task_id] = title
+            self.item_titles[item_id] = title
+            self.item_meta[task_id] = (kind, parent)
+            self.item_meta[item_id] = (kind, parent)
+            command = (
+                self.item_commands.get(item_id)
+                or self.item_commands.get(task_id)
+                or self.item_commands.get(parent or "")
+            )
+            turn_id = self._remember_turn(item_id, parent)
+            items.append(BackgroundProcessItem(
+                item_id=item_id,
+                kind=kind,
+                status="running",
+                turn_id=turn_id,
+                parent_id=parent,
+                title=title,
+                command=command,
+            ))
+        return [BackgroundProcessSync(items=items)]
+
+    def _feed_compaction(self, msg: SystemMessage) -> list[ProcessEvent]:
+        event = _compaction_event_from_row(
+            msg.data if isinstance(msg.data, dict) else {})
+        if event is None:
+            return []
+        self.compact_boundary_id = event.item_id
+        event.turn_id = self.turn_id
+        if self._compaction_id is not None:
+            # Status UUIDs and persisted boundary UUIDs differ. Bind the live
+            # placeholder to its actual boundary so later history deduplicates.
+            event.input = {"compaction_started_id": self._compaction_id}
+            self._compaction_id = None
+        return [event]
+
+    def _feed_compaction_status(self, msg: SystemMessage) -> list[ProcessEvent]:
+        data = msg.data if isinstance(msg.data, dict) else {}
+        if data.get("status") != "compacting":
+            if data.get("compact_error") and self._compaction_id is not None:
+                return self._end_unfinished_compaction("failed")
+            return []
+        if self._compaction_id is not None:
+            return []  # Native heartbeats do not create new animations.
+        self._compaction_id = _wire_id(
+            data.get("uuid") or str(uuid.uuid4()), "compaction")
+        return [ProcessEvent(
+            item_id=self._compaction_id, kind="compaction", phase="start",
+            status="running", title="压缩上下文", turn_id=self.turn_id,
+        )]
+
+    def _end_unfinished_compaction(self, status: str) -> list[ProcessEvent]:
+        if self._compaction_id is None:
+            return []
+        item_id, self._compaction_id = self._compaction_id, None
+        return [ProcessEvent(
+            item_id=item_id, kind="compaction", phase="end", status=status,
+            title="压缩上下文", turn_id=self.turn_id,
+        )]
 
     def _feed_hook(self, msg: HookEventMessage) -> list:
         data = msg.data if isinstance(msg.data, dict) else {}
@@ -930,6 +1551,7 @@ class StreamTranslator:
             return [ProcessEvent(
                 item_id=item_id, kind="hook", phase="start", status="running",
                 turn_id=turn, parent_id=parent, title=title,
+                background=self._background_for_turn(turn),
             )]
         exit_code = data.get("exit_code")
         exit_code = exit_code if isinstance(exit_code, int) else None
@@ -949,6 +1571,7 @@ class StreamTranslator:
             item_id=item_id, kind="hook", phase="end", status=status,
             turn_id=turn, parent_id=parent, title=title, summary=summary,
             exit_code=exit_code, duration_ms=duration_ms,
+            background=self._background_for_turn(turn),
         )]
 
     def feed(self, msg) -> list:
@@ -964,27 +1587,48 @@ class StreamTranslator:
                             TaskUpdatedMessage, TaskNotificationMessage)):
             return self._feed_task(msg)
         if isinstance(msg, SystemMessage):
+            fallback = model_fallback_event(msg.data, turn_id=self.turn_id)
+            if fallback is not None:
+                return [fallback]
             if msg.subtype in {"tool_progress", "bash_progress"}:
                 return self._feed_progress_system(msg)
             if msg.subtype == "tool_use_summary":
                 return self._feed_tool_summary(msg)
+            if msg.subtype == "background_tasks_changed":
+                return self._feed_background_tasks_changed(msg)
+            if msg.subtype == "compact_boundary":
+                return self._feed_compaction(msg)
+            if msg.subtype == "status":
+                return self._feed_compaction_status(msg)
             return []
         if isinstance(msg, ResultMessage):
-            events = []
+            # A terminal without a boundary must not leave an eternal spinner
+            # or invent a successful compact (including interrupted commands).
+            events = self._end_unfinished_compaction(
+                "interrupted" if msg.is_error else "failed")
+            if not self._usage_rebound and not msg.is_error:
+                events.extend(self._usage.replace(self.turn_id,
+                    native_usage(msg.usage, "claude")))
             if (not msg.is_error and not self._has_final_text
                     and self._ambiguous_final_mid is not None):
                 events.append(AssistantMsgEnd(
-                    message_id=self._ambiguous_final_mid, channel="final"))
+                    message_id=self._ambiguous_final_mid,
+                    turn_id=self.turn_id, channel="final"))
             for tool_id in sorted({key[0] for key in self._tool_pending}):
                 events.extend(self._flush_tool_deltas(tool_id))
-            events.append(TurnEnd(result=TurnResult(
-                subtype=msg.subtype,
+            missing_boundary = self.manual_compact and self.compact_boundary_id is None
+            if self.manual_compact and self.compact_boundary_id and not msg.is_error:
+                events.extend(compact_completion_events(self.compact_boundary_id, self.turn_id))
+            terminal = TurnEnd(result=TurnResult(
+                subtype="error" if missing_boundary and not msg.is_error else msg.subtype,
                 duration_ms=msg.duration_ms,
-                is_error=msg.is_error,
+                is_error=msg.is_error or missing_boundary,
                 total_cost_usd=msg.total_cost_usd,
                 num_turns=msg.num_turns,
             ), turn_id=self._last_assistant_uuid,
-                checkpoint_id=self._last_user_uuid))
+                checkpoint_id=self._last_user_uuid)
+            terminal._changes_turn_id = self.turn_id
+            events.append(terminal)
             self._last_assistant_uuid = None
             self._last_user_uuid = None
             self._ambiguous_final_mid = None
@@ -1015,6 +1659,11 @@ def extract_session_id(msg) -> str | None:
 
 def extract_model(msg) -> str | None:
     """Pull the current model out of the init SystemMessage."""
+    if isinstance(msg, SystemMessage):
+        fallback = model_fallback_event(msg.data)
+        if (fallback is not None and fallback.input
+                and fallback.input.get("scope") == "session"):
+            return fallback.input["fallback_model"]
     if isinstance(msg, SystemMessage) and msg.subtype == "init":
         data = msg.data
         if isinstance(data, dict):
@@ -1052,6 +1701,49 @@ def transcript_path(session_id: str) -> str | None:
         return None
 
 
+def transcript_presence(session_id: str) -> bool | None:
+    """Return exact Claude transcript presence, preserving lookup uncertainty.
+
+    ``transcript_path`` intentionally collapses every filesystem failure into
+    ``None`` for ordinary history fallbacks. Engine ownership migration cannot:
+    an unreadable catalog is not proof that the same UUID belongs to Codex.
+    """
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
+    try:
+        root = claude_projects_dir().resolve()
+        entries = os.scandir(root)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    scanned = 0
+    try:
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        return None
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    return None
+                scanned += 1
+                if scanned > _MAX_TRANSCRIPT_MATCHES:
+                    return None
+                candidate = os.path.join(entry.path, f"{session_id}.jsonl")
+                try:
+                    info = os.lstat(candidate)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                return True if stat.S_ISREG(info.st_mode) else None
+    except OSError:
+        return None
+    return False
+
+
 def _bounded_jsonl_lines(file):
     """Yield complete records while skipping a single pathological long line."""
     while True:
@@ -1066,6 +1758,60 @@ def _bounded_jsonl_lines(file):
             line = file.readline(_MAX_TRANSCRIPT_RECORD_CHARS + 1)
 
 
+def read_claude_history_image_asset(
+    source_path: str,
+    image_id: str,
+) -> ClaudeHistoryImageAsset | None:
+    """Rehydrate one already-authorized image id from the canonical JSONL.
+
+    Callers must first prove that ``image_id`` is referenced by the requested
+    turn.  This function performs no path discovery and returns no neighboring
+    image, so an opaque id cannot be used to enumerate transcript attachments.
+    """
+    if not isinstance(image_id, str) or not _SAFE_WIRE_ID.fullmatch(image_id):
+        return None
+    try:
+        with open(source_path, encoding="utf-8") as source:
+            for line in _bounded_jsonl_lines(source):
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                message = row.get("message")
+                content = (
+                    message.get("content") if isinstance(message, dict) else None
+                )
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (
+                        not _claude_history_tool_result_block(block)
+                        or _claude_history_tool_result_error(block)
+                    ):
+                        continue
+                    tool_id = block.get("tool_use_id")
+                    if (
+                        not isinstance(tool_id, str)
+                        or not _SAFE_WIRE_ID.fullmatch(tool_id)
+                    ):
+                        continue
+                    for index, image in enumerate(
+                        _claude_image_blocks(block.get("content"))
+                    ):
+                        candidate_id = claude_history_image_id(tool_id, index)
+                        if candidate_id != image_id:
+                            continue
+                        return ClaudeHistoryImageAsset(
+                            item_id=tool_id,
+                            image_id=candidate_id,
+                            media_type=image["media_type"],
+                            data=image["data"],
+                        )
+    except (OSError, UnicodeError):
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class CompactTranscriptPage:
     messages: list[SimpleNamespace]
@@ -1075,43 +1821,45 @@ class CompactTranscriptPage:
     oldest_cursor: str | None
 
 
-class TranscriptTimestamps(dict[str, float]):
-    """Timestamp map with exact SDK query aliases retained from JSONL.
+def _queued_prompt_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Project an accepted native human attachment using its SDK echo identity.
 
-    ``claude_agent_sdk.get_session_messages()`` intentionally projects only the
-    transcript UUID and message body.  Claude Code nevertheless persists the
-    originating remote query id in ``promptId``.  Keeping that metadata on the
-    existing side-read avoids another full transcript scan while allowing a
-    History row to reconcile with the browser's live optimistic row after a
-    session switch.  It remains a normal ``dict`` for existing callers.
+    Mid-response inputs are persisted as queued_command attachments, while the
+    SDK's catalog drops attachments entirely. Queue-operation records alone do
+    not prove consumption, and task notifications must never become humans.
+    Keep the attachment UUID in the ancestry graph; source_uuid owns the public
+    prompt, its live alias and its pagination cursor.
     """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.client_message_ids: dict[str, str] = {}
-
-
-def _remember_transcript_client_id(
-    timestamps: TranscriptTimestamps,
-    row: dict[str, Any],
-) -> None:
-    uid = row.get("uuid")
-    prompt_id = row.get("promptId")
-    if (
-        row.get("type") == "user"
-        and isinstance(uid, str)
-        and _SAFE_WIRE_ID.fullmatch(uid)
-        and isinstance(prompt_id, str)
-        and _SAFE_WIRE_ID.fullmatch(prompt_id)
-        and prompt_id != uid
+    attachment = row.get("attachment")
+    if (row.get("type") != "attachment" or row.get("isSidechain") is True
+            or row.get("isMeta") or not isinstance(attachment, dict)
+            or attachment.get("type") != "queued_command"
+            or attachment.get("commandMode") != "prompt"):
+        return None
+    origin = attachment.get("origin")
+    if origin is not None and not (
+        isinstance(origin, dict) and origin.get("kind") == "human"
     ):
-        timestamps.client_message_ids[uid] = prompt_id
+        return None
+    uid = attachment.get("source_uuid")
+    prompt = attachment.get("prompt")
+    if (not isinstance(uid, str) or not _SAFE_WIRE_ID.fullmatch(uid)
+            or not isinstance(prompt, (str, list))):
+        return None
+    return {**row, "type": "user", "uuid": uid,
+            "message": {"role": "user", "content": prompt}}
 
 
 def _compact_visible_user(row: dict[str, Any]) -> bool:
+    if row.get("type") == "attachment":
+        projected = _queued_prompt_row(row)
+        if projected is None:
+            return False
+        row = projected
     origin = row.get("origin")
     if (
         row.get("type") != "user"
+        or bool(row.get("isMeta"))
         or origin == "task-notification"
         or (
             isinstance(origin, dict)
@@ -1144,18 +1892,26 @@ def _compact_visible_user(row: dict[str, Any]) -> bool:
     )
 
 
-def _compact_chain_index(
+def _compact_user_cursor(row: dict[str, Any]) -> str | None:
+    if not _compact_visible_user(row):
+        return None
+    if row.get("type") == "attachment":
+        return row["attachment"]["source_uuid"]
+    return row.get("uuid")
+
+
+def _transcript_graph_index(
     source_path: str,
     *,
     index_store=None,
     snapshot_size: int | None = None,
     max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
 ):
-    """Return compact main-chain ids plus bounded graph metadata.
+    """Return the bounded raw ancestry graph without retaining payloads.
 
-    Payloads are parsed only transiently. The retained graph stores small
-    identity fields and byte offsets so the second phase can seek directly to
-    the requested page instead of scanning or retaining every message body.
+    The same source-bound index backs compact pagination and the narrow delayed
+    request-retry repair below. Keeping graph construction in one place avoids
+    a second whole-transcript scan for ordinary production history reads.
     """
     rows: dict[str, tuple[object, ...]] = {}
     leaf: str | None = None
@@ -1167,7 +1923,7 @@ def _compact_chain_index(
                 snapshot_size=snapshot_size,
                 max_record_bytes=max_record_bytes,
                 max_entries=_MAX_TRANSCRIPT_CHAIN_ENTRIES,
-                visible_user=_compact_visible_user,
+                visible_user=_compact_user_cursor,
             )
         except Exception:
             indexed = None
@@ -1223,6 +1979,7 @@ def _compact_chain_index(
                     if len(rows) >= _MAX_TRANSCRIPT_CHAIN_ENTRIES \
                             and uid not in rows:
                         return None
+                    public_uid = _compact_user_cursor(row)
                     rows[uid] = (
                         row.get("type"),
                         row.get("subtype"),
@@ -1230,8 +1987,9 @@ def _compact_chain_index(
                         row.get("logicalParentUuid"),
                         row.get("isSidechain"),
                         offset,
-                        _compact_visible_user(row),
+                        bool(public_uid),
                         len(line),
+                        public_uid,
                     )
                     if row.get("isSidechain") is not True:
                         leaf = uid
@@ -1239,11 +1997,17 @@ def _compact_chain_index(
             return None
     if not leaf:
         return None
+    return leaf, rows, queued
 
+
+def _ordered_graph_chain(
+    leaf: str,
+    rows: dict[str, tuple[object, ...]],
+) -> list[str] | None:
+    """Follow the engine's active ancestry, honoring compact logical parents."""
     chain_ids: list[str] = []
     seen: set[str] = set()
     cursor: str | None = leaf
-    saw_compact = False
     while cursor and cursor not in seen:
         seen.add(cursor)
         metadata = rows.get(cursor)
@@ -1251,15 +2015,516 @@ def _compact_chain_index(
             return None
         chain_ids.append(cursor)
         row_type, subtype, parent_uuid, logical_parent_uuid = metadata[:4]
-        is_compact = row_type == "system" and subtype == "compact_boundary"
-        saw_compact = saw_compact or is_compact
-        parent = logical_parent_uuid if is_compact else parent_uuid
+        parent = (
+            logical_parent_uuid
+            if row_type == "system" and subtype == "compact_boundary"
+            else parent_uuid
+        )
         if not isinstance(parent, str) or not _SAFE_WIRE_ID.fullmatch(parent):
             parent = None
         cursor = parent
-    if cursor is not None or not saw_compact:
+    if cursor is not None:
         return None
-    return list(reversed(chain_ids)), rows, queued
+    return list(reversed(chain_ids))
+
+
+def _compact_chain_index(
+    source_path: str,
+    *,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+):
+    """Return compact main-chain ids plus bounded graph metadata."""
+    graph = _transcript_graph_index(
+        source_path,
+        index_store=index_store,
+        snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes,
+    )
+    if graph is None:
+        return None
+    leaf, rows, queued = graph
+    chain_ids = _ordered_graph_chain(leaf, rows)
+    if chain_ids is None:
+        return None
+
+    if not any(
+        rows[uid][0] == "system" and rows[uid][1] == "compact_boundary"
+        for uid in chain_ids
+    ):
+        return None
+    # Claude persists the completed boundary before replaying the command that
+    # caused it. Put that exact /compact row before its boundary for pagination
+    # and narrative ownership; ordinary post-compaction prompts stay in place.
+    commands: dict[str, str] = {}
+    boundary = None
+    try:
+        with open(source_path, "rb") as source:
+            for uid in chain_ids:
+                if rows[uid][:2] == ("system", "compact_boundary"):
+                    boundary = uid
+                elif boundary is not None and rows[uid][6]:
+                    row = _indexed_transcript_row(source, uid, rows[uid],
+                                                 max_record_bytes=max_record_bytes)
+                    compact = _indexed_transcript_row(source, boundary, rows[boundary],
+                                                     max_record_bytes=max_record_bytes)
+                    if (row and compact and compact_metadata(compact).get("trigger") != "auto"
+                            and manual_compact_prompt((row.get("message") or {}).get("content"))):
+                        commands[boundary] = uid
+                    boundary = None
+    except OSError:
+        return None
+    if commands:
+        moved = set(commands.values())
+        chain_ids = [part for uid in chain_ids if uid not in moved
+                     for part in ([commands[uid], uid] if uid in commands else [uid])]
+    return chain_ids, rows, queued
+
+
+def _indexed_transcript_row(
+    source,
+    uid: str,
+    metadata: tuple[object, ...],
+    *,
+    max_record_bytes: int,
+) -> dict[str, Any] | None:
+    """Seek and validate one source-bound graph row."""
+    offset = metadata[5]
+    record_bytes = metadata[7]
+    if (
+        not isinstance(offset, int)
+        or not isinstance(record_bytes, int)
+        or record_bytes <= 0
+        or record_bytes > max(1024, int(max_record_bytes))
+    ):
+        return None
+    try:
+        source.seek(offset)
+        raw = source.read(record_bytes)
+        if len(raw) != record_bytes:
+            return None
+        row = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(row, dict) or row.get("uuid") != uid:
+        return None
+    return row
+
+
+def _transcript_epoch(row: dict[str, Any]) -> float | None:
+    value = row.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00") if value.endswith("Z") else value
+        ).timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _tool_result_user_row(row: dict[str, Any]) -> bool:
+    message = row.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    kinds = [
+        block.get("type")
+        for block in content
+        if isinstance(block, dict)
+    ]
+    return bool(kinds) and len(kinds) == len(content) and all(
+        kind == "tool_result"
+        or isinstance(kind, str) and kind.endswith("_tool_result")
+        for kind in kinds
+    )
+
+
+def _delayed_retry_tail(
+    source,
+    retry_uid: str,
+    retry_index: int,
+    active_chain: list[str],
+    canonical_ids: set[str],
+    rows: dict[str, tuple[object, ...]],
+    children: dict[str, list[str]],
+    *,
+    max_record_bytes: int,
+) -> tuple[str, list[SimpleNamespace], dict[str, float]] | None:
+    """Return one unambiguous completed sibling bypassed by a delayed retry."""
+    retry_metadata = rows[retry_uid]
+    retry_parent = retry_metadata[2]
+    retry_offset = retry_metadata[5]
+    if (
+        not isinstance(retry_parent, str)
+        or retry_parent not in canonical_ids
+        or not isinstance(retry_offset, int)
+    ):
+        return None
+    retry_row = _indexed_transcript_row(
+        source, retry_uid, retry_metadata,
+        max_record_bytes=max_record_bytes,
+    )
+    if retry_row is None or (
+        retry_row.get("source") != "request_retry"
+        or not isinstance(retry_row.get("retryAttempt"), int)
+        or retry_row["retryAttempt"] < 1
+        or not isinstance(retry_row.get("maxRetries"), int)
+        or retry_row["maxRetries"] < retry_row["retryAttempt"]
+    ):
+        return None
+    retry_epoch = _transcript_epoch(retry_row)
+    if retry_epoch is None:
+        return None
+
+    # The later prompt must actually continue through this retry node. Without
+    # that proof this may be an ordinary abandoned API-error branch.
+    next_user_uid = next((
+        uid for uid in active_chain[retry_index + 1:]
+        if bool(rows[uid][6]) and uid in canonical_ids
+    ), None)
+    if next_user_uid is None:
+        return None
+    next_user_metadata = rows[next_user_uid]
+    next_user_offset = next_user_metadata[5]
+    if not isinstance(next_user_offset, int) or next_user_offset <= retry_offset:
+        return None
+    next_user_row = _indexed_transcript_row(
+        source, next_user_uid, next_user_metadata,
+        max_record_bytes=max_record_bytes,
+    )
+    if next_user_row is None:
+        return None
+
+    active_ids = set(active_chain)
+    alternatives = [
+        uid for uid in children.get(retry_parent, ())
+        if uid != retry_uid
+        and uid not in active_ids
+        and rows[uid][4] is not True
+        and isinstance(rows[uid][5], int)
+        and rows[uid][5] < retry_offset
+    ]
+    # Competing siblings are a real fork. Never guess which answer to revive.
+    if len(alternatives) != 1:
+        return None
+
+    cursor = alternatives[0]
+    visited: set[str] = set()
+    path_rows: list[dict[str, Any]] = []
+    path_meta: list[tuple[object, ...]] = []
+    total_bytes = 0
+    while cursor not in visited:
+        visited.add(cursor)
+        if len(visited) > _MAX_DELAYED_RETRY_TAIL_ROWS:
+            return None
+        metadata = rows.get(cursor)
+        if (
+            metadata is None
+            or metadata[4] is True
+            or cursor in active_ids
+            or bool(metadata[6])
+            or not isinstance(metadata[5], int)
+            or metadata[5] >= retry_offset
+            or not isinstance(metadata[7], int)
+        ):
+            return None
+        total_bytes += metadata[7]
+        if total_bytes > _MAX_DELAYED_RETRY_TAIL_BYTES:
+            return None
+        row = _indexed_transcript_row(
+            source, cursor, metadata,
+            max_record_bytes=max_record_bytes,
+        )
+        if row is None:
+            return None
+        row_type = metadata[0]
+        if row_type == "user":
+            if not _tool_result_user_row(row):
+                return None
+        elif row_type == "assistant":
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                return None
+            stop_reason = message.get("stop_reason")
+            if stop_reason not in {None, "tool_use", "end_turn"}:
+                return None
+        elif row_type != "attachment":
+            # Compact/system/error/task rows change conversation semantics and
+            # are never presentation-only completion tails.
+            return None
+        path_rows.append(row)
+        path_meta.append(metadata)
+
+        successors = [
+            uid for uid in children.get(cursor, ())
+            if uid not in active_ids
+            and rows[uid][4] is not True
+            and isinstance(rows[uid][5], int)
+            and rows[uid][5] < retry_offset
+        ]
+        if not successors:
+            break
+        if len(successors) != 1:
+            return None
+        cursor = successors[0]
+    else:
+        return None
+
+    terminal_row = path_rows[-1] if path_rows else None
+    terminal_message = (
+        terminal_row.get("message")
+        if isinstance(terminal_row, dict) else None
+    )
+    if (
+        not isinstance(terminal_message, dict)
+        or terminal_row.get("type") != "assistant"
+        or terminal_message.get("role") != "assistant"
+        or terminal_message.get("stop_reason") != "end_turn"
+    ):
+        return None
+    terminal_epoch = _transcript_epoch(terminal_row)
+    next_user_epoch = _transcript_epoch(next_user_row)
+    if (
+        terminal_epoch is None
+        or next_user_epoch is None
+        or not retry_epoch < terminal_epoch < next_user_epoch
+        or path_meta[-1][5] >= retry_offset
+    ):
+        return None
+
+    messages: list[SimpleNamespace] = []
+    recovered_timestamps: dict[str, float] = {}
+    for row in path_rows:
+        row_type = row.get("type")
+        message = row.get("message")
+        if row_type not in {"user", "assistant"} or not isinstance(message, dict):
+            continue
+        messages.append(SimpleNamespace(
+            type=row_type,
+            uuid=row["uuid"],
+            session_id=(
+                row.get("sessionId")
+                if isinstance(row.get("sessionId"), str) else None
+            ),
+            message=message,
+            is_meta=bool(row.get("isMeta")),
+            parent_tool_use_id=(
+                row.get("parentToolUseID")
+                or row.get("parent_tool_use_id")
+            ),
+        ))
+        epoch = _transcript_epoch(row)
+        if epoch is not None:
+            recovered_timestamps[row["uuid"]] = epoch
+    if not messages or messages[-1].uuid != terminal_row["uuid"]:
+        return None
+    return retry_parent, messages, recovered_timestamps
+
+
+def recover_claude_delayed_retry_tail(
+    session_id: str,
+    messages,
+    *,
+    path: str | None = None,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+    timestamps: dict[str, float] | None = None,
+) -> list:
+    """Restore only completed tails bypassed by delayed request-retry records.
+
+    Claude's supported session reader follows the newest ``parentUuid`` chain.
+    A network retry can be appended much later with an older timestamp and make
+    the next human prompt branch from the middle of an already completed turn.
+    The raw answer remains on disk but disappears from that projection. This
+    repair is intentionally narrower than general branch recovery: physical
+    order, engine timestamps, retry provenance, a later human prompt and one
+    linear successful sibling must all agree, otherwise the SDK result wins.
+    """
+    canonical = list(messages or ())
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return canonical
+    source_path = path or transcript_path(session_id)
+    if not source_path:
+        return canonical
+    graph = _transcript_graph_index(
+        source_path,
+        index_store=index_store,
+        snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes,
+    )
+    if graph is None:
+        return canonical
+    leaf, rows, _queued = graph
+    active_chain = _ordered_graph_chain(leaf, rows)
+    if active_chain is None:
+        return canonical
+    canonical_ids = {
+        uid for message in canonical
+        if isinstance((uid := getattr(message, "uuid", None)), str)
+    }
+    if not canonical_ids:
+        return canonical
+    children: dict[str, list[str]] = {}
+    for uid, metadata in rows.items():
+        parent = metadata[2]
+        if isinstance(parent, str):
+            children.setdefault(parent, []).append(uid)
+    for siblings in children.values():
+        siblings.sort(key=lambda uid: (
+            rows[uid][5] if isinstance(rows[uid][5], int) else -1))
+
+    insertions: dict[
+        str, tuple[list[SimpleNamespace], dict[str, float]]
+    ] = {}
+    recovered_ids: set[str] = set()
+    try:
+        with open(source_path, "rb") as source:
+            for index, uid in enumerate(active_chain):
+                metadata = rows[uid]
+                if metadata[0] != "system" or metadata[1] != "api_error":
+                    continue
+                recovered = _delayed_retry_tail(
+                    source,
+                    uid,
+                    index,
+                    active_chain,
+                    canonical_ids,
+                    rows,
+                    children,
+                    max_record_bytes=max_record_bytes,
+                )
+                if recovered is None:
+                    continue
+                parent_uid, tail, recovered_timestamps = recovered
+                if parent_uid in insertions or any(
+                    item.uuid in canonical_ids or item.uuid in recovered_ids
+                    for item in tail
+                ):
+                    continue
+                insertions[parent_uid] = (tail, recovered_timestamps)
+                recovered_ids.update(item.uuid for item in tail)
+    except OSError:
+        return canonical
+    if not insertions:
+        return canonical
+
+    output: list = []
+    for message in canonical:
+        output.append(message)
+        uid = getattr(message, "uuid", None)
+        insertion = insertions.get(uid)
+        if insertion:
+            tail, recovered_timestamps = insertion
+            output.extend(tail)
+            if timestamps is not None:
+                timestamps.update(recovered_timestamps)
+    return output
+
+
+def recover_claude_native_metadata(
+    session_id: str,
+    messages: list,
+    *,
+    path: str | None,
+    timestamps: dict[str, float],
+    internal_events: dict[str, ProcessEvent],
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+    include_queued_prompts: bool = True,
+) -> list:
+    """Restore queued human inputs, model notes and results on active ancestry.
+
+    The SDK catalog omits these rows. These positional shells are solely a UI
+    projection, never a prompt sent back to Claude. Exact native tool results
+    additionally prove historical Edit/Write patches. Page boundaries, rewinds
+    and sidechains must not resurrect unrelated metadata.
+    """
+    if not path or not messages:
+        return messages
+    graph = _transcript_graph_index(
+        path, index_store=index_store, snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes)
+    if graph is None:
+        return messages
+    leaf, rows, _ = graph
+    chain = _ordered_graph_chain(leaf, rows)
+    if chain is None:
+        return messages
+    visible = {getattr(message, "uuid", None) for message in messages}
+    by_id = {getattr(message, "uuid", None): message for message in messages}
+    insertions: dict[str, list[SimpleNamespace]] = {}
+    restored_prompts: set[str] = set()
+    anchor = None
+    restored = 0
+    try:
+        with open(path, "rb") as source:
+            for uid in chain:
+                metadata = rows[uid]
+                if metadata[0] == "attachment" and metadata[6]:
+                    public_uid = metadata[8]
+                    if public_uid in visible:
+                        anchor = public_uid
+                    elif (include_queued_prompts and anchor is not None
+                          and public_uid not in restored_prompts):
+                        row = _indexed_transcript_row(
+                            source, uid, metadata, max_record_bytes=max_record_bytes)
+                        projected = _queued_prompt_row(row) if row else None
+                        if projected is not None:
+                            insertions.setdefault(anchor, []).append(SimpleNamespace(
+                                type="user", uuid=public_uid, session_id=session_id,
+                                message=projected["message"], is_queued_prompt=True,
+                                parent_tool_use_id=None,
+                            ))
+                            restored_prompts.add(public_uid)
+                            stamp = _transcript_epoch(projected)
+                            if stamp is not None:
+                                timestamps[public_uid] = stamp
+                    else:
+                        # A human outside this selected page also bounds notes.
+                        anchor = None
+                if metadata[0] in {"user", "assistant"} and uid not in visible:
+                    anchor = None
+                if uid in visible:
+                    anchor = uid
+                    if metadata[0] == "user":
+                        row = _indexed_transcript_row(
+                            source, uid, metadata, max_record_bytes=max_record_bytes)
+                        result = row.get("toolUseResult") if row else None
+                        if isinstance(result, dict):
+                            by_id[uid].tool_use_result = result
+                if metadata[0:2] != ("system", FALLBACK_TOOL):
+                    continue
+                if anchor is None or restored >= 64:
+                    continue
+                row = _indexed_transcript_row(
+                    source, uid, metadata, max_record_bytes=max_record_bytes)
+                event = model_fallback_event(row)
+                if event is None or row is None:
+                    continue
+                internal_events[uid] = event
+                stamp = _transcript_epoch(row)
+                if stamp is not None:
+                    timestamps[uid] = stamp
+                if uid not in visible:
+                    insertions.setdefault(anchor, []).append(SimpleNamespace(
+                        type="system", uuid=uid, session_id=session_id,
+                        message={"role": "system", "content": ""},
+                        parent_tool_use_id=None,
+                    ))
+                restored += 1
+    except OSError:
+        return messages
+    output = []
+    for message in messages:
+        output.append(message)
+        output.extend(insertions.get(getattr(message, "uuid", None), ()))
+    return output
 
 
 def _load_compact_chain_messages(
@@ -1274,7 +2539,7 @@ def _load_compact_chain_messages(
     list[SimpleNamespace], dict[str, float], dict[str, ProcessEvent]
 ] | None:
     messages: list[SimpleNamespace] = []
-    timestamps = TranscriptTimestamps()
+    timestamps: dict[str, float] = {}
     internal_events: dict[str, ProcessEvent] = {}
     try:
         with open(source_path, "rb") as source:
@@ -1294,8 +2559,15 @@ def _load_compact_chain_messages(
                     return None
                 if row.get("uuid") != uid:
                     return None
-                _remember_transcript_client_id(timestamps, row)
+                projected = _queued_prompt_row(row)
+                if projected is not None:
+                    row = projected
+                    uid = projected["uuid"]
                 internal = _internal_user_event_from_row(row, queued)
+                if internal is None:
+                    internal = _compaction_event_from_row(row)
+                if internal is None:
+                    internal = model_fallback_event(row)
                 if internal is not None:
                     internal_events[uid] = internal
                 row_type = row.get("type")
@@ -1307,10 +2579,29 @@ def _load_compact_chain_messages(
                         uuid=uid,
                         session_id=session_id,
                         message=message,
+                        is_meta=bool(row.get("isMeta")),
+                        is_queued_prompt=projected is not None,
                         parent_tool_use_id=(
                             row.get("parentToolUseID")
                             or row.get("parent_tool_use_id")
                         ),
+                        tool_use_result=row.get("toolUseResult"),
+                    ))
+                elif row_type == "system" and internal is not None:
+                    # The SDK projection drops system rows. Preserve a tiny
+                    # positional shell so translate_history can place the
+                    # existing compaction ProcessEvent at the true boundary.
+                    messages.append(SimpleNamespace(
+                        type="system",
+                        subtype=row.get("subtype"),
+                        uuid=uid,
+                        session_id=session_id,
+                        message={
+                            "role": "system",
+                            "content": "",
+                        },
+                        internal_event=internal,
+                        parent_tool_use_id=None,
                     ))
                 timestamp = row.get("timestamp")
                 if not isinstance(timestamp, str):
@@ -1327,26 +2618,29 @@ def _load_compact_chain_messages(
     return messages, timestamps, internal_events
 
 
-def transcript_timestamps(session_id: str) -> dict[str, float]:
+def transcript_timestamps(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> dict[str, float]:
     """Map each transcript entry's uuid -> epoch seconds, read straight from the
     .jsonl. The SDK's SessionMessage drops the per-message timestamp, so without
     this, history events default their `ts` to now (making every past message show
     the current time — "like a clock"). Best-effort: {} if not found/readable.
     session_id is globally unique, so a glob across all project dirs locates it."""
-    out = TranscriptTimestamps()
+    out: dict[str, float] = {}
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return out
     try:
-        path = transcript_path(session_id)
-        if not path:
+        source_path = path or transcript_path(session_id)
+        if not source_path:
             return out
-        with open(path) as f:
+        with open(source_path) as f:
             for line in _bounded_jsonl_lines(f):
                 try:
                     d = json.loads(line)
                 except Exception:
                     continue
-                _remember_transcript_client_id(out, d)
                 uid, ts = d.get("uuid"), d.get("timestamp")
                 if not uid or not isinstance(ts, str):
                     continue
@@ -1459,7 +2753,7 @@ def transcript_compact_history_page(
         return None
     ordered_ids, rows, queued = indexed
     visible = [
-        (index, uid)
+        (index, rows[uid][8])
         for index, uid in enumerate(ordered_ids)
         if bool(rows[uid][6])
     ]
@@ -1482,7 +2776,8 @@ def transcript_compact_history_page(
     for uid in ordered_ids:
         metadata = rows[uid]
         payload_prefix.append(payload_prefix[-1] + (
-            int(metadata[7]) if metadata[0] in {"user", "assistant"} else 0
+            int(metadata[7])
+            if metadata[0] in {"user", "assistant"} or metadata[6] else 0
         ))
     while True:
         chain_start = 0 if start == 0 else visible[start][0]
@@ -1521,6 +2816,51 @@ def _notification_tag(text: str, name: str, limit: int) -> str | None:
     return _short_text(text[start:end].strip(), limit)
 
 
+def _compaction_event_from_row(row: dict[str, Any]) -> ProcessEvent | None:
+    uid = row.get("uuid")
+    if not (
+        row.get("type") == "system"
+        and row.get("subtype") == "compact_boundary"
+        and isinstance(uid, str)
+        and _SAFE_WIRE_ID.fullmatch(uid)
+    ):
+        return None
+    metadata = compact_metadata(row)
+    trigger = metadata.get("trigger")
+    pre_tokens = metadata.get("pre_tokens")
+    post_tokens = metadata.get("post_tokens")
+    summary_bits: list[str] = []
+    if trigger == "auto":
+        summary_bits.append("自动压缩")
+    elif trigger == "manual":
+        summary_bits.append("手动压缩")
+    if all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (pre_tokens, post_tokens)
+    ):
+        summary_bits.append(f"{pre_tokens:,} → {post_tokens:,} tokens")
+    duration = metadata.get("duration_ms")
+    duration_ms = (
+        duration
+        if isinstance(duration, int) and not isinstance(duration, bool)
+        and duration >= 0
+        else None
+    )
+    event = ProcessEvent(
+        item_id=uid,
+        kind="compaction",
+        phase="end",
+        status="succeeded",
+        title="压缩上下文",
+        summary=" · ".join(summary_bits) or None,
+        duration_ms=duration_ms,
+    )
+    timestamp = _parse_timestamp(row.get("timestamp"))
+    if timestamp is not None:
+        event.ts = timestamp
+    return event
+
+
 def _internal_user_event_from_row(
     row: dict[str, Any],
     queued: set[tuple[int, str]] | frozenset[tuple[int, str]],
@@ -1555,20 +2895,28 @@ def _internal_user_event_from_row(
         if value and value.isdigit():
             usage[tag] = int(value)
     status = _task_status(raw_status)
-    item_id = _agent_process_id(tool_id) if tool_id else task_id
     return ProcessEvent(
-        item_id=item_id,
-        kind="agent" if tool_id else "task",
+        # tool-use-id is correlation, not proof of an Agent. translate_history
+        # has the preceding ToolUse name and promotes this exact event only when
+        # its parent is an Agent/Task tool.
+        item_id=task_id,
+        kind="task",
         phase="end",
         status=status,
         parent_id=tool_id,
-        title=summary or ("协作代理" if tool_id else "后台任务"),
+        title="后台任务",
+        summary=summary,
         progress=_task_progress(usage),
         duration_ms=usage.get("duration_ms"),
+        background=True,
     )
 
 
-def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
+def transcript_internal_user_events(
+    session_id: str,
+    *,
+    path: str | None = None,
+) -> dict[str, ProcessEvent]:
     """Recover structured Claude-internal user rows from raw transcript proof.
 
     ``get_session_messages`` drops ``origin`` and queue-operation records.  We
@@ -1579,13 +2927,13 @@ def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
     """
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return {}
-    path = transcript_path(session_id)
-    if not path:
+    source_path = path or transcript_path(session_id)
+    if not source_path:
         return {}
     queued: set[tuple[int, str]] = set()
     events: dict[str, ProcessEvent] = {}
     try:
-        with open(path, encoding="utf-8") as source:
+        with open(source_path, encoding="utf-8") as source:
             for line in _bounded_jsonl_lines(source):
                 try:
                     row = json.loads(line)
@@ -1612,18 +2960,27 @@ def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
     return events
 
 
-def translate_history(messages, tool_result_max: int, timestamps: dict | None = None,
-                      internal_user_events: dict[str, ProcessEvent] | None = None) -> list:
+def translate_history(
+    messages,
+    tool_result_max: int,
+    timestamps: dict | None = None,
+    internal_user_events: dict[str, ProcessEvent] | None = None,
+    *,
+    client_message_ids: Mapping[str, str] | None = None,
+    snapshot_in_progress: bool = False,
+) -> list:
     """Translate a session's on-disk transcript (list[SessionMessage]) into wire
     events the client reducer renders as past turns.
 
     The transcript carries no ResultMessage, so synthetic TurnEnd frames delimit
     turns. `timestamps` (uuid -> epoch seconds, from transcript_timestamps) stamps
     each UserMsg with its real ask-time and each TurnEnd with the turn's last
-    message time (answer-done time) — otherwise history shows "now". Rich
+    conversational message time (answer-done time) — otherwise history shows
+    "now". Late internal task bookkeeping remains visible in the process view,
+    but cannot move an already-settled answer's terminal clock. Rich
     assistant blocks retain the same thinking/commentary/final and semantic tool
     structure as the live stream. Non-conversational user turns (compact summaries,
-    slash-command envelopes, local-command stdout) remain hidden.
+    slash-command envelopes other than /compact, local-command stdout) remain hidden.
     """
     events: list = []
     turn_open = False
@@ -1633,10 +2990,21 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     current_turn_id = None
     history_tool_diffs: dict[str, tuple[str, bool]] = {}
     history_tool_names: dict[str, str] = {}
+    history_image_reads: dict[str, tuple[str, str | None]] = {}
     history_plan_id: str | None = None
     ambiguous_final_mid: str | None = None
     ambiguous_final_start: int | None = None
+    settled_answer_seen = False
+    background_followup = False
     turn_failed = False
+    compact_requested = False
+    # Older wrappers could bind a replacement query's browser id to Claude's
+    # late ``[Request interrupted by user]`` record.  The marker terminates the
+    # preceding turn; transfer that proven-but-misplaced alias only when the
+    # immediately following canonical message is the replacement's visible
+    # top-level user row.  Any intervening row cancels the repair, preventing an
+    # alias from crossing tool protocol, model output, metadata, or a branch.
+    pending_interrupted_alias: tuple[int, str] | None = None
 
     def _history_id(value, kind: str, position: str) -> str:
         """Keep valid engine ids; deterministically repair malformed legacy rows.
@@ -1657,14 +3025,74 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     def _ts(uid):
         return timestamps.get(uid) if timestamps else None
 
-    client_message_ids = getattr(timestamps, "client_message_ids", {})
+    def _history_image_result_event(
+        tool_id: str,
+        image_read: tuple[str, str | None],
+        raw_content: Any,
+        *,
+        is_error: bool,
+        source_uid: str | None = None,
+    ) -> ProcessEvent:
+        image_path, image_parent = image_read
+        tool_name = history_tool_names.get(tool_id) or "Read"
+        if not is_error and _claude_image_blocks(raw_content):
+            event = ProcessEvent(
+                item_id=tool_id,
+                kind="server_tool",
+                phase="end",
+                status="succeeded",
+                turn_id=current_turn_id,
+                parent_id=image_parent,
+                title="查看图片",
+                input={"file_path": image_path},
+                tool="view_image",
+                background=background_followup or None,
+            )
+        else:
+            output, was_truncated = bounded_text(
+                _safe_image_read_result_content(tool_name, raw_content),
+                tool_result_max,
+            )
+            _category, fallback_title, _server = _tool_meta(
+                tool_name, {"file_path": image_path})
+            event = ProcessEvent(
+                item_id=tool_id,
+                kind="server_tool",
+                phase="end",
+                status="failed" if is_error else "succeeded",
+                turn_id=current_turn_id,
+                parent_id=image_parent,
+                title=fallback_title,
+                input={"file_path": image_path},
+                output=output or None,
+                tool=tool_name,
+                truncated=was_truncated or None,
+                background=background_followup or None,
+            )
+        timestamp = _ts(source_uid) if source_uid is not None else None
+        if timestamp is not None:
+            event.ts = timestamp
+        return event
+
+    client_message_ids = client_message_ids or {}
 
     def _um(uid, prompt):
+        nonlocal pending_interrupted_alias
+        from cc_remote.session_messages import parse_message
+        source = parse_message(prompt)
         client_msg_id = client_message_ids.get(uid)
+        if (
+            client_msg_id is None
+            and pending_interrupted_alias is not None
+            and pending_interrupted_alias[0] == message_index
+        ):
+            client_msg_id = pending_interrupted_alias[1]
+        pending_interrupted_alias = None
         um = UserMsg(
             msg_id=uid,
             client_msg_id=client_msg_id,
-            prompt=prompt,
+            prompt=source.prompt if source else prompt,
+            source_thread_id=source.source_thread_id if source else None,
         )
         t = _ts(uid)
         if t is not None:
@@ -1677,13 +3105,15 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     ):
         nonlocal turn_open, last_assistant_uuid, current_turn_id, history_plan_id
         nonlocal ambiguous_final_mid, ambiguous_final_start
-        nonlocal turn_start_ts, turn_failed
+        nonlocal turn_start_ts, settled_answer_seen, turn_failed
+        nonlocal background_followup
+        nonlocal compact_requested
         if turn_open:
             # SessionMessage rows can omit stop_reason. Live must conservatively
             # treat such text as commentary, but history has the next user/EOF as
             # an authoritative turn boundary. Promote only the final top-level
             # ambiguous text row that was not followed by any tool activity.
-            if (ambiguous_final_mid is not None
+            if (subtype != "steered" and ambiguous_final_mid is not None
                     and ambiguous_final_start is not None):
                 for event_index in range(ambiguous_final_start, len(events)):
                     event = events[event_index]
@@ -1721,9 +3151,18 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
             ambiguous_final_mid = None
             ambiguous_final_start = None
             turn_start_ts = None
+            settled_answer_seen = False
+            background_followup = False
             turn_failed = False
+            compact_requested = False
 
     for message_index, m in enumerate(messages):
+        advance_terminal_clock = True
+        if (
+            pending_interrupted_alias is not None
+            and pending_interrupted_alias[0] < message_index
+        ):
+            pending_interrupted_alias = None
         msg = m.message
         if not isinstance(msg, dict):
             continue
@@ -1733,15 +3172,54 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
         message_uid = _history_id(source_uid, "msg", str(message_index))
 
         if role == "user":
+            if (getattr(m, "is_meta", False)
+                    and source_uid not in (internal_user_events or {})):
+                # Native recovery/continuation prompts are part of the current
+                # human turn. Match the SDK's isMeta filter even when reading
+                # raw compact ancestry, without guessing from prompt text.
+                continue
+            if getattr(m, "is_queued_prompt", False) and _compact_visible_user({
+                "type": "user", "message": msg,
+            }):
+                # A consumed human input starts a new visible segment, exactly
+                # like the live TurnSteered echo. It is not proof that the
+                # preceding physical response finished or its text was final.
+                if not settled_answer_seen:
+                    stamp = _ts(source_uid)
+                    if stamp is not None:
+                        last_ts = max(last_ts or stamp, stamp)
+                    close_turn("steered", False)
+            compact_prompt = manual_compact_prompt(content)
+            if compact_prompt is not None:
+                content = compact_prompt
             if isinstance(content, str):
                 internal_event = (internal_user_events or {}).get(source_uid)
                 if internal_event is not None:
+                    # Claude may append a task-notification hours after an
+                    # ``end_turn`` while cold-resuming old background work.
+                    # Keep the lifecycle update in detail, but the already
+                    # completed answer remains the turn's terminal boundary.
+                    if settled_answer_seen or ambiguous_final_mid is not None:
+                        advance_terminal_clock = False
+                        background_followup = True
                     event = internal_event.model_copy(deep=True)
+                    parent_name = (
+                        history_tool_names.get(event.parent_id or "") or ""
+                    ).lower()
+                    if parent_name in {"agent", "task"} and event.parent_id:
+                        event.item_id = _agent_process_id(event.parent_id)
+                        event.kind = "agent"
+                        event.title = event.summary or "协作代理"
+                        event.background = True
                     event.turn_id = event.turn_id or current_turn_id
                     t = _ts(source_uid)
                     if t is not None:
                         event.ts = t
                     events.append(event)
+                    from cc_remote.wrapper.agent_returns import return_receipt
+
+                    events.append(return_receipt(event, f"claude:{internal_event.item_id}",
+                        event.item_id if event.kind == "agent" and event.parent_id else None))
                     turn_open = True
                 elif _is_meta_user_text(content):
                     continue
@@ -1751,8 +3229,24 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     events.append(_um(message_uid, content))
                     turn_open = True
                     current_turn_id = message_uid
+                    background_followup = False
+                    compact_requested = compact_prompt is not None
+                    # A command row alone does not prove successful compaction.
+                    turn_failed = compact_requested
             elif isinstance(content, list):
+                if content and all(
+                    isinstance(block, dict) and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and _is_meta_user_text(block["text"])
+                    for block in content
+                ):
+                    continue
                 if _is_interrupted_user_content(content):
+                    misplaced_alias = client_message_ids.get(message_uid)
+                    pending_interrupted_alias = (
+                        (message_index + 1, misplaced_alias)
+                        if misplaced_alias is not None else None
+                    )
                     marker_ts = _ts(source_uid)
                     if marker_ts is not None:
                         last_ts = marker_ts
@@ -1767,44 +3261,87 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         if img:
                             imgs.append(img)
                 made = False
+                text_made = False
+                prompt_text = "\n".join(
+                    b["text"] for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                    and isinstance(b.get("text"), str) and b["text"]
+                    and not _is_meta_user_text(b["text"])
+                )
                 for block_index, b in enumerate(content):
                     if not isinstance(b, dict):
                         continue
                     bt = b.get("type")
-                    if bt == "tool_result":
+                    if _claude_history_tool_result_block(b):
                         ambiguous_final_mid = None
                         ambiguous_final_start = None
                         tool_id = _history_id(
                             b.get("tool_use_id"), "tool",
                             f"{message_index}-{block_index}-result")
+                        raw_result_content = b.get("content")
+                        image_read = history_image_reads.pop(tool_id, None)
+                        is_error = _claude_history_tool_result_error(b)
+                        if image_read is not None:
+                            events.append(_history_image_result_event(
+                                tool_id,
+                                image_read,
+                                raw_result_content,
+                                is_error=is_error,
+                                source_uid=source_uid,
+                            ))
+                            continue
                         text, was_truncated = bounded_text(
                             _safe_result_content(
-                                history_tool_names.get(tool_id), b.get("content")),
+                                history_tool_names.get(tool_id), raw_result_content),
                             tool_result_max)
                         diff_info = history_tool_diffs.pop(tool_id, None)
-                        is_error = bool(b.get("is_error"))
+                        native_diff = (native_claude_diff(getattr(msg, "tool_use_result", None))
+                                       if not is_error else None)
                         truncated = bool(
                             was_truncated or (diff_info and diff_info[1])) or None
+                        agent_result = (history_tool_names.get(tool_id) or "").lower() in {
+                            "agent", "task"}
+                        result_text = (
+                            raw_result_content
+                            if isinstance(raw_result_content, str) else ""
+                        )
+                        async_launched = agent_result and (
+                            "async agent launched" in result_text.lower()
+                        )
                         events.append(ToolResult(
                             tool_use_id=tool_id,
                             content=text,
                             is_error=is_error,
                             truncated=truncated,
-                            status="failed" if is_error else "succeeded",
-                            diff=diff_info[0] if diff_info and not is_error else None,
+                            status=("failed" if is_error else
+                                    "running" if async_launched else "succeeded"),
+                            diff=native_diff or (diff_info[0] if diff_info and not is_error else None),
+                            diff_source="native" if native_diff else "fragment",
+                            diff_truncated=False if native_diff else bool(diff_info and diff_info[1]),
                         ))
+                        if agent_result:
+                            events.append(ProcessEvent(
+                                item_id=_agent_process_id(tool_id), kind="agent",
+                                phase=("update" if async_launched else "end"),
+                                status=("failed" if is_error else
+                                        "running" if async_launched else "succeeded"),
+                                turn_id=current_turn_id, parent_id=tool_id,
+                                title="协作代理", background=True,
+                            ))
                     elif bt == "text":
                         txt = b.get("text", "")
-                        if txt and not _is_meta_user_text(txt):
+                        if txt and not _is_meta_user_text(txt) and not text_made:
                             close_turn()
                             turn_start_ts = _ts(source_uid)
-                            um = _um(message_uid, txt)
+                            um = _um(message_uid, prompt_text)
+                            text_made = True
                             if imgs and not made:
                                 um.images = imgs
                                 made = True
                             events.append(um)
                             turn_open = True
                             current_turn_id = message_uid
+                            background_followup = False
                 if imgs and not made:   # image-only user turn
                     close_turn()
                     turn_start_ts = _ts(source_uid)
@@ -1813,15 +3350,39 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     events.append(um)
                     turn_open = True
                     current_turn_id = message_uid
+                    background_followup = False
+        elif role == "system":
+            internal_event = ((internal_user_events or {}).get(source_uid)
+                              or getattr(m, "internal_event", None))
+            if internal_event is not None:
+                # Manual compaction can finish minutes after an answer. Keep
+                # its process timestamp without retiming the settled response.
+                if settled_answer_seen or ambiguous_final_mid is not None:
+                    advance_terminal_clock = False
+                event = internal_event.model_copy(deep=True)
+                event.turn_id = event.turn_id or current_turn_id
+                timestamp = _ts(source_uid)
+                if timestamp is not None:
+                    event.ts = timestamp
+                events.append(event)
+                turn_open = True
+                if compact_requested and event.kind == "compaction" and event.status == "succeeded":
+                    receipt = compact_completion_events(event.item_id, current_turn_id)
+                    for item in receipt:
+                        item.ts = event.ts
+                    events.extend(receipt)
+                    turn_failed = False
         elif role == "assistant":
             if not isinstance(content, list):
                 continue
             if _is_synthetic_no_response(msg):
                 continue
+            pending_interrupted_alias = None
             if _is_synthetic_api_error(msg):
                 turn_failed = True
             if _CLAUDE_MESSAGE_UUID.fullmatch(source_uid):
                 last_assistant_uuid = source_uid
+            assistant_event_start = len(events)
             mid = message_uid
             thinking_mid = _wire_id(f"{mid}:thinking", "msg", str(message_index))
             has_client_tool = any(
@@ -1848,6 +3409,16 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             and b.get("type").endswith("_tool_result")))
                     for b in content)
             )
+            # Any later assistant activity re-opens the conversational tail.
+            # A top-level end_turn text settles it again; nested Agent answers
+            # and tool-bearing messages are not enclosing-turn boundaries.
+            settled_answer_seen = (
+                parent is None
+                and not has_tool_activity
+                and text_channel == "final"
+                and has_text
+                and msg.get("stop_reason") == "end_turn"
+            )
             if has_tool_activity:
                 ambiguous_final_mid = None
                 ambiguous_final_start = None
@@ -1870,27 +3441,32 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                     txt = b.get("text", "")
                     if not text_started:
                         events.append(AssistantMsgStart(
-                            message_id=mid, channel=text_channel))
+                            message_id=mid, channel=text_channel,
+                            background=background_followup or None))
                         text_started = True
                     if txt:
                         events.append(Delta(
-                            message_id=mid, text=txt, channel=text_channel))
+                            message_id=mid, text=txt, channel=text_channel,
+                            background=background_followup or None))
                 elif bt == "thinking":
                     thinking = b.get("thinking", "")
                     if not thinking_started:
                         events.append(AssistantMsgStart(
-                            message_id=thinking_mid, channel="thinking"))
+                            message_id=thinking_mid, channel="thinking",
+                            background=background_followup or None))
                         thinking_started = True
                     if isinstance(thinking, str) and thinking:
                         safe_thinking, _ = bounded_text(thinking, tool_result_max)
                         if safe_thinking:
                             events.append(Delta(
                                 message_id=thinking_mid, text=safe_thinking,
-                                channel="thinking"))
+                                channel="thinking",
+                                background=background_followup or None))
                 elif bt in {"tool_use", "server_tool_use"}:
                     if not text_started:
                         events.append(AssistantMsgStart(
-                            message_id=mid, channel="commentary"))
+                            message_id=mid, channel="commentary",
+                            background=background_followup or None))
                         text_started = True
                     # a stored tool_use input SHOULD be a dict, but old/odd history
                     # can carry a scalar (e.g. 3); coerce so ToolUse validation
@@ -1903,18 +3479,46 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                         f"{message_index}-{block_index}-use")
                     server_tool = bt == "server_tool_use"
                     redacted_input = _redact_sensitive_input(raw_input)
+                    public_input = _public_tool_input(
+                        b.get("name") or "", raw_input)
                     category, title, server = _tool_meta(
                         b.get("name") or "", redacted_input,
                         server_tool=server_tool)
-                    events.append(ToolUse(
-                        message_id=mid,
-                        tool_use_id=tool_id,
-                        tool=b.get("name") or "",
-                        input=bounded_tool_input(redacted_input, tool_result_max),
-                        category=category, title=title, parent_id=parent,
-                        server=server,
-                    ))
+                    image_path = _claude_image_read_path(
+                        b.get("name"), raw_input)
+                    if image_path is not None:
+                        history_image_reads[tool_id] = (image_path, parent)
+                        events.append(ProcessEvent(
+                            item_id=tool_id,
+                            kind="server_tool",
+                            phase="start",
+                            status="running",
+                            turn_id=current_turn_id,
+                            parent_id=parent,
+                            title="查看图片",
+                            input={"file_path": image_path},
+                            tool="view_image",
+                            background=background_followup or None,
+                        ))
+                    else:
+                        events.append(ToolUse(
+                            message_id=mid,
+                            tool_use_id=tool_id,
+                            tool=b.get("name") or "",
+                            input=bounded_tool_input(
+                                public_input, tool_result_max),
+                            category=category, title=title, parent_id=parent,
+                            server=server,
+                            background=background_followup or None,
+                        ))
                     history_tool_names[tool_id] = b.get("name") or ""
+                    if image_path is None and category == "agent":
+                        events.append(ProcessEvent(
+                            item_id=_agent_process_id(tool_id), kind="agent",
+                            phase="start", status="running",
+                            turn_id=current_turn_id, parent_id=tool_id,
+                            title=title, background=True,
+                        ))
                     diff, diff_truncated = _tool_diff(
                         b.get("name") or "", raw_input, tool_result_max)
                     if diff:
@@ -1941,41 +3545,87 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
                             item_id=plan_id, kind="plan", phase="end",
                             status="succeeded", turn_id=current_turn_id,
                             title="计划模式", summary="计划已完成"))
-                elif bt == "tool_result" or (
-                        isinstance(bt, str) and bt.endswith("_tool_result")
-                        and b.get("tool_use_id")):
+                elif _claude_history_tool_result_block(b):
                     tool_id = _history_id(
                         b.get("tool_use_id"), "tool",
                         f"{message_index}-{block_index}-assistant-result")
+                    raw_result_content = b.get("content")
+                    image_read = history_image_reads.pop(tool_id, None)
+                    is_error = _claude_history_tool_result_error(b)
+                    if image_read is not None:
+                        events.append(_history_image_result_event(
+                            tool_id,
+                            image_read,
+                            raw_result_content,
+                            is_error=is_error,
+                            source_uid=source_uid,
+                        ))
+                        continue
                     text, was_truncated = bounded_text(
                         _safe_result_content(
-                            history_tool_names.get(tool_id), b.get("content")),
+                            history_tool_names.get(tool_id), raw_result_content),
                         tool_result_max)
-                    result_type = (b.get("content") or {}).get("type", "") if isinstance(
-                        b.get("content"), dict) else ""
-                    is_error = bool(b.get("is_error")) or "error" in str(result_type).lower()
                     diff_info = history_tool_diffs.pop(tool_id, None)
+                    agent_result = (history_tool_names.get(tool_id) or "").lower() in {
+                        "agent", "task"}
+                    result_text = (
+                        raw_result_content
+                        if isinstance(raw_result_content, str) else ""
+                    )
+                    async_launched = agent_result and (
+                        "async agent launched" in result_text.lower()
+                    )
                     events.append(ToolResult(
                         tool_use_id=tool_id, content=text, is_error=is_error,
-                        status="failed" if is_error else "succeeded",
+                        status=("failed" if is_error else
+                                "running" if async_launched else "succeeded"),
                         truncated=bool(
                             was_truncated or (diff_info and diff_info[1])) or None,
                         diff=diff_info[0] if diff_info and not is_error else None,
+                        background=background_followup or None,
                     ))
+                    if agent_result:
+                        events.append(ProcessEvent(
+                            item_id=_agent_process_id(tool_id), kind="agent",
+                            phase=("update" if async_launched else "end"),
+                            status=("failed" if is_error else
+                                    "running" if async_launched else "succeeded"),
+                            turn_id=current_turn_id, parent_id=tool_id,
+                            title="协作代理", background=True,
+                        ))
             if thinking_started:
                 events.append(AssistantMsgEnd(
-                    message_id=thinking_mid, channel="thinking"))
+                    message_id=thinking_mid, channel="thinking",
+                    background=background_followup or None))
             if text_started:
                 events.append(AssistantMsgEnd(
-                    message_id=mid, channel=text_channel))
+                    message_id=mid, channel=text_channel,
+                    background=background_followup or None))
                 turn_open = True
+            assistant_ts = _ts(source_uid)
+            if assistant_ts is not None:
+                for event in events[assistant_event_start:]:
+                    event.ts = assistant_ts
         # advance last_ts AFTER handling m: a leading close_turn (for the next user
         # msg) stamps the PRIOR turn's tail; the final close_turn stamps this turn's
         # last (assistant) message = answer-done time.
         mts = _ts(source_uid)
-        if mts is not None:
+        if (
+            mts is not None
+            and advance_terminal_clock
+            # A notification alone cannot extend a settled answer. Actual
+            # assistant output after it is a new conversational continuation
+            # and must advance the footer to its real source time.
+            and (not background_followup or role == "assistant")
+        ):
             last_ts = mts
-    close_turn()
+    # Claude's transcript does not persist the SDK ResultMessage. EOF normally
+    # acts as a synthetic completed boundary for an idle historical snapshot,
+    # but it is not lifecycle evidence while the resident SDK iterator is still
+    # active. Keep only that final group open; every earlier group was already
+    # closed authoritatively by the next visible user message.
+    if not snapshot_in_progress:
+        close_turn()
     return events
 
 
@@ -1990,212 +3640,184 @@ def _parse_timestamp(value: Any) -> float | None:
         return None
 
 
-def translate_subagent_history(session_id: str, tool_result_max: int) -> list:
-    """Recover bounded Claude subagent timelines omitted by SessionMessage.
+_subagent_projection = IncrementalJsonlProjection()
 
-    Claude stores each subagent below ``<session>/subagents/agent-*.jsonl``.
-    The SDK's ``get_session_messages`` intentionally returns only the main chain,
-    so process history would otherwise disappear after reload. We correlate each
-    agentId through the main Agent/Task tool result, omit the private initial
-    subagent prompt, and reuse ``translate_history`` for the public assistant/tool
-    blocks. Uncorrelated files are skipped rather than creating phantom turns.
+
+def _new_subagent_projection():
+    return {"records": {}, "agent_tools": {}, "order": [], "current_turn": None}
+
+
+def _update_subagent_projection(state, row, index):
+    records, agent_tools, order = state["records"], state["agent_tools"], state["order"]
+    current_turn = state["current_turn"]
+    msg = row.get("message") if isinstance(row.get("message"), dict) else {}
+    role = msg.get("role") or row.get("type")
+    content = msg.get("content")
+    if role == "user":
+        origin = row.get("origin")
+        visible = (isinstance(content, str) and content
+                   and not _is_meta_user_text(content))
+        if (isinstance(origin, dict)
+                and origin.get("kind") == "task-notification"):
+            visible = False
+        if isinstance(content, list):
+            visible = any(
+                isinstance(block, dict) and block.get("type") == "text"
+                and block.get("text")
+                and not _is_meta_user_text(block.get("text"))
+                for block in content)
+        if visible:
+            current_turn = _wire_id(row.get("uuid"), "msg", str(index))
+        result_meta = row.get("toolUseResult")
+        if isinstance(result_meta, dict):
+            agent_id = result_meta.get("agentId")
+            tool_id = next((
+                block.get("tool_use_id") for block in (content or [])
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+            ), None) if isinstance(content, list) else None
+            if agent_id:
+                agent_key = str(agent_id)
+                known_tool = agent_tools.get(agent_key)
+                candidate = _wire_id(tool_id, "tool") if tool_id else None
+                if known_tool is None and candidate in records:
+                    known_tool = candidate
+                    agent_tools[agent_key] = candidate
+                if known_tool is not None:
+                    record = records[known_tool]
+                    record["agent_id"] = agent_key
+                    title = _short_text(
+                        result_meta.get("description"), 1000)
+                    if title:
+                        record["title"] = title
+                    raw_status = result_meta.get("status")
+                    if (bool(result_meta.get("isAsync"))
+                            or str(raw_status).lower()
+                            == "async_launched"):
+                        # The same agent can resume after an earlier
+                        # notification. A later launch re-opens the
+                        # same public run rather than creating a ghost.
+                        record["async"] = True
+                        record["terminal"] = None
+        origin = row.get("origin")
+        if (isinstance(origin, dict)
+                and origin.get("kind") == "task-notification"
+                and isinstance(content, str)):
+            task_match = re.search(
+                r"<task-id>([^<]{1,256})</task-id>", content)
+            tool_match = re.search(
+                r"<tool-use-id>([^<]{1,256})</tool-use-id>", content)
+            status_match = re.search(
+                r"<status>([^<]{1,64})</status>", content)
+            summary_match = re.search(
+                r"<summary>([\s\S]{0,65536}?)</summary>", content)
+            agent_key = task_match.group(1) if task_match else None
+            parent = (
+                _wire_id(tool_match.group(1), "tool")
+                if tool_match else agent_tools.get(agent_key or "")
+            )
+            if parent in records:
+                record = records[parent]
+                record["terminal"] = _task_status(
+                    status_match.group(1) if status_match else None)
+                record["terminal_ts"] = _parse_timestamp(
+                    row.get("timestamp"))
+                if summary_match:
+                    record["summary"] = _short_text(
+                        summary_match.group(1), 64 * 1024)
+    elif role == "assistant" and isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if str(block.get("name") or "").lower() not in {"agent", "task"}:
+                continue
+            tool_id = _wire_id(
+                block.get("id"), "tool", f"{index}-agent")
+            tool_input = block.get("input") if isinstance(
+                block.get("input"), dict) else {}
+            if tool_id not in records:
+                order.append(tool_id)
+            records[tool_id] = {
+                **records.get(tool_id, {}),
+                "tool_id": tool_id,
+                "turn": current_turn,
+                "start_ts": _parse_timestamp(row.get("timestamp")),
+                "async": records.get(tool_id, {}).get("async", False),
+                "terminal": records.get(tool_id, {}).get("terminal"),
+                "title": (
+                _short_text(tool_input.get("description"), 1000)
+                or _short_text(tool_input.get("subagent_type"), 1000)
+                or "协作代理"),
+            }
+    state["current_turn"] = current_turn
+
+
+def translate_subagent_history(
+    session_id: str,
+    tool_result_max: int,
+    *,
+    path: str | None = None,
+) -> list:
+    """Recover only lightweight Claude Agent lifecycle cards.
+
+    Full subagent conversations belong to ``GetAgentDetail`` and must never be
+    flattened back into the parent turn.  The main transcript is authoritative
+    for launch/notification state; EOF without a terminal is deliberately
+    ``unknown`` rather than a fabricated success.
     """
-    main_path = transcript_path(session_id)
+    main_path = path or transcript_path(session_id)
     if not main_path:
         return []
-    subagent_dir = os.path.join(os.path.splitext(main_path)[0], "subagents")
-    if not os.path.isdir(subagent_dir):
-        return []
 
-    tool_turns: dict[str, str] = {}
-    tool_titles: dict[str, str] = {}
-    agent_tools: dict[str, str] = {}
-    current_turn: str | None = None
     try:
-        with open(main_path, encoding="utf-8") as source:
-            for index, line in enumerate(_bounded_jsonl_lines(source)):
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                msg = row.get("message") if isinstance(row.get("message"), dict) else {}
-                role = msg.get("role") or row.get("type")
-                content = msg.get("content")
-                if role == "user":
-                    origin = row.get("origin")
-                    visible = (isinstance(content, str) and content
-                               and not _is_meta_user_text(content))
-                    if (isinstance(origin, dict)
-                            and origin.get("kind") == "task-notification"):
-                        visible = False
-                    if isinstance(content, list):
-                        visible = any(
-                            isinstance(block, dict) and block.get("type") == "text"
-                            and block.get("text")
-                            and not _is_meta_user_text(block.get("text"))
-                            for block in content)
-                    if visible:
-                        current_turn = _wire_id(row.get("uuid"), "msg", str(index))
-                    result_meta = row.get("toolUseResult")
-                    if isinstance(result_meta, dict):
-                        agent_id = result_meta.get("agentId")
-                        tool_id = next((
-                            block.get("tool_use_id") for block in (content or [])
-                            if isinstance(block, dict) and block.get("type") == "tool_result"
-                        ), None) if isinstance(content, list) else None
-                        if agent_id and tool_id:
-                            agent_tools[str(agent_id)] = _wire_id(tool_id, "tool")
-                elif role == "assistant" and isinstance(content, list):
-                    for block in content:
-                        if not isinstance(block, dict) or block.get("type") != "tool_use":
-                            continue
-                        if str(block.get("name") or "").lower() not in {"agent", "task"}:
-                            continue
-                        tool_id = _wire_id(
-                            block.get("id"), "tool", f"{index}-agent")
-                        if current_turn:
-                            tool_turns[tool_id] = current_turn
-                        tool_input = block.get("input") if isinstance(
-                            block.get("input"), dict) else {}
-                        tool_titles[tool_id] = (
-                            _short_text(tool_input.get("description"), 1000)
-                            or _short_text(tool_input.get("subagent_type"), 1000)
-                            or "协作代理")
+        with history_stage("claude_agents"):
+            state = _subagent_projection.read(
+                main_path, _new_subagent_projection, _update_subagent_projection,
+                _bounded_jsonl_lines)
     except (OSError, UnicodeError):
         return []
+    records, order = state["records"], state["order"]
 
-    paths = sorted(glob.iglob(os.path.join(subagent_dir, "agent-*.jsonl")))
     events: list = []
-    total_bytes = 0
-    for file_index, path in enumerate(paths[:_MAX_SUBAGENT_FILES]):
-        try:
-            size = os.path.getsize(path)
-        except OSError:
+    for tool_id in order[:_MAX_SUBAGENT_FILES]:
+        record = records[tool_id]
+        if not record.get("turn") or not record.get("async"):
             continue
-        total_bytes += size
-        if size > _MAX_SUBAGENT_TOTAL_BYTES or total_bytes > _MAX_SUBAGENT_TOTAL_BYTES:
-            break
-        raw_rows = []
-        agent_id = None
-        timestamps: dict[str, float] = {}
-        first_ts = last_ts = None
-        final_summary = None
-        try:
-            with open(path, encoding="utf-8") as source:
-                for row_index, line in enumerate(_bounded_jsonl_lines(source)):
-                    try:
-                        row = json.loads(line)
-                    except Exception:
-                        continue
-                    if not agent_id and row.get("agentId"):
-                        agent_id = str(row.get("agentId"))
-                    uid = _wire_id(
-                        row.get("uuid"), "msg", f"{file_index}-{row_index}")
-                    ts = _parse_timestamp(row.get("timestamp"))
-                    if ts is not None:
-                        timestamps[uid] = ts
-                        first_ts = ts if first_ts is None else min(first_ts, ts)
-                        last_ts = ts if last_ts is None else max(last_ts, ts)
-                    msg = row.get("message") if isinstance(
-                        row.get("message"), dict) else None
-                    if not msg:
-                        continue
-                    content = msg.get("content")
-                    role = msg.get("role") or row.get("type")
-                    # The private delegated prompt is already present in the
-                    # parent Agent tool input. Do not render it a second time.
-                    if role == "user" and not (
-                            isinstance(content, list) and any(
-                                isinstance(block, dict)
-                                and block.get("type") == "tool_result"
-                                for block in content)):
-                        continue
-                    if role == "assistant" and isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                candidate = _short_text(block.get("text"), 4096)
-                                if candidate:
-                                    final_summary = candidate
-                    raw_rows.append(SimpleNamespace(
-                        uuid=uid,
-                        type=role,
-                        message=msg,
-                        # Nest all internal tools under the agent process row.
-                        parent_tool_use_id=None,
-                    ))
-        except (OSError, UnicodeError):
-            continue
-        if not agent_id:
-            match = re.fullmatch(r"agent-([A-Za-z0-9._:@-]+)\.jsonl", os.path.basename(path))
-            agent_id = match.group(1) if match else None
-        parent = agent_tools.get(agent_id or "")
-        turn = tool_turns.get(parent or "")
-        if not parent or not turn:
-            continue
-        agent_item = _wire_id(f"agent:{agent_id}", "agent")
-        title = tool_titles.get(parent, "协作代理")
-        start = ProcessEvent(
-            item_id=agent_item, kind="agent", phase="start", status="running",
-            turn_id=turn, parent_id=parent, title=title,
+        status = record.get("terminal")
+        terminal = status in {"succeeded", "failed", "cancelled"}
+        event = ProcessEvent(
+            item_id=_agent_process_id(tool_id), kind="agent",
+            phase="end" if terminal else "snapshot",
+            status=status if terminal else "unknown",
+            turn_id=record["turn"], parent_id=tool_id,
+            title=record.get("title") or "协作代理",
+            summary=(record.get("summary") if terminal
+                     else "未收到结束信号"),
+            background=True,
         )
-        if first_ts is not None:
-            start.ts = first_ts
-        sequence = [start]
-        translated = translate_history(
-            raw_rows, tool_result_max, timestamps=timestamps)
-        for event in translated:
-            if isinstance(event, TurnEnd) or isinstance(event, UserMsg):
-                continue
-            if isinstance(event, (AssistantMsgStart, Delta, AssistantMsgEnd)):
-                if event.channel != "thinking":
-                    event.channel = "commentary"
-            if isinstance(event, ToolUse):
-                event.parent_id = agent_item
-            if isinstance(event, ProcessEvent):
-                event.turn_id = turn
-                event.parent_id = event.parent_id or agent_item
-            sequence.append(event)
-        end = ProcessEvent(
-            item_id=agent_item, kind="agent", phase="end", status="succeeded",
-            turn_id=turn, parent_id=parent, title=title, summary=final_summary,
-        )
-        if last_ts is not None:
-            end.ts = last_ts
-        sequence.append(end)
-        if len(events) + len(sequence) > _MAX_SUBAGENT_EVENTS:
-            break
-        events.extend(sequence)
+        start_ts = record.get("start_ts")
+        end_ts = record.get("terminal_ts")
+        if isinstance(start_ts, float) and isinstance(end_ts, float):
+            event.duration_ms = max(0, round((end_ts - start_ts) * 1000))
+        if isinstance(end_ts, float):
+            event.ts = end_ts
+        events.append(event)
     return events
 
 
 def merge_subagent_history(events: list, subagent_events: list) -> list:
-    """Insert each recovered agent timeline immediately below its Agent tool."""
+    """Insert recovered lifecycle refinements below their Agent tool call."""
     if not subagent_events:
         return events
-    groups: dict[str, list[list]] = {}
-    current: list | None = None
-    current_parent = None
+    groups: dict[str, list] = {}
     for event in subagent_events:
         if (isinstance(event, ProcessEvent) and event.kind == "agent"
-                and event.phase == "start"):
-            current = [event]
-            current_parent = event.parent_id
-            continue
-        if current is None:
-            continue
-        current.append(event)
-        if (isinstance(event, ProcessEvent) and event.kind == "agent"
-                and event.phase == "end"):
-            if current_parent:
-                groups.setdefault(current_parent, []).append(current)
-            current = None
-            current_parent = None
+                and event.parent_id):
+            groups.setdefault(event.parent_id, []).append(event)
     merged = []
     for event in events:
         merged.append(event)
         if isinstance(event, ToolUse):
-            for sequence in groups.pop(event.tool_use_id, []):
-                merged.extend(sequence)
+            merged.extend(groups.pop(event.tool_use_id, []))
     return merged
 
 
@@ -2203,11 +3825,14 @@ def _is_meta_user_text(text: str) -> bool:
     """Skip non-conversational user turns that would just clutter the history:
     compact summaries, slash-command envelopes, and local-command stdout/stderr."""
     t = text.lstrip()
+    if manual_compact_prompt(t) is not None:
+        return False
     return (
         t.startswith("This session is being continued from a previous conversation")
         or t.startswith("<command-name>")
         or t.startswith("<command-message>")
         or t.startswith("<command-args>")
+        or t.startswith("<local-command-caveat>")
         or t.startswith("<local-command-stdout>")
         or t.startswith("<local-command-stderr>")
     )
@@ -2239,13 +3864,21 @@ def _is_interrupted_user_content(content: Any) -> bool:
     This row is lifecycle metadata for the preceding prompt, not a second
     human-authored message. Claude currently persists it as one text block.
     """
+    if not isinstance(content, list) or len(content) != 1:
+        return False
+    block = content[0]
+    if isinstance(block, dict):
+        block_type = block.get("type")
+        text = block.get("text")
+    elif isinstance(block, TextBlock):
+        block_type = "text"
+        text = block.text
+    else:
+        return False
     return (
-        isinstance(content, list)
-        and len(content) == 1
-        and isinstance(content[0], dict)
-        and content[0].get("type") == "text"
-        and isinstance(content[0].get("text"), str)
-        and content[0]["text"].strip() == _INTERRUPTED_USER_TEXT
+        block_type == "text"
+        and isinstance(text, str)
+        and text.strip() == _INTERRUPTED_USER_TEXT
     )
 
 

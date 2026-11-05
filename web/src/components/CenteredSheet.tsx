@@ -1,0 +1,74 @@
+import { useEffect, useRef, type ReactNode, type RefObject } from "react";
+import { createPortal } from "react-dom";
+import { useChatDialogGeometry } from "../chat-dialog-geometry";
+import { Icon } from "../icons";
+import "./CenteredSheet.css";
+
+/** Shared selection surface, centered in the visible chat on every device. */
+export function CenteredSheet({ open, label, onClose, children, className = "",
+  maxWidth = 520, maxHeight = 720, minimumHeight = 360, header = true, returnFocusRef }: {
+  open: boolean;
+  label: string;
+  onClose: () => void;
+  children: ReactNode;
+  className?: string;
+  maxWidth?: number;
+  maxHeight?: number;
+  /** Allow content-heavy pickers to use the visible viewport when chat space is short. */
+  minimumHeight?: number;
+  header?: boolean;
+  /** Touch browsers may leave the trigger unfocused when opening a dialog. */
+  returnFocusRef?: RefObject<HTMLElement | null>;
+}) {
+  const ref = useRef<HTMLElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+  const geometry = useChatDialogGeometry({
+    open, maxWidth, maxHeight, minimumHeight,
+  });
+  const visible = open && !!geometry;
+  useEffect(() => {
+    if (!visible) return;
+    const previous = returnFocusRef?.current ?? document.activeElement as HTMLElement | null;
+    // Do not focus a text field and summon the phone keyboard on opening.
+    ref.current?.focus({ preventScroll: true });
+    const onKey = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeRef.current();
+      } else if (event.key === "Tab") {
+        const nodes = [...(ref.current?.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), summary, a[href], [tabindex="0"]',
+        ) ?? [])].filter(node => node.getClientRects().length > 0);
+        const current = nodes.indexOf(document.activeElement as HTMLElement);
+        event.preventDefault();
+        const next = current < 0 ? (event.shiftKey ? nodes.length - 1 : 0)
+          : (current + (event.shiftKey ? -1 : 1) + nodes.length) % nodes.length;
+        (nodes[next] ?? ref.current)?.focus({ preventScroll: true });
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      if (previous?.isConnected) previous.focus({ preventScroll: true });
+    };
+  // Viewport and keyboard geometry changes must not reset focus or scrolling.
+  }, [visible, returnFocusRef]);
+  if (!open || (!geometry && typeof document !== "undefined")) return null;
+  const content = <>
+    <div className="scrim show centered-sheet-scrim" onClick={onClose} />
+    <section ref={ref} tabIndex={-1} className={`sheet show centered-sheet ${className}`}
+      role="dialog" aria-modal="true" aria-label={label} style={geometry ?? undefined} data-lock-horizontal-swipe>
+      {header && <header className="centered-sheet-head">
+        <span className="sheet-title">{label}</span>
+        <button type="button" onClick={onClose} aria-label={`关闭${label}`}>
+          <Icon name="close" size={18} />
+        </button>
+      </header>}
+      {children}
+    </section>
+  </>;
+  return typeof document === "undefined" ? content : createPortal(content, document.body);
+}

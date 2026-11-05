@@ -17,8 +17,10 @@ checkpoint boundary.  Empty directories are not representable in Git trees.
 """
 
 from __future__ import annotations
+import shutil
 
 import copy
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import hashlib
 import json
 import os
@@ -31,7 +33,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.file_lock_compat import flock, LOCK_EX, LOCK_UN
@@ -48,6 +50,7 @@ _TURN_ID_MAX = 512
 # conversation-only rollback remains available and count alignment is preserved.
 _MAX_RETAINED_TURNS = 100
 _MAX_OBJECT_BYTES = 256 * 1024 * 1024
+_PROFILE_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 
 
 class CheckpointError(RuntimeError):
@@ -190,16 +193,227 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
             pass
 
 
+def _checkpoint_session_key(session_id: str) -> str:
+    return hashlib.sha256(
+        session_id.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:24]
+
+
+def cleanup_codex_checkpoint_session(
+    state_dir: Path,
+    session_id: str,
+) -> int:
+    """Force-remove one session's journals without needing its former cwd."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id is required")
+    root = (
+        Path(state_dir).expanduser().resolve(strict=False)
+        / "codex-checkpoints"
+    )
+    try:
+        repositories = [
+            entry
+            for entry in os.scandir(root)
+            if entry.is_dir(follow_symlinks=False)
+        ]
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise CheckpointError(
+            "Unable to inspect Codex checkpoint journals"
+        ) from exc
+
+    session_key = _checkpoint_session_key(session_id)
+    removed = 0
+    for repository in repositories:
+        candidate = Path(repository.path) / session_key
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to inspect Codex checkpoint journal"
+            ) from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise CheckpointError(
+                "Checkpoint session path is not a directory"
+            )
+
+        lock_fd: Optional[int] = None
+        tombstone: Optional[Path] = None
+        try:
+            lock_flags = os.O_RDWR | os.O_CREAT
+            lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            tombstone = candidate.with_name(
+                f".{candidate.name}.delete-{uuid.uuid4().hex}"
+            )
+            try:
+                os.replace(candidate, tombstone)
+            except FileNotFoundError:
+                tombstone = None
+                continue
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to retire Codex checkpoint journal"
+            ) from exc
+        finally:
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+        if tombstone is not None:
+            try:
+                shutil.rmtree(tombstone, ignore_errors=False)
+            except OSError as exc:
+                raise CheckpointError(
+                    "Unable to remove Codex checkpoint journal"
+                ) from exc
+            removed += 1
+    return removed
+
+
+def migrate_codex_checkpoint_profiles(
+    state_dir: Path,
+    transform: Callable[[str], str],
+    *,
+    profile_revision: int,
+) -> int:
+    """Crash-resumably move private checkpoint journals to new wire ids."""
+    if (
+        isinstance(profile_revision, bool)
+        or not isinstance(profile_revision, int)
+        or profile_revision < 1
+    ):
+        raise CheckpointError("Invalid Codex profile revision")
+    root = Path(state_dir).expanduser().resolve(strict=False) / "codex-checkpoints"
+    try:
+        repositories = [
+            entry for entry in os.scandir(root)
+            if entry.is_dir(follow_symlinks=False)
+        ]
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise CheckpointError(
+            "Unable to inspect Codex checkpoint journals") from exc
+
+    migrated = 0
+    for repository in repositories:
+        repository_dir = Path(repository.path)
+        try:
+            candidates = [
+                entry for entry in os.scandir(repository.path)
+                if entry.is_dir(follow_symlinks=False)
+            ]
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to inspect Codex checkpoint repository") from exc
+        staged: list[tuple[Path, Path]] = []
+        for candidate in candidates:
+            directory = Path(candidate.path)
+            manifest_path = directory / "manifest.json"
+            try:
+                info = manifest_path.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_size > _PROFILE_MANIFEST_MAX_BYTES
+                ):
+                    raise CheckpointError(
+                        "Checkpoint manifest is not a bounded regular file")
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise CheckpointError(
+                    "Checkpoint manifest is corrupt") from exc
+            if not isinstance(manifest, dict):
+                raise CheckpointError("Checkpoint manifest is corrupt")
+            session_id = manifest.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise CheckpointError("Checkpoint manifest has no session identity")
+            durable_revision = manifest.get("profile_revision", 0)
+            if (
+                isinstance(durable_revision, bool)
+                or not isinstance(durable_revision, int)
+                or durable_revision < 0
+            ):
+                raise CheckpointError(
+                    "Checkpoint profile revision is invalid")
+            is_stage = candidate.name.startswith(
+                f".profile-r{profile_revision}-")
+            if durable_revision < profile_revision:
+                target_session_id = transform(session_id)
+                target_name = _checkpoint_session_key(target_session_id)
+                if not is_stage and candidate.name != target_name:
+                    stage = repository_dir / (
+                        f".profile-r{profile_revision}-{candidate.name}")
+                    if stage.exists():
+                        raise CheckpointError(
+                            "Checkpoint profile migration has a staged collision")
+                    os.replace(directory, stage)
+                    directory = stage
+                    manifest_path = directory / "manifest.json"
+                manifest["session_id"] = target_session_id
+                manifest["profile_revision"] = profile_revision
+                _atomic_write(
+                    manifest_path,
+                    json.dumps(
+                        manifest,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("utf-8"),
+                )
+                manifest_directory_fd = os.open(
+                    manifest_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(manifest_directory_fd)
+                finally:
+                    os.close(manifest_directory_fd)
+                session_id = target_session_id
+                durable_revision = profile_revision
+                migrated += 1
+            if is_stage or directory.name.startswith(
+                f".profile-r{profile_revision}-"
+            ):
+                target = repository_dir / _checkpoint_session_key(session_id)
+                staged.append((directory, target))
+
+        for stage, target in staged:
+            if target.exists():
+                raise CheckpointError(
+                    "Checkpoint profile migration target already exists")
+            os.replace(stage, target)
+        if staged:
+            directory_fd = os.open(repository_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    return migrated
+
+
 class CodexCheckpointJournal:
     """Persistent per-session checkpoint journal for one Git worktree."""
 
-    def __init__(self, cwd: str, state_dir: Path, session_id: str):
+    def __init__(
+        self,
+        cwd: str,
+        state_dir: Path,
+        session_id: str,
+        *,
+        profile_revision: int = 0,
+    ):
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id is required")
         self.repository_root, self.git_dir, self.common_git_dir = _discover_repository(
             cwd
         )
         self.session_id = session_id
+        self.profile_revision = profile_revision
         self.state_root = Path(os.path.realpath(Path(state_dir).expanduser()))
         try:
             if (
@@ -216,9 +430,7 @@ class CodexCheckpointJournal:
         repository_key = hashlib.sha256(
             self.repository_root.encode("utf-8", errors="surrogatepass")
         ).hexdigest()[:20]
-        session_key = hashlib.sha256(
-            session_id.encode("utf-8", errors="surrogatepass")
-        ).hexdigest()[:24]
+        session_key = _checkpoint_session_key(session_id)
         self.session_dir = (
             self.state_root / "codex-checkpoints" / repository_key / session_key
         )
@@ -262,6 +474,7 @@ class CodexCheckpointJournal:
             "version": _FORMAT_VERSION,
             "repository_root": self.repository_root,
             "session_id": self.session_id,
+            "profile_revision": self.profile_revision,
             "active": None,
             "restore": None,
             "turns": [],
@@ -293,6 +506,7 @@ class CodexCheckpointJournal:
             or manifest.get("version") != _FORMAT_VERSION
             or manifest.get("repository_root") != self.repository_root
             or manifest.get("session_id") != self.session_id
+            or manifest.get("profile_revision", 0) != self.profile_revision
             or not isinstance(manifest.get("turns"), list)
             or "restore" not in manifest
         ):
@@ -421,26 +635,45 @@ class CodexCheckpointJournal:
         self,
         pre_head: Optional[str],
         post_head: Optional[str],
-        post_tree: str,
+        *,
+        pre_entries: dict[str, TreeEntry],
+        post_entries: dict[str, TreeEntry],
+        pre_index_entries: dict[str, tuple[str, ...]],
+        post_index_entries: dict[str, tuple[str, ...]],
+        changed_paths: tuple[str, ...],
     ) -> bool:
-        """Accept only a forward commit with a clean index and worktree."""
+        """Accept a forward commit with only unchanged untracked leftovers."""
         if not pre_head or not post_head or pre_head == post_head:
             return False
         if self._git(
             "merge-base", "--is-ancestor", pre_head, post_head, check=False
         ).returncode != 0:
             return False
-        head_tree_result = self._git(
-            "rev-parse", "--verify", f"{post_head}^{{tree}}", check=False
-        )
-        index_tree_result = self._git(
-            "write-tree", env=self._git_env(), check=False
-        )
-        if head_tree_result.returncode != 0 or index_tree_result.returncode != 0:
+        head_entries = self._tree_entries(post_head)
+        # Use the index captured with the post-image, not a fresh write-tree:
+        # write-tree can refresh the user's real index cache as a side effect.
+        if post_index_entries.keys() != head_entries.keys():
             return False
-        head_tree = _decode(head_tree_result.stdout).strip()
-        index_tree = _decode(index_tree_result.stdout).strip()
-        return bool(head_tree) and post_tree == head_tree == index_tree
+        for path, entry in head_entries.items():
+            rows = post_index_entries[path]
+            if len(rows) != 1 or rows[0].partition(" ")[2] != (
+                f"{entry.mode} {entry.oid} 0"
+            ) or post_entries.get(path) != entry:
+                return False
+
+        pre_head_entries = self._tree_entries(pre_head)
+        untracked_before = (
+            pre_entries.keys() - pre_head_entries.keys() - pre_index_entries.keys()
+        )
+        untracked_after = post_entries.keys() - head_entries.keys()
+        # A baseline file may have been committed in this turn. Everything left
+        # outside HEAD must already have been untracked and remain byte/type/mode
+        # identical, including permission bits not represented in Git trees.
+        if untracked_after != untracked_before - head_entries.keys():
+            return False
+        if untracked_after.intersection(changed_paths):
+            return False
+        return all(post_entries[path].kind == "blob" for path in untracked_after)
 
     @staticmethod
     def _trim_turn_window(manifest: dict[str, Any]) -> None:
@@ -708,7 +941,11 @@ class CodexCheckpointJournal:
             if pre_head is not None and not isinstance(pre_head, str):
                 raise CheckpointError("Active checkpoint HEAD is invalid")
             if self._clean_head_advance(
-                pre_head, post_head, post_tree
+                pre_head, post_head,
+                pre_entries=pre_entries, post_entries=post_entries,
+                pre_index_entries=pre_index_entries,
+                post_index_entries=post_index_entries,
+                changed_paths=changed_paths,
             ):
                 # A normal commit legitimately advances both HEAD and index.
                 # File rollback cannot rewrite Git history, but this tombstone

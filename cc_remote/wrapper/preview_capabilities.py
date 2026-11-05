@@ -65,8 +65,8 @@ class PreviewCapability:
             and file_stat.st_dev == self.device
             and file_stat.st_ino == self.inode
             and getattr(file_stat, "st_uid", -1) == self.uid
-            and self.uid == current_uid()
-            and (not require_write or self.mode == "read_write")
+            and (not require_write or (
+                self.mode == "read_write" and self.uid == os.geteuid()))
         )
 
 
@@ -439,7 +439,7 @@ class PreviewCapabilityStore:
             mode, source, granted_at,
         ) = row
         if (
-            engine not in {"claude", "codex"}
+            engine not in {"claude", "codex", "dsh"}
             or space not in {"code", "work"}
             or not cls._valid_text(session_id, maximum=128)
             or not cls._valid_text(path, maximum=PREVIEW_PATH_MAX_BYTES)
@@ -587,8 +587,9 @@ class PreviewCapabilityStore:
             os.close(descriptor)
         if not stat.S_ISREG(file_stat.st_mode):
             raise PreviewCapabilityError("预览目标必须是普通文件")
-        if getattr(file_stat, "st_uid", -1) != current_uid():
-            raise PreviewCapabilityError("只允许预览当前用户拥有的文件")
+        # os.open already enforces the process user's read permission, including
+        # groups and ACLs. Readable project files may be owned by root or another
+        # account (for example container-generated files).
         return file_stat
 
     def _persist_grant(
@@ -730,7 +731,7 @@ class PreviewCapabilityStore:
         snapshot to the file identity observed at that tool boundary. They must
         not silently turn a transient read into durable future path access.
         """
-        if engine not in {"claude", "codex"} or space not in {"code", "work"}:
+        if engine not in {"claude", "codex", "dsh"} or space not in {"code", "work"}:
             raise PreviewCapabilityError("会话范围无效")
         if not self._valid_text(session_id, maximum=128):
             raise PreviewCapabilityError("会话标识无效")
@@ -742,6 +743,8 @@ class PreviewCapabilityStore:
             raise PreviewCapabilityError("预览权限来源无效")
         canonical = self._canonical_path(path)
         file_stat = self._inspect_regular_file(canonical)
+        if mode == "read_write" and file_stat.st_uid != os.geteuid():
+            raise PreviewCapabilityError("只允许编辑当前用户拥有的文件")
         return PreviewCapability(
             engine=engine,
             space=space,

@@ -30,10 +30,46 @@ const SCHEMA = 1;
 // assistant blocks after switching away from and back to a running session.
 // v10 separates the instant timeline skeleton from heavyweight detail so one
 // image or tool output can no longer evict an otherwise valid completed turn.
-// v11 discards rows written before Claude transcript promptId was retained as
-// clientMsgId. Those rows can otherwise paint beside the live optimistic row
-// after switching engines until authoritative History replaces both.
-const CACHE_VER = 11;
+// v11 attempted to retain Claude's transcript promptId as clientMsgId. Claude
+// Code generates promptId internally, so it is not the browser Query.msg_id.
+// v12 discards both older shapes; only wrapper-observed native UUID aliases may
+// reconcile a canonical History turn with its optimistic browser row.
+// v13 discards projections written by the delayed completed-message replay bug.
+// The cache is only a rebuildable local projection; canonical History restores
+// the same conversations without guessing whether repeated prose was pollution.
+// v14 discards completed prompt-less replay orphans which an older matcher kept
+// when several tool blocks legitimately shared one assistant message id.
+// v15 discards projections written when a wrapper restart recovered the tail of
+// an active Codex turn without re-announcing its exact logical message owner.
+// v16 discards completed Codex projections written before canonical History
+// persisted that exact owner. Hard refresh keeps IndexedDB, so a version fence
+// is required to remove already-polluted duplicate layers once.
+// v17 also discards legacy CLI projections whose historical user row did not
+// yet reuse the adjacent native app-server item id emitted by the live stream.
+// v18 discards active projections written while an evicted TurnBinding was
+// seeded after (instead of before) its proven replay suffix. Those rows can
+// contain a canonical History owner plus a second prompt-less live layer; the
+// cache is rebuildable, so one clean reload is safer than shape-based guessing.
+// v19 persists exact process presence independently from deferred detail size.
+// Older rows can resurrect an empty "已处理" shell or hide a known process
+// after a detail page is replaced, so they must be rebuilt from v36 History.
+// v20 discards v19 Codex process clocks which may contain parser-time defaults.
+// SQLite projection migrations cannot invalidate a browser's IndexedDB copy,
+// and a hard refresh deliberately preserves that local cache.
+// v21 discards Claude projections which may have persisted an interrupt marker
+// as the browser alias for the following native user row.  The rebuilt v22
+// History store fixes the owner, but IndexedDB needs its own explicit fence.
+// v22 discards Codex turns whose bounded post-compact tail persisted a late
+// process start. The wrapper now overlays an exact source-bound live clock.
+// v23 discards Codex projections which may contain a prompt-less leading
+// compaction row split from the real user message that owns the turn.
+// v24 discards Claude rows whose completion clock could include late internal
+// resume bookkeeping, and projections bloated by automatic full-detail paging.
+// v25 reprojects native async questions instead of preserving plain-answer shells.
+// v26 discards summaries where those questions hid ordinary unphased replies.
+// v27 removes Claude turns split by native isMeta recovery prompts.
+// v28 discards projections missing native cross-thread message provenance.
+const CACHE_VER = 28;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
@@ -220,6 +256,8 @@ function projectTurnForCache(turn: Turn): Turn {
     error: clipCacheString(turn.error, 32 * 1024) ?? undefined,
     progress: clipCacheString(turn.progress, 8 * 1024) ?? undefined,
     blocks,
+    detailReasons: turn.detailReasons
+      ? [...turn.detailReasons] : undefined,
     // Keep a small optimistic attachment set for a flicker-free first paint.
     // Larger bodies stay in the transcript image store and are refilled through
     // History image references instead of evicting the whole turn.
@@ -235,6 +273,7 @@ function projectTurnForCache(turn: Turn): Turn {
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: undefined,
     detailHasMore: false,
     detailOldestCursor: null,
@@ -386,6 +425,73 @@ export function boundCachedTurns(turns: unknown[]): unknown[] {
   return kept;
 }
 
+function cachedTurnRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+function cachedCompactionTurnIds(turn: Record<string, unknown>): Set<string> {
+  const blocks = Array.isArray(turn.blocks) ? turn.blocks : [];
+  return new Set(blocks.flatMap((value) => {
+    const block = cachedTurnRecord(value);
+    return block?.kind === "process"
+      && block.processKind === "compaction"
+      && typeof block.turn_id === "string"
+      && block.turn_id
+      ? [block.turn_id] : [];
+  }));
+}
+
+function cachedNativeTurnIds(turn: Record<string, unknown>): Set<string> {
+  return new Set([
+    turn.forkPointId,
+    turn.liveTaskId,
+    turn.codexTurnId,
+  ].filter((value): value is string => typeof value === "string" && !!value));
+}
+
+/** Identify only the exact v15 corruption produced when a reconnect replayed
+ * a compacted Codex tail after its original TurnBinding cursor.  This is not a
+ * general duplicate matcher: legitimate optimistic steers may briefly leave
+ * two open rows, and repeated text/native task ids are never identity proof. */
+export function hasOrphanedActiveCompactionProjection(
+  turns: unknown,
+): boolean {
+  if (!Array.isArray(turns)) return false;
+  const records = turns.map(cachedTurnRecord)
+    .filter((turn): turn is Record<string, unknown> => turn !== null);
+  const orphans = records.filter((turn) => {
+    if (turn.done !== false || turn.prompt !== ""
+        || typeof turn.id !== "string" || !turn.id) return false;
+    if ([
+      turn.clientMsgId,
+      turn.historyTurnId,
+      turn.forkPointId,
+      turn.checkpointId,
+      turn.codexTurnId,
+      turn.liveTaskId,
+    ].some((value) => typeof value === "string" && !!value)) return false;
+    const blocks = Array.isArray(turn.blocks) ? turn.blocks : [];
+    const ownsAssistantEnvelope = blocks.some((value) => {
+      const block = cachedTurnRecord(value);
+      return block?.kind === "text" && block.message_id === turn.id;
+    });
+    return ownsAssistantEnvelope
+      && cachedCompactionTurnIds(turn).size === 1;
+  });
+  if (orphans.length !== 1) return false;
+
+  const orphan = orphans[0];
+  const [compactionTurnId] = cachedCompactionTurnIds(orphan);
+  const canonical = records.filter((turn) => {
+    if (turn === orphan || turn.done !== false
+        || typeof turn.prompt !== "string" || !turn.prompt) return false;
+    return cachedNativeTurnIds(turn).has(compactionTurnId)
+      && cachedCompactionTurnIds(turn).has(compactionTurnId);
+  });
+  return canonical.length === 1;
+}
+
 async function pruneCacheStore(d: IDBDatabase): Promise<void> {
   await new Promise<void>((resolve) => {
     const tx = d.transaction(STORE, "readwrite");
@@ -396,7 +502,8 @@ async function pruneCacheStore(d: IDBDatabase): Promise<void> {
       const cur = req.result;
       if (!cur) return;
       const value = cur.value as (CachedSession & { v?: number }) | undefined;
-      if (!value || value.v !== CACHE_VER) {
+      if (!value || value.v !== CACHE_VER
+          || hasOrphanedActiveCompactionProjection(value.turns)) {
         cur.delete();
         cur.continue();
         return;
@@ -427,6 +534,9 @@ export interface CachedSession {
   revision: string;
   generation?: string;
   control?: SessionControl | null;
+  /** Paint-only proof that the saved projection reached the first turn.
+   * It never carries or authorizes a pagination cursor. */
+  historyAtStart?: boolean;
   savedAt: number;
 }
 
@@ -467,7 +577,8 @@ export async function loadSession(sessionId: string): Promise<CachedSession | nu
         // Ignore stale caches from before the current shape (v must match).
         if (invalidatedSessions.has(sessionId) || !r || r.v !== CACHE_VER
             || typeof r.revision !== "string" || !r.revision
-            || (r.control != null && !isSessionControl(r.control))) {
+            || (r.control != null && !isSessionControl(r.control))
+            || hasOrphanedActiveCompactionProjection(r.turns)) {
           resolve(null);
           return;
         }
@@ -523,6 +634,7 @@ export async function loadAllReplayState(): Promise<{
         if (r && r.v === CACHE_VER
             && typeof r.revision === "string" && r.revision
             && typeof r.lastSeq === "number"
+            && !hasOrphanedActiveCompactionProjection(r.turns)
             && (r.lastSeq > 0 || isSessionControl(r.control))) {
           const sid = String(cur.key);
           const control = controlForCachedSession(sid, r.control);
@@ -553,6 +665,7 @@ const pending = new Map<string, {
   sid: string; turns: unknown[]; lastSeq: number; revision: string;
   generation?: string;
   control?: SessionControl | null;
+  historyAtStart?: boolean;
   epoch: number;
 }>();
 // A destructive history mutation must invalidate both the committed IDB row
@@ -574,6 +687,7 @@ function sessionEpoch(sessionId: string): number {
 export function saveSession(
   sessionId: string, turns: unknown[], lastSeq: number, revision: string,
   generation?: string, control?: SessionControl | null,
+  historyAtStart?: boolean,
 ): void {
   if (typeof indexedDB === "undefined" || !sessionId || !revision) return;
   if (invalidatedSessions.has(sessionId)) return;
@@ -588,6 +702,7 @@ export function saveSession(
     revision,
     generation,
     control: controlForCachedSession(sessionId, control),
+    historyAtStart: historyAtStart === true,
     epoch: sessionEpoch(sessionId),
   });
   if (saveTimer) return;
@@ -608,10 +723,19 @@ async function flush(): Promise<void> {
         if (invalidatedSessions.has(job.sid)
             || job.epoch !== sessionEpoch(job.sid)) continue;
         const turns = boundCachedTurns(job.turns);
+        if (hasOrphanedActiveCompactionProjection(turns)) {
+          store.delete(job.sid);
+          continue;
+        }
         store.put(
           { v: CACHE_VER, turns, lastSeq: job.lastSeq,
             revision: job.revision, generation: job.generation,
             control: job.control,
+            // If cache bounding dropped an older row, this projection no
+            // longer proves the conversation start even when the live runtime
+            // had loaded it before saving.
+            historyAtStart: job.historyAtStart === true
+              && turns.length === job.turns.length,
             savedAt: Date.now() }, job.sid);
       }
       tx.oncomplete = () => resolve();

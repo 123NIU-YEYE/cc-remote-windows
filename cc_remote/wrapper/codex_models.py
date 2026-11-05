@@ -20,11 +20,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from typing import Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
+from cc_remote.wrapper.os_compat import kill_process_tree
 from cc_remote.wrapper.codex_runtime import (
     codex_env as _codex_env,
     resolve_codex_bin as _resolve_codex_bin,
@@ -32,26 +34,87 @@ from cc_remote.wrapper.codex_runtime import (
 
 log = logger("cc_remote.wrapper.codex_models")
 
-_TTL = 600.0          # catalog is baked into the binary; re-probe only if it's upgraded
+# Internal effort/default lookups may reuse a catalog. Explicit picker requests
+# refresh it: native availability can change independently of the CLI version.
+_TTL = 600.0
 _RPC_TIMEOUT = 30.0
 _MAX_MODELS = 256
 _MAX_EFFORTS = 16
 _MAX_CATALOG_TEXT = 4096
+_MAX_SERVICE_TIERS = 16
+_SERVICE_TIER_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 
-_cache: Optional[list[dict]] = None
-_cache_ts: float = 0.0
-_lock = asyncio.Lock()
+
+def normalize_service_tier(value: str | None) -> str:
+    """Keep native tier ids; ``fast`` is the CLI alias for ``priority``."""
+    if not value or value == "default":
+        return "default"
+    return "priority" if value == "fast" else value
+
+
+def _service_tiers(model: dict) -> list[dict[str, str]] | None:
+    # Missing metadata is unknown, not an authoritative empty entitlement list.
+    raw = model.get("serviceTiers")
+    if not isinstance(raw, list):
+        return None
+    result: list[dict[str, str]] = []
+    seen = {"default", "toggle"}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tier = item.get("id")
+        if not isinstance(tier, str) or not _SERVICE_TIER_ID.fullmatch(tier):
+            continue
+        tier = normalize_service_tier(tier)
+        if tier in seen:
+            continue
+        seen.add(tier)
+        result.append({
+            "id": tier,
+            "name": str(item.get("name") or tier)[:128],
+            "description": str(item.get("description") or "")[:_MAX_CATALOG_TEXT],
+        })
+        if len(result) >= _MAX_SERVICE_TIERS:
+            break
+    return result
+
+
+def resolve_service_tier(
+    model: str | None, tier: str | None, catalog: list[dict],
+) -> str | None:
+    """Validate a paid tier against this account AND model before changing it."""
+    normalized = normalize_service_tier(tier)
+    if normalized == "default":
+        return None
+    entry = next((m for m in catalog if m.get("id") == model), None)
+    if entry is None or entry.get("service_tiers") is None:
+        raise ValueError("未读取到当前模型的速度档位，请刷新模型列表后重试。")
+    if not any(t.get("id") == normalized for t in entry["service_tiers"]):
+        raise ValueError("当前账号的所选模型不支持此速度档位，请重新选择。")
+    return normalized
+
+_profile_cache: dict[str, tuple[list[dict], float]] = {}
+_inflight: dict[str, asyncio.Task[list[dict]]] = {}
 
 # Cost/latency order, low -> high. Used only to clamp an unsupported request DOWN
 # to something the model accepts; unknown levels sort last so they never win.
 EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+# Wire/display sentinel used only when app-server explicitly selected the
+# model's default but model/list is temporarily unavailable. It is never sent
+# back to turn/start as a reasoning effort.
+MODEL_DEFAULT_EFFORT = "model-default"
 
 
 def _rank(effort: str) -> int:
     return EFFORT_ORDER.index(effort) if effort in EFFORT_ORDER else len(EFFORT_ORDER)
 
 
-async def _rpc_model_list() -> list[dict]:
+def _profile_cache_key(codex_home: str | None) -> str:
+    return (os.path.realpath(os.path.expanduser(codex_home))
+            if codex_home else "")
+
+
+async def _rpc_model_list(codex_home: str | None = None) -> list[dict]:
     """One-shot `codex app-server --stdio` -> initialize -> model/list -> die.
     No thread, no turn, no tokens."""
     binp = await asyncio.to_thread(_resolve_codex_bin)
@@ -61,7 +124,8 @@ async def _rpc_model_list() -> list[dict]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         cwd=os.path.expanduser("~"),
-        env=_codex_env(binp),
+        env=(_codex_env(binp) if codex_home is None
+             else _codex_env(binp, codex_home)),
         limit=16 * 1024 * 1024,
     )
 
@@ -90,14 +154,35 @@ async def _rpc_model_list() -> list[dict]:
                     }}})
         await asyncio.wait_for(await_result(1), _RPC_TIMEOUT)
         await send({"jsonrpc": "2.0", "method": "initialized"})
-        await send({"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}})
-        res = await asyncio.wait_for(await_result(2), _RPC_TIMEOUT)
-        return (res or {}).get("data") or []
+        result: list[dict] = []
+        cursor = None
+        seen: set[str] = set()
+        for rid in range(2, 18):
+            params: dict = {"limit": _MAX_MODELS}
+            if cursor:
+                params["cursor"] = cursor
+            await send({"jsonrpc": "2.0", "id": rid,
+                        "method": "model/list", "params": params})
+            res = await asyncio.wait_for(await_result(rid), _RPC_TIMEOUT)
+            result.extend((res or {}).get("data") or [])
+            cursor = (res or {}).get("nextCursor")
+            if not cursor:
+                return result
+            if not isinstance(cursor, str) or cursor in seen or len(result) >= _MAX_MODELS:
+                raise RuntimeError("Codex model catalog pagination exceeded bounds")
+            seen.add(cursor)
+        raise RuntimeError("Codex model catalog pagination exceeded bounds")
     finally:
         if proc.stdin is not None:
             proc.stdin.close()
         try:
-            proc.terminate()
+            if os.name == "nt":
+                # Windows: the app-server spawns node helpers that outlive a
+                # plain terminate() and keep the thread locks this probe only
+                # borrowed, so reap the whole tree.
+                kill_process_tree(proc.pid)
+            else:
+                proc.terminate()
         except ProcessLookupError:
             pass
         try:
@@ -133,42 +218,88 @@ def _normalize(raw: list[dict]) -> list[dict]:
                 str(m.get("defaultReasoningEffort"))[:64]
                 if m.get("defaultReasoningEffort") else None),
             "is_default": bool(m.get("isDefault")),
+            "service_tiers": _service_tiers(m),
+            "default_service_tier": normalize_service_tier(
+                m.get("defaultServiceTier")
+                if isinstance(m.get("defaultServiceTier"), str) else None)[:64],
         })
         if len(out) >= _MAX_MODELS:
             break
     return out
 
 
-async def codex_catalog(force: bool = False) -> list[dict]:
-    """Normalized model list, cached. Never raises: on failure we serve the last
-    good catalog (or []), and the web falls back to its static table."""
-    global _cache, _cache_ts
-    async with _lock:
-        if not force and _cache is not None and (time.time() - _cache_ts) < _TTL:
-            return _cache
-        try:
-            data = _normalize(await _rpc_model_list())
-        except Exception as e:
-            log.warning("codex model/list failed", error=str(e))
-            return _cache or []
+async def codex_catalog(
+    force: bool = False,
+    *,
+    codex_home: str | None = None,
+) -> list[dict]:
+    """Refresh on explicit reads; cache internal lookups by account home.
+
+    Concurrent readers share one native query per account. A disconnected
+    reader cannot cancel another reader's refresh, and a slow account cannot
+    block other accounts. Discovery failures retain only this account's last
+    good catalog (or []), without extending its cache lifetime.
+    """
+    cache_key = _profile_cache_key(codex_home)
+    pending = _inflight.get(cache_key)
+    if pending is None:
+        cached, cached_ts = _profile_cache.get(cache_key, (None, 0.0))
+        if not force and cached is not None and time.monotonic() - cached_ts < _TTL:
+            return cached
+        pending = asyncio.create_task(_refresh_catalog(cache_key, codex_home))
+        _inflight[cache_key] = pending
+    return await asyncio.shield(pending)
+
+
+async def _refresh_catalog(cache_key: str, codex_home: str | None) -> list[dict]:
+    cached, _ = _profile_cache.get(cache_key, (None, 0.0))
+    try:
+        data = _normalize(await _rpc_model_list(codex_home))
         if not data:
             log.warning("codex model/list returned nothing")
-            return _cache or []
-        _cache, _cache_ts = data, time.time()
+            return cached or []
+        _profile_cache[cache_key] = (data, time.monotonic())
         log.info("codex catalog", count=len(data), ids=[m["id"] for m in data])
         return data
+    except Exception as e:
+        log.warning("codex model/list failed", error=str(e))
+        return cached or []
+    finally:
+        _inflight.pop(cache_key, None)
 
 
-async def efforts_for(model: Optional[str]) -> list[str]:
+async def efforts_for(
+    model: Optional[str],
+    *,
+    codex_home: str | None = None,
+) -> list[str]:
     if not model:
         return []
-    for m in await codex_catalog():
+    for m in await codex_catalog(codex_home=codex_home):
         if m["id"] == model:
             return m["efforts"]
     return []
 
 
-async def clamp_effort(model: Optional[str], effort: Optional[str]) -> Optional[str]:
+async def default_effort_for(
+    model: Optional[str],
+    *,
+    codex_home: str | None = None,
+) -> Optional[str]:
+    if not model:
+        return None
+    for candidate in await codex_catalog(codex_home=codex_home):
+        if candidate["id"] == model:
+            value = candidate.get("default_effort")
+            return value if isinstance(value, str) and value else None
+    return None
+
+
+async def clamp_effort(
+    model: Optional[str], effort: Optional[str],
+    *,
+    codex_home: str | None = None,
+) -> Optional[str]:
     """Coerce `effort` to something `model` actually supports.
 
     Clamps DOWN — the highest supported level at or below the request — so we never
@@ -178,7 +309,7 @@ async def clamp_effort(model: Optional[str], effort: Optional[str]) -> Optional[
     """
     if not effort:
         return effort
-    supported = await efforts_for(model)
+    supported = await efforts_for(model, codex_home=codex_home)
     if not supported or effort in supported:
         return effort
     want = _rank(effort)

@@ -9,6 +9,7 @@ import pytest
 
 from cc_remote.protocol import ForkSession, SessionForked
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.wrapper import claude_forks as claude_forks_module
 from cc_remote.wrapper.claude_forks import (
     ClaudeForkJournalError,
     claude_fork_marker,
@@ -137,6 +138,35 @@ def test_claude_handler_passes_exact_sdk_boundary_then_renames_and_lists(monkeyp
     asyncio.run(run())
 
 
+def test_archived_claude_parent_rejects_fork_before_sdk(monkeypatch):
+    async def run():
+        machine, _ = _resident_machine(monkeypatch)
+        archived = _info()
+        archived.tag = "archived"
+
+        def fork(*_args, **_kwargs):
+            raise AssertionError("archived parent must not reach SDK fork")
+
+        monkeypatch.setattr(
+            machine_module,
+            "get_session_info",
+            lambda _session_id, directory=None: archived,
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "fork_session",
+            fork,
+        )
+
+        result = await machine._handle_fork_session(_command())
+
+        assert result.type == "error" and result.code == "auth"
+        assert "已归档" in result.message
+        assert machine._claude_forks.get("request-1") is None
+
+    asyncio.run(run())
+
+
 def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
     async def run():
         machine, _ = _resident_machine(monkeypatch)
@@ -144,6 +174,8 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
             model="claude-opus-5",
             effort="max",
             permission_mode="acceptEdits",
+            auto_compact_mode="custom",
+            auto_compact_threshold_tokens=250_000,
         )
         visible_title = {"value": claude_fork_marker("request-1")}
 
@@ -167,14 +199,19 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
         command = _command()
         await machine._handle_fork_session(command)
         inherited = machine._claude_controls.get(CHILD)
-        assert inherited.model == "claude-opus-5"
+        assert inherited.model == "claude-opus-5[1m]"
         assert inherited.effort == "max"
         assert inherited.permission_mode == "acceptEdits"
+        assert inherited.auto_compact_mode == "custom"
+        assert inherited.auto_compact_threshold_tokens == 250_000
         assert machine._claude_forks.entries[
             "request-1"]["controls"] == {
-                "model": "claude-opus-5",
+                "model": "claude-opus-5[1m]",
                 "effort": "max",
                 "permission_mode": "acceptEdits",
+                "auto_compact_mode": "custom",
+                "auto_compact_threshold_tokens": 250_000,
+                "applied_auto_compact_mode": "inherit",
             }
 
         machine._claude_controls.update(
@@ -182,11 +219,14 @@ def test_claude_fork_inherits_parent_model_and_permission_once(monkeypatch):
             model="claude-sonnet-5",
             effort=None,
             permission_mode="plan",
+            auto_compact_mode="auto",
         )
         await machine._handle_fork_session(command)
         child_choice = machine._claude_controls.get(CHILD)
         assert child_choice.model == "claude-sonnet-5"
         assert child_choice.permission_mode == "plan"
+        assert child_choice.auto_compact_mode == "auto"
+        assert machine.sessions[PARENT].sdk.auto_compact_mode == "custom"
 
     asyncio.run(run())
 
@@ -542,6 +582,48 @@ def test_ack_loss_retry_never_overwrites_user_renamed_child(monkeypatch):
         assert "request-1" not in machine._claude_fork_locks
 
     asyncio.run(run())
+
+
+def test_claude_fork_child_delete_lifecycle_survives_restart(tmp_path):
+    from cc_remote.wrapper.claude_forks import ClaudeForkJournal
+
+    journal = ClaudeForkJournal(tmp_path)
+    journal.begin("request-1", PARENT, CUTOFF, CWD)
+    journal.claim_submission("request-1")
+    journal.complete("request-1", CHILD)
+
+    assert journal.begin_delete(CHILD) == "delete_pending"
+    assert ClaudeForkJournal(tmp_path).child_entry(CHILD)["status"] == (
+        "delete_pending")
+    assert journal.abort_delete(CHILD) is True
+    assert journal.begin_delete(CHILD) == "delete_pending"
+    assert journal.finish_delete(CHILD) is True
+    reloaded = ClaudeForkJournal(tmp_path)
+    assert reloaded.child_entry(CHILD)["status"] == "deleted"
+    assert reloaded.complete("request-1", CHILD)["status"] == "deleted"
+
+
+def test_claude_fork_journal_never_compacts_deleted_replay_tombstone(
+    tmp_path, monkeypatch,
+):
+    from cc_remote.wrapper.claude_forks import ClaudeForkJournal
+
+    monkeypatch.setattr(claude_forks_module, "_MAX_ENTRIES", 1)
+    journal = ClaudeForkJournal(tmp_path)
+    journal.begin("request-deleted", PARENT, CUTOFF, CWD)
+    journal.claim_submission("request-deleted")
+    journal.complete("request-deleted", CHILD)
+    journal.begin_delete(CHILD)
+    journal.finish_delete(CHILD)
+
+    with pytest.raises(ClaudeForkJournalError, match="capacity exhausted"):
+        journal.begin(
+            "request-new", PARENT,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd", CWD,
+        )
+
+    assert ClaudeForkJournal(tmp_path).get(
+        "request-deleted")["status"] == "deleted"
 
 
 def test_cold_claude_source_uses_session_info_cwd_without_spawning(monkeypatch):

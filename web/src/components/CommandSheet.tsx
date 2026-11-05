@@ -1,15 +1,18 @@
 import {
-  isCmd, commandsFor, modelsFor, effortsFor, permsFor,
-  permissionProfilesFor,
+  isCmd, commandsFor, modelsFor, effortsFor, effortIsSelectable, permsFor,
+  permissionProfilesFor, dshPermissionLabel,
   type Cmd, type CmdGroup, type Catalog,
 } from "../data";
 import { Icon } from "../icons";
-import type { PermissionProfileInfo } from "../protocol";
+import type { DshPermissionOption, DshState, PermissionProfileInfo } from "../protocol";
+import { CenteredSheet } from "./CenteredSheet";
 
 interface Props {
+  dsh?: DshState;
+  dshPermissions?: DshPermissionOption[];
   open: boolean;
   kind: "commands" | "models" | "efforts" | "perms";
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   // command mode: the token typed after "/" in the composer (prefix filter).
   // There is NO input box in this sheet anymore — the composer textarea is the
@@ -23,6 +26,7 @@ interface Props {
   onPickEffort?: (effort: string) => void;
   currentPerm?: string;
   onPickPerm?: (perm: string) => void;
+  onUseDefaultPerm?: () => void;
   currentPermissionProfile?: string | null;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onPickPermissionProfile?: (profile: string) => void;
@@ -31,9 +35,9 @@ interface Props {
 }
 
 export function CommandSheet({
-  open, kind, engine, catalog, filter = "", onClose, onPickCommand,
+  open, kind, engine, catalog, dsh, dshPermissions, filter = "", onClose, onPickCommand,
   currentModel, onPickModel, currentEffort, onPickEffort, currentPerm,
-  onPickPerm, currentPermissionProfile, permissionProfiles,
+  onPickPerm, onUseDefaultPerm, currentPermissionProfile, permissionProfiles,
   onPickPermissionProfile, currentWebSearch, onPickWebSearch,
 }: Props) {
   const isCmdMode = kind === "commands";
@@ -42,7 +46,7 @@ export function CommandSheet({
   const f = filter.toLowerCase();
   // Effort levels are per-model, so the effort sheet must be built from the model
   // currently selected, not just the engine.
-  const MODELS = modelsFor(engine, catalog), EFFORTS = effortsFor(engine, currentModel, catalog), PERMS = permsFor(engine);
+  const MODELS = modelsFor(engine, catalog), EFFORTS = effortsFor(engine, currentModel, catalog), PERMS = engine === "dsh" ? (dshPermissions ?? dsh?.permissions ?? []).map(p => ({ id: p.value, name: dshPermissionLabel(p.value, p.name), ds: p.description, ic: "shield", danger: p.value === "danger-full-access" })) : permsFor(engine);
   const PROFILES = permissionProfilesFor(permissionProfiles);
 
   // Prefix-match on the slash (same rule the composer uses to decide visibility),
@@ -67,11 +71,8 @@ export function CommandSheet({
     : isEffortMode ? "选择思考强度" : "选择模型";
 
   return (
-    <>
-      <div className={"scrim" + (open ? " show" : "")} onClick={onClose} />
-      <div className={"sheet" + (open ? " show" : "")} role="dialog" aria-label={title}>
-        <div className="sheet-grip" />
-        <div className="sheet-title">{isCmdMode ? (filter ? `/${filter}` : "命令面板") : title}</div>
+    <CenteredSheet open={open} label={isCmdMode && filter ? `/${filter}` : title}
+      onClose={onClose} className={isPermMode ? `permission-sheet${engine === "dsh" ? " dsh-permission-sheet" : ""}` : ""}>
         <div className="sheet-scroll">
           {isCmdMode ? (
             visible.map((g, gi) => (
@@ -92,47 +93,62 @@ export function CommandSheet({
           ) : isPermMode ? (
             <>
               {engine === "codex" && <div className="cmd-group">审批方式</div>}
-              {PERMS.map((p) => (
-                <button
-                  key={p.id}
-                  className={"cmd" + (p.id === currentPerm ? " sel" : "") + (p.danger ? " danger" : "")}
-                  onClick={() => onPickPerm?.(p.id)}
-                >
-                  <span className="cmd-ic"><Icon name={p.ic} size={17} /></span>
-                  <span className="cmd-tx">
-                    <span className="cmd-nm">{p.name}</span>
-                    <span className="cmd-ds">{p.ds}</span>
-                  </span>
-                  {p.id === currentPerm
-                    ? <span className="cmd-check"><Icon name="check" size={19} /></span>
-                    : <span className="cmd-kbd" />}
-                </button>
-              ))}
+              <div className={`permission-options permission-approvals${engine === "dsh" && onUseDefaultPerm ? " permission-with-default" : ""}`}>
+                {onUseDefaultPerm && (
+                  <button className={"cmd" + (!currentPerm ? " sel" : "")}
+                    onClick={onUseDefaultPerm}>
+                    <span className="cmd-ic"><Icon name="shield" size={17} /></span>
+                    <span className="cmd-tx">
+                      <span className="cmd-nm">默认权限</span>
+                      <span className="cmd-ds">{engine === "dsh" ? "使用 DSH 原生默认设置" : "使用新会话的默认权限设置"}</span>
+                    </span>
+                    {!currentPerm && <span className="cmd-check"><Icon name="check" size={19} /></span>}
+                  </button>
+                )}
+                {PERMS.map((p) => (
+                  <button
+                    key={p.id}
+                    className={"cmd" + (p.id === currentPerm ? " sel" : "") + (p.danger ? " danger" : "")}
+                    onClick={() => onPickPerm?.(p.id)} disabled={engine === "dsh" && p.id === "custom"}
+                  >
+                    <span className="cmd-ic"><Icon name={p.ic} size={17} /></span>
+                    <span className="cmd-tx">
+                      <span className="cmd-nm">{p.name}</span>
+                      <span className="cmd-ds">{p.ds}</span>
+                    </span>
+                    {p.id === currentPerm
+                      ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                      : <span className="cmd-kbd" />}
+                  </button>
+                ))}
+              </div>
               {engine === "codex" && (
                 <>
                   <div className="cmd-group">执行环境</div>
-                  {PROFILES.map((profile) => (
-                    <button
-                      key={profile.id}
-                      className={"cmd" + (profile.id === currentPermissionProfile ? " sel" : "") + (profile.danger ? " danger" : "")}
-                      onClick={() => onPickPermissionProfile?.(profile.id)}
-                      disabled={!profile.allowed}
-                      title={profile.allowed
-                        ? profile.id
-                        : `${profile.id} · 当前机器策略不允许选择`}
-                    >
-                      <span className="cmd-ic"><Icon name={profile.ic} size={17} /></span>
-                      <span className="cmd-tx">
-                        <span className="cmd-nm">{profile.name}</span>
-                        <span className="cmd-ds">{profile.ds}{
-                          profile.allowed ? "" : " · 当前策略不可用"
-                        }</span>
-                      </span>
-                      {profile.id === currentPermissionProfile
-                        ? <span className="cmd-check"><Icon name="check" size={19} /></span>
-                        : <span className="cmd-kbd" />}
-                    </button>
-                  ))}
+                  <div className="permission-options permission-profiles">
+                    {PROFILES.map((profile) => (
+                      <button
+                        key={profile.id}
+                        className={"cmd" + (profile.id === currentPermissionProfile ? " sel" : "") + (profile.danger ? " danger" : "")}
+                        onClick={() => onPickPermissionProfile?.(profile.id)}
+                        disabled={!profile.allowed}
+                        title={profile.allowed
+                          ? profile.id
+                          : `${profile.id} · 当前机器策略不允许选择`}
+                      >
+                        <span className="cmd-ic"><Icon name={profile.ic} size={17} /></span>
+                        <span className="cmd-tx">
+                          <span className="cmd-nm">{profile.name}</span>
+                          <span className="cmd-ds">{profile.ds}{
+                            profile.allowed ? "" : " · 当前策略不可用"
+                          }</span>
+                        </span>
+                        {profile.id === currentPermissionProfile
+                          ? <span className="cmd-check"><Icon name="check" size={19} /></span>
+                          : <span className="cmd-kbd" />}
+                      </button>
+                    ))}
+                  </div>
                   {PROFILES.length === 0 && (
                     <div className="cmd-empty">当前目录没有可选执行环境</div>
                   )}
@@ -159,7 +175,9 @@ export function CommandSheet({
             EFFORTS.map((ef) => (
               <button
                 key={ef.id}
-                className={"cmd" + (ef.id === currentEffort ? " sel" : "")}
+                className={"cmd" + (
+                  effortIsSelectable(currentEffort) && ef.id === currentEffort
+                    ? " sel" : "")}
                 onClick={() => onPickEffort?.(ef.id)}
               >
                 <span className="cmd-ic"><Icon name={ef.ic} size={17} /></span>
@@ -167,7 +185,7 @@ export function CommandSheet({
                   <span className="cmd-nm">{ef.name}</span>
                   <span className="cmd-ds">{ef.ds}</span>
                 </span>
-                {ef.id === currentEffort
+                {effortIsSelectable(currentEffort) && ef.id === currentEffort
                   ? <span className="cmd-check"><Icon name="check" size={19} /></span>
                   : <span className="cmd-kbd" />}
               </button>
@@ -191,7 +209,6 @@ export function CommandSheet({
             ))
           )}
         </div>
-      </div>
-    </>
+    </CenteredSheet>
   );
 }

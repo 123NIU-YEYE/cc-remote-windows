@@ -107,6 +107,75 @@ now += 600;
 assert.equal(coordinator.request({ sid: "session-1", limit: 4 }, send), true);
 assert.equal(sends, 7);
 
+// A durable completion receipt is published after TurnEnd. A newest-page read
+// already in flight may have captured the pre-terminal transcript, so this
+// causal trigger must replace rather than share it. The reducer's build_seq
+// ordering decides which of the two same-cursor responses may install.
+const completionCoordinator = new HistoryRequestCoordinator(() => now, 500);
+let completionSends = 0;
+const sendCompletionHistory = () => { completionSends += 1; return true; };
+assert.equal(completionCoordinator.request({
+  sid: "completion-repair", limit: 4, generation: "generation-1",
+}, sendCompletionHistory, undefined, { causalKey: "completion-old" }), true);
+assert.equal(completionCoordinator.request({
+  sid: "completion-repair", limit: 4, generation: "generation-1",
+}, sendCompletionHistory, undefined, {
+  supersedePending: true, causalKey: "completion-new",
+}), true);
+assert.equal(completionSends, 2,
+  "post-terminal recovery must not coalesce into a pre-terminal read");
+assert.deepEqual(completionCoordinator.complete({
+  session_id: "completion-repair", generation: "generation-1",
+}), { matched: [], stale: [] },
+"the first indistinguishable response cannot release the replacement retry");
+assert.deepEqual(completionCoordinator.complete({
+  session_id: "completion-repair", generation: "generation-1",
+}), {
+  matched: [], stale: [],
+  settledCausalKey: "completion-new",
+}, "the last same-cursor response settles the newest causal boundary");
+
+const directCausalCoordinator = new HistoryRequestCoordinator(() => now, 500);
+assert.equal(directCausalCoordinator.request({
+  sid: "completion-direct", limit: 4,
+}, () => true, undefined, { causalKey: "completion-direct" }), true);
+assert.deepEqual(directCausalCoordinator.complete({
+  session_id: "completion-direct",
+}), {
+  matched: [], stale: [],
+  settledCausalKey: "completion-direct",
+}, "an unambiguous response settles its exact causal request immediately");
+
+const alreadyCausalCoordinator = new HistoryRequestCoordinator(
+  () => now, 500,
+);
+let alreadyCausalSends = 0;
+const sendAlreadyCausal = () => { alreadyCausalSends += 1; return true; };
+assert.equal(alreadyCausalCoordinator.request({
+  sid: "completion-current", limit: 4,
+}, sendAlreadyCausal, undefined, { causalKey: "completion-current" }), true);
+assert.equal(alreadyCausalCoordinator.request({
+  sid: "completion-current", limit: 4,
+}, sendAlreadyCausal, undefined, {
+  supersedePending: true, causalKey: "completion-current",
+}), false);
+assert.equal(alreadyCausalSends, 1,
+  "a focus read started after the same receipt already covers recovery");
+
+const rejectedCompletionReplacement = new HistoryRequestCoordinator(
+  () => now, 500,
+);
+assert.equal(rejectedCompletionReplacement.request({
+  sid: "completion-rejected", limit: 4,
+}, () => true, undefined, { causalKey: "completion-old" }), true);
+assert.equal(rejectedCompletionReplacement.request({
+  sid: "completion-rejected", limit: 4,
+}, () => false, undefined, {
+  supersedePending: true, causalKey: "completion-new",
+}), false);
+assert.equal(rejectedCompletionReplacement.size(), 1,
+  "a rejected terminal replacement keeps the original read authority");
+
 const rejectedSendCoordinator = new HistoryRequestCoordinator(() => now, 500);
 rejectedSendCoordinator.beginConnection();
 assert.equal(rejectedSendCoordinator.request(
@@ -155,7 +224,9 @@ assert.deepEqual(
   browseCoordinator.complete({
     session_id: "session-browse", before: "turn-5",
     generation: "generation-a", revision: "revision-a",
-  }).map((context) => [context.scopeKey, context.viewId, context.windowEpoch]),
+  }).matched.map((context) => [
+    context.scopeKey, context.viewId, context.windowEpoch,
+  ]),
   [
     ["machine-a:code:codex", "view-old", 1],
     ["machine-a:code:codex", "view-new", 2],
@@ -171,13 +242,160 @@ assert.equal(browseCoordinator.request({
 assert.deepEqual(browseCoordinator.complete({
   session_id: "session-browse", before: "turn-5",
   generation: "generation-b", revision: "revision-a",
-}), [], "an old revision cannot consume a newer browse waiter");
-assert.equal(browseCoordinator.size(), 1);
-browseCoordinator.beginConnection();
+}), {
+  matched: [],
+  stale: [browseContext("view-revision-b", 3)],
+}, "an old revision releases, but cannot install into, a newer browse waiter");
+assert.equal(browseCoordinator.size(), 0);
+assert.equal(browseCoordinator.request({
+  sid: "session-browse", before: "turn-5", limit: 12,
+  generation: "generation-b", revision: "revision-b",
+  browse: browseContext("view-before-reconnect", 4),
+}, () => true), true);
+assert.deepEqual(browseCoordinator.beginConnection(), [{
+  sid: "session-browse",
+  generation: "generation-b",
+  revision: "revision-b",
+  browse: browseContext("view-before-reconnect", 4),
+}], "a reconnect returns the exact browse waiter so its spinner can settle");
+assert.equal(browseCoordinator.request({
+  sid: "session-browse", limit: 4,
+  generation: "generation-c", revision: "revision-c",
+}, () => true), true);
 assert.deepEqual(browseCoordinator.complete({
   session_id: "session-browse", before: "turn-5",
   generation: "generation-b", revision: "revision-b",
-}), [], "a response from the previous socket has no local browse authority");
+}), { matched: [], stale: [] },
+"a response from the previous socket has no local browse authority");
+assert.equal(browseCoordinator.size(), 1,
+  "the obsolete page response cannot clear the new connection's head read");
+
+// A reconnect may immediately retry the exact same pagination cursor. Keep the
+// old request's authority long enough to classify its delayed response without
+// consuming or releasing the new connection's waiter.
+const sameCursorCoordinator = new HistoryRequestCoordinator(() => now, 500);
+assert.equal(sameCursorCoordinator.request({
+  sid: "same-cursor", before: "turn-9", limit: 12,
+  generation: "generation-old", revision: "revision-old",
+  browse: browseContext("view-old-connection", 5),
+}, () => true), true);
+assert.deepEqual(sameCursorCoordinator.beginConnection(), [{
+  sid: "same-cursor",
+  generation: "generation-old",
+  revision: "revision-old",
+  browse: browseContext("view-old-connection", 5),
+}]);
+assert.equal(sameCursorCoordinator.request({
+  sid: "same-cursor", before: "turn-9", limit: 12,
+  generation: "generation-new", revision: "revision-new",
+  browse: browseContext("view-new-connection", 6),
+}, () => true), true);
+assert.deepEqual(sameCursorCoordinator.complete({
+  session_id: "same-cursor", before: "turn-9",
+  generation: "generation-old", revision: "revision-old",
+}), { matched: [], stale: [] });
+assert.equal(sameCursorCoordinator.size(), 1,
+  "a delayed same-cursor response must preserve the replacement waiter");
+assert.deepEqual(sameCursorCoordinator.complete({
+  session_id: "same-cursor", before: "turn-9",
+  generation: "generation-new", revision: "revision-new",
+}), {
+  matched: [browseContext("view-new-connection", 6)],
+  stale: [],
+});
+assert.equal(sameCursorCoordinator.size(), 0);
+
+const replacementCancellations: unknown[] = [];
+assert.equal(sameCursorCoordinator.request({
+  sid: "same-cursor", before: "turn-9", limit: 12,
+  generation: "generation-a", revision: "revision-a",
+  browse: browseContext("view-replaced", 7),
+}, () => true), true);
+assert.equal(sameCursorCoordinator.request({
+  sid: "same-cursor", before: "turn-9", limit: 12,
+  generation: "generation-b", revision: "revision-b",
+  browse: browseContext("view-replacement", 8),
+}, () => true, (cancelled) => replacementCancellations.push(...cancelled)), true);
+assert.deepEqual(replacementCancellations, [{
+  sid: "same-cursor",
+  generation: "generation-a",
+  revision: "revision-a",
+  browse: browseContext("view-replaced", 7),
+}], "a successful replacement settles the displaced spinner immediately");
+assert.deepEqual(sameCursorCoordinator.complete({
+  session_id: "same-cursor", before: "turn-9",
+  generation: "generation-a", revision: "revision-a",
+}), { matched: [], stale: [] });
+assert.equal(sameCursorCoordinator.size(), 1);
+
+// Two retired reads require two responses to exhaust their authority. The
+// first delayed response must not erase every tombstone and expose the active
+// replacement to the second one.
+const duplicateOldCoordinator = new HistoryRequestCoordinator(() => now, 500);
+for (let epoch = 0; epoch < 2; epoch += 1) {
+  assert.equal(duplicateOldCoordinator.request({
+    sid: "duplicate-old", before: "turn-11", limit: 12,
+    generation: "generation-old", revision: "revision-old",
+  }, () => true), true);
+  duplicateOldCoordinator.beginConnection();
+}
+assert.equal(duplicateOldCoordinator.request({
+  sid: "duplicate-old", before: "turn-11", limit: 12,
+  generation: "generation-new", revision: "revision-new",
+  browse: browseContext("view-after-two-reconnects", 9),
+}, () => true), true);
+for (let response = 0; response < 2; response += 1) {
+  assert.deepEqual(duplicateOldCoordinator.complete({
+    session_id: "duplicate-old", before: "turn-11",
+    generation: "generation-old", revision: "revision-old",
+  }), { matched: [], stale: [] });
+  assert.equal(duplicateOldCoordinator.size(), 1);
+}
+
+// A reconnect can retire every command in RelayWs's 256-command reliable
+// outbox. Authorities must not expire merely because the transcript scan took
+// longer than the normal coalescing timeout, and the old 64-entry ceiling must
+// not expose a same-cursor replacement.
+const saturatedRetiredCoordinator = new HistoryRequestCoordinator(
+  () => now,
+  500,
+);
+for (let index = 0; index < 256; index += 1) {
+  assert.equal(saturatedRetiredCoordinator.request({
+    sid: `retired-${index}`, before: `turn-${index}`, limit: 12,
+    generation: "generation-old", revision: "revision-old",
+  }, () => true), true);
+}
+saturatedRetiredCoordinator.beginConnection();
+now += 10_000;
+assert.equal(saturatedRetiredCoordinator.request({
+  sid: "retired-0", before: "turn-0", limit: 12,
+  generation: "generation-new", revision: "revision-new",
+  browse: browseContext("saturated-replacement", 10),
+}, () => true), true);
+assert.deepEqual(saturatedRetiredCoordinator.complete({
+  session_id: "retired-0", before: "turn-0",
+  generation: "generation-old", revision: "revision-old",
+}), { matched: [], stale: [] });
+assert.equal(saturatedRetiredCoordinator.size(), 1,
+  "the oldest in-flight authority survives a saturated reconnect and slow scan");
+assert.deepEqual(saturatedRetiredCoordinator.complete({
+  session_id: "retired-0", before: "turn-0",
+  generation: "generation-new", revision: "revision-new",
+}), {
+  matched: [browseContext("saturated-replacement", 10)],
+  stale: [],
+});
+
+const retainedReplacementCancellations: unknown[] = [];
+assert.equal(sameCursorCoordinator.request({
+  sid: "same-cursor", before: "turn-9", limit: 12,
+  generation: "generation-c", revision: "revision-c",
+  browse: browseContext("view-replacement", 8),
+}, () => true, (cancelled) =>
+  retainedReplacementCancellations.push(...cancelled)), true);
+assert.deepEqual(retainedReplacementCancellations, [],
+  "the same local waiter transfers to its replacement without flickering idle");
 
 const detailCoordinator = new HistoryDetailRequestCoordinator();
 assert.equal(detailCoordinator.begin({
@@ -282,6 +500,46 @@ assert.deepEqual(detailCoordinator.complete({
   before: olderDetailContext.before,
 }), olderDetailContext,
   "the response before cursor is part of the exact coordinator key");
+
+const resetDetailCoordinator = new HistoryDetailRequestCoordinator();
+const resetRuntimeContext = {
+  ...newestDetailContext,
+  turnId: "reset-turn",
+};
+const resetOlderContext = {
+  ...resetRuntimeContext,
+  before: "stale-snapshot-cursor",
+};
+const retainedOtherTurn = {
+  ...resetRuntimeContext,
+  turnId: "unrelated-turn",
+};
+assert.deepEqual(resetDetailCoordinator.register(resetRuntimeContext), {
+  accepted: true, send: true,
+});
+assert.deepEqual(resetDetailCoordinator.register(resetOlderContext), {
+  accepted: true, send: true,
+});
+assert.deepEqual(resetDetailCoordinator.register(retainedOtherTurn), {
+  accepted: true, send: true,
+});
+assert.deepEqual(resetDetailCoordinator.cancelTurn({
+  sid: resetRuntimeContext.sid,
+  revision: resetRuntimeContext.revision,
+  turnId: resetRuntimeContext.turnId,
+}), [resetRuntimeContext, resetOlderContext],
+"snapshot reset cancels every stale page waiter for only that exact turn");
+assert.deepEqual(resetDetailCoordinator.completeAll({
+  session_id: resetRuntimeContext.sid,
+  revision: resetRuntimeContext.revision,
+  turn_id: resetRuntimeContext.turnId,
+}), [], "a late stale response cannot re-enter the replacement projection");
+assert.deepEqual(resetDetailCoordinator.completeAll({
+  session_id: retainedOtherTurn.sid,
+  revision: retainedOtherTurn.revision,
+  turn_id: retainedOtherTurn.turnId,
+}), [retainedOtherTurn], "resetting one turn cannot cancel another detail read");
+
 detailCoordinator.begin({
   target: "runtime",
   scopeKey: "machine-a:code:codex",

@@ -4,6 +4,8 @@ import asyncio
 
 import pytest
 
+pytest.importorskip("fcntl", reason="requires Unix PTY or service deployment support")
+
 from cc_remote.claude_broker.client import BrokerClientError
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 

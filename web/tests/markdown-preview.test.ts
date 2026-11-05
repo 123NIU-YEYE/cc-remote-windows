@@ -8,6 +8,10 @@ import { createServer } from "vite";
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
 import { parseLocalFileTarget } from "../src/file-link.ts";
 import {
+  parseCodexFileCitationDirective,
+  remarkCodexFileCitations,
+} from "../src/codex-file-citation.ts";
+import {
   InlineImageAssetCache,
   classifyMessageImageTarget,
 } from "../src/inline-image-assets.ts";
@@ -20,6 +24,57 @@ import {
   mermaidSourceProblem,
 } from "../src/mermaid.ts";
 import type { ServerEvent } from "../src/protocol.ts";
+import type { Turn } from "../src/domain/conversation.ts";
+import { presentAsyncQuestionReplies, supplementalAnswerPrompt } from "../src/async-question-presentation.ts";
+import { MARKDOWN_HTML_README } from "./fixtures/markdown-html.ts";
+import { previewImageDimension } from "../src/markdown-preview-html.ts";
+
+for (const [input, expected] of [[820, 820], ["64", 64], ["100%", "100%"],
+  ["40%", "40%"], [4096, 4096]] as const) {
+  assert.equal(previewImageDimension(input), expected);
+}
+for (const input of [undefined, null, "", 0, -1, "-10px", "99px", "100.1%",
+  "101%", "0%", 4097, "99999999", "calc(100vh)", "1;position:fixed"]) {
+  assert.equal(previewImageDimension(input), undefined);
+}
+
+const nativeQuestion: Turn = { id: "question-turn", prompt: "检查日志", done: true,
+  blocks: [{ kind: "text", message_id: "question-message", text: "native question", done: true,
+    delivery: "async", questions: [{ title: "在哪个设备？" }, { title: "用的什么手势？" }] }] };
+const nativeReply: Turn = { id: "reply-turn", done: false, blocks: [],
+  prompt: supplementalAnswerPrompt([{ question: "用的什么手势？", answer: "三指拖拽\n第二行也要保留" }]) };
+const presentation = presentAsyncQuestionReplies([nativeQuestion, nativeReply]);
+assert.deepEqual(presentation.replies.get(nativeReply.id), [{ question: "用的什么手势？", answer: "三指拖拽\n第二行也要保留" }]);
+assert.equal(presentation.answered.has("question-message"), true);
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, nativeReply], nativeReply.id).answered.size, 0,
+  "an optimistic reply does not mark the question answered before native acceptance");
+assert.equal(presentAsyncQuestionReplies([nativeQuestion,
+  { ...nativeReply, clientMsgId: "pending-client" }], "pending-client").answered.size, 0,
+  "a pending reply's native alias also waits for acceptance");
+assert.equal(presentAsyncQuestionReplies([nativeReply]).replies.size, 0, "never guess from a prefix without the native question");
+assert.equal(presentAsyncQuestionReplies([nativeReply, nativeQuestion]).replies.size, 0, "a future question cannot own this reply");
+const repeatedQuestion = { ...nativeQuestion, id: "after-compaction" };
+for (const turns of [
+  [nativeQuestion, repeatedQuestion, nativeReply],
+  [nativeQuestion, nativeReply, repeatedQuestion],
+]) {
+  const restored = presentAsyncQuestionReplies(turns);
+  assert.equal(restored.replies.size, 1, "native question replay is not an ambiguous second question");
+  assert.equal(restored.questionOwners.get("question-message"), nativeQuestion.id);
+  assert.equal(restored.answered.has("question-message"), true,
+    "all row aliases agree that the same native question was answered");
+}
+const independentQuestion: Turn = { ...nativeQuestion, id: "independent-question",
+  blocks: nativeQuestion.blocks.map(block => ({ ...block, message_id: "other-question-message" })) };
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, independentQuestion, nativeReply]).replies.size, 0,
+  "distinct native questions with equal titles remain ambiguous");
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply, error: "rejected" }]).answered.size, 0);
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, { ...nativeReply, prompt: "补充回答：\n\n问题：其他问题\n回答：保留原文" }]).replies.size, 0);
+const multiReply = { ...nativeReply, prompt: supplementalAnswerPrompt([
+  { question: "在哪个设备？", answer: "Mac" }, { question: "用的什么手势？", answer: "三指拖拽" },
+]) };
+assert.equal(presentAsyncQuestionReplies([nativeQuestion, multiReply]).replies.get(nativeReply.id)?.length, 2);
+assert.equal(nativeReply.prompt, "补充回答：\n\n问题：用的什么手势？\n回答：三指拖拽\n第二行也要保留", "presentation never rewrites the wire payload");
 
 assert.deepEqual(classifyPreviewTarget("docs/README.md", "./img/a.png"), {
   kind: "local", value: "docs/img/a.png",
@@ -61,6 +116,91 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+const reorderedCitation = ':codex-file-citation{purpose="output" '
+  + 'label="报告 } 终版" path="/tmp/demo} final.gif" '
+  + 'artifact_kind="animation"}';
+assert.deepEqual(parseCodexFileCitationDirective(reorderedCitation), {
+  citation: {
+    path: "/tmp/demo} final.gif",
+    purpose: "output",
+    artifactKind: "animation",
+    label: "报告 } 终版",
+  },
+  end: reorderedCitation.length,
+}, "citation attributes are order-independent and quoted braces stay in values");
+for (const malformed of [
+  ':codex-file-citation{path="/tmp/report.pdf" garbage that should remain}',
+  ':codex-file-citation{path="/tmp/report.pdf" purpose="unsafe"}',
+  ':codex-file-citation{path="/tmp/a.pdf" path="/tmp/b.pdf"}',
+  ':codex-file-citation{path="relative.pdf" purpose="output"}',
+  ':codex-file-citation{path="https://example.com/report.pdf"}',
+  ':codex-file-citation{path="//server/share/report.pdf"}',
+  String.raw`:codex-file-citation{path="/tmp/line\nfeed.pdf"}`,
+  `:codex-file-citation{path=${JSON.stringify(`/tmp/${"界".repeat(1400)}.pdf`)}}`,
+  `:codex-file-citation{path=${JSON.stringify(`/tmp/\uD800.pdf`)}}`,
+]) {
+  assert.equal(parseCodexFileCitationDirective(malformed), null,
+    "malformed or unsafe citation syntax must remain literal");
+}
+
+interface CitationAstNode {
+  type: string;
+  value?: string;
+  url?: string;
+  title?: string | null;
+  children?: CitationAstNode[];
+}
+
+const citationTree: CitationAstNode = {
+  type: "root",
+  children: [{
+    type: "paragraph",
+    children: [{
+      type: "text",
+      value: `前 ${reorderedCitation} 后 `
+        + ':codex-file-citation{path="/tmp/report.pdf" invalid tail}',
+    }, {
+      type: "code",
+      value: ':codex-file-citation{path="/tmp/example.pdf"}',
+    }, {
+      type: "link",
+      children: [{
+        type: "text",
+        value: ':codex-file-citation{path="/tmp/already-linked.pdf"}',
+      }],
+    }],
+  }],
+};
+remarkCodexFileCitations()(citationTree);
+const citationChildren = citationTree.children![0].children!;
+assert.deepEqual(citationChildren.slice(0, 2).map((node) => node.type), [
+  "text", "link",
+]);
+assert.equal(citationChildren[1].url,
+  encodeURIComponent("/tmp/demo} final.gif"));
+assert.equal(citationChildren[1].title,
+  "cc-remote-file-citation:output:animation");
+assert.match(citationChildren[2].value ?? "", /invalid tail/,
+  "an invalid directive and its surrounding prose must not be swallowed");
+assert.match(citationChildren[3].value ?? "", /codex-file-citation/,
+  "code nodes stay literal");
+assert.match(citationChildren[4].children?.[0].value ?? "", /codex-file-citation/,
+  "existing links are not rewritten");
+
+const repeatedIncompleteCitation = (
+  ':codex-file-citation{path="/tmp/incomplete.pdf" '
+).repeat(20_000);
+const adversarialCitationTree: CitationAstNode = {
+  type: "root",
+  children: [{ type: "text", value: repeatedIncompleteCitation }],
+};
+const citationScanStarted = performance.now();
+remarkCodexFileCitations()(adversarialCitationTree);
+const citationScanMs = performance.now() - citationScanStarted;
+assert.ok(citationScanMs < 1_500,
+  `incomplete citation scanning must stay linear (took ${citationScanMs.toFixed(1)}ms)`);
+assert.equal(adversarialCitationTree.children![0].value,
+  repeatedIncompleteCitation, "incomplete streaming syntax remains visible");
 assert.equal(isMermaidFenceClass("language-mermaid"), true);
 assert.equal(isMermaidFenceClass("foo language-mermaid bar"), true);
 assert.equal(isMermaidFenceClass("language-mermaid-extra"), false);
@@ -382,15 +522,126 @@ const harness = await createServer({
 });
 try {
   const { initialState, reduce } = await harness.ssrLoadModule("/src/reducer.ts");
-  const { preloadMarkdownMathPlugins } = await harness.ssrLoadModule(
+  const {
+    advanceMarkdownMathState,
+    hasMathDelimiters,
+    normalizeMathDelimiters,
+    preloadMarkdownMathPlugins,
+  } = await harness.ssrLoadModule(
     "/src/markdown-math.ts");
   await preloadMarkdownMathPlugins();
+  const malformedMath = String.raw`坏的 \(text；正常 \(x^2\)`;
+  assert.equal(
+    normalizeMathDelimiters(malformedMath),
+    String.raw`坏的 \(text；正常 $x^2$`,
+    "an unmatched opener must not consume a later complete formula",
+  );
+  assert.equal(hasMathDelimiters(malformedMath), true);
+  let streamedMath = advanceMarkdownMathState({
+    source: "",
+    normalized: "",
+    active: false,
+  }, "\\(x\\");
+  assert.equal(streamedMath.active, false);
+  streamedMath = advanceMarkdownMathState(
+    streamedMath, "\\(x\\)");
+  assert.deepEqual(streamedMath, {
+    source: "\\(x\\)",
+    normalized: "$x$",
+    active: true,
+  }, "a closing bracket delimiter split after its slash activates immediately");
+  let streamedDisplayMath = advanceMarkdownMathState({
+    source: "",
+    normalized: "",
+    active: false,
+  }, "\\[x\\");
+  streamedDisplayMath = advanceMarkdownMathState(
+    streamedDisplayMath, "\\[x\\]");
+  assert.equal(streamedDisplayMath.active, true);
+  assert.equal(streamedDisplayMath.normalized, "\n$$\nx\n$$\n");
+  const escapedSplit = advanceMarkdownMathState({
+    source: "literal \\\\",
+    normalized: "literal \\\\",
+    active: false,
+  }, "literal \\\\)");
+  assert.equal(escapedSplit.active, false,
+    "an even trailing slash run must stay escaped across the append boundary");
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
   const { buildSandboxDocument } = await harness.ssrLoadModule(
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const { preloadMarkdownExtras } = await harness.ssrLoadModule(
+    "/src/use-markdown-extras.ts");
+  // Bare breaks work on the first render, before lazy disclosure parsers load.
+  for (const tag of ["<br>", "<br/>", "<br />", "<BR>"]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: `| 项 | 结果 |\n| --- | --- |\n| 唤醒后下指令 | 先向前${tag}再向右 |`, done: true,
+    }));
+    assert.match(markup, /<td>先向前<br\/>再向右<\/td>/);
+    assert.doesNotMatch(markup, /&lt;br/i);
+    const leading = renderToStaticMarkup(createElement(MessageBlock, {
+      text: `${tag}好，这段正文不会多一行。`, done: true,
+    }));
+    assert.match(leading, /<p>好，这段正文不会多一行。<\/p>/);
+    assert.doesNotMatch(leading, /<br\/>/);
+  }
+  for (const done of [false, true]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: "<br>\n<br />\n\n正文第一行<br>第二行<br><br>第四行\n\n下一段<br>仍然换行", done,
+    }));
+    assert.match(markup, /<p>正文第一行<br\/>第二行<br\/><br\/>第四行<\/p>/);
+    assert.match(markup, /<p>下一段<br\/>仍然换行<\/p>/);
+    assert.doesNotMatch(markup, /<p>\s*<br/);
+  }
+  const literalBreaks = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "`<br>` 与 \\<br> 以及 &lt;br&gt;\n\n```html\n<br>\n```\n\n<br onclick=alert(1)>\n\n<script>alert(2)</script>", done: true,
+  }));
+  assert.doesNotMatch(literalBreaks, /<br\b|<script\b/);
+  assert.match(literalBreaks, /&lt;br&gt;/);
+  assert.match(literalBreaks, /&lt;br onclick=/);
+  await preloadMarkdownExtras();
+  const disclosureMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "Before\n\n<details>\n<summary>文件清单</summary>\n\n"
+      + "- **new** `README.md`\n- [source](/tmp/source.py)\n\n"
+      + "<details open>\n<summary>Nested</summary>\n\nInner body\n\n</details>\n\n"
+      + "</details>\n\nAfter",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.match(disclosureMarkup, /<details class="message-disclosure">\s*<summary>文件清单<\/summary>/);
+  assert.match(disclosureMarkup, /<strong>new<\/strong>/);
+  assert.match(disclosureMarkup, /message-file-link/);
+  assert.match(disclosureMarkup, /<details class="message-disclosure" open="">\s*<summary>Nested<\/summary>/);
+  assert.match(disclosureMarkup, /<p>After<\/p>/);
+  const disclosureBreaks = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "<details><summary>摘要<br>第二行</summary>内容<br/>下一行</details>", done: true,
+  }));
+  assert.match(disclosureBreaks, /<summary>摘要<br\/>第二行<\/summary>内容<br\/>下一行/);
+  const unsafeDisclosure = renderToStaticMarkup(createElement(MessageBlock, {
+    text: '<details>\n<summary>Safe</summary>\n\n'
+      + '<script>alert(1)</script><img src=x onerror="alert(2)">\n\n'
+      + '<iframe src="https://example.com"></iframe>\n\n</details>',
+    done: true,
+  }));
+  assert.doesNotMatch(unsafeDisclosure, /<(script|img|iframe)\b/);
+  assert.match(unsafeDisclosure, /&lt;script&gt;/);
+  const literalDisclosure = renderToStaticMarkup(createElement(MessageBlock, {
+    text: '```html\n<details><summary>Example</summary></details>\n```',
+    done: true,
+  }));
+  assert.doesNotMatch(literalDisclosure, /<details>/);
+  assert.match(literalDisclosure, /&lt;details&gt;/);
+  for (const raw of [
+    '<details ontoggle="alert(1)"><summary>Title</summary></details>',
+    '<details style="position:fixed"><summary>Title</summary></details>',
+    '<details>\n<summary>Title</summary>\n\n<a href="javascript:alert(1)">x</a>\n</details>',
+    '<details>\n<summary>Title</summary>\n\n<svg><script>alert(1)</script></svg>\n</details>',
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, { text: raw, done: true }));
+    assert.doesNotMatch(markup, /<(?:a|svg|script)\b|<details[^>]+(?:ontoggle|style)=/);
+  }
   const codeCopyMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "请执行：\n\n```sh\necho ready\n```",
     done: true,
@@ -447,10 +698,27 @@ $$`,
     text: String.raw`\[ r = \frac{h}{\sin |\alpha|} \]`,
     done: false,
   }));
-  assert.doesNotMatch(streamingMathMarkup, /class="katex/,
-    "streaming formula source stays stable until the message is terminal");
-  assert.match(streamingMathMarkup, /\\frac/,
-    "streaming formula source remains readable instead of repeatedly re-laying out");
+  assert.match(streamingMathMarkup, /class="katex-display"/,
+    "a complete streaming formula renders before the message is terminal");
+  const incompleteStreamingMathMarkup = renderToStaticMarkup(
+    createElement(MessageBlock, {
+      text: String.raw`推导中：\( r = \frac{h}{\sin |\alpha|}`,
+      done: false,
+    }),
+  );
+  assert.doesNotMatch(incompleteStreamingMathMarkup, /class="katex/,
+    "an unmatched streaming opener must remain readable source");
+  assert.match(incompleteStreamingMathMarkup, /\\frac/);
+  const mixedStreamingMathMarkup = renderToStaticMarkup(
+    createElement(MessageBlock, {
+      text: String.raw`已完成 \(x^2\)，继续 \(y^2`,
+      done: false,
+    }),
+  );
+  assert.match(mixedStreamingMathMarkup, /class="katex"/,
+    "matched spans render without waiting for an incomplete tail");
+  assert.match(mixedStreamingMathMarkup, /继续 \(y\^2/,
+    "normalization must not consume an unmatched tail opener");
   const literalMathMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "Inline code: `\\(\\alpha\\)`\n\n"
       + "```text\n\\[not math\\]\n```",
@@ -479,6 +747,29 @@ $$`,
     "Codex App git directives need a native status instead of leaking wire text");
   assert.doesNotMatch(codexDirectiveMarkup, /::git-commit|private-project/,
     "directive attributes are local UI metadata and must not render as prose");
+  const codexVisualizationMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "visualize{\"path\":\"/Volumes/MuggleSSD/workspace/robot-dog/"
+      + ".visualizations/concept.html\",\"title\":\"双轮足结构草图\"}"
+      + "\n\n请确认结构方向。",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.match(codexVisualizationMarkup, /codex-visualization-card/,
+    "Codex visualize directives need a native artifact entry");
+  assert.match(codexVisualizationMarkup, /双轮足结构草图/);
+  assert.match(codexVisualizationMarkup, /HTML 可视化/);
+  assert.match(codexVisualizationMarkup, /请确认结构方向/);
+  assert.doesNotMatch(codexVisualizationMarkup, /visualize|\/Volumes\/MuggleSSD/,
+    "visualize wire text and private absolute paths must not leak into prose");
+  const invalidVisualizationMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "visualize{\"path\":\"https://example.com/concept.html\"}",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.doesNotMatch(invalidVisualizationMarkup, /codex-visualization-card/,
+    "network targets must not be promoted to authenticated local previews");
+  assert.match(invalidVisualizationMarkup, /visualize/,
+    "an invalid directive remains visible instead of silently discarding content");
   const fencedDirectiveMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "```text\n::git-commit{cwd=\"/tmp/example\"}\n```",
     done: true,
@@ -523,7 +814,7 @@ $$`,
   assert.match(newChatMarkup, /aria-label="添加照片"/);
   assert.match(newChatMarkup, /aria-label="添加文件"/);
   assert.equal(
-    (newChatMarkup.match(/<button[^>]+aria-label="添加照片"/g) ?? []).length, 1);
+    (newChatMarkup.match(/<button[^>]+aria-label="添加附件"/g) ?? []).length, 1);
   assert.equal(
     (newChatMarkup.match(/<button[^>]+aria-label="添加文件"/g) ?? []).length, 0);
   assert.match(newChatMarkup, /type="file"[^>]*accept="image\/\*"[^>]*multiple/,
@@ -1008,8 +1299,66 @@ $$`,
   assert.match(markup, />预览</);
   assert.match(markup, />源码</);
   assert.match(markup, />保存</);
-  assert.match(markup, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(markup, /alert\(1\)/);
   assert.doesNotMatch(markup, /<script>/);
+
+  const renderHtmlMarkdown = (content: string) => renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: {
+      file: "docs/readme_zh.md", sid: "html-readme", requestId: "html-readme-r1",
+      kind: "md", content, assets: {},
+    },
+    active: "diff", hasBtw: false, onTab: () => {}, onClose: () => {},
+    onOpenFile: () => {},
+  })).split('<div class="prose markdown-preview">')[1];
+  const htmlMarkdown = renderHtmlMarkdown(MARKDOWN_HTML_README);
+  assert.match(htmlMarkdown, /<h1 align="center">Microduck<\/h1>/);
+  assert.match(htmlMarkdown, /<img[^>]*src="https:\/\/preview\.example\/header\.png"/);
+  assert.match(htmlMarkdown, /<img[^>]*width="820"[^>]*height="320"/);
+  assert.match(htmlMarkdown, /referrerPolicy="no-referrer"/);
+  assert.match(htmlMarkdown, /<button[^>]*aria-label="在 Remote 中打开 docs\/README.md">English<\/button>/);
+  assert.match(htmlMarkdown, /<a href="https:\/\/preview\.example\/project" target="_blank" rel="noopener noreferrer"/);
+  assert.match(htmlMarkdown, /<em>通过强化学习/);
+  assert.match(htmlMarkdown, /<strong>这个仓库/);
+  assert.match(htmlMarkdown, /<details class="message-disclosure"><summary>安装说明<\/summary>/);
+  assert.match(htmlMarkdown, /<strong>Markdown<\/strong>/);
+  assert.match(htmlMarkdown, /<table>/);
+  assert.match(htmlMarkdown, /<input[^>]*disabled=""/);
+  assert.match(htmlMarkdown, /<h2 id="cc-preview-installation">安装<\/h2>/);
+  assert.match(htmlMarkdown, /href="#cc-preview-installation"/);
+  assert.doesNotMatch(htmlMarkdown, /<script|<style|<iframe|<form|<button>不可提交|<source/);
+  assert.doesNotMatch(htmlMarkdown, /mdUnsafe|javascript:|onerror=|onclick=|position:fixed|srcset=/i);
+  assert.doesNotMatch(htmlMarkdown, /<img[^>]*src="(?:\.\/|\/private\/|docs\/)/,
+    "raw HTML images must use the existing local asset loader, never a browser-local URL");
+  assert.match(renderHtmlMarkdown('```html\n<p align="center">example</p>\n```'),
+    /&lt;p align=&quot;center&quot;&gt;example&lt;\/p&gt;/,
+    "code examples remain literal HTML source");
+  assert.match(renderHtmlMarkdown('<p>Formula: $x^2$</p>\n\n$$y = 2$$'), /class="katex"/,
+    "HTML sanitation must run before the trusted math renderer");
+  assert.match(renderHtmlMarkdown('<a name="旧章节"></a>\n\n[跳转](#%E6%97%A7%E7%AB%A0%E8%8A%82)'),
+    /href="#cc-preview-旧章节"/);
+  const footnotes = renderHtmlMarkdown('Note[^one]\n\n[^one]: Kept footnote');
+  assert.match(footnotes, /id="cc-preview-user-content-fn-one"/);
+  assert.match(footnotes, /href="#cc-preview-user-content-fn-one"/);
+  const chatStillLiteral = renderToStaticMarkup(createElement(MessageBlock, {
+    text: '<h1 align="center">Literal chat HTML</h1>', done: true,
+  }));
+  assert.doesNotMatch(chatStillLiteral, /<h1/);
+  assert.match(chatStillLiteral, /&lt;h1/);
+
+  for (const unsafe of [
+    '<a href="jav&#x61;script:alert(1)">x</a>',
+    '<a href="java&#10;script:alert(1)">x</a>',
+    '<svg><a href="javascript:alert(1)">x</a><script>alert(1)</script></svg>',
+    '<math><mi xlink:href="data:text/html,bad">x</mi></math>',
+    '<img src="data:image/svg+xml,bad" style="width:999999px" onerror="alert(1)">',
+    '<div id="__proto__" name="location" class="preview-injected"><p>content</p></div>',
+    '<object data="https://preview.example/private"></object>',
+  ]) {
+    const safe = renderHtmlMarkdown(unsafe);
+    assert.doesNotMatch(safe, /<svg|<math|<script|<object|javascript:|xlink:href|onerror=/i);
+    assert.doesNotMatch(safe, /id="__proto__"|name="location"|class="preview-injected"/);
+    assert.doesNotMatch(safe, /<img[^>]*(?:style=|src="data:)/);
+  }
   const readOnlyMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
     artifact: authorizationState.artifact!,
     active: "diff",
@@ -1072,6 +1421,46 @@ $$`,
   assert.match(messageMarkup, /在 Remote 中打开/);
   assert.doesNotMatch(messageMarkup, /href="\/home\/nancy/);
 
+  for (const [href, path] of [
+    ["/tmp/listen/short.wav", "/tmp/listen/short.wav"],
+    ["file:///tmp/listen/short.wav", "/tmp/listen/short.wav"],
+    ["file://localhost/tmp/listen/long%20clip.wav", "/tmp/listen/long clip.wav"],
+    ["file:///tmp/listen/", "/tmp/listen/"],
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: `| 音频 |\n|---|\n| [试听](${href}) |`,
+      done: true,
+      onOpenFile: () => {},
+    }));
+    assert.match(markup, /<button[^>]*class="message-file-link"/,
+      `${href} must enter the authenticated preview instead of becoming a disabled link`);
+    assert.ok(markup.includes(`aria-label="在 Remote 中打开 ${path}"`));
+    assert.doesNotMatch(markup, /href=|message-link-disabled/);
+  }
+  for (const href of [
+    "file://other-host/tmp/clip.wav", "file:///tmp/bad%00.wav",
+    "javascript:alert(1)", "data:text/html,test", "vscode://file/tmp/clip.wav",
+  ]) {
+    const markup = renderToStaticMarkup(createElement(MessageBlock, {
+      text: `[试听](<${href}>)`, done: true, onOpenFile: () => {},
+    }));
+    assert.match(markup, /message-link-disabled/);
+    assert.doesNotMatch(markup, /message-file-link|href=/,
+      "local-file support must not allow remote authorities or other URI schemes");
+  }
+  const unavailableFilePreview = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "[试听](file:///tmp/clip.wav)", done: true,
+  }));
+  assert.match(unavailableFilePreview, /message-link-disabled/);
+  assert.doesNotMatch(unavailableFilePreview, /href=/,
+    "without a session preview callback, never navigate the browser to file://");
+  const fileUrlImage = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "![image](file:///tmp/clip.png)", done: true, onLoadImage: () => true,
+  }));
+  assert.match(fileUrlImage, /message-image-error/);
+  assert.doesNotMatch(fileUrlImage, /<img|message-image-loading/,
+    "the link exception must not change the existing image URL policy");
+
   const source = Array.from({ length: 740 }, (_, index) => `line ${index + 1}`).join("\n");
   const sourceMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
     artifact: {
@@ -1130,16 +1519,56 @@ $$`,
   assert.match(pdfMarkup, /PPTX → PDF/);
   assert.match(pdfMarkup, /正在准备预览/);
 
+  let audioState = reduce(initialState, {
+    type: "open_file_loading", file: "sample.wav", sid: "audio-session",
+    requestId: "audio-1", kind: "file",
+  });
+  const audioReply = { v: 58, type: "file_preview", ts: 4, sid: "audio-session",
+    path: "sample.wav", request_id: "audio-1", format: "audio", content: "",
+    media_type: "audio/wav", data: "UklGRg==", size: 4096,
+    truncated: false, mtime_ns: "1" } as ServerEvent;
+  const audioLoading = audioState;
+  assert.equal(reduce(audioState, { type: "event", event: {
+    ...audioReply, sid: "another-session",
+  } }), audioLoading, "audio bytes must stay in their requesting session");
+  audioState = reduce(audioState, { type: "event", event: audioReply });
+  assert.equal(audioState.artifact?.kind, "audio");
+  assert.equal(audioState.artifact?.mediaType, "audio/wav");
+  const audioMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: audioState.artifact!, active: "diff", hasBtw: false,
+    onTab: () => {}, onClose: () => {},
+  }));
+  assert.match(audioMarkup, /<audio[^>]*controls/);
+  assert.doesNotMatch(audioMarkup, /auto[Pp]lay/);
+  assert.match(audioMarkup, /刷新文件/);
+  audioState = reduce(audioState, {
+    type: "open_file_loading", file: "next.wav", sid: "audio-session",
+    requestId: "audio-2", kind: "file",
+  });
+  assert.equal(audioState.artifact?.data, undefined);
+  assert.equal(reduce(audioState, { type: "event", event: audioReply }), audioState,
+    "a late audio response cannot replace the newly selected file");
+
   const sandbox = buildSandboxDocument("<h1>safe</h1>");
   assert.match(sandbox, /Content-Security-Policy/);
   assert.match(sandbox, /default-src &#39;none&#39;|default-src 'none'/);
   assert.match(sandbox, /<body><h1>safe<\/h1><\/body>/);
+  const darkVisualizationSandbox = buildSandboxDocument(
+    "<div style=\"color:var(--foreground)\">visual</div>", "", "dark");
+  assert.match(darkVisualizationSandbox, /data-theme="dark"/);
+  assert.match(darkVisualizationSandbox, /--foreground:#ecedf3/);
+  assert.match(darkVisualizationSandbox, /--viz-series-1:#8590ff/,
+    "Codex visualizations need their host palette inside the isolated iframe");
+  const lightVisualizationSandbox = buildSandboxDocument("visual", "", "light");
+  assert.match(lightVisualizationSandbox, /data-theme="light"/);
+  assert.match(lightVisualizationSandbox, /--background:#fff/);
 
   const artifactPanelSource = readFileSync(
     resolve(process.cwd(), "src/components/ArtifactPanel.tsx"), "utf8");
-  assert.match(artifactPanelSource, /DOMPurify\.sanitize/);
-  assert.match(artifactPanelSource, /sandbox=""/);
-  assert.match(artifactPanelSource, /FORBID_TAGS/);
+  assert.match(artifactPanelSource, /new DOMParser\(\)\.parseFromString/);
+  assert.match(artifactPanelSource, /sandbox="allow-scripts"/);
+  assert.doesNotMatch(artifactPanelSource, /allow-same-origin/);
+  assert.match(artifactPanelSource, /iframe,object,embed,form,base,link,meta\[http-equiv\],script\[src\]/);
   assert.match(artifactPanelSource, /\["md", "html"\]\.includes\(artifact\.kind\)/);
   assert.match(artifactPanelSource, /artifact\.kind === "html" && mode === "preview"/);
   assert.match(artifactPanelSource, /mode === "source"[\s\S]*?<SourceFile content=\{artifact\.content/);

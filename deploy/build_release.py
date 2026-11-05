@@ -31,12 +31,18 @@ _SYSTEMS = {"linux", "darwin"}
 _ARCHES = {"x86_64", "arm64"}
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _RELAY_DEPLOY = (
+    "linux_service.py",
     "Caddyfile",
     "Caddyfile.insecure",
+    "Caddyfile.viewer.example",
     "caddy_managed_block.py",
+    "cleanup.py",
+    "release_retention.py",
     "cc-remote-relay.service",
     "env.relay.example",
     "install-relay.sh",
+    "install_cli.py",
+    "install_lock.py",
     "python-version.txt",
     "release_manifest.py",
     "setup-vps.sh",
@@ -44,14 +50,26 @@ _RELAY_DEPLOY = (
     "validate_protocol_bundle.py",
 )
 _WRAPPER_DEPLOY = (
+    "linux_service.py",
+    "wrapper_exec.py",
+    "adopt_wrapper.py",
     "atomic_symlink.py",
+    "check_codex_readiness.py",
+    "check_codex_lifetime.py",
+    "cleanup.py",
+    "release_retention.py",
     "cc-remote-wrapper.service",
     "com.muggle.cc-remote.wrapper.plist.in",
     "env.wrapper.example",
     "install-wrapper.sh",
+    "install_cli.py",
+    "install_lock.py",
+    "install_claude_service.py",
+    "prepare_wrapper_stage.py",
     "python-version.txt",
     "release_manifest.py",
     "validate_protocol_bundle.py",
+    "work_registry_snapshot.py",
 )
 _WRAPPER_SCRIPTS = (
     "codex-auth-daemon-restart",
@@ -217,6 +235,8 @@ def build_bundle(
             raise BuildError(str(exc)) from exc
         if not (root / "web" / "dist" / "index.html").is_file():
             raise BuildError("web/dist is missing; build the web client first")
+        if not (root / "web" / "dist" / "cc-remote-viewer-runner.js").is_file():
+            raise BuildError("Viewer runner is missing; run the complete web build first")
 
     prefix = f"cc-remote-{role}-v{product_version}"
     name = f"{prefix}-{system}-{machine}.tar.gz"
@@ -230,6 +250,8 @@ def build_bundle(
         _copy_file(root / lock_name, staging / lock_name)
         _copy_file(uv_bin, staging / "bin" / "uv")
         (staging / "bin" / "uv").chmod(0o755)
+        _copy_file(root / "scripts" / "cc-remote", staging / "bin" / "cc-remote")
+        (staging / "bin" / "cc-remote").chmod(0o755)
         _copy_file(
             root / "deploy" / "uv-LICENSE-MIT",
             staging / "licenses" / "uv-LICENSE-MIT",
@@ -240,6 +262,8 @@ def build_bundle(
             _copy_file(root / "deploy" / filename, staging / "deploy" / filename)
             if filename.endswith(".sh"):
                 (staging / "deploy" / filename).chmod(0o755)
+        if role == "wrapper":
+            _copy_tree(root / "integrations" / "dsh", staging / "integrations" / "dsh")
         if role == "relay":
             _copy_tree(root / "web" / "dist", staging / "web" / "dist")
         else:

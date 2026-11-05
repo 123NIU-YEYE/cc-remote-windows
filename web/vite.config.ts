@@ -27,7 +27,10 @@ export default defineConfig({
             },
             {
               name: "initial-vendor",
-              test: /node_modules[\\/]/,
+              // Keep relay delivery, reducer and projection primitives together.
+              // This compresses their common field names without increasing
+              // startup requests or pulling any lazy UI into the initial load.
+              test: /node_modules[\\/]|preload-helper|src[\\/](?:compaction-orphans|history-browse|history-requests|history-detail-projection|reducer|runtime-bounds|remote-viewer|file-changes|tool-command|use-link-popover|web-link-url|ws)\.ts$|src[\\/]icons\.tsx$/,
               tags: ["$initial"],
               priority: 10,
             },

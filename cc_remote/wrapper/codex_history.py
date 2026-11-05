@@ -13,17 +13,27 @@ import hashlib
 import json
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
 
+from cc_remote.wrapper.codex_delegation import (
+    normalize_codex_delegation_item, parse_codex_delegation,
+)
+
 from cc_remote.protocol import TurnEnd, TurnResult, UserMsg
+from cc_remote.wrapper.claude_compaction import compact_completion_events
+from cc_remote.wrapper.codex_history_prefetch import CodexHistoryPrefetch
 from cc_remote.wrapper.codex_rpc import (
     CodexRpcRejected,
     CodexRpcResponseTooLarge,
     codex_rpc,
 )
-from cc_remote.wrapper.codex_stream import CodexStreamTranslator
-from cc_remote.wrapper.history_store import materialize_history_turns
+from cc_remote.wrapper.codex_stream import (
+    CodexStreamTranslator,
+    MIN_PROCESS_DURATION_MS,
+)
+from cc_remote.wrapper.history_store import HistorySourceFingerprint, materialize_history_turns
+from cc_remote.wrapper.history_metrics import history_timed
 
 
 _Rpc = Callable[
@@ -33,6 +43,10 @@ _Rpc = Callable[
 _RecoverUser = Callable[
     [str, str, str, int],
     Awaitable[UserMsg | None],
+]
+_RecoverUsers = Callable[
+    [str, tuple[str, ...]],
+    Awaitable[dict[str, UserMsg]],
 ]
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _TURN_STATUSES = frozenset({
@@ -53,6 +67,8 @@ _MAX_DETAIL_CACHE_ENTRIES = 64
 _MAX_DETAIL_CACHE_BYTES = 64 * 1024 * 1024
 _MAX_ACTIVE_TURN_CACHE_ENTRIES = 4
 _MAX_TERMINAL_REFRESH_FALLBACKS = 64
+# Match the browser's ordinary older-page request, without changing wire pages.
+_READ_AHEAD_TURNS = 12
 
 
 class CodexHistoryError(RuntimeError):
@@ -67,6 +83,10 @@ class CodexHistoryInvalidResponse(CodexHistoryError):
     """The app-server returned malformed or internally inconsistent history."""
 
 
+class CodexHistoryProjectionTooLarge(CodexHistoryInvalidResponse):
+    """Valid item pagination reached our bounded projection budget."""
+
+
 class CodexHistoryCursorError(CodexHistoryInvalidResponse):
     """A browser-safe cursor has no mapping in this wrapper generation."""
 
@@ -78,6 +98,21 @@ class CodexHistoryPage:
     has_more: bool
     oldest_id: str | None
     newest_id: str | None
+    # Native ids are newest first, matching the official descending page. They
+    # stay wrapper-private and let the caller validate projection completeness
+    # without guessing from visible steer-segment ids.
+    native_turn_ids: tuple[str, ...] = ()
+    # Official user item ids and rollout user ids are intentionally unrelated.
+    # Join positive rollout evidence through the native task plus chronological
+    # steer index instead of guessing that either visible id is shared.
+    native_segment_by_visible_id: dict[
+        str, tuple[str, int]
+    ] = field(default_factory=dict)
+    file_change_offsets_by_visible_id: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    file_changes_truncated: set[str] = field(default_factory=set)
+    # Positive source evidence only. A bounded scan can prove more users, but
+    # cannot prove their absence. Never publish a summary that drops these steers.
+    source_segment_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -194,6 +229,7 @@ def _validated_turn(
                     "invalid Codex user content")
 
     normalized = dict(value)
+    normalized["items"] = [normalize_codex_delegation_item(item) for item in items]
     normalized["startedAt"] = _optional_nonnegative_int(
         value.get("startedAt"), "startedAt")
     normalized["completedAt"] = _optional_nonnegative_int(
@@ -235,11 +271,14 @@ def _user_message(item: dict[str, Any], *, ts: float | None) -> UserMsg:
                     "invalid Codex image data")
             images.append({"media_type": media_type, "data": data})
 
+    prompt = "".join(prompt_parts)
+    delegation = parse_codex_delegation(prompt)
     kwargs: dict[str, Any] = {
+        "source_thread_id": delegation.source_thread_id if delegation else item.get("_ccRemoteSourceThreadId"),
         "msg_id": _wire_id(item.get("id"), "user"),
         "client_msg_id": _optional_wire_id(
             item.get("clientId"), "client-message"),
-        "prompt": "".join(prompt_parts),
+        "prompt": delegation.prompt if delegation else prompt,
         "images": images or None,
     }
     if ts is not None:
@@ -252,9 +291,34 @@ def _user_message(item: dict[str, Any], *, ts: float | None) -> UserMsg:
 
 
 def _segments(items: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    ordered_items = items
+    first_user_index = next((
+        index
+        for index, item in enumerate(items)
+        if item.get("type") == "userMessage"
+    ), None)
+    if (
+        first_user_index is not None
+        and first_user_index > 0
+        and all(
+            item.get("type") == "contextCompaction"
+            for item in items[:first_user_index]
+        )
+    ):
+        # Codex can persist automatic compaction before the user item which
+        # logically owns the new turn.  Leaving that prefix in place creates a
+        # synthetic prompt-less continuation followed by the real question.
+        # Normalize only an all-compaction leading prefix: assistant/tool
+        # prefixes are genuine autonomous continuations and must stay separate.
+        ordered_items = [
+            items[first_user_index],
+            *items[:first_user_index],
+            *items[first_user_index + 1:],
+        ]
+
     segments: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
-    for item in items:
+    for item in ordered_items:
         if item.get("type") == "userMessage" and current:
             segments.append(current)
             current = []
@@ -279,7 +343,24 @@ def _translate_segment(
     started_ts = float(started) if isinstance(started, int) else None
     completed_ts = float(completed) if isinstance(completed, int) else None
     translator = CodexStreamTranslator(tool_result_max)
-    events = []
+    events: list[dict[str, Any]] = []
+
+    def serialized(event, timestamp: float | None) -> dict[str, Any]:
+        """Keep parser time out of persisted-history evidence.
+
+        Every protocol model receives a wall-clock ``ts`` by default for live
+        transport.  Official history can omit both turn timestamps, though;
+        serializing that default would make the time at which the browser read
+        history look like the time at which the model worked.  Only an
+        app-server timestamp is authoritative here.
+        """
+        event.sid = thread_id
+        if timestamp is not None:
+            event.ts = timestamp
+        payload = event.model_dump(mode="json")
+        if timestamp is None:
+            payload.pop("ts", None)
+        return payload
 
     if not any(item.get("type") == "userMessage" for item in segment):
         # Automatic continuation turns have no user item. Anchor them to the
@@ -291,15 +372,12 @@ def _translate_segment(
             prompt="",
             sid=thread_id,
         )
-        if started_ts is not None:
-            anchor.ts = started_ts
-        events.append(anchor)
+        events.append(serialized(anchor, started_ts))
 
     for item in segment:
         if item.get("type") == "userMessage":
             event = _user_message(item, ts=started_ts)
-            event.sid = thread_id
-            events.append(event)
+            events.append(serialized(event, started_ts))
             continue
         if (
             item.get("type") == "agentMessage"
@@ -320,15 +398,17 @@ def _translate_segment(
                 "item": item,
             },
         })
-        for event in translated:
-            event.sid = thread_id
-            if started_ts is not None:
-                event.ts = started_ts
-        events.extend(translated)
+        events.extend(serialized(event, started_ts) for event in translated)
 
     final_segment = segment_index == segment_count - 1
     status = turn["status"]
     if final_segment and status != "inProgress":
+        if (status == "completed"
+                and any(item.get("type") == "contextCompaction" for item in segment)
+                and any(item.get("type") == "userMessage"
+                        and _user_message(item, ts=started_ts).prompt == "/compact" for item in segment)):
+            events.extend(serialized(event, completed_ts)
+                          for event in compact_completion_events(native_turn_id, native_turn_id))
         translated = translator.feed({
             "method": "turn/completed",
             "params": {
@@ -345,11 +425,7 @@ def _translate_segment(
                 },
             },
         })
-        for event in translated:
-            event.sid = thread_id
-            if completed_ts is not None:
-                event.ts = completed_ts
-        events.extend(translated)
+        events.extend(serialized(event, completed_ts) for event in translated)
     elif not final_segment:
         terminal = TurnEnd(
             result=TurnResult(
@@ -359,11 +435,9 @@ def _translate_segment(
             ),
             sid=thread_id,
         )
-        if started_ts is not None:
-            terminal.ts = started_ts
-        events.append(terminal)
+        events.append(serialized(terminal, started_ts))
 
-    return [event.model_dump(mode="json") for event in events]
+    return events
 
 
 def _translate_turn(
@@ -402,11 +476,11 @@ def _needs_terminal_full_refresh(
     )
 
 
-def _merge_terminal_summary_agents(
+def _merge_terminal_summary_messages(
     cached_items: list[dict[str, Any]],
     summary_items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep steer shape while restoring terminal agents after full-read failure."""
+    """Keep full shape while restoring terminal messages after read failure."""
     merged = list(cached_items)
     indices = {
         item.get("id"): index
@@ -414,7 +488,8 @@ def _merge_terminal_summary_agents(
         if isinstance(item.get("id"), str)
     }
     for item in summary_items:
-        if item.get("type") != "agentMessage":
+        item_type = item.get("type")
+        if item_type not in {"userMessage", "agentMessage"}:
             continue
         item_id = item.get("id")
         if not isinstance(item_id, str):
@@ -423,7 +498,11 @@ def _merge_terminal_summary_agents(
         if index is None:
             indices[item_id] = len(merged)
             merged.append(item)
-        else:
+        elif item_type == "agentMessage":
+            # A full user item may retain richer content than its summary
+            # counterpart (notably attachment metadata). User content is
+            # immutable once its stable id exists, while terminal agent shells
+            # legitimately gain their final text and phase.
             merged[index] = item
     return merged
 
@@ -437,10 +516,12 @@ class CodexOfficialHistory:
         *,
         rpc: _Rpc = codex_rpc,
         recover_user: _RecoverUser | None = None,
+        recover_users: _RecoverUsers | None = None,
     ) -> None:
         self.tool_result_max = tool_result_max
         self._rpc = rpc
         self._recover_user = recover_user
+        self._recover_users = recover_users
         self._before_cursors: OrderedDict[
             tuple[str, str], str | None
         ] = OrderedDict()
@@ -449,6 +530,12 @@ class CodexOfficialHistory:
         ] = OrderedDict()
         self._summary_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
+        ] = OrderedDict()
+        # Only authoritative prompts belong here. A recovery miss can be
+        # temporary while Codex is still flushing the correlated Goal records;
+        # caching None would permanently hide that prompt from later pages.
+        self._automatic_users: OrderedDict[
+            tuple[str, str], UserMsg
         ] = OrderedDict()
         # The official summary view collapses same-turn steer boundaries to the
         # first user and latest assistant item. Once an active turn has been
@@ -466,6 +553,13 @@ class CodexOfficialHistory:
         self._terminal_refresh_fallbacks: OrderedDict[
             tuple[str, str], None
         ] = OrderedDict()
+        # Full/summary official items can expose the exact native user id and
+        # Remote clientId even when a moving active head later forces rollout
+        # fallback. Keep only these bounded ids so Machine can strengthen its
+        # source-bound durable alias without retaining another history copy.
+        self._client_message_identities: OrderedDict[
+            tuple[str, str], tuple[str, str]
+        ] = OrderedDict()
         self._detail_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
         ] = OrderedDict()
@@ -474,6 +568,109 @@ class CodexOfficialHistory:
         ] = OrderedDict()
         self._detail_event_bytes: dict[tuple[str, str], int] = {}
         self._detail_cache_bytes = 0
+        self._read_sources: OrderedDict[str, HistorySourceFingerprint] = OrderedDict()
+        self._prefetch = CodexHistoryPrefetch(
+            self._fetch_summary, self._cacheable_summary)
+
+    async def _fetch_summary(self, thread_id: str, cursor: str | None, limit: int) -> Any:
+        return await self._call("thread/turns/list", {
+            "threadId": thread_id, "cursor": cursor, "limit": limit,
+            "sortDirection": "desc", "itemsView": "summary",
+        })
+
+    @staticmethod
+    def _cacheable_summary(response: Any, limit: int) -> bool:
+        try:
+            rows, cursor = _response_page(response)
+            if len(rows) > limit or (not rows and cursor is not None):
+                return False
+            turns = [_validated_turn(row, expected_view="summary") for row in rows]
+            return (all(turn["status"] != "inProgress" for turn in turns)
+                    and len({turn["id"] for turn in turns}) == len(turns))
+        except CodexHistoryInvalidResponse:
+            return False
+
+    def can_restore_page(self, thread_id, before, turn_ids):
+        return (bool(turn_ids) and (thread_id, before) in self._before_cursors
+                and all((thread_id, turn_id) in self._locators
+                        and (thread_id, turn_id) in self._summary_events
+                        for turn_id in turn_ids)
+                and (thread_id, turn_ids[0]) in self._before_cursors)
+
+    def page_native_ids(self, thread_id, turn_ids):
+        """Native ownership comes from locators, never visible/fork user ids."""
+        locators = [self._locators.get((thread_id, turn_id)) for turn_id in turn_ids]
+        if not locators or any(locator is None for locator in locators):
+            return frozenset()
+        return frozenset(locator.native_turn_id for locator in locators)
+
+    def prefetch_summary_page(self, thread_id: str, before: str) -> None:
+        """Read only one next page, after the requested History was delivered."""
+        cursor = self._before_cursors.get((thread_id, before))
+        self._prefetch.prefetch(
+            thread_id, cursor, _READ_AHEAD_TURNS, self._read_sources.get(thread_id))
+
+    async def close(self) -> None:
+        await self._prefetch.close()
+
+    def remember_automatic_user(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+        user: UserMsg,
+    ) -> None:
+        """Remember the authoritative live Goal prompt for one native turn."""
+        if not user.prompt:
+            return
+        self._remember(
+            self._automatic_users,
+            (thread_id, native_turn_id),
+            user,
+        )
+
+    def has_automatic_user(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+    ) -> bool:
+        """Return whether a live or recovered Goal prompt is authoritative."""
+        return (thread_id, native_turn_id) in self._automatic_users
+
+    def _remember_client_message_identities(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+        items: list[dict[str, Any]],
+    ) -> None:
+        for item in items:
+            if item.get("type") != "userMessage":
+                continue
+            client_message_id = _optional_wire_id(
+                item.get("clientId"), "client-message")
+            if client_message_id is None:
+                continue
+            native_message_id = _wire_id(item.get("id"), "user")
+            key = (thread_id, native_message_id)
+            value = (native_turn_id, client_message_id)
+            previous = self._client_message_identities.get(key)
+            if previous is not None and previous != value:
+                raise CodexHistoryInvalidResponse(
+                    "Codex client-message identity changed")
+            self._remember(self._client_message_identities, key, value)
+
+    def take_client_message_identities(
+        self,
+        thread_id: str,
+    ) -> tuple[tuple[str, str, str], ...]:
+        """Drain exact official ids observed during the latest page reads."""
+        identities: list[tuple[str, str, str]] = []
+        for key in list(self._client_message_identities):
+            if key[0] != thread_id:
+                continue
+            native_turn_id, client_message_id = (
+                self._client_message_identities.pop(key))
+            identities.append((native_turn_id, key[1], client_message_id))
+        return tuple(identities)
 
     async def _call(self, method: str, params: dict[str, Any]) -> Any:
         return await self._rpc(method, params, None)
@@ -501,6 +698,11 @@ class CodexOfficialHistory:
         ):
             self._terminal_refresh_fallbacks.popitem(last=False)
 
+    async def summary_page_with_source(self, thread_id: str, **kwargs) -> CodexHistoryPage:
+        """Advertise support for discovering source segments before projection."""
+        return await self.summary_page(thread_id, **kwargs)
+
+    @history_timed("codex_summary")
     async def summary_page(
         self,
         thread_id: str,
@@ -510,7 +712,18 @@ class CodexOfficialHistory:
         include_live_detail: bool = False,
         active_turn_ids: set[str] | frozenset[str] = frozenset(),
         hydrate_recent: int = 0,
+        client_message_ids: dict[str, str] | None = None,
+        segment_client_message_ids: (
+            dict[tuple[str, int], str] | None
+        ) = None,
+        source: HistorySourceFingerprint | None = None,
+        minimum_user_segments: dict[str, int] | None = None,
+        source_segments: Callable[
+            [tuple[str, ...]], Awaitable[dict[str, int]]
+        ] | None = None,
+        source_user: _RecoverUser | None = None,
     ) -> CodexHistoryPage:
+        recover_user = source_user or self._recover_user
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
             raise ValueError("Codex history limit must be between 1 and 200")
         if (
@@ -532,14 +745,15 @@ class CodexOfficialHistory:
                 raise CodexHistoryCursorError(
                     "Codex history has no older page")
 
+        if source is not None:
+            self._read_sources[thread_id] = source
+            self._read_sources.move_to_end(thread_id)
+            while len(self._read_sources) > 64:
+                self._read_sources.popitem(last=False)
+        else:
+            self._read_sources.pop(thread_id, None)
         try:
-            response = await self._call("thread/turns/list", {
-                "threadId": thread_id,
-                "cursor": page_cursor,
-                "limit": limit,
-                "sortDirection": "desc",
-                "itemsView": "summary",
-            })
+            response = await self._prefetch.read(thread_id, page_cursor, limit, source)
         except CodexRpcRejected as exc:
             if _unsupported(exc):
                 raise CodexHistoryUnsupported(
@@ -551,6 +765,16 @@ class CodexOfficialHistory:
             _validated_turn(row, expected_view="summary")
             for row in rows
         ]
+        if source_segments is not None:
+            # Resolve source-proven steering boundaries before translating the
+            # page. Otherwise the first projection drops those users and the
+            # caller has to repeat the entire projection to restore them.
+            counts = await source_segments(tuple(
+                _wire_id(turn["id"], "turn") for turn in validated_rows))
+            minimum_user_segments = dict(minimum_user_segments or {})
+            for native, count in counts.items():
+                minimum_user_segments[native] = max(
+                    count, minimum_user_segments.get(native, 0))
         prefetched_full: dict[int, dict[str, Any]] = {}
         terminal_refresh_indices: dict[int, tuple[str, str]] = {}
         for index, turn in enumerate(validated_rows):
@@ -581,6 +805,20 @@ class CodexOfficialHistory:
                 )
             )
         ]
+        retained_full_indices = set(range(max(hydration_indices) + 1)) if hydration_indices else set()
+        # A page with several source-proven steering inputs previously needed
+        # a separate cursor walk + full read for every collapsed native turn.
+        # Read that bounded prefix once. Oversized/unsupported full pages keep
+        # the existing exact-turn/item fallback below.
+        collapsed_indices = [
+            index for index, turn in enumerate(validated_rows)
+            if (minimum_user_segments or {}).get(_wire_id(turn["id"], "turn"), 0)
+            > sum(item.get("type") == "userMessage" for item in self._native_full_turns.get(
+                (thread_id, _wire_id(turn["id"], "turn")), turn)["items"])
+        ]
+        if before is not None and len(collapsed_indices) >= 2:
+            hydration_indices.extend(collapsed_indices)
+            retained_full_indices.update(collapsed_indices)
         failed_terminal_prefetch: set[tuple[str, str]] = set()
         # A single descending full page is cheaper than walking an opaque cursor
         # once per recent row. Include any preceding cached row only when needed
@@ -609,7 +847,8 @@ class CodexOfficialHistory:
                     ) != _wire_id(validated_rows[index]["id"], "turn"):
                         raise CodexHistoryInvalidResponse(
                             "Codex recent full page changed identity")
-                    prefetched_full[index] = full_turn
+                    if index in retained_full_indices:
+                        prefetched_full[index] = full_turn
             except CodexRpcRejected as exc:
                 if not _unsupported(exc):
                     raise
@@ -636,8 +875,39 @@ class CodexOfficialHistory:
         visible_seen: set[str] = set()
         projected_rows: list[dict[str, Any]] = []
         chronological_segments: list[
-            tuple[list[dict[str, Any]], _TurnLocator]
+            tuple[list[dict[str, Any]], _TurnLocator, bool]
         ] = []
+        if self._recover_users is not None:
+            missing_automatic: list[str] = []
+            for native_index, summary_turn in enumerate(validated_rows):
+                turn = prefetched_full.get(native_index, summary_turn)
+                if any(
+                    item.get("type") == "userMessage"
+                    for item in turn["items"]
+                ):
+                    continue
+                native_id = _wire_id(turn["id"], "turn")
+                if (thread_id, native_id) not in self._automatic_users:
+                    missing_automatic.append(native_id)
+            if missing_automatic:
+                recovered_users = await self._recover_users(
+                    thread_id, tuple(missing_automatic))
+                if not isinstance(recovered_users, dict):
+                    raise CodexHistoryInvalidResponse(
+                        "invalid automatic Codex user recovery")
+                for native_id in missing_automatic:
+                    recovered = recovered_users.get(native_id)
+                    if recovered is not None and not isinstance(
+                        recovered, UserMsg
+                    ):
+                        raise CodexHistoryInvalidResponse(
+                            "invalid automatic Codex user row")
+                    if recovered is not None and recovered.prompt:
+                        self._remember(
+                            self._automatic_users,
+                            (thread_id, native_id),
+                            recovered,
+                        )
         for native_index, summary_turn in enumerate(validated_rows):
             turn = prefetched_full.get(native_index, summary_turn)
             native_id = _wire_id(turn["id"], "turn")
@@ -721,11 +991,12 @@ class CodexOfficialHistory:
                     # Keep the exact full item sequence but accept lifecycle and
                     # timing from the newest official summary response. If the
                     # terminal full read failed, at least merge its authoritative
-                    # final agent so the collapsed process row cannot hide the
-                    # completed answer behind a detail click.
+                    # terminal user/agent messages so a full snapshot captured
+                    # between compaction and the user-item flush cannot retain
+                    # an empty prompt or hide the completed answer.
                     items = cached_full["items"]
                     if terminal_refresh:
-                        items = _merge_terminal_summary_agents(
+                        items = _merge_terminal_summary_messages(
                             items, summary_turn["items"])
                     turn = {
                         **cached_full,
@@ -738,18 +1009,27 @@ class CodexOfficialHistory:
                     }
                     self._native_full_turns.move_to_end(
                         (thread_id, native_id))
-            if self._recover_user is not None:
+            minimum_segments = (minimum_user_segments or {}).get(native_id, 0)
+            if sum(item.get("type") == "userMessage" for item in turn["items"]) < minimum_segments:
+                turn = await self._restore_steered_turn(
+                    thread_id, turn, locator, minimum_segments)
+                if active_turn:
+                    turn.update(status="inProgress", completedAt=None, durationMs=None)
+                self._remember(self._native_full_turns, (thread_id, native_id), dict(turn))
+                while len(self._native_full_turns) > _MAX_ACTIVE_TURN_CACHE_ENTRIES:
+                    self._native_full_turns.popitem(last=False)
+            if recover_user is not None or self._recover_users is not None:
                 copied_items = None
                 user_index = 0
                 for item_index, item in enumerate(turn["items"]):
                     if item.get("type") != "userMessage":
                         continue
-                    if any(
+                    if recover_user is not None and any(
                         part.get("type") == "localImage"
                         for part in item.get("content", [])
                     ):
                         visible_id = _wire_id(item.get("id"), "user")
-                        recovered = await self._recover_user(
+                        recovered = await recover_user(
                             thread_id,
                             native_id,
                             visible_id,
@@ -766,6 +1046,45 @@ class CodexOfficialHistory:
                     user_index += 1
                 if copied_items is not None:
                     turn["items"] = copied_items
+                if user_index == 0:
+                    automatic_key = (thread_id, native_id)
+                    if automatic_key in self._automatic_users:
+                        recovered = self._automatic_users[automatic_key]
+                        self._automatic_users.move_to_end(automatic_key)
+                    elif self._recover_users is None:
+                        recovered = await recover_user(
+                            thread_id,
+                            native_id,
+                            native_id,
+                            0,
+                        )
+                        if recovered is not None and recovered.prompt:
+                            self._remember(
+                                self._automatic_users,
+                                automatic_key,
+                                recovered,
+                            )
+                    else:
+                        recovered = None
+                    if recovered is not None and recovered.prompt:
+                        turn["items"] = [{
+                            "type": "userMessage",
+                            "id": native_id,
+                            "clientId": recovered.client_msg_id,
+                            "content": [{
+                                "type": "text",
+                                "text": recovered.prompt,
+                            }],
+                            "_ccRemoteSourceThreadId": recovered.source_thread_id,
+                            "_ccRemoteImages": [
+                                dict(image) for image in recovered.images or []
+                            ],
+                        }, *turn["items"]]
+            self._remember_client_message_identities(
+                thread_id,
+                native_id,
+                turn["items"],
+            )
             projected_rows.append(turn)
             segments = _translate_turn(
                 thread_id, turn, tool_result_max=self.tool_result_max)
@@ -793,6 +1112,7 @@ class CodexOfficialHistory:
                         request_before=before,
                         request_limit=limit,
                     ),
+                    turn.get("itemsView") == "full",
                 ))
 
         if active_turn_ids and before is None and not (
@@ -806,7 +1126,7 @@ class CodexOfficialHistory:
         # The official page is descending by native turn. Preserve the order of
         # steer segments inside each native turn while reversing native turns.
         grouped: list[list[
-            tuple[list[dict[str, Any]], _TurnLocator]
+            tuple[list[dict[str, Any]], _TurnLocator, bool]
         ]] = []
         offset = 0
         for projected_turn in projected_rows:
@@ -818,10 +1138,51 @@ class CodexOfficialHistory:
             for native_group in reversed(grouped)
             for segment in native_group
         ]
+        # Official pagination counts native turns, whereas the rollout
+        # compatibility reader counts visible user segments. One native turn
+        # may contain several steer segments, so replaying the native request
+        # limit can trim the oldest visible row out of its own detail fallback.
+        # Preserve the exact source page but widen its visible-row budget to the
+        # number this official page actually materialized.
+        rollout_fallback_limit = max(limit, len(ordered))
+        if rollout_fallback_limit != limit:
+            ordered = [
+                (
+                    segment_events,
+                    replace(
+                        locator,
+                        request_limit=rollout_fallback_limit,
+                    ),
+                    process_detail_exact,
+                )
+                for segment_events, locator, process_detail_exact in ordered
+            ]
+
+        native_aliases = client_message_ids or {}
+        segment_aliases = segment_client_message_ids or {}
+        for segment_events, locator, _process_detail_exact in ordered:
+            user = next((
+                event for event in segment_events
+                if event.get("type") == "user_msg"
+            ), None)
+            if user is None or user.get("client_msg_id") is not None:
+                continue
+            native_message_id = user.get("msg_id")
+            alias = (
+                native_aliases.get(native_message_id)
+                if isinstance(native_message_id, str) else None
+            )
+            if alias is None:
+                alias = segment_aliases.get((
+                    locator.native_turn_id,
+                    locator.segment_index,
+                ))
+            if alias is not None:
+                user["client_msg_id"] = alias
 
         events = tuple(
             event
-            for segment_events, _locator in ordered
+            for segment_events, _locator, _process_detail_exact in ordered
             for event in segment_events
         )
         turns = materialize_history_turns(
@@ -831,19 +1192,39 @@ class CodexOfficialHistory:
         if len(turns) != len(ordered):
             raise CodexHistoryInvalidResponse(
                 "Codex page segment count changed during projection")
-        for turn, (segment_events, locator) in zip(turns, ordered):
+        for turn, (
+            segment_events,
+            locator,
+            process_detail_exact,
+        ) in zip(turns, ordered):
             visible_id = turn["id"]
             if (
                 locator.native_turn_id in active_turn_ids
                 and locator.segment_index == locator.segment_count - 1
             ):
                 turn["forkPointId"] = locator.native_turn_id
-            # ``itemsView=summary`` is explicit authoritative evidence that a
-            # full projection exists even when its process-item count is not
-            # exposed. Keep the detail affordance available without loading the
-            # heavyweight item list on first paint.
-            turn["detailEventCount"] = max(
-                1, int(turn.get("detailEventCount") or 0))
+            # A native summary proves that more item data can be requested, but
+            # it does not prove that the hidden payload contains a process the
+            # UI is allowed to show. Keep that uncertainty distinct from both
+            # exact direct answers and exact process-bearing full projections.
+            if (
+                not process_detail_exact
+                and turn.get("processDetailState") == "none"
+            ):
+                turn["processDetailState"] = "unknown"
+            process_started = turn.get("processStartedTs")
+            process_done = turn.get("processDoneTs")
+            if (
+                isinstance(process_started, int)
+                and isinstance(process_done, int)
+                and process_done - process_started < MIN_PROCESS_DURATION_MS
+            ):
+                # Full native items inherit the turn-level second timestamp,
+                # so parsing several real process items can otherwise invent a
+                # misleading 0s interval. Presence remains exact; timing waits
+                # for a source-backed witness with distinct event timestamps.
+                turn.pop("processStartedTs", None)
+                turn.pop("processDoneTs", None)
             self._remember(
                 self._locators, (thread_id, visible_id), locator)
             previous_summary = self._summary_events.get(
@@ -855,6 +1236,14 @@ class CodexOfficialHistory:
                 (thread_id, visible_id),
                 tuple(segment_events),
             )
+
+        native_segment_by_visible_id = {
+            turn["id"]: (
+                locator.native_turn_id,
+                locator.segment_index,
+            )
+            for turn, (_events, locator, _exact) in zip(turns, ordered)
+        }
 
         oldest_id = turns[0]["id"] if turns else None
         newest_id = turns[-1]["id"] if turns else None
@@ -873,6 +1262,11 @@ class CodexOfficialHistory:
             has_more=next_cursor is not None,
             oldest_id=oldest_id,
             newest_id=newest_id,
+            native_turn_ids=tuple(
+                _wire_id(turn["id"], "turn")
+                for turn in validated_rows
+            ),
+            native_segment_by_visible_id=native_segment_by_visible_id,
         )
 
     def _locator(self, thread_id: str, visible_turn_id: str) -> _TurnLocator:
@@ -919,6 +1313,39 @@ class CodexOfficialHistory:
             self._detail_cache_bytes = max(
                 0, self._detail_cache_bytes - size)
 
+    async def _restore_steered_turn(
+        self,
+        thread_id: str,
+        summary: dict[str, Any],
+        locator: _TurnLocator,
+        minimum_segments: int,
+    ) -> dict[str, Any]:
+        """Hydrate an exact source-proven collapsed turn, including older pages.
+
+        Keep the native cursor family and item identities. If both bounded APIs
+        fail, fail the page read instead of authoritatively deleting prompts or
+        feeding an official cursor to the rollout pagination family.
+        """
+        turn = summary
+        try:
+            turn = await self._full_turn(thread_id, locator)
+        except CodexRpcRejected as exc:
+            if not _unsupported(exc):
+                raise
+        except CodexRpcResponseTooLarge:
+            pass
+        if sum(item.get("type") == "userMessage" for item in turn["items"]) < minimum_segments:
+            try:
+                items = await self._items_for_turn(thread_id, locator.native_turn_id)
+            except (CodexHistoryUnsupported, CodexRpcResponseTooLarge) as exc:
+                raise CodexHistoryInvalidResponse(
+                    "Codex summary omits source-proven user segments") from exc
+            turn = {**summary, "itemsView": "full", "items": items}
+        if sum(item.get("type") == "userMessage" for item in turn["items"]) < minimum_segments:
+            raise CodexHistoryInvalidResponse(
+                "Codex item projection omits source-proven user segments")
+        return turn
+
     async def _items_for_turn(
         self,
         thread_id: str,
@@ -931,7 +1358,7 @@ class CodexOfficialHistory:
         page_count = 0
         while True:
             if page_count >= _MAX_ITEM_PAGES:
-                raise CodexHistoryInvalidResponse(
+                raise CodexHistoryProjectionTooLarge(
                     "Codex item pagination exceeded its page limit")
             page_count += 1
             response = await self._call("thread/items/list", {
@@ -972,7 +1399,7 @@ class CodexOfficialHistory:
                 seen_items.add(item_id)
                 items.append(normalized_item)
                 if len(items) > _MAX_DETAIL_ITEMS:
-                    raise CodexHistoryUnsupported(
+                    raise CodexHistoryProjectionTooLarge(
                         "Codex turn exceeds the bounded official item projection")
             if next_cursor is None:
                 return items
@@ -988,23 +1415,35 @@ class CodexOfficialHistory:
         locator: _TurnLocator,
     ) -> dict[str, Any]:
         cursor = locator.page_cursor
-        for _index in range(locator.native_index):
+        remaining = locator.native_index
+        skipped_ids: set[str] = set()
+        seen_cursors: set[str] = set()
+        while remaining:
             response = await self._call("thread/turns/list", {
                 "threadId": thread_id,
                 "cursor": cursor,
-                "limit": 1,
+                "limit": remaining,
                 "sortDirection": "desc",
                 "itemsView": "notLoaded",
             })
             rows, next_cursor = _response_page(response)
-            if len(rows) != 1:
+            if not rows or len(rows) > remaining:
                 raise CodexHistoryInvalidResponse(
                     "Codex detail locator no longer resolves")
-            _validated_turn(rows[0], expected_view="notLoaded")
-            if next_cursor is None:
+            for row in rows:
+                skipped = _validated_turn(row, expected_view="notLoaded")
+                native_id = _wire_id(skipped["id"], "turn")
+                if native_id in skipped_ids or native_id == locator.native_turn_id:
+                    raise CodexHistoryInvalidResponse("Codex detail locator changed identity")
+                skipped_ids.add(native_id)
+            if next_cursor is None or next_cursor in seen_cursors:
                 raise CodexHistoryInvalidResponse(
                     "Codex detail locator ended early")
             cursor = next_cursor
+            seen_cursors.add(cursor)
+            # Older official builds may cap pages below the requested limit.
+            # Preserve their ordinary cursor walk while batching when supported.
+            remaining -= len(rows)
 
         response = await self._call("thread/turns/list", {
             "threadId": thread_id,
@@ -1040,6 +1479,9 @@ class CodexOfficialHistory:
                 try:
                     items = await self._items_for_turn(
                         thread_id, locator.native_turn_id)
+                except CodexHistoryProjectionTooLarge as exc:
+                    raise CodexHistoryUnsupported(
+                        "official Codex turn detail exceeds projection budget") from exc
                 except CodexRpcRejected as exc:
                     if not _unsupported(exc):
                         raise
@@ -1139,10 +1581,13 @@ class CodexOfficialHistory:
 
     def invalidate_thread(self, thread_id: str) -> None:
         """Drop every generation-local cursor/cache entry for one thread."""
+        self._prefetch.invalidate(thread_id)
+        self._read_sources.pop(thread_id, None)
         for mapping in (
             self._before_cursors,
             self._locators,
             self._summary_events,
+            self._automatic_users,
             self._native_full_turns,
             self._terminal_refresh_fallbacks,
         ):

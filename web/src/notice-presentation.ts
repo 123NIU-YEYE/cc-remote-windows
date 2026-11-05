@@ -17,11 +17,12 @@ function isOfficialNotice(notice: Notice): boolean {
 /** Notices that belong in the conversation surface.
  *
  * Official app-server diagnostics are retained in session state for the Codex
- * status sheet, but never interrupt the transcript.  Locally-authored action
- * outcomes stay visible with product copy instead of raw runtime vocabulary.
+ * status sheet, but never interrupt the transcript. Routine compaction receipts
+ * already have inline progress. Other local outcomes use product copy.
  */
 export function conversationNotices(notices: Notice[]): Notice[] {
-  return notices.filter((notice) => !isOfficialNotice(notice)).map((notice) => {
+  return notices.filter((notice) => !isOfficialNotice(notice)
+    && !(notice.notice_id.startsWith("compact-") && notice.severity === "info")).map((notice) => {
     if (notice.notice_id.startsWith("schedule-")) {
       if (notice.severity === "warning") {
         const retrying = notice.title.includes("重试");
@@ -68,8 +69,8 @@ export function conversationNotices(notices: Notice[]): Notice[] {
     if (notice.notice_id.startsWith("compact-")) {
       return {
         ...notice,
-        title: "正在整理上下文",
-        message: "整理完成后可继续使用当前会话。",
+        title: cleanProductText(notice.title),
+        message: cleanProductText(notice.message),
         detail: null,
       };
     }

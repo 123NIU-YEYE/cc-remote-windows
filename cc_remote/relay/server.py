@@ -12,10 +12,13 @@ The relay never imports claude_agent_sdk and never touches the model API.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import re
+import sqlite3
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -23,7 +26,7 @@ from typing import Optional
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from cc_remote.config import (
     RelayConfig, relay_config, valid_machine_id, validate_relay_config,
@@ -31,10 +34,16 @@ from cc_remote.config import (
 from cc_remote.log import logger
 from cc_remote.protocol import PROTOCOL_VERSION
 from cc_remote.relay.auth import (
-    SESSION_COOKIE_NAME, SessionClaims, authenticate_login,
+    SessionClaims, authenticate_login,
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.devices import DeviceStore
+from cc_remote.relay.harmony_push import (
+    HarmonyPushDispatcher, HarmonyPushStore, HarmonySubscription, HuaweiPushSender,
+    TOKEN_RE as HARMONY_TOKEN_RE,
+)
+from cc_remote.relay.link_preview import LinkPreviewService, PreviewUnavailable
+from cc_remote.relay.viewer import ViewerError, ViewerRelay, main_cookie_name
 from cc_remote.relay.pairing import RelayHub
 from cc_remote.relay.push import (
     PushDispatcher, PushOutcome, PushSubscription, PushSubscriptionStore,
@@ -401,11 +410,11 @@ async def _read_json_limited(req: Request, max_bytes: int):
 
 
 async def _active_claims(
-    req: Request,
+    req: Request | WebSocket,
     cfg: RelayConfig,
     sessions: SessionRegistry,
 ) -> SessionClaims | None:
-    token = req.cookies.get(SESSION_COOKIE_NAME, "")
+    token = req.cookies.get(main_cookie_name(cfg, req), "")
     claims = session_token_claims(token, cfg.session_secret)
     if (
         claims is None
@@ -424,6 +433,16 @@ def _push_subject(claims: SessionClaims) -> str:
 def _device_subject(claims: SessionClaims) -> str:
     # Legacy single-password mode is one owner, just like Push subscriptions.
     return claims.subject or "legacy"
+
+
+def _btw_owner_id(claims: SessionClaims, secret: str) -> str:
+    """Derive an opaque, reload-stable BTW owner from authenticated claims."""
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        f"cc-remote:btw-owner:{_device_subject(claims)}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"owner-{digest[:32]}"
 
 
 async def _claims_allow_machine(
@@ -508,6 +527,7 @@ async def _serve_client_until_expiry(
     expires_at: int,
     revoked: asyncio.Event,
     machine_id: str = "default",
+    owner_id: str | None = None,
 ) -> None:
     """Serve until disconnect, signed expiry, or server-side revocation."""
     remaining = max(0.0, expires_at - time.time())
@@ -531,7 +551,13 @@ async def _serve_client_until_expiry(
 
     guard_task = asyncio.create_task(guard())
     try:
-        if machine_id == "default":
+        bound_owner = owner_id or getattr(
+            getattr(websocket, "state", None), "btw_owner_id", None)
+        if bound_owner is not None:
+            await hub.serve_client(websocket, machine_id, bound_owner)
+        elif machine_id == "default":
+            # Preserve the small embedded/test hub surface when no account
+            # identity was attached by the authenticated endpoint.
             await hub.serve_client(websocket)
         else:
             await hub.serve_client(websocket, machine_id)
@@ -557,6 +583,8 @@ def create_app(
     validate_relay_config(cfg)
     app = FastAPI(title="cc-remote relay")
     sessions = SessionRegistry(cfg.session_registry_cap)
+    link_previews = LinkPreviewService()
+    link_preview_limiter = LoginRateLimiter(max_per_ip=120)
     devices = device_store or DeviceStore(cfg.device_db_path)
     push_store: PushSubscriptionStore | None = None
     push_dispatcher: PushDispatcher | None = None
@@ -570,9 +598,23 @@ def create_app(
                 subscription.session_jti, subscription.expires_at),
         )
 
+    harmony_store: HarmonyPushStore | None = None
+    harmony_dispatcher: HarmonyPushDispatcher | None = None
+    if cfg.harmony_push_service_account:
+        try:
+            harmony_sender = HuaweiPushSender(cfg.harmony_push_service_account)
+            harmony_store = HarmonyPushStore(cfg.push_db_path)
+            harmony_dispatcher = HarmonyPushDispatcher(
+                harmony_store, origin=cfg.public_origin, sender=harmony_sender,
+                category=cfg.harmony_push_category,
+                test_message=cfg.harmony_push_test_message,
+                session_active=lambda sub: sessions.active_id(sub.session_jti, sub.expires_at),
+            )
+        except (ValueError, OSError, sqlite3.Error):
+            harmony_store = None
+            log.warning("Harmony push disabled: check service-account configuration")
+
     async def on_live_turn_end(machine_id: str, msg: object) -> None:
-        if push_dispatcher is None:
-            return
         result = getattr(msg, "result", None)
         raw_context = getattr(msg, "notification_context", None)
         context = (
@@ -582,11 +624,13 @@ def create_app(
         )
         if context is not None:
             context["sid"] = getattr(msg, "sid", None)
-        await push_dispatcher.notify_turn_end(
-            machine_id,
-            outcome=_turn_push_outcome(result),
-            context=context,
-        )
+        # One provider's outage must not prevent delivery through the other.
+        await asyncio.gather(*(
+            dispatcher.notify_turn_end(
+                machine_id, outcome=_turn_push_outcome(result), context=context)
+            for dispatcher in (push_dispatcher, harmony_dispatcher)
+            if dispatcher is not None
+        ), return_exceptions=True)
 
     hub = RelayHub(cfg, on_live_turn_end=on_live_turn_end)
     login_slots = asyncio.Semaphore(cfg.login_inflight_cap)
@@ -595,14 +639,53 @@ def create_app(
     app.state.login_slots = login_slots
     app.state.push_store = push_store
     app.state.push_dispatcher = push_dispatcher
+    app.state.harmony_push_store = harmony_store
+    app.state.harmony_push_dispatcher = harmony_dispatcher
     app.state.device_store = devices
+    viewers = ViewerRelay(
+        cfg, lambda req: _active_claims(req, cfg, sessions), sessions.active,
+        lambda claims, machine: _claims_allow_machine(claims, machine, devices),
+        lambda req: _request_origin_allowed(req, cfg),
+    )
+    app.state.viewers = viewers
 
     @app.middleware("http")
     async def static_shell_cache_policy(req: Request, call_next):
         """Never let a protocol upgrade reload into a stale application shell."""
+        grant_id = viewers.host_grant(req)
+        if grant_id is None and req.url.path.startswith("/__cc_viewer/bridge/"):
+            from cc_remote.relay.viewer_bridge import bridge_runner
+            return await bridge_runner(req, viewers)
+        viewer_api = req.url.path == "/api/viewers" or req.url.path.startswith("/api/viewers/")
+        if grant_id is not None or viewer_api:
+            try:
+                response = (await viewers.host(req, grant_id) if grant_id is not None
+                            else await viewers.api(req))
+            except (ViewerError, ValueError, asyncio.TimeoutError) as exc:
+                status = exc.status if isinstance(exc, ViewerError) else 400
+                code = exc.code if isinstance(exc, ViewerError) else "invalid_request"
+                if grant_id is not None:
+                    messages = {
+                        "device_offline": "设备已离线，请连接后重新打开预览。",
+                        "resource_unavailable": "资源不存在、已更改或未包含在预览范围内。",
+                        "publication_changed": "预览配置已更新，请重新打开。",
+                        "preview_expired": "预览已过期，请从 cc-remote 重新打开。",
+                    }
+                    response = HTMLResponse(
+                        '<meta charset="utf-8"><p style="font:15px system-ui;padding:24px">'
+                        + messages.get(code, "当前无法打开预览，请返回 cc-remote 重试。") + "</p>",
+                        status_code=status,
+                    )
+                else:
+                    response = JSONResponse({"error": code}, status_code=status)
+            if grant_id is not None:
+                response.headers.update(viewers.headers(grant_id))
+            if viewer_api or req.url.path.startswith("/__cc_viewer/") or response.status_code >= 400:
+                response.headers["Cache-Control"] = "no-store"
+            return response
         response = await call_next(req)
         path = req.url.path
-        if path in {"/", "/index.html", "/sw.js", "/cc-remote-build.json"}:
+        if path in {"/", "/index.html", "/sw.js", "/cc-remote-build.json", "/cc-remote-viewer-runner.js"}:
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
         elif (
             path.startswith("/assets/")
@@ -690,6 +773,51 @@ def create_app(
         return JSONResponse(
             {"ok": True}, headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/push/harmony/config")
+    async def harmony_push_config(req: Request) -> JSONResponse:
+        if await _active_claims(req, cfg, sessions) is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        return JSONResponse({"enabled": harmony_dispatcher is not None},
+                            headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/push/harmony/{operation}")
+    async def harmony_push_binding(operation: str, req: Request) -> JSONResponse:
+        if operation not in {"subscribe", "unsubscribe"}:
+            return JSONResponse({"ok": False}, status_code=404)
+        if not _request_origin_allowed(req, cfg):
+            return JSONResponse({"error": "origin_rejected"}, status_code=403)
+        claims = await _active_claims(req, cfg, sessions)
+        if claims is None:
+            return JSONResponse({"ok": False}, status_code=401)
+        if harmony_store is None:
+            return JSONResponse({"error": "harmony_push_disabled"}, status_code=503)
+        try:
+            body = await _read_json_limited(req, _PUSH_BODY_MAX_BYTES)
+        except _BodyTooLarge:
+            return JSONResponse({"error": "too_large"}, status_code=413)
+        except Exception:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        token = body.get("token") if isinstance(body, dict) else None
+        if not isinstance(token, str) or not HARMONY_TOKEN_RE.fullmatch(token):
+            return JSONResponse({"error": "invalid_subscription"}, status_code=400)
+        if operation == "unsubscribe":
+            await harmony_store.remove_token(_push_subject(claims), token)
+        else:
+            machine = body.get("machine_id")
+            mode = body.get("notification_mode", "generic")
+            if (not isinstance(machine, str) or not valid_machine_id(machine)
+                    or not isinstance(mode, str) or mode not in {"generic", "session"}
+                    or not await _claims_allow_machine(claims, machine, devices)):
+                return JSONResponse({"error": "invalid_subscription"}, status_code=400)
+            try:
+                await harmony_store.upsert(HarmonySubscription(
+                    subject=_push_subject(claims), machine_id=machine, token=token,
+                    notification_mode=mode, session_jti=claims.jti, expires_at=claims.expires_at,
+                ))
+            except ValueError:
+                return JSONResponse({"error": "subscription_limit"}, status_code=429)
+        return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+
     @app.post("/api/login")
     async def login(req: Request) -> JSONResponse:
         if not _request_origin_allowed(req, cfg):
@@ -766,7 +894,7 @@ def create_app(
             {"ok": True, "exp": exp}, headers={"Cache-Control": "no-store"}
         )
         response.set_cookie(
-            SESSION_COOKIE_NAME,
+            main_cookie_name(cfg, req),
             token,
             max_age=cfg.session_ttl_seconds,
             path="/",
@@ -776,9 +904,30 @@ def create_app(
         )
         return response
 
+    @app.post("/api/link-preview")
+    async def link_preview(req: Request):
+        headers = {"Cache-Control": "no-store"}
+        if not _request_origin_allowed(req, cfg, allow_missing=False):
+            return JSONResponse({"error": "origin_denied"}, status_code=403, headers=headers)
+        if await _active_claims(req, cfg, sessions) is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401, headers=headers)
+        if link_preview_limiter.limited(_request_ip(req)):
+            return JSONResponse({"error": "rate_limited"}, status_code=429, headers=headers)
+        try:
+            async with asyncio.timeout(2):
+                body = await _read_json_limited(req, 8192)
+            if (not isinstance(body, dict) or not isinstance(body.get("url"), str)
+                    or not isinstance(body.get("detail", "page"), str)
+                    or body.get("detail", "page") not in {"page", "icon"}):
+                raise ValueError
+            result = await link_previews.get(body["url"], icon_only=body.get("detail") == "icon")
+        except (_BodyTooLarge, ValueError, PreviewUnavailable, TimeoutError):
+            return JSONResponse({}, headers=headers)
+        return JSONResponse(result, headers=headers)
+
     @app.get("/api/session")
     async def session_status(req: Request) -> JSONResponse:
-        token = req.cookies.get(SESSION_COOKIE_NAME, "")
+        token = req.cookies.get(main_cookie_name(cfg, req), "")
         claims = session_token_claims(token, cfg.session_secret)
         if (
             claims is None
@@ -802,15 +951,17 @@ def create_app(
                 status_code=403,
                 headers={"Cache-Control": "no-store"},
             )
-        token = req.cookies.get(SESSION_COOKIE_NAME, "")
+        token = req.cookies.get(main_cookie_name(cfg, req), "")
         claims = session_token_claims(token, cfg.session_secret)
         if claims is not None:
             if push_store is not None:
                 await push_store.remove_session(claims.jti)
+            if harmony_store is not None:
+                await harmony_store.remove_session(claims.jti)
             await sessions.revoke(claims.jti)
         response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
         response.delete_cookie(
-            SESSION_COOKIE_NAME,
+            main_cookie_name(cfg, req),
             path="/",
             secure=_request_cookie_secure(req),
             httponly=True,
@@ -836,12 +987,13 @@ def create_app(
                 "last_seen": record.last_seen,
                 "online": record.machine_id in connected,
                 "managed": True,
+                **hub.device_version(record.machine_id),
             }
             for record in records
         ]
         known = {record.machine_id for record in records}
         visible_legacy = {
-            machine_id for machine_id in connected
+            machine_id for machine_id in connected | set(hub.versioned_machine_ids)
             if claims.allows_machine(machine_id)
         }
         if "*" not in claims.machines:
@@ -856,6 +1008,7 @@ def create_app(
                 "last_seen": None,
                 "online": machine_id in connected,
                 "managed": False,
+                **hub.device_version(machine_id),
             })
         pairing_expires_at = await devices.pairing_expires_at(subject)
         return JSONResponse(
@@ -979,6 +1132,8 @@ def create_app(
         if not revoked:
             return JSONResponse({"error": "not_found"}, status_code=404)
         await hub.disconnect_wrapper(machine_id, reason="device revoked")
+        hub.forget_wrapper_version(machine_id)
+        await viewers.disconnect_machine(machine_id)
         return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/machines")
@@ -1002,6 +1157,34 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.websocket("/ws/viewer")
+    async def viewer_ws(websocket: WebSocket) -> None:
+        authorization = websocket.headers.get("authorization", "")
+        token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        scope = wrapper_machine_scope(token, cfg)
+        dynamic = scope is None
+        if dynamic:
+            scope = await devices.machine_for_token(token)
+        if scope is None or websocket.headers.get("origin"):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        async def authorized(machine_id: str) -> bool:
+            return (await devices.machine_for_token(token) == machine_id) if dynamic else True
+        await viewers.serve_wrapper(websocket, scope, authorized)
+
+    @app.websocket("/ws/viewer-client")
+    async def viewer_client_ws(websocket: WebSocket) -> None:
+        # This is a browser-only resource connection, never a wrapper role or
+        # chat connection. A public grant ID is not authentication.
+        from cc_remote.relay.viewer_bridge import serve_bridge
+        claims = await _active_claims(websocket, cfg, sessions)
+        if (claims is None or websocket.headers.get("authorization")
+                or not _request_origin_allowed(websocket, cfg, allow_missing=False)):
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+        await serve_bridge(websocket, viewers, claims)
+
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
         authorization = websocket.headers.get("authorization", "")
@@ -1019,7 +1202,7 @@ def create_app(
                 role = "wrapper"
         claims: Optional[SessionClaims] = None
         if role is None:
-            token = websocket.cookies.get(SESSION_COOKIE_NAME, "")
+            token = websocket.cookies.get(main_cookie_name(cfg, websocket), "")
             origin = websocket.headers.get("origin", "")
             origin_ok = _request_origin_allowed(
                 websocket, cfg, allow_missing=False,
@@ -1093,18 +1276,25 @@ def create_app(
                 # Keep the legacy call shape for embedded relays and tests that
                 # replace the expiry guard. Named machines use the extended
                 # route-aware form below.
+                websocket.state.btw_owner_id = _btw_owner_id(
+                    claims, cfg.session_secret)
                 await _serve_client_until_expiry(
                     websocket, hub, claims.expires_at, revoked)
             else:
+                websocket.state.btw_owner_id = _btw_owner_id(
+                    claims, cfg.session_secret)
                 await _serve_client_until_expiry(
                     websocket, hub, claims.expires_at, revoked, machine_id)
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
+        from cc_remote import __version__
+
         return JSONResponse(
             {
                 "ok": True,
                 "protocol": PROTOCOL_VERSION,
+                "version": __version__,
                 "wrapper_connected": hub.wrapper_connected,
                 "machines": hub.machine_ids,
                 "clients": hub.client_count,

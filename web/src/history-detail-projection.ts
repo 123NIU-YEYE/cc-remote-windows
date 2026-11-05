@@ -42,6 +42,44 @@ export function nextAutoLoadDetailTurn(
     : null;
 }
 
+function hasTurnIdentity(
+  turn: Pick<Turn, "id" | "clientMsgId" | "historyTurnId">,
+  identity: string,
+): boolean {
+  return [turn.id, turn.clientMsgId, turn.historyTurnId].includes(identity);
+}
+
+/** Select the next detail request for the one canonical active History head.
+ *
+ * Recency, array position, prompt text, and native task ids are deliberately
+ * insufficient: a reconnect may retain several unfinished local rows, while
+ * ``historyNewestId`` is the wrapper's exact source projection. Recovery loads
+ * only the bounded newest page. Once that canonical page is installed, older
+ * pages remain available through the existing explicit pagination controls;
+ * reconnect must not turn one long active turn into an unbounded DOM restore. */
+export function nextActiveDetailRequest(
+  turns: readonly Turn[],
+  historyNewestId: string | null | undefined,
+  active: boolean,
+): { turnId: string; before?: string } | null {
+  if (!active || !historyNewestId) return null;
+  const matches = turns.filter((turn) =>
+    !turn.done && hasTurnIdentity(turn, historyNewestId));
+  if (matches.length !== 1) return null;
+  const turn = matches[0];
+  if (turn.detailLoading === true
+      || turn.detailRestorePending === true
+      || turn.detailResetPending === true
+      || !!turn.detailError
+      || turn.detailProjection?.capped === true) return null;
+
+  const projection = turn.detailProjection;
+  if (projection && projection.segments.length > 0) {
+    return null;
+  }
+  return turn.detailLoaded === true ? null : { turnId: turn.id };
+}
+
 function pageKey(before: string | null | undefined): string {
   return before ?? LATEST_DETAIL_PAGE_KEY;
 }
@@ -103,8 +141,57 @@ function insertSegment(
     : [...withoutSamePage, incoming];
 }
 
-function flattenEvents(segments: readonly TurnDetailSegment[]): ServerEvent[] {
-  return segments.flatMap((segment) => segment.events);
+function blockIdentity(block: Block): string {
+  if (block.kind === "text") return `text:${block.message_id}`;
+  if (block.kind === "tool") return `tool:${block.tool_use_id}`;
+  return `process:${block.item_id}`;
+}
+
+function materializeSegments(
+  segments: readonly TurnDetailSegment[],
+  decode: (events: ServerEvent[]) => Turn | undefined,
+): { detail: Turn | undefined; blocks: Block[] } {
+  let detail: Turn | undefined;
+  const blocks: Block[] = [];
+  const blockIndexes = new Map<string, number>();
+
+  // A wire page is deliberately a self-contained turn: the wrapper repeats
+  // the user/terminal envelope around a source-disjoint set of display groups.
+  // Decoding concatenated raw pages makes an intermediate TurnEnd close the
+  // target before the next page and silently projects later commentary/tools
+  // into a prompt-less turn. Decode each page independently, then join only
+  // its authoritative display-block identities in cursor order.
+  for (const segment of segments) {
+    const decoded = decode(segment.events);
+    if (!decoded) continue;
+    detail = decoded;
+    for (const block of visibleBlocks(decoded)) {
+      const identity = blockIdentity(block);
+      const existing = blockIndexes.get(identity);
+      if (existing == null) {
+        blockIndexes.set(identity, blocks.length);
+        blocks.push(block);
+      } else {
+        // Retry/repair windows may overlap at an exact native block boundary.
+        // The later source page refreshes that payload in place; equal text or
+        // titles are never treated as identity evidence.
+        const previous = blocks[existing];
+        if (previous.kind === "tool" && block.kind === "tool"
+            && block.tool === "tool" && Object.keys(block.input).length === 0) {
+          // A rollout byte window can begin with an output whose call is on
+          // the preceding page. Keep the recovered call metadata and take the
+          // newer result; the generic output-only envelope is not a new tool.
+          blocks[existing] = { ...previous, ...block,
+            tool: previous.tool, input: previous.input, category: previous.category,
+            title: previous.title, parent_id: previous.parent_id, server: previous.server,
+            startedTs: previous.startedTs ?? block.startedTs };
+        } else {
+          blocks[existing] = block;
+        }
+      }
+    }
+  }
+  return { detail, blocks };
 }
 
 function segmentChars(segments: readonly TurnDetailSegment[]): number {
@@ -149,8 +236,9 @@ export function installTurnDetailProjectionPage(
       : current?.newerCursor === before ? "newer" : "unknown";
 
   let segments = insertSegment(current?.segments ?? [], incoming);
-  let detail = decode(flattenEvents(segments));
-  let blocks = visibleBlocks(detail);
+  let materialized = materializeSegments(segments, decode);
+  let detail = materialized.detail;
+  let blocks = materialized.blocks;
   let capped = current?.capped ?? false;
 
   // Pages are bounded to 256 events/8 MiB by the wrapper. Keep a sliding
@@ -167,8 +255,9 @@ export function installTurnDetailProjectionPage(
     segments = retainOlderSide
       ? segments.slice(0, -1) : segments.slice(1);
     capped = true;
-    detail = decode(flattenEvents(segments));
-    blocks = visibleBlocks(detail);
+    materialized = materializeSegments(segments, decode);
+    detail = materialized.detail;
+    blocks = materialized.blocks;
   }
 
   if (blocks.length > maxItems || encodedChars(blocks) > maxChars) {
@@ -178,6 +267,15 @@ export function installTurnDetailProjectionPage(
       retained = retained.slice(Math.max(1, Math.ceil(retained.length / 16)));
     }
     blocks = retained;
+  }
+  if (detail) {
+    detail = {
+      ...detail,
+      blocks: [
+        ...blocks,
+        ...detail.blocks.filter(isFinal),
+      ],
+    };
   }
   const oldest = segments[0];
   const newest = segments.at(-1);

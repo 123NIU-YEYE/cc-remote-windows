@@ -12,8 +12,8 @@ from cc_remote.wrapper.codex_handle import _initialize_params
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_v3_product_version_is_consistent_across_runtime_and_web_metadata():
-    assert __version__ == "3.0.0"
+def test_product_version_is_consistent_across_runtime_and_web_metadata():
+    assert __version__ == "4.0.29"
     assert re.fullmatch(r"[1-9]\d*\.\d+\.\d+", __version__)
 
     package = json.loads((ROOT / "web/package.json").read_text(encoding="utf-8"))
@@ -40,13 +40,11 @@ def test_release_docs_distinguish_product_and_wire_protocol_versions():
     readme_en = (ROOT / "README_en.md").read_text(encoding="utf-8")
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert "当前版本：v3.0.0" in readme
-    assert "## v3 架构升级" in readme
-    assert "Current release: v3.0.0" in readme_en
-    assert "## What changed in v3" in readme_en
+    assert f"产品版本：v{__version__}" in readme
+    assert f"Product version: v{__version__}" in readme_en
     for document in (readme, readme_en, changelog):
-        assert "v3.0.0" in document
-        assert "protocol v29" in document.lower()
+        assert f"v{__version__}" in document
+        assert f"protocol v{PROTOCOL_VERSION}" in document.lower()
 
 
 def test_readmes_use_safe_markdown_for_navigation_and_images():

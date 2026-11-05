@@ -8,9 +8,12 @@ process, so disconnecting one remote session cannot stop other Codex clients.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
+import hashlib
 import json
 import os
 import re
+from cc_remote.wrapper import resource_compat as resource  # Windows rlimit shim
 import signal
 import shutil
 import stat
@@ -24,8 +27,12 @@ from urllib.parse import urlsplit
 
 from cc_remote.log import logger
 from cc_remote.wrapper.os_compat import current_uid
+from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
+from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
 from cc_remote.wrapper.process_scan import (
     _darwin_process_info,
+    ProcessIdentity,
+    process_identity,
     process_owner_uid,
 )
 
@@ -38,6 +45,14 @@ _OUTPUT_MAX = 64 * 1024
 _PID_RECORD_MAX = 4096
 _STALE_UPDATER_EXIT_TIMEOUT = 3.0
 _WINDOWS_WS_START_TIMEOUT = 10.0
+_DAEMON_UPGRADE_SETTLE_TIMEOUT = 5.0
+_DAEMON_UPGRADE_POLL_INTERVAL = 0.1
+_DAEMON_NOFILE_SOFT_LIMIT = 4096
+_RLIMIT_EXEC = str(Path(__file__).with_name("rlimit_exec.py"))
+_PROC_ROOT = Path("/proc")
+_HIGH_NOFILE_DAEMON_OPERATIONS = frozenset({
+    "bootstrap", "enable-remote-control", "restart", "start",
+})
 
 
 def codex_daemon_mode(value: Optional[str] = None) -> str:
@@ -59,10 +74,29 @@ class CodexDaemonInfo:
     socket_path: Optional[str]
     verified_remote_control: bool = False
     websocket_url: Optional[str] = None
+    nofile_verified: bool = False
+
+
+@dataclass(frozen=True)
+class CodexSocketIdentity:
+    """A profile-scoped standalone listener generation, not a daemon PID."""
+
+    codex_home: str
+    socket_path: str
+    device: int
+    inode: int
+    created_ns: int
+
+
+CodexServerIdentity = ProcessIdentity | CodexSocketIdentity
 
 
 class CodexDaemonUpgradeRequired(RuntimeError):
     """The managed shared daemon could not be aligned with the selected CLI."""
+
+
+class CodexProfileDaemonUnavailable(CodexDaemonUpgradeRequired):
+    """A configured account profile has no usable shared control plane."""
 
 
 @dataclass(frozen=True)
@@ -75,17 +109,45 @@ class _CommandResult:
 def _run_command(
     argv: tuple[str, ...], env: Mapping[str, str], timeout: float,
 ) -> _CommandResult:
-    """Blocking subprocess boundary, kept separate for deterministic tests."""
-    try:
-        result = subprocess.run(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=dict(env),
-            timeout=timeout,
-            check=False,
+    """Run native lifecycle commands outside the disposable Wrapper release."""
+    # Native start/restart inherits this cwd into the durable app-server. A
+    # release can be retired while that server survives several Wrapper upgrades.
+    # Never fall back to the caller's cwd, including for read-only lifecycle probes.
+    home = env.get("HOME") or str(Path.home())
+    if not os.path.isabs(home) or not os.path.isdir(home):
+        return _CommandResult(127, b"", b"InvalidDaemonWorkingDirectory")
+    command_argv = argv
+    lifecycle_command = os.name == "posix" and any(
+        argv[index:index + 2] == ("app-server", "daemon")
+        and argv[index + 2] in _HIGH_NOFILE_DAEMON_OPERATIONS
+        for index in range(max(0, len(argv) - 2))
+    )
+    if lifecycle_command:
+        # The official lifecycle command launches the durable daemon.  Its
+        # resource limits are inherited at that boundary, so raising only this
+        # short-lived child also raises the managed daemon without changing the
+        # wrapper or unrelated user processes.
+        command_argv = (
+            sys.executable,
+            _RLIMIT_EXEC,
+            str(_DAEMON_NOFILE_SOFT_LIMIT),
+            *argv,
         )
+    try:
+        with barrier.launch() if mutates_daemon(argv) else nullcontext():
+            if lifecycle_command and needs_isolation():
+                result = run_isolated(command_argv, env, home, timeout)
+            else:
+                result = subprocess.run(
+                    command_argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=dict(env),
+                    cwd=home,
+                    timeout=timeout,
+                    check=False,
+                )
     except (OSError, subprocess.SubprocessError) as exc:
         # Exception text can contain paths or command details.  The manager's
         # caller needs only a bounded failure class to select stdio fallback.
@@ -95,6 +157,166 @@ def _run_command(
         bytes(result.stdout or b"")[:_OUTPUT_MAX],
         bytes(result.stderr or b"")[:_OUTPUT_MAX],
     )
+
+
+def _prepare_profile_standalone(
+    codex_bin: str,
+    env: Mapping[str, str],
+) -> Optional[bool]:
+    """Expose one verified managed CLI payload inside a sibling CODEX_HOME.
+
+    Official daemon bootstrap looks for
+    ``$CODEX_HOME/packages/standalone/current/codex``. A second account made
+    with ``CODEX_HOME=... codex login`` owns valid auth and session state, but
+    normally still executes the primary home's global ``~/.local/bin/codex``;
+    it therefore has no profile-local managed path for bootstrap.
+
+    Share only the managed CLI's ``current`` entry. Daemon sockets, auth,
+    config, rollouts, and all other state stay rooted in the sibling
+    ``CODEX_HOME``. Refuse ambiguous layouts instead of replacing anything the
+    user already installed.
+    """
+    raw_home = env.get("CODEX_HOME")
+    if not isinstance(raw_home, str) or not raw_home:
+        return None
+    profile_home = Path(os.path.realpath(os.path.expanduser(raw_home)))
+    if not profile_home.is_absolute():
+        return None
+    try:
+        binary = Path(codex_bin).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    # Accept only the official standalone release layout. A package-manager
+    # binary or arbitrary executable must not become a trusted daemon payload.
+    if (
+        binary.parent.name != "bin"
+        or binary.parent.parent.parent.name != "releases"
+        or binary.parent.parent.parent.parent.name != "standalone"
+    ):
+        return None
+    standalone_root = binary.parent.parent.parent.parent
+    source_current = standalone_root / "current"
+    try:
+        source_binary = (source_current / "codex").resolve(strict=True)
+        source_stat = standalone_root.stat()
+        home_stat = profile_home.stat()
+    except OSError:
+        return None
+    if (
+        source_binary != binary
+        or not stat.S_ISDIR(source_stat.st_mode)
+        or source_stat.st_uid != os.getuid()
+        or not stat.S_ISDIR(home_stat.st_mode)
+        or home_stat.st_uid != os.getuid()
+    ):
+        return None
+
+    destination = profile_home / "packages" / "standalone" / "current"
+    if destination.is_file() or destination.is_dir():
+        try:
+            existing = (destination / "codex").resolve(strict=True)
+        except OSError:
+            return False
+        if existing == binary:
+            return os.access(existing, os.X_OK)
+        # A configured account may already own an older official standalone
+        # ``current`` symlink.  Merely restarting that daemon cannot upgrade it:
+        # the official lifecycle command launches the stale path again.  Only
+        # replace the pointer when every part of the old target is the same
+        # user's canonical standalone release layout.  Directories, ordinary
+        # files, broken links, and third-party layouts remain user-owned.
+        profile_standalone = profile_home / "packages" / "standalone"
+        try:
+            destination_stat = destination.lstat()
+            existing_stat = existing.stat()
+            existing_release = existing.parent.parent
+            safely_replaceable = bool(
+                stat.S_ISLNK(destination_stat.st_mode)
+                and destination_stat.st_uid == os.getuid()
+                and stat.S_ISREG(existing_stat.st_mode)
+                and existing_stat.st_uid == os.getuid()
+                and os.access(existing, os.X_OK)
+                and existing.parent.name == "bin"
+                and existing_release.parent.name == "releases"
+                and existing_release.parent.parent == profile_standalone
+            )
+        except OSError:
+            return False
+        if not safely_replaceable:
+            return False
+        replacement = destination.with_name(
+            f".{destination.name}.cc-remote-{os.getpid()}-"
+            f"{time.monotonic_ns()}"
+        )
+        try:
+            os.symlink(source_current, replacement, target_is_directory=True)
+            # The official updater may advance ``current`` concurrently.  A
+            # symlink's target is immutable, so the same inode proves the path
+            # still names the exact pointer validated above.  If it changed,
+            # preserve the updater's result instead of overwriting it.
+            if not os.path.samestat(destination_stat, destination.lstat()):
+                replacement.unlink()
+                try:
+                    concurrent = (destination / "codex").resolve(strict=True)
+                except OSError:
+                    return False
+                return concurrent == binary and os.access(concurrent, os.X_OK)
+            os.replace(replacement, destination)
+        except OSError:
+            try:
+                replacement.unlink()
+            except OSError:
+                pass
+            return False
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            # The atomic replacement is already visible. A directory-fsync
+            # failure weakens crash durability but must not make callers retry
+            # or report that the old pointer is still active.
+            log.warning(
+                "Codex profile standalone directory fsync failed",
+                error_type=type(exc).__name__,
+            )
+        try:
+            prepared = (destination / "codex").resolve(strict=True)
+        except OSError:
+            return False
+        return prepared == binary and os.access(prepared, os.X_OK)
+    # ``Path.exists`` is false for a broken symlink. Never replace one.
+    if os.path.lexists(destination):
+        return False
+
+    try:
+        for directory in (
+            profile_home / "packages",
+            profile_home / "packages" / "standalone",
+        ):
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            directory_stat = directory.lstat()
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.getuid()
+            ):
+                return False
+        os.symlink(source_current, destination, target_is_directory=True)
+    except FileExistsError:
+        # A concurrent profile bootstrap won the race. Validate its result.
+        pass
+    except OSError:
+        return False
+    try:
+        prepared = (destination / "codex").resolve(strict=True)
+    except OSError:
+        return False
+    return prepared == binary and os.access(prepared, os.X_OK)
 
 
 def _json_object(data: bytes) -> Optional[dict[str, Any]]:
@@ -121,7 +343,8 @@ def _managed_pid(path: Path) -> Optional[int]:
     try:
         descriptor = os.open(
             path,
-            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0),
+            os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
@@ -139,6 +362,183 @@ def _managed_pid(path: Path) -> Optional[int]:
     payload = _json_object(data)
     pid = payload.get("pid") if payload is not None else None
     return pid if isinstance(pid, int) and pid > 1 else None
+
+
+def _managed_daemon_process_identity(
+    codex_home: str | Path,
+) -> Optional[ProcessIdentity]:
+    """Return the exact same-user app-server generation from official state.
+
+    The durable updater keeps running while replacing its app-server child.
+    A per-client proxy can therefore remain superficially alive after the
+    socket generation it joined has gone away.  Pair the official bounded PID
+    record with the kernel process start token so PID reuse cannot make an old
+    proxy look current.
+    """
+    home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
+    pid = _managed_pid(home / "app-server-daemon" / "app-server.pid")
+    if pid is None or process_owner_uid(pid) != os.getuid():
+        return None
+    return process_identity(pid)
+
+
+def _protected_socket_directory(uid: int) -> Path:
+    # Match codex-uds: independent of HOME, TMPDIR, and account settings.
+    return Path("/tmp").resolve() / f"codex-daemon-{uid}"
+
+
+def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, int, int]:
+    """Validate a native listener, including Codex 0.156's protected alias.
+
+    Native Unix aliases point to /tmp/codex-daemon-UID/SHA256(canonical address).
+    Accept only that exact mapping, never an arbitrary or cross-account link.
+    The physical listener's identity fences replacement behind an unchanged alias.
+    """
+    uid = os.getuid() if owner_uid is None else owner_uid
+    address = Path(path)
+    parent = address.parent
+    parent_info = parent.lstat()
+    if (not address.is_absolute() or str(parent.resolve()) != str(parent)
+            or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != uid
+            or parent_info.st_mode & 0o022):
+        raise ValueError("Codex socket parent is not private to its owner")
+    info = address.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        directory = _protected_socket_directory(uid)
+        target = directory / hashlib.sha256(os.fsencode(address)).hexdigest()
+        if info.st_uid != uid or os.readlink(address) != str(target):
+            raise ValueError("Codex socket alias does not match its account address")
+        directory_info = directory.lstat()
+        if (not stat.S_ISDIR(directory_info.st_mode) or directory_info.st_uid != uid
+                or stat.S_IMODE(directory_info.st_mode) != 0o700):
+            raise ValueError("Codex protected socket directory is not private")
+        info = target.lstat()
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != uid
+            or info.st_mode & 0o077):
+        raise ValueError("Codex socket is not private to its owner")
+    return info.st_dev, info.st_ino, info.st_ctime_ns
+
+
+def _standalone_socket_identity(
+    codex_home: str, socket_path: str,
+) -> Optional[CodexSocketIdentity]:
+    """Observe a private native listener without connecting or scanning PIDs.
+
+    A standalone app-server has no managed PID record. Its Unix listener is
+    replaced on restart, so inode/ctime changes fence old proxies just as a
+    PID/start-token change does for a managed daemon. Never substitute another
+    account's socket, follow an arbitrary symlink, or accept a shared-writable path.
+    The proxy handshake still proves that the observed listener speaks Codex.
+    """
+    try:
+        home = Path(codex_home).resolve()
+        path = Path(socket_path)
+        if not path.is_absolute():
+            return None
+        parent = path.parent.resolve()
+        parent.relative_to(home)
+        device, inode, created_ns = socket_identity(str(parent / path.name))
+        return CodexSocketIdentity(
+            str(home), str(parent / path.name),
+            device, inode, created_ns,
+        )
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _linux_process_start_ticks(pid: int) -> Optional[int]:
+    """Return one stable Linux process-generation token."""
+    try:
+        raw = (_PROC_ROOT / str(pid) / "stat").read_bytes()
+        end = raw.rfind(b") ")
+        if end < 0:
+            return None
+        fields = raw[end + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _ensure_managed_daemon_nofile(
+    codex_bin: str,
+    env: Mapping[str, str],
+    lifecycle: Mapping[str, Any],
+    *,
+    allow_local_listener: bool = False,
+) -> Optional[bool]:
+    """Raise and verify the actual managed Linux daemon's file limit.
+
+    The official lifecycle client can hand the detached process to the user's
+    systemd manager, which may replace the caller's inherited soft limit. A
+    high-limit launcher alone is therefore not evidence on Linux. Resolve the
+    exact same-user PID record, validate its executable/argv and process
+    generation, apply ``prlimit`` to that PID, then read it back.
+
+    ``None`` means this platform has no supported cross-process verification;
+    lifecycle commands still run through ``rlimit_exec`` so Darwin descendants
+    inherit the requested limit. ``False`` is a Linux verification failure and
+    callers must not advertise the managed daemon as ready.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    prlimit = getattr(resource, "prlimit", None)
+    if prlimit is None:
+        return False
+    codex_home = env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    daemon_root = Path(os.path.realpath(os.path.expanduser(codex_home))) / (
+        "app-server-daemon"
+    )
+    pid = _managed_pid(daemon_root / "app-server.pid")
+    if pid is None or process_owner_uid(pid) != os.getuid():
+        return False
+    proc_root = _PROC_ROOT / str(pid)
+    before = _linux_process_start_ticks(pid)
+    if before is None:
+        return False
+    expected_path = _text(lifecycle.get("managedCodexPath")) or codex_bin
+    try:
+        executable = os.path.realpath(os.readlink(proc_root / "exe"))
+        expected_executable = os.path.realpath(expected_path)
+        raw_cmdline = (proc_root / "cmdline").read_bytes()
+    except OSError:
+        return False
+    argv = tuple(value for value in raw_cmdline.split(b"\0") if value)
+    listeners = [
+        argv[index + 1] for index, value in enumerate(argv[:-1])
+        if value == b"--listen"
+    ] + [value.split(b"=", 1)[1] for value in argv if value.startswith(b"--listen=")]
+    expected_socket = os.fsencode(str(daemon_root.parent / "app-server-control/app-server-control.sock"))
+    local_listener = allow_local_listener and listeners in (
+        [b"unix://" + expected_socket],
+        [b"unix://"],
+    )
+    if (
+        executable != expected_executable
+        or b"app-server" not in argv
+        or (b"--remote-control" not in argv and not local_listener)
+    ):
+        return False
+    try:
+        soft, hard = prlimit(pid, resource.RLIMIT_NOFILE)
+        if hard != resource.RLIM_INFINITY and hard < _DAEMON_NOFILE_SOFT_LIMIT:
+            return False
+        if soft != resource.RLIM_INFINITY and soft < _DAEMON_NOFILE_SOFT_LIMIT:
+            prlimit(
+                pid,
+                resource.RLIMIT_NOFILE,
+                (_DAEMON_NOFILE_SOFT_LIMIT, hard),
+            )
+        verified_soft, _verified_hard = prlimit(pid, resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return False
+    after = _linux_process_start_ticks(pid)
+    return bool(
+        after == before
+        and (
+            verified_soft == resource.RLIM_INFINITY
+            or verified_soft >= _DAEMON_NOFILE_SOFT_LIMIT
+        )
+    )
 
 
 def _darwin_process_state(pid: int) -> Optional[str]:
@@ -388,17 +788,24 @@ class CodexDaemonManager:
         socket_path: Optional[str] = None,
         websocket_url: Optional[str] = None,
         command_timeout: float = _COMMAND_TIMEOUT,
+        require_shared: bool = False,
+        allow_restart: bool = True,
     ):
         self.mode = codex_daemon_mode(mode)
         self.socket_path = socket_path
         self.websocket_url = websocket_url
         self.command_timeout = max(1.0, float(command_timeout))
+        self.require_shared = bool(require_shared)
+        self.allow_restart = bool(allow_restart)
         self._lock = asyncio.Lock()
         self._capability_identity: Optional[tuple[object, ...]] = None
         self._capable = False
         self._ready_identity: Optional[tuple[object, ...]] = None
         self._ready: Optional[CodexDaemonInfo] = None
         self._windows_server_proc: Optional[asyncio.subprocess.Process] = None
+        self._ready_codex_home: Optional[str] = None
+        self._standalone_socket_path: Optional[str] = None
+        self._managed_identity_required = False
 
     @property
     def info(self) -> Optional[CodexDaemonInfo]:
@@ -408,14 +815,48 @@ class CodexDaemonManager:
     def strict_shared_affinity(self) -> bool:
         """Whether a verified managed daemon must not degrade to stdio."""
         return bool(
-            self._ready is not None
-            and self._ready.verified_remote_control
+            self.require_shared
+            or (not self.allow_restart and self._ready is not None)
+            or (
+                self._ready is not None
+                and self._ready.verified_remote_control
+            )
         )
 
     def invalidate(self) -> None:
         """Forget liveness after unexpected proxy EOF; keep help capability."""
         self._ready_identity = None
         self._ready = None
+        # Keep the profile-scoped home after the first verified connection so
+        # other resident handles can still compare their process generation.
+        # Clearing it here would make one proxy EOF look like a daemon swap to
+        # every healthy sibling handle and cause a reconnect cascade.
+
+    def current_process_identity(self) -> Optional[CodexServerIdentity]:
+        """Observe the discovered server generation (PID or native listener).
+
+        Keep this historical method name for handle/test manager compatibility.
+        Once a managed PID is observed, missing/unreadable PID state is an
+        outage, never permission to downgrade to standalone socket tracking.
+        invalidate() must preserve this barrier for healthy sibling handles.
+        """
+        home = self._ready_codex_home
+        if home is None:
+            return None
+        identity = _managed_daemon_process_identity(home)
+        if identity is not None:
+            self._managed_identity_required = True
+        if self._managed_identity_required or self._standalone_socket_path is None:
+            return identity
+        # Only a genuinely absent PID file permits the standalone identity.
+        # Broken symlinks, corrupt records and permission errors fail closed.
+        try:
+            (Path(home) / "app-server-daemon" / "app-server.pid").lstat()
+        except FileNotFoundError:
+            return _standalone_socket_identity(home, self._standalone_socket_path)
+        except OSError:
+            pass
+        return None
 
     async def _run(
         self, codex_bin: str, env: Mapping[str, str], *args: str,
@@ -474,6 +915,36 @@ class CodexDaemonManager:
             codex_bin, env, "app-server", "daemon", "start")
         return _json_object(result.stdout) if result.returncode == 0 else None
 
+    async def bootstrap(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> bool:
+        """Install one profile-local durable daemon with remote control.
+
+        Official daemon state is rooted in ``CODEX_HOME``.  This command is
+        therefore safe for explicitly configured sibling profiles and is the
+        supported first-start path on headless Linux hosts.
+        """
+        prepared = await asyncio.to_thread(
+            _prepare_profile_standalone, codex_bin, env)
+        if prepared is False:
+            log.warning(
+                "Codex profile managed standalone path could not be prepared")
+        result = await self._run(
+            codex_bin,
+            env,
+            "app-server",
+            "daemon",
+            "bootstrap",
+            "--remote-control",
+        )
+        if result.returncode != 0:
+            log.warning(
+                "Codex profile daemon bootstrap failed",
+                returncode=result.returncode,
+            )
+            return False
+        return True
+
     async def restart(
         self, codex_bin: str, env: Mapping[str, str],
     ) -> bool:
@@ -495,19 +966,37 @@ class CodexDaemonManager:
             app_server_version=_text(
                 lifecycle.get("appServerVersion"), 128),
         )
+        prepared = await asyncio.to_thread(
+            _prepare_profile_standalone, codex_bin, env,
+        )
+        if prepared is False:
+            log.warning(
+                "Codex profile managed standalone could not be aligned"
+            )
         if not await self.restart(codex_bin, env):
             self.invalidate()
             raise CodexDaemonUpgradeRequired(
                 "Codex shared daemon is older than the selected CLI and "
                 "could not be restarted"
             )
-        verified = await self.version(codex_bin, env)
-        if verified is None or _managed_daemon_lags_cli(verified):
-            self.invalidate()
-            raise CodexDaemonUpgradeRequired(
-                "Codex shared daemon did not upgrade to the selected CLI"
-            )
-        return verified
+        deadline = (
+            asyncio.get_running_loop().time()
+            + _DAEMON_UPGRADE_SETTLE_TIMEOUT
+        )
+        while True:
+            verified = await self.version(codex_bin, env)
+            if verified is not None and not _managed_daemon_lags_cli(verified):
+                return verified
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self.invalidate()
+                raise CodexDaemonUpgradeRequired(
+                    "Codex shared daemon did not upgrade to the selected CLI"
+                )
+            await asyncio.sleep(min(
+                _DAEMON_UPGRADE_POLL_INTERVAL,
+                remaining,
+            ))
 
     async def enable_remote_control(
         self, codex_bin: str, env: Mapping[str, str],
@@ -526,6 +1015,9 @@ class CodexDaemonManager:
             return None
         if os.name == "nt":
             return await self._ensure_windows_ws_started(codex_bin, env)
+        codex_home = os.path.realpath(os.path.expanduser(
+            env.get("CODEX_HOME") or "~/.codex"
+        ))
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._ready_identity and self._ready is not None:
             return self._ready
@@ -534,9 +1026,20 @@ class CodexDaemonManager:
             if identity == self._ready_identity and self._ready is not None:
                 return self._ready
             if not await self.capability(codex_bin, env):
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon commands are unavailable"
+                    )
                 return None
 
+            if not self.allow_restart:
+                return await self._prepare_without_restart(codex_bin, env, identity)
+
             lifecycle = await self.version(codex_bin, env)
+            if lifecycle is None and self.require_shared:
+                log.info("bootstrapping required Codex profile daemon")
+                if await self.bootstrap(codex_bin, env):
+                    lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
                 await self.start(codex_bin, env)
                 lifecycle = await self.version(codex_bin, env)
@@ -560,16 +1063,25 @@ class CodexDaemonManager:
                 if await self.restart(codex_bin, env):
                     lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
-                log.warning("Codex daemon start unavailable; using stdio")
                 self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon could not be started"
+                    )
+                log.warning("Codex daemon start unavailable; using stdio")
                 return None
             remote = await self.enable_remote_control(codex_bin, env)
             if remote is None:
                 existing = _existing_proxy_candidate(lifecycle)
                 if existing is None:
+                    self.invalidate()
+                    if self.require_shared:
+                        raise CodexProfileDaemonUnavailable(
+                            "Codex profile shared daemon remote control is "
+                            "unavailable"
+                        )
                     log.warning(
                         "Codex daemon remote control unavailable; using stdio")
-                    self.invalidate()
                     return None
                 # An official client already owns this app-server generation.
                 # proxy_args() exposes it tentatively; CodexHandle validates the
@@ -578,6 +1090,12 @@ class CodexDaemonManager:
                 log.info("using existing official Codex app-server candidate")
                 self._ready_identity = identity
                 self._ready = existing
+                self._ready_codex_home = codex_home
+                self._standalone_socket_path = (
+                    existing.socket_path
+                    if self.socket_path in {None, existing.socket_path}
+                    else None
+                )
                 return existing
 
             # Only a successful enable proves that this is the official managed
@@ -585,8 +1103,12 @@ class CodexDaemonManager:
             # this point it is safe to align an older daemon generation.
             verified = await self.version(codex_bin, env)
             if verified is None:
-                log.warning("Codex daemon version probe failed; using stdio")
                 self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon could not be verified"
+                    )
+                log.warning("Codex daemon version probe failed; using stdio")
                 return None
             before_alignment = verified
             verified = await self._align_managed_daemon(
@@ -603,12 +1125,41 @@ class CodexDaemonManager:
                     )
             info = _daemon_info(verified, remote)
             if info is None:
+                self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon did not confirm remote "
+                        "control"
+                    )
                 log.warning(
                     "Codex daemon did not confirm remote control; using stdio")
-                self.invalidate()
                 return None
+            nofile_verified = await asyncio.to_thread(
+                _ensure_managed_daemon_nofile,
+                codex_bin,
+                env,
+                verified,
+            )
+            if nofile_verified is False:
+                self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon file limit could not be "
+                        "verified"
+                    )
+                log.warning(
+                    "Codex daemon file limit unavailable; using stdio")
+                return None
+            info = CodexDaemonInfo(
+                socket_path=info.socket_path,
+                verified_remote_control=info.verified_remote_control,
+                nofile_verified=nofile_verified is True,
+            )
             self._ready_identity = identity
             self._ready = info
+            self._ready_codex_home = codex_home
+            self._managed_identity_required = True
+            self._standalone_socket_path = None
             return info
 
     async def _ensure_windows_ws_started(
@@ -672,6 +1223,51 @@ class CodexDaemonManager:
             self._ready_identity = identity
             self._ready = info
             return info
+    async def _prepare_without_restart(
+        self, codex_bin: str, env: Mapping[str, str], identity: tuple[object, ...],
+    ) -> Optional[CodexDaemonInfo]:
+        """Prepare local sharing without interrupting native clients.
+
+        Official ``start`` reuses an existing listener. In contrast, bootstrap,
+        restart and even enable-remote-control can stop a running generation.
+        Local TUI/proxy sharing only needs the Unix listener; cloud remote
+        control is a separate native setting and is not changed here.
+        """
+        lifecycle = await self.version(codex_bin, env)
+        if lifecycle is None:
+            await self.start(codex_bin, env)
+            lifecycle = await self.version(codex_bin, env)
+        if lifecycle is None and self.require_shared:
+            prepared = await asyncio.to_thread(
+                _prepare_profile_standalone, codex_bin, env)
+            if prepared is True:
+                await self.start(codex_bin, env)
+                lifecycle = await self.version(codex_bin, env)
+        info = _existing_proxy_candidate(lifecycle) if lifecycle else None
+        if info is None:
+            self.invalidate()
+            if self.require_shared:
+                raise CodexProfileDaemonUnavailable(
+                    "Codex shared daemon unavailable; existing processes were preserved")
+            return None
+        codex_home = os.path.realpath(os.path.expanduser(
+            env.get("CODEX_HOME") or "~/.codex"))
+        if _managed_daemon_process_identity(codex_home) is not None:
+            self._managed_identity_required = True
+            nofile = await asyncio.to_thread(
+                _ensure_managed_daemon_nofile, codex_bin, env, lifecycle,
+                allow_local_listener=True)
+            if nofile is False:
+                self.invalidate()
+                raise CodexProfileDaemonUnavailable(
+                    "Codex shared daemon file limit could not be verified")
+            info = CodexDaemonInfo(
+                socket_path=info.socket_path, nofile_verified=nofile is True)
+        self._ready_identity = identity
+        self._ready = info
+        self._ready_codex_home = codex_home
+        self._standalone_socket_path = info.socket_path
+        return info
 
     async def proxy_args(
         self, codex_bin: str, env: Mapping[str, str],
@@ -692,14 +1288,21 @@ class CodexDaemonManager:
             argv.extend(["--sock", socket_path])
         return argv
 
-_DEFAULT_MANAGERS: dict[tuple[str, Optional[str]], CodexDaemonManager] = {}
+_DEFAULT_MANAGERS: dict[
+    tuple[str, Optional[str], Optional[str]], CodexDaemonManager
+] = {}
 
 
 def default_codex_daemon_manager(
     mode: Optional[str] = None, *, socket_path: Optional[str] = None,
+    codex_home: Optional[str] = None,
 ) -> CodexDaemonManager:
     normalized = codex_daemon_mode(mode)
-    key = (normalized, socket_path)
+    normalized_home = (
+        os.path.realpath(os.path.expanduser(codex_home))
+        if codex_home else None
+    )
+    key = (normalized, socket_path, normalized_home)
     manager = _DEFAULT_MANAGERS.get(key)
     if manager is None:
         manager = CodexDaemonManager(normalized, socket_path=socket_path)

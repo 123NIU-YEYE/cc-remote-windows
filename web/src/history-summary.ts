@@ -19,6 +19,7 @@ export function summaryHistoryTurns(history: History): Turn[] | null {
   }
   return history.turns.map((turn) => ({
     ...turn,
+    fileChangesTurnId: turn.fileChanges ? turn.id : undefined,
     blocks: turn.blocks as Turn["blocks"],
     clientMsgId: turn.clientMsgId ?? undefined,
     forkPointId: turn.forkPointId ?? undefined,
@@ -31,5 +32,10 @@ export function summaryHistoryTurns(history: History): Turn[] | null {
     ts: turn.ts ?? undefined,
     doneTs: turn.doneTs ?? undefined,
     durationMs: turn.durationMs ?? undefined,
+    processDetailState: turn.processDetailState ?? undefined,
+    detailReasons: turn.detailReasons
+      ? [...turn.detailReasons] : undefined,
+    processStartedTs: turn.processStartedTs ?? undefined,
+    processDoneTs: turn.processDoneTs ?? undefined,
   }));
 }

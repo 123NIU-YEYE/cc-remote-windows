@@ -1,14 +1,61 @@
 // Icon paths lifted verbatim from design/prototype.html (the I dictionary).
 // One <Icon name="..."/> component renders the SVG; sizes via prop.
 import { useEffect, useState } from "react";
+import type { Engine } from "./protocol";
+import dshMark from "./assets/dsh-mark.svg?no-inline";
+import engineMarks from "./assets/engine-marks.svg?no-inline";
+import claudeWorkingFrames from "./assets/claude-working.svg?no-inline";
+
+export function EngineIcon({ engine, size = 16 }: { engine: Engine; size?: number }) {
+  if (engine === "dsh") return <span className="engine-brand-icon dsh" aria-hidden="true" style={{ width: size, height: size, maskImage: `url(${dshMark})`, WebkitMaskImage: `url(${dshMark})` }} />;
+  return <svg viewBox="0 0 24 24" width={size} height={size}
+    className={`engine-brand-icon ${engine}`} aria-hidden="true" focusable="false">
+    <use href={`${engineMarks}#${engine}`} />
+  </svg>;
+}
+
+// Claude uses its brand mark; keep Codex's existing spark animation unchanged.
+export function EngineWorking({ engine, size = 22 }: { engine: Engine; size?: number }) {
+  return engine === "claude"
+    ? <span className="claude-working-mark" style={{ width: size, height: size }} aria-hidden="true">
+        <img src={claudeWorkingFrames} width={size * 9} height={size} alt="" draggable={false} />
+      </span>
+    : <ClaudeWorking size={size} />;
+}
+
+export function EngineDone({ engine, size = 22, label }: {
+  engine: Engine; size?: number; label?: string;
+}) {
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    if (!playing) return;
+    const timer = window.setTimeout(() => setPlaying(false), 810);
+    return () => window.clearTimeout(timer);
+  }, [playing]);
+  return engine === "claude"
+    ? <button type="button" className="engine-done-mark spark-btn" aria-label={label ?? "Claude 已完成"}
+        title="重播完成动画" onClick={() => {
+          if (!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) setPlaying(true);
+        }}>
+        {playing ? <EngineWorking engine={engine} size={size} /> : <EngineIcon engine={engine} size={size} />}
+      </button>
+    : engine === "dsh" ? <EngineIcon engine={engine} size={size} /> : <ClaudeSpark size={size} label={label ?? "Codex"} />;
+}
 
 const PATHS: Record<string, string> = {
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
+  paperclip: '<path d="m21 11-8.5 8.5a6 6 0 0 1-8.5-8.5l9-9a4 4 0 0 1 5.7 5.7l-9 9a2 2 0 0 1-2.8-2.8l8.4-8.4"/>',
+  'panel-right': '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M15 4v16"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 16 5-5 4 4 3-3 6 6"/>',
+  camera: '<path d="M8 6l1.5-2h5L16 6h3a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"/><circle cx="12" cy="13" r="4"/>',
   back: '<path d="M15 18l-6-6 6-6"/>',
+  bold: '<path d="M6 12h8a4 4 0 0 1 0 8H6V4h7a4 4 0 0 1 0 8"/>',
   dots: '<circle cx="12" cy="5" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="12" cy="19" r="1.4"/>',
   send: '<path d="M12 19V6M6 12l6-6 6 6"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
+  pause: '<path d="M8 5v14M16 5v14"/>',
+  'arrow-right': '<path d="M5 12h14m-5-5 5 5-5 5"/>',
   bolt: '<path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/>',
   queue: '<path d="M4 7h16M4 12h16M4 17h10"/>',
   term: '<path d="M5 8l4 4-4 4M12 16h7"/>',
@@ -21,7 +68,9 @@ const PATHS: Record<string, string> = {
   eye: '<path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="2.7"/>',
   'eye-off': '<path d="M3 3l18 18M10.6 5.2A9.7 9.7 0 0112 5c6 0 9.5 7 9.5 7a15 15 0 01-2.3 3.2M6.2 6.2C3.8 8 2.5 12 2.5 12s3.5 7 9.5 7a9.7 9.7 0 004-1M9.9 9.9a3 3 0 004.2 4.2"/>',
   user: '<circle cx="12" cy="8" r="3.4"/><path d="M5.5 20a6.5 6.5 0 0113 0"/>',
+  sliders: '<path d="M4 7h3m6 0h7M4 17h7m6 0h3"/><circle cx="10" cy="7" r="3"/><circle cx="14" cy="17" r="3"/>',
   spark: '<path d="M12 3l1.6 4.9L18.5 9.5l-4.9 1.6L12 16l-1.6-4.9L5.5 9.5l4.9-1.6L12 3z"/>',
+  message: '<path d="M20 14a3 3 0 01-3 3H9l-5 4v-4a3 3 0 01-2-3V6a3 3 0 013-3h12a3 3 0 013 3z"/><path d="M7 8h8M7 12h5"/>',
   read: '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5"/>',
   'file-plus': '<path d="M5 4h9l5 5v11H5z"/><path d="M14 4v5h5M9 14h6M12 11v6"/>',
   bash: '<rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="M7 10l2.5 2L7 14M12.5 14.5H16"/>',
@@ -30,6 +79,8 @@ const PATHS: Record<string, string> = {
   review: '<path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="2.7"/>',
   shield: '<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6l7-3z"/><path d="M9.2 12l2 2 3.6-4"/>',
   verify: '<circle cx="12" cy="12" r="8.5"/><path d="M8.5 12.5l2.3 2.3 4.7-5"/>',
+  info: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5M12 16h.01"/>',
+  warning: '<path d="M10.3 4.4 2.5 18a2 2 0 001.7 3h15.6a2 2 0 001.7-3L13.7 4.4a2 2 0 00-3.4 0Z"/><path d="M12 9v4M12 17h.01"/>',
   run: '<path d="M8 5.5v13l11-6.5-11-6.5z"/>',
   research: '<circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.5-4.5M11 8v6M8 11h6"/>',
   simplify: '<path d="M4 7h16M7 12h10M10 17h4"/>',
@@ -48,10 +99,11 @@ const PATHS: Record<string, string> = {
   pin: '<path d="M9 3h6l-1 6 3 3v2H7v-2l3-3zM12 14v7"/>',
   trash: '<path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"/>',
   branch: '<circle cx="6" cy="5" r="2"/><circle cx="18" cy="7" r="2"/><circle cx="6" cy="19" r="2"/><path d="M6 7v10M8 8.5c4.5 0 5.5-1.5 8-1.5"/>',
-  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 012-2h10"/>',
+  copy: '<rect x="8" y="8" width="14" height="14" rx="2"/><path d="M4 16a2 2 0 01-2-2V4a2 2 0 012-2h10a2 2 0 012 2"/>',
   expand: '<path d="M9 4H4v5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>',
   refresh: '<path d="M20 7v5h-5"/><path d="M19 12a7.5 7.5 0 10.4 4.7"/>',
   history: '<path d="M4 8V3m0 0h5M4 3l3.2 3.2"/><path d="M5.2 17.5A8.5 8.5 0 1012 3.5"/><path d="M12 7.5V12l3 2"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/>',
   calendar: '<rect x="3.5" y="5.5" width="17" height="15" rx="2.5"/><path d="M8 3.5v4M16 3.5v4M3.5 10h17"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
   'chevron-left': '<path d="M15 18l-6-6 6-6"/>',
@@ -98,21 +150,20 @@ export function ClaudeMark({ size = 16, className }: { size?: number; className?
 
 // A clickable Claude spark that sits under a finished reply: static at rest,
 // and on click it plays ONE loop of the working morph, then settles back.
-export function ClaudeSpark({ size = 22, className }: { size?: number; className?: string }) {
+export function ClaudeSpark({ size = 22, className, label = "Claude" }: {
+  size?: number; className?: string; label?: string;
+}) {
   const [frame, setFrame] = useState(-1); // -1 = static
-  const play = () => {
-    if (frame >= 0) return; // already playing
-    let i = 0;
-    setFrame(0);
-    const id = window.setInterval(() => {
-      i += 1;
-      if (i >= WORK_FRAMES.length) { window.clearInterval(id); setFrame(-1); }
-      else setFrame(i);
-    }, 110);
-  };
+  useEffect(() => {
+    if (frame < 0) return;
+    const id = window.setTimeout(() => setFrame(frame + 1 < WORK_FRAMES.length ? frame + 1 : -1), 110);
+    return () => window.clearTimeout(id);
+  }, [frame]);
+  const play = () => { if (frame < 0) setFrame(0); };
   const [a, b] = frame >= 0 ? WORK_FRAMES[frame] : [0.9, 0.42];
   return (
-    <button type="button" className={"spark-btn" + (className ? " " + className : "")} onClick={play} aria-label="Claude">
+    <button type="button" className={"spark-btn" + (className ? " " + className : "")} onClick={play} aria-label={label}
+      title="重播完成动画">
       <svg viewBox="0 0 24 24" width={size} height={size} fill="currentColor" aria-hidden="true">
         {b > 0 && <path d={SPARK} transform={sparkTransform(b, 45)} opacity={frame >= 0 ? 0.8 : 0.55} />}
         {a > 0 && <path d={SPARK} transform={sparkTransform(a)} />}

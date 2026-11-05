@@ -10,13 +10,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import sys
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable
+
+from cc_remote.wrapper.codex_delegation import codex_message_target
 
 from cc_remote.attachments import (
     ALLOWED_IMAGE_TYPES,
@@ -27,9 +33,56 @@ from cc_remote.attachments import (
     image_dimensions,
 )
 from cc_remote.protocol import ConversationTurn
+from cc_remote.wrapper.usage_limit import is_usage_limit_failure
 
 
-_SCHEMA_VERSION = 12
+# v17 also discards Codex pages whose legacy rollout user rows were materialized
+# without the adjacent native app-server item id used by the live stream. v18
+# rebuilds page projections once: older summary pages could be truncated against
+# source-complete event size before lightweight turns were materialized. v19
+# rebuilds summaries with exact/unknown process-detail metadata; raw details,
+# image assets, and compact ancestry remain source-valid. v20 adds the Claude
+# Agent detail cache. v21 discards Codex pages/details that may contain parser-
+# time timestamps created when official turns omitted startedAt/completedAt.
+# v22 rebuilds Claude pages/details whose browser-message alias may have been
+# attached to a synthetic interrupt marker instead of the replacement prompt.
+# v23 rebuilds Codex projections whose bounded single-turn tail treated a late
+# compaction marker as the first public-process timestamp.
+# v24 rebuilds Codex pages after source-bound live process clocks become an
+# independent input which can change without modifying rollout bytes. v25
+# rebuilds Codex pages whose leading compact marker was projected as a separate
+# prompt-less turn before the owning user item reached the full snapshot. v26
+# rebuilds Claude pages/details whose terminal clock could be extended by a
+# cold-resume task notification appended after the final answer. v27 rebuilds
+# Claude narrative projections so image-producing Read results use the lazy
+# view-image projection instead of cached textual tool output. v28 rebuilds
+# Codex narrative projections that discarded native async question metadata.
+# v29 rebuilds Codex summary pages where an async question hid a normal answer
+# without phase metadata. Source-complete details and binary assets remain valid.
+# v30 rebuilds Codex narrative rows with bounded generated-image references.
+# Binary assets and other engines' projections remain source-valid.
+# v31 retains native model fallback notes and durable per-turn file summaries.
+# v32 repairs missing file summaries on the full-page cache population path.
+# v35 preserves task_complete.error and binds assistant-only native turns.
+# v36 restores explicit usage-limit failures and their native retry dates.
+# v37 restores reviewed policy-refusal copy across both branch histories.
+# Rebuild pages which promoted an RPC-accepted steer's presentation clock to
+# process presence before the native user segment existed.
+# v39 hides local command caveats and preserves the pre-compact answer clock.
+# v40 gives real Claude background replies their source completion time while
+# retaining the old boundary for task bookkeeping without a reply.
+# v41 keeps native isMeta recovery prompts inside their original human turn.
+# v42 replaces recovered text prefixes and bounds summary answer block counts.
+# v43 makes manual /compact a visible turn owning its native boundary.
+# v44 restores consumed human queued_command attachments as visible inputs.
+# v45 restores public AgentMessage records in new Codex rollouts and the
+# native owner of source-window tails. Old tools-only projections must rebuild.
+# v46 restores native commands, source clocks and closed segment envelopes.
+# v47 preserves native cross-thread provenance and outgoing message receipts.
+# v48 retains Codex async task receipt boundaries in compact summaries.
+# v49 retains native child/task return identities for all engines.
+# v50 keeps return-link metadata out of process counts and timing.
+_SCHEMA_VERSION = 50
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -41,9 +94,55 @@ _SUMMARY_LIVE_FIELD_MAX_CHARS = 4 * 1024
 _SUMMARY_LIVE_BLOCK_MAX = 24
 _SUMMARY_BLOCK_MAX = 32
 _VOLATILE_EVENT_FIELDS = frozenset({"ts", "seq", "to", "route_id"})
+_SUMMARY_PAGE_PAYLOAD_SQL = """
+json_set(
+    payload_json,
+    '$.events',
+    COALESCE(
+        (
+            SELECT json_group_array(json(event.value))
+            FROM json_each(payload_json, '$.events') AS event
+            WHERE json_extract(event.value, '$.type') IN ('model', 'effort')
+        ),
+        json('[]')
+    )
+)
+""".strip()
 _COMPACT_SOURCE_LIMIT = 16
+_COMPACT_MEMORY_BYTES = 32 * 1024 * 1024
+_COMPACT_MEMORY_ENTRIES = 2
 _SAFE_COMPACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_DETAIL_SNAPSHOT_TOKEN = re.compile(r"^[0-9a-f]{64}$")
+_DETAIL_SNAPSHOT_TURN_HASH = re.compile(r"^[0-9a-f]{16}$")
 _GENERIC_HISTORY_TURN_FAILURE = "该轮未正常结束"
+
+
+def history_turn_snapshot_hash(turn_id: str) -> str:
+    """Return the compact, non-reversible turn key used in detail cursors."""
+    return hashlib.sha256(
+        turn_id.encode("utf-8", "surrogatepass")
+    ).hexdigest()[:16]
+
+
+def _summary_projection_fallback(
+    error: sqlite3.OperationalError,
+) -> str | None:
+    """Classify only JSON projection failures that a raw read can recover."""
+    message = str(error).casefold()
+    if (
+        ("no such function" in message or "no such table" in message)
+        and any(
+            name in message
+            for name in ("json_set", "json_each", "json_group_array")
+        )
+    ):
+        return "unsupported"
+    if (
+        "malformed json" in message
+        or "json cannot hold blob" in message
+    ):
+        return "payload"
+    return None
 _PROVIDER_AUTH_TURN_FAILURE = (
     "模型服务认证已失效或当前账号无权限，"
     "请检查当前服务的凭据或账号权限后重试。"
@@ -55,6 +154,10 @@ _SAFE_HISTORY_TURN_FAILURES = frozenset({
     "请求过于频繁或当前额度受限，请稍后重试。",
     "请求超时，请重新尝试。",
     "Codex 上游服务暂时不可用，请稍后重试。",
+    "当前模型繁忙，请稍后重试或切换模型。",
+    "上游模型因安全策略拒绝了本次请求（cyber_policy）。"
+    "这不是本地权限或网络错误；请核实并说明任务背景与授权范围，"
+    "若属误判请向服务提供方反馈。",
 })
 _LEGACY_HISTORY_TURN_FAILURES = {
     "Codex 登录已失效或当前账号无权限，请重新登录后重试。":
@@ -76,7 +179,7 @@ def _historical_turn_failure(value: Any) -> str:
     legacy = _LEGACY_HISTORY_TURN_FAILURES.get(message)
     if legacy is not None:
         return legacy
-    if message in _SAFE_HISTORY_TURN_FAILURES:
+    if message in _SAFE_HISTORY_TURN_FAILURES or is_usage_limit_failure(message):
         return message
     return _GENERIC_HISTORY_TURN_FAILURE
 
@@ -136,7 +239,7 @@ class HistorySourceFingerprint:
             device=device,
             inode=inode,
             size=int(stat.st_size),
-            mtime_ns=int(stat.st_mtime_ns),
+            mtime_ns=_sqlite_int(stat.st_mtime_ns),
             head_sha256=hashlib.sha256(head).hexdigest(),
             tail_sha256=hashlib.sha256(tail).hexdigest(),
             sample_sha256=digest.hexdigest(),
@@ -224,6 +327,15 @@ class MaterializedHistoryPage:
     oldest_id: str | None
     newest_id: str | None
     turns: tuple[dict[str, Any], ...] = ()
+    # Claude transcript EOF is only a synthetic terminal. Bind newest-page
+    # projections to the resident lifecycle state so an exact source
+    # fingerprint cached during a turn cannot close it (or remain open) after
+    # ResultMessage changes state without adding another JSONL row.
+    in_progress: bool | None = None
+    # Codex can resume one persisted rollout task under a different control
+    # user-item id without appending another source record first. Bind a newest-
+    # page projection to the complete source-proven active task set.
+    active_task_ids: tuple[str, ...] = ()
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -232,6 +344,8 @@ class MaterializedHistoryPage:
             "oldest_id": self.oldest_id,
             "newest_id": self.newest_id,
             "turns": list(self.turns),
+            "in_progress": self.in_progress,
+            "active_task_ids": list(self.active_task_ids),
         }
 
     def semantic_token(self) -> str:
@@ -253,6 +367,8 @@ class MaterializedHistoryPage:
             "oldest_id": self.oldest_id,
             "newest_id": self.newest_id,
             "turns": list(self.turns),
+            "in_progress": self.in_progress,
+            "active_task_ids": list(self.active_task_ids),
         }
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True,
@@ -275,6 +391,14 @@ class MaterializedHistoryPage:
         if not isinstance(turns, (list, tuple)) or not all(
                 isinstance(turn, dict) for turn in turns):
             raise ValueError("invalid materialized history turns")
+        raw_in_progress = payload.get("in_progress")
+        if raw_in_progress is not None and not isinstance(raw_in_progress, bool):
+            raise ValueError("invalid materialized history lifecycle")
+        raw_active_task_ids = payload.get("active_task_ids", [])
+        if not isinstance(raw_active_task_ids, (list, tuple)) or not all(
+                isinstance(value, str) and value
+                for value in raw_active_task_ids):
+            raise ValueError("invalid materialized history active tasks")
         # The SQLite projection is rebuildable, but can outlive a wire-schema
         # change.  Validate its cached summary at this single boundary so an
         # obsolete field is never served to the client; callers invalidate the
@@ -295,13 +419,49 @@ class MaterializedHistoryPage:
             newest_id=(payload.get("newest_id")
                        if isinstance(payload.get("newest_id"), str) else None),
             turns=tuple(normalized_turns),
+            in_progress=raw_in_progress,
+            active_task_ids=tuple(sorted(set(raw_active_task_ids))),
         )
 
 
+@dataclass(frozen=True)
+class MaterializedTurnDetail:
+    """One source-bound heavyweight turn projection.
+
+    ``source_token`` is populated only for a standalone immutable detail row.
+    A group recovered from a compact page remains readable, but must not issue
+    snapshot-bound cursors because its tighter detail row may already be gone.
+    """
+
+    events: tuple[dict[str, Any], ...]
+    turn_id: str
+    source_token: str | None = None
+
+
 def _event_ms(value: Any) -> int | None:
-    if not isinstance(value, (int, float)):
+    """Normalise a wire timestamp to whole milliseconds.
+
+    Sources disagree on the unit: the protocol sends seconds, some rollouts and
+    the Codex app-server send milliseconds, and proto-style records send
+    nanoseconds. Scaling "whatever we got" by 1000 therefore overflowed SQLite's
+    64-bit INTEGER (``int too large to convert to SQLite INTEGER``) and aborted
+    every index write. Normalise by magnitude first, then clamp so a future unit
+    change degrades to a saturated value instead of failing the whole page.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
-    return round(float(value) * 1000)
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    if number >= 1e17:          # nanoseconds
+        number /= 1e6
+    elif number >= 1e14:        # microseconds
+        number /= 1e3
+    elif number >= 1e11:        # already milliseconds
+        pass
+    else:                       # seconds
+        number *= 1e3
+    return min(int(round(number)), 2**63 - 1)
 
 
 def group_history_events(
@@ -330,6 +490,9 @@ def group_history_events(
 def _turn_id(group: list[dict[str, Any]]) -> str | None:
     for event in group:
         if event.get("type") == "user_msg" and isinstance(event.get("msg_id"), str):
+            return event["msg_id"]
+    for event in group:
+        if event.get("type") == "turn_binding" and isinstance(event.get("msg_id"), str):
             return event["msg_id"]
     for event in reversed(group):
         if event.get("type") == "turn_end" and isinstance(event.get("turn_id"), str):
@@ -456,7 +619,10 @@ def materialize_history_turns(
             continue
         prompt = ""
         has_user = False
+        continuation = None
         client_msg_id = None
+        source_thread_id = None
+        session_messages: dict[str, dict] = {}
         prompt_truncated = False
         image_refs: list[dict[str, Any]] = []
         deferred_image_count = 0
@@ -467,17 +633,29 @@ def materialize_history_turns(
         fork_point = None
         checkpoint_id = None
         done = False
+        steered = False
         interrupted = False
         error = None
         channels: dict[str, str] = {}
         texts: dict[str, list[str]] = {}
         text_order: list[str] = []
         text_done: set[str] = set()
+        text_first_ms: dict[str, int] = {}
+        text_last_ms: dict[str, int] = {}
+        text_done_ms: dict[str, int] = {}
+        text_background: set[str] = set()
+        async_messages: dict[str, dict[str, Any]] = {}
         detail_items: set[str] = set()
+        process_evidence: dict[str, dict[str, Any]] = {}
         live_blocks: list[dict[str, Any]] = []
         live_texts: dict[str, dict[str, Any]] = {}
         live_tools: dict[str, dict[str, Any]] = {}
         live_processes: dict[str, dict[str, Any]] = {}
+        generated_images: dict[str, dict[str, Any]] = {}
+        model_notices: dict[str, dict[str, Any]] = {}
+        task_receipts: dict[str, dict[str, Any]] = {}
+        source_order: dict[str, int] = {}
+        receipts_truncated = False
 
         def short(value: Any) -> str | None:
             if not isinstance(value, str) or not value:
@@ -503,12 +681,118 @@ def materialize_history_turns(
                 block["channel"] = channel
             return block
 
-        for event in group:
+        def touch_process(
+            item_id: str,
+            event: dict[str, Any],
+            *,
+            visible: bool = True,
+            terminal: bool = False,
+        ) -> None:
+            row = process_evidence.setdefault(item_id, {
+                "visible": False,
+                "terminal": False,
+                "first_ms": None,
+                "last_ms": None,
+                "terminal_ms": None,
+            })
+            row["visible"] = bool(row["visible"] or visible)
+            row["terminal"] = bool(row["terminal"] or terminal)
+            # Hidden reasoning/success-hook plumbing cannot start the public
+            # process clock. If a hook later becomes actionable, its first
+            # visible failure event establishes the timestamp instead.
+            if not row["visible"]:
+                return
+            stamp = _event_ms(event.get("ts"))
+            if stamp is None:
+                return
+            if row["first_ms"] is None:
+                row["first_ms"] = stamp
+            row["last_ms"] = stamp
+            if terminal:
+                row["terminal_ms"] = stamp
+
+        for event_index, event in enumerate(group):
             event_type = event.get("type")
+            source_id = (event.get("item_id") or event.get("tool_use_id")
+                         or event.get("message_id"))
+            if isinstance(source_id, str):
+                source_order.setdefault(source_id, event_index)
+            if (event_type == "process"
+                    and ((event.get("server") == "cc_remote_tasks"
+                          and event.get("tool") == "task_result" and event.get("kind") == "task")
+                         or (event.get("server") == "cc_remote"
+                             and event.get("tool") in {"agent_return", "task_return"}))
+                    and event.get("phase") == "end"
+                    and isinstance(event.get("item_id"), str)):
+                # This compact boundary is narrative, not a heavy tool body.
+                # Retain it alongside the answer, even before detail is opened.
+                task_receipts[event["item_id"]] = {
+                    "kind": "process", "item_id": event["item_id"],
+                    "processKind": event.get("kind"), "phase": "end", "done": True,
+                    "turn_id": event.get("turn_id"),
+                    "status": event.get("status") or "unknown",
+                    "server": event.get("server"), "tool": event.get("tool"),
+                    "input": {"agent_run_id": (event.get("input") or {}).get("agent_run_id")},
+                    "title": short(event.get("title")) or "后台任务",
+                    "summary": short(event.get("summary")),
+                    "startedTs": _event_ms(event.get("ts")),
+                }
+                if len(task_receipts) > 16:
+                    task_receipts.pop(next(iter(task_receipts)))
+                    receipts_truncated = True
+                if (event.get("server") == "cc_remote"
+                        and event["item_id"].startswith(("return-", "dsh-return-"))):
+                    # Link metadata is already in the summary. It must not add
+                    # a process disclosure, count or duration to the parent.
+                    continue
+            if (event_type == "process" and event.get("kind") == "model"
+                    and event.get("tool") == "model_refusal_fallback"
+                    and isinstance(event.get("item_id"), str)):
+                model_notices[event["item_id"]] = {
+                    "kind": "process", "item_id": event["item_id"],
+                    "processKind": "model", "phase": "snapshot",
+                    "status": "succeeded", "done": True,
+                    "title": "模型已回退", "tool": "model_refusal_fallback",
+                    "summary": short(event.get("summary")),
+                }
+                while len(model_notices) > 4:
+                    model_notices.pop(next(iter(model_notices)))
+                # This note is fully included in the visible summary. It must
+                # not create an empty deferred process disclosure on reload.
+                continue
+            if (event_type == "process" and event.get("tool") == "image_generation"
+                    and event.get("phase") == "end"
+                    and event.get("status") == "succeeded"
+                    and isinstance(event.get("item_id"), str)):
+                # A generated image is output, not just heavy process detail.
+                # Keep a bounded reference in summary; never its result/prompt.
+                image_input: dict[str, Any] = {}
+                raw_input = event.get("input")
+                if isinstance(raw_input, dict):
+                    path = short(raw_input.get("file_path"))
+                    if path:
+                        image_input["file_path"] = path
+                    ref = raw_input.get("history_image")
+                    if isinstance(ref, dict):
+                        image_input["history_image"] = {
+                            key: ref[key] for key in (
+                                "image_id", "media_type", "width", "height", "byte_size"
+                            ) if key in ref
+                        }
+                generated_images[event["item_id"]] = {
+                    "kind": "process", "item_id": event["item_id"],
+                    "processKind": "server_tool", "phase": "end",
+                    "status": "succeeded", "done": True, "title": "生成图片",
+                    "turn_id": event.get("turn_id"), "tool": "image_generation",
+                    "input": image_input,
+                }
+                while len(generated_images) > 8:
+                    generated_images.pop(next(iter(generated_images)))
             if started_ms is None:
                 started_ms = _event_ms(event.get("ts"))
             if event_type == "user_msg":
                 has_user = True
+                source_thread_id = event.get("source_thread_id")
                 if isinstance(event.get("client_msg_id"), str):
                     client_msg_id = event["client_msg_id"]
                 if isinstance(event.get("prompt"), str):
@@ -527,33 +811,63 @@ def materialize_history_turns(
             elif event_type == "assistant_msg_start":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str):
+                    if event.get("background") is True:
+                        text_background.add(message_id)
                     channels[message_id] = str(event.get("channel") or "unknown")
                     if message_id not in texts:
                         texts[message_id] = []
                         text_order.append(message_id)
                     add_live_text(message_id, channels[message_id])
+                    stamp = _event_ms(event.get("ts"))
+                    if stamp is not None:
+                        text_first_ms.setdefault(message_id, stamp)
+                        text_last_ms[message_id] = stamp
             elif event_type == "delta":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str) and isinstance(event.get("text"), str):
+                    if event.get("background") is True:
+                        text_background.add(message_id)
                     channels[message_id] = str(
                         event.get("channel") or channels.get(message_id) or "unknown")
                     if message_id not in texts:
                         texts[message_id] = []
                         text_order.append(message_id)
-                    texts[message_id].append(event["text"])
+                    if event.get("replace"):
+                        texts[message_id] = [event["text"]]
+                    else:
+                        texts[message_id].append(event["text"])
                     block = add_live_text(message_id, channels[message_id])
                     if block is not None:
-                        block["text"] += event["text"]
+                        block["text"] = event["text"] if event.get("replace") else block["text"] + event["text"]
+                    stamp = _event_ms(event.get("ts"))
+                    if stamp is not None:
+                        text_first_ms.setdefault(message_id, stamp)
+                        text_last_ms[message_id] = stamp
             elif event_type == "assistant_msg_end":
                 message_id = event.get("message_id")
                 if isinstance(message_id, str):
+                    if event.get("delivery") == "async":
+                        async_messages[message_id] = {
+                            "delivery": "async", "questions": event.get("questions"),
+                        }
+                    if event.get("background") is True:
+                        text_background.add(message_id)
                     text_done.add(message_id)
                     block = live_texts.get(message_id)
                     if block is not None:
                         block["done"] = True
+                    stamp = _event_ms(event.get("ts"))
+                    if stamp is not None:
+                        text_first_ms.setdefault(message_id, stamp)
+                        text_last_ms[message_id] = stamp
+                        text_done_ms[message_id] = stamp
             elif event_type == "turn_binding":
+                if event.get("autonomous") and event.get("continuation") == "subagent":
+                    continuation = event["continuation"]
                 if isinstance(event.get("turn_id"), str):
                     fork_point = event["turn_id"]
+                if started_ms is None:
+                    started_ms = _event_ms(event.get("ts"))
             elif event_type == "turn_end":
                 done = True
                 done_ms = _event_ms(event.get("ts"))
@@ -564,6 +878,7 @@ def materialize_history_turns(
                 result = event.get("result")
                 if isinstance(result, dict):
                     subtype = str(result.get("subtype") or "")
+                    steered = subtype == "steered"
                     if (
                         subtype != "steered"
                         and isinstance(result.get("duration_ms"), int)
@@ -581,6 +896,20 @@ def materialize_history_turns(
             elif event_type == "error":
                 if isinstance(event.get("message"), str):
                     error = _historical_turn_failure(event["message"])
+            if event_type == "tool_use" and len(session_messages) < 16:
+                target = codex_message_target(event.get("tool"), event.get("input"), event.get("server"))
+                item_id = event.get("tool_use_id")
+                if target and isinstance(item_id, str):
+                    session_messages.setdefault(item_id, {
+                        "itemId": item_id, "threadId": target, "status": "sending",
+                    })
+            elif event_type == "tool_result" and event.get("tool_use_id") in session_messages:
+                receipt = session_messages[event["tool_use_id"]]
+                from cc_remote.session_messages import receipt_status
+                receipt["status"] = receipt_status(event.get("content")) if receipt["threadId"].startswith("ccr:") else (
+                    "failed" if event.get("is_error") or event.get("status") in {
+                        "failed", "cancelled", "declined", "interrupted",
+                    } else "sent")
             if include_live_detail and event_type == "tool_use":
                 tool_id = event.get("tool_use_id")
                 message_id = event.get("message_id")
@@ -603,6 +932,10 @@ def materialize_history_turns(
                         }
                         live_tools[tool_id] = block
                         live_blocks.append(block)
+            if event_type == "tool_use":
+                tool_id = event.get("tool_use_id")
+                if isinstance(tool_id, str):
+                    touch_process(f"tool:{tool_id}", event)
             elif include_live_detail and event_type == "tool_result":
                 tool_id = event.get("tool_use_id")
                 block = live_tools.get(tool_id) if isinstance(tool_id, str) else None
@@ -621,6 +954,14 @@ def materialize_history_turns(
                         result["truncated"] = bool(event["truncated"])
                     block["result"] = result
                     block["done"] = True
+            if event_type == "tool_result":
+                tool_id = event.get("tool_use_id")
+                if (
+                    isinstance(tool_id, str)
+                    and f"tool:{tool_id}" in process_evidence
+                ):
+                    touch_process(
+                        f"tool:{tool_id}", event, terminal=True)
             elif (include_live_detail and event_type == "process"
                   and event.get("kind") != "reasoning"):
                 item_id = event.get("item_id")
@@ -652,6 +993,16 @@ def materialize_history_turns(
                     for key in ("exit_code", "duration_ms", "truncated"):
                         if event.get(key) is not None:
                             block[key] = event[key]
+                    for key in ("command", "cwd"):
+                        value = short(event.get(key))
+                        if value is not None:
+                            block[key] = value
+                    if event.get("background") is True:
+                        block["background"] = True
+                    stamp = _event_ms(event.get("ts"))
+                    if block.get("background") is True and stamp is not None:
+                        block.setdefault("startedTs", stamp)
+                        block["updatedTs"] = stamp
                     block["phase"] = event.get("phase") or block["phase"]
                     block["status"] = event.get("status") or block["status"]
                     block["done"] = (
@@ -661,6 +1012,9 @@ def materialize_history_turns(
                             "interrupted",
                         }
                     )
+                    if (block.get("background") is True
+                            and block["done"] and stamp is not None):
+                        block["terminalTs"] = stamp
             elif include_live_detail and event_type == "turn_plan":
                 item_id = event.get("item_id")
                 if isinstance(item_id, str):
@@ -702,24 +1056,84 @@ def materialize_history_turns(
                     else:
                         block.clear()
                         block.update(replacement)
+            if event_type == "process":
+                item_id = event.get("item_id")
+                kind = event.get("kind")
+                status = event.get("status")
+                phase = event.get("phase")
+                if isinstance(item_id, str):
+                    actionable_hook = kind == "hook" and status in {
+                        "failed", "declined", "cancelled", "interrupted",
+                    }
+                    visible = kind != "reasoning" and (
+                        kind != "hook" or actionable_hook)
+                    touch_process(
+                        f"process:{item_id}",
+                        event,
+                        visible=visible,
+                        terminal=(
+                            phase == "end"
+                            or status in {
+                                "succeeded", "failed", "declined",
+                                "cancelled", "interrupted",
+                            }
+                        ),
+                    )
+            elif event_type == "turn_plan":
+                item_id = event.get("item_id")
+                if isinstance(item_id, str):
+                    raw_plan = event.get("plan")
+                    terminal = bool(
+                        isinstance(raw_plan, list)
+                        and raw_plan
+                        and all(
+                            isinstance(entry, dict)
+                            and entry.get("status") == "completed"
+                            for entry in raw_plan
+                        )
+                    )
+                    touch_process(
+                        f"plan:{item_id}", event, terminal=terminal)
+            elif event_type == "turn_diff":
+                item_id = event.get("item_id")
+                if isinstance(item_id, str):
+                    # A diff snapshot is complete at the event boundary.
+                    touch_process(
+                        f"diff:{item_id}", event, terminal=True)
             if event_type in {"tool_use", "process", "turn_plan", "turn_diff"}:
                 detail_id = event.get("tool_use_id") or event.get("item_id")
                 if isinstance(detail_id, str):
                     detail_items.add(detail_id)
 
-        final_ids = [
+        # Async questions are displayable content, not evidence of a formal
+        # final answer. Select ordinary answers (including the legacy unphased
+        # fallback) independently, then include questions in source order.
+        final_id_set = {
             message_id for message_id in text_order
             if channels.get(message_id) == "final"
-        ]
-        if not final_ids:
-            final_ids = [
+            and message_id not in async_messages
+        }
+        if not final_id_set:
+            final_id_set = {
                 message_id for message_id in text_order
                 if channels.get(message_id) in {None, "unknown"}
-            ]
-        final_id_set = set(final_ids)
+                and message_id not in async_messages
+            }
+        final_id_set.update(async_messages)
+        final_ids = [
+            message_id for message_id in text_order if message_id in final_id_set
+        ]
         for message_id in text_order:
             if message_id not in final_id_set and any(texts.get(message_id, ())):
                 detail_items.add(message_id)
+                if channels.get(message_id) == "commentary":
+                    process_evidence[f"text:{message_id}"] = {
+                        "visible": True,
+                        "terminal": message_id in text_done,
+                        "first_ms": text_first_ms.get(message_id),
+                        "last_ms": text_last_ms.get(message_id),
+                        "terminal_ms": text_done_ms.get(message_id),
+                    }
         # Codex reconstructs summary-only process/text envelopes while parsing
         # a rollout. For an assistant-only continuation those synthetic rows
         # can carry the parse time because there is no UserMsg to provide the
@@ -729,19 +1143,33 @@ def materialize_history_turns(
                 and (started_ms is None or started_ms > done_ms)):
             started_ms = max(0, done_ms - (duration_ms or 0))
         blocks = []
+        # A turn may contain arbitrarily many native answers/questions. The
+        # wire summary is bounded by both characters and block count; full
+        # source events remain available through GetTurnDetail.
+        final_ids = [message_id for message_id in final_ids
+                     if any(texts.get(message_id, ()))]
+        answer_limit = _SUMMARY_BLOCK_MAX - len(task_receipts)
+        summary_truncated = receipts_truncated or len(final_ids) > answer_limit
+        final_ids = final_ids[-answer_limit:]
+        final_block_count = len(final_ids)
+        notice_limit = max(0, _SUMMARY_BLOCK_MAX - final_block_count - len(task_receipts))
+        notices = list(model_notices.values())[-notice_limit:] if notice_limit else []
+        image_limit = max(0, notice_limit - len(notices))
+        image_summaries = list(generated_images.values())[-image_limit:] if image_limit else []
         if include_live_detail:
             final_id_set = set(final_ids)
-            final_block_count = sum(
-                bool("".join(texts.get(message_id, ())))
-                for message_id in final_ids
-            )
             live_block_limit = max(
                 0,
                 min(_SUMMARY_LIVE_BLOCK_MAX,
-                    _SUMMARY_BLOCK_MAX - final_block_count),
+                    image_limit - len(image_summaries)),
             )
             candidates: list[dict[str, Any]] = []
             for block in live_blocks:
+                if block.get("tool") == "model_refusal_fallback":
+                    continue
+                if (block.get("tool") == "image_generation"
+                        and block.get("status") == "succeeded"):
+                    continue
                 if (block.get("kind") == "text"
                         and block.get("message_id") in final_id_set):
                     continue
@@ -761,6 +1189,12 @@ def materialize_history_turns(
                 )
                 for block in candidates:
                     if block.get("done"):
+                        continue
+                    if (
+                        steered
+                        and block.get("kind") == "process"
+                        and block.get("processKind") == "plan"
+                    ):
                         continue
                     block["done"] = True
                     if block.get("kind") == "process":
@@ -799,9 +1233,11 @@ def materialize_history_turns(
                 )
                 block["text"] = text[:keep]
                 remaining_live_chars -= keep
-            blocks.extend(candidates)
+            blocks.extend(block for block in candidates
+                          if block.get("item_id") not in task_receipts)
+        blocks.extend(notices)
+        blocks.extend(image_summaries)
         remaining_summary_chars = _SUMMARY_TEXT_MAX_CHARS
-        summary_truncated = False
         for message_id in final_ids:
             text = "".join(texts.get(message_id, ()))
             if text:
@@ -817,18 +1253,79 @@ def materialize_history_turns(
                         text = text[:keep] + suffix
                     summary_truncated = True
                 remaining_summary_chars -= len(text)
-                blocks.append({
+                text_block = {
                     "kind": "text",
                     "message_id": message_id,
                     "text": text,
                     "done": done,
                     "channel": "final",
-                })
+                }
+                metadata = async_messages.get(message_id)
+                if metadata:
+                    text_block["delivery"] = "async"
+                    metadata_chars = len(json.dumps(metadata, ensure_ascii=False))
+                    if metadata_chars <= remaining_summary_chars:
+                        text_block["questions"] = metadata["questions"]
+                        remaining_summary_chars -= metadata_chars
+                    else:
+                        # Detail retains the complete native card. Summary
+                        # budgets must also count its structured text/options.
+                        summary_truncated = True
+                if message_id in text_background:
+                    text_block["background"] = True
+                    started_ts = text_first_ms.get(message_id)
+                    done_ts = text_done_ms.get(message_id)
+                    if started_ts is not None:
+                        text_block["startedTs"] = started_ts
+                    if done_ts is not None:
+                        text_block["doneTs"] = done_ts
+                blocks.append(text_block)
+        if task_receipts:
+            blocks.extend(task_receipts.values())
+            blocks.sort(key=lambda block: source_order.get(
+                block.get("item_id") or block.get("tool_use_id")
+                or block.get("message_id"), -1))
+        visible_process = [
+            row for row in process_evidence.values()
+            if row.get("visible")
+        ]
+        process_started_ms = None
+        if visible_process and all(
+                isinstance(row.get("first_ms"), int)
+                for row in visible_process):
+            process_started_ms = min(
+                int(row["first_ms"]) for row in visible_process)
+        process_done_ms = None
+        if process_started_ms is not None and visible_process:
+            if all(
+                    row.get("terminal")
+                    and isinstance(row.get("terminal_ms"), int)
+                    for row in visible_process):
+                process_done_ms = max(
+                    int(row["terminal_ms"]) for row in visible_process)
+            elif done and done_ms is not None:
+                # TurnEnd is the final trustworthy fence for any process item
+                # whose producer omitted its own terminal timestamp.
+                process_done_ms = done_ms
+            if process_done_ms is not None:
+                process_done_ms = max(process_started_ms, process_done_ms)
+        detail_reasons = []
+        if visible_process:
+            detail_reasons.append("process")
+        if prompt_truncated:
+            detail_reasons.append("prompt_truncated")
+        if summary_truncated:
+            detail_reasons.append("answer_truncated")
+        if deferred_image_count:
+            detail_reasons.append("image_deferred")
         turn: dict[str, Any] = {
             "id": turn_id,
             "prompt": prompt,
             "blocks": blocks,
             "done": done,
+            "processDetailState": (
+                "present" if visible_process else "none"),
+            "detailReasons": detail_reasons,
             "detailEventCount": (
                 len(detail_items)
                 + int(prompt_truncated)
@@ -839,6 +1336,9 @@ def materialize_history_turns(
         }
         optional = {
             "clientMsgId": client_msg_id,
+            "sourceThreadId": source_thread_id,
+            "sessionMessages": list(session_messages.values()) or None,
+            "continuation": continuation if not has_user else None,
             "forkPointId": fork_point,
             "checkpointId": checkpoint_id,
             "imageRefs": image_refs or None,
@@ -846,6 +1346,8 @@ def materialize_history_turns(
             "ts": started_ms,
             "doneTs": done_ms,
             "durationMs": duration_ms,
+            "processStartedTs": process_started_ms,
+            "processDoneTs": process_done_ms,
             "error": error,
         }
         turn.update({key: value for key, value in optional.items() if value is not None})
@@ -873,6 +1375,10 @@ class HistoryIndexStore:
         self.path = Path(state_dir) / "history-index.sqlite3"
         self.max_entries = max(1, int(max_entries))
         self.max_bytes = max(1024, int(max_bytes))
+        self._summary_json_sql_available: bool | None = None
+        self._compact_memory: OrderedDict[tuple, tuple] = OrderedDict()
+        self._compact_memory_bytes = 0
+        self._compact_memory_lock = RLock()
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -887,16 +1393,149 @@ class HistoryIndexStore:
         connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
+    def _select_page_row(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        summary_only: bool,
+        projected_sql: str,
+        raw_sql: str,
+        parameters: tuple[Any, ...],
+    ) -> sqlite3.Row | None:
+        """Read one page without turning unrelated SQLite faults into retries."""
+        if not summary_only or self._summary_json_sql_available is False:
+            return connection.execute(raw_sql, parameters).fetchone()
+        try:
+            row = connection.execute(
+                projected_sql, parameters,
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            fallback = _summary_projection_fallback(exc)
+            if fallback is None:
+                raise
+            if fallback == "unsupported":
+                # A custom SQLite build without JSON1 would otherwise throw on
+                # every summary read before doing the same full-payload query.
+                self._summary_json_sql_available = False
+            return connection.execute(raw_sql, parameters).fetchone()
+        self._summary_json_sql_available = True
+        return row
+
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current == 10:
-                # v11 changes only Claude history translation: compacted
-                # transcripts now reconnect their pre-compact active ancestry.
-                # Exact v10 source fingerprints would otherwise keep serving a
-                # semantically stale post-compact-only page forever. Preserve
-                # Codex pages/images (which can be expensive to rebuild) and
-                # invalidate only the rebuildable Claude projection.
+            if current in range(10, 44):
+                # Accepted human attachments change Claude turn ownership and
+                # cursors without changing transcript bytes. Rebuild only its
+                # derived narrative/graph; preserve other engines and assets.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
+                for table in ("claude_compact_sources", "claude_compact_records", "claude_compact_queue"):
+                    connection.execute(f"DROP TABLE IF EXISTS {table}")
+            if current in range(10, 43):
+                # /compact is now a visible native command. Its graph boundary
+                # and the derived pages must agree; retain source-bound assets.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
+                for table in ("claude_compact_sources", "claude_compact_records", "claude_compact_queue"):
+                    connection.execute(f"DROP TABLE IF EXISTS {table}")
+            if current in range(10, 42):
+                # v42 bounds answer summaries and handles recovered prefixes.
+                # Full source events, images and native graph indexes remain
+                # valid; only materialized pages require a fresh projection.
+                connection.execute(
+                    "DELETE FROM history_pages WHERE engine IN ('claude', 'codex')")
+            if current in range(10, 41):
+                # isMeta changes both turn boundaries and the visible-user
+                # graph without changing native bytes. Rebuild Claude's derived
+                # narrative/index only; retain Codex and source-bound assets.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
+                for table in (
+                    "claude_compact_sources", "claude_compact_records", "claude_compact_queue",
+                ):
+                    connection.execute(f"DROP TABLE IF EXISTS {table}")
+            if current in range(10, 40):
+                # Real background replies had the original answer's timestamp.
+                # Only Claude narrative changes; keep all source-bound assets.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
+            if current in range(10, 39):
+                # Native /compact envelopes are not human turns. Rebuild the
+                # Claude narrative and cached visible-user graph together.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='claude'")
+                for table in (
+                    "claude_compact_sources", "claude_compact_records", "claude_compact_queue",
+                ):
+                    connection.execute(f"DROP TABLE IF EXISTS {table}")
+            if current in range(10, 38):
+                # RPC-accepted steers could cache a phantom process. Invalidate
+                # only derived Codex narrative; retain other engines and assets.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if current in range(10, 37):
+                # Both earlier branch histories may cache generic policy errors.
+                # Keep source bytes, other engines and binary assets intact.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if current in range(10, 36):
+                # Native quota errors used to collapse into a generic failure.
+                # Rebuild only Codex narrative projections, once; source bytes,
+                # other engines, and binary assets remain untouched.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if current in range(10, 35):
+                # Existing source bytes do not change when the translator starts
+                # honoring task_complete.error. Rebuild Codex narrative only.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if current in range(10, 34):
+                # v34 separates 64-row wire pages from the full native file
+                # index. Rebuild derived summaries, not transcripts or archives.
+                connection.execute("DELETE FROM history_pages")
+                connection.execute("DELETE FROM history_turn_details WHERE engine='codex'")
+            if current in range(10, 33):
+                # v33 carries Codex per-tool diff/file-count truncation into
+                # the archive. Old source fingerprints cannot reveal that
+                # translator fix. Rebuild only derived Codex pages/details;
+                # native rollouts, immutable archives and images stay intact.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if current == 31:
+                # v32 rebuilt page presentation only; v33 separately rebuilds
+                # Codex details above. Native transcripts, archives and images
+                # are independent of both projection migrations.
+                connection.execute("DELETE FROM history_pages")
+            if current in range(10, 31):
+                # v31 retains model fallback notes and per-turn file summaries.
+                # Binary assets and native graph indexes are unaffected.
+                connection.execute("DELETE FROM history_pages")
+                connection.execute("DELETE FROM history_turn_details")
+            if current in range(10, 30):
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            if current in range(10, 28):
+                # v28 retains native async questions. Rollout bytes and source
+                # fingerprints are unchanged; rebuild Codex narrative only.
+                # Claude state, binary assets and Agent/compact indexes survive.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            if current == 28:
+                # v29 changes only the summary selection. The source token is
+                # unchanged, so old pages need an explicit invalidation; keep
+                # complete details, Claude history and all independent assets.
+                connection.execute(
+                    "DELETE FROM history_pages WHERE engine='codex'")
+            if current in (10, 11, 12, 13, 14):
+                # v14 corrected Claude browser-message identity and v15
+                # narrowly restores completed tails bypassed by delayed
+                # request-retry branches. Exact transcript fingerprints cannot
+                # reveal either projection change, so invalidate only Claude's
+                # rebuildable pages/details/images. Preserve expensive Codex
+                # projections and the independent compact-chain graph index.
                 for table in (
                     "history_pages",
                     "history_turn_details",
@@ -904,7 +1543,65 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
-            elif current not in (0, 11, _SCHEMA_VERSION):
+            if current in range(10, 27):
+                # v22 changes Claude turn identity, v26 changes its terminal
+                # clock, and v27 changes image Read projection without changing
+                # transcript bytes. Rebuild only Claude narrative rows so every
+                # repair reaches History;
+                # source-bound images, compact ancestry, and Agent detail
+                # payloads stay valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='claude'")
+            if current in (21, 22, 23, 24):
+                # v23 restores the first real public-process timestamp from an
+                # omitted oversized prefix. v24 additionally overlays a
+                # source-bound live clock which can appear without changing
+                # rollout bytes. v25 repairs leading compaction ownership.
+                # Only Codex narrative projections need rebuilding; Claude
+                # history and binary assets remain valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            if 0 < current < 48:
+                # v47 projects native Codex cross-thread input envelopes;
+                # v48 retains async task receipt boundaries in summary pages.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if current in (10, 11, 12, 13, 14, 15, 16):
+                # v16 makes browser/native ownership durable; v17 reuses the
+                # adjacent native response-item id for legacy Codex user rows.
+                # Source fingerprints reveal neither projection change, so
+                # rebuild pages and source-complete details once. Image assets
+                # contain no turn-owner identity and remain valid/source-bound.
+                for table in (
+                    "history_pages",
+                    "history_turn_details",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            elif current in (17, 18):
+                # Page payloads are rebuildable and may contain either the old
+                # pre-summary size truncation or no v36 process-detail state.
+                # v21 additionally invalidates Codex details whose official
+                # events may contain parser-time timestamps; the independent
+                # v22 block above has already invalidated Claude details. All
+                # source-bound image assets remain valid.
+                connection.execute("DELETE FROM history_pages")
+                connection.execute(
+                    "DELETE FROM history_turn_details WHERE engine='codex'")
+            elif current in (19, 20):
+                # v20 adds an independent source-bound Claude Agent detail LRU.
+                # v21 rebuilds timestamp-bearing Codex projections; the v22
+                # block above rebuilds Claude narrative identity. Images and
+                # Agent detail payloads remain byte-for-byte valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            elif current in (21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49):
+                # The independent v22-v44 invalidations above suffice.
+                pass
+            elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the
                 # transport-compacted History frame.  Both Claude and Codex v8
@@ -915,6 +1612,7 @@ class HistoryIndexStore:
                 connection.execute("DROP TABLE IF EXISTS history_pages")
                 connection.execute("DROP TABLE IF EXISTS history_turn_details")
                 connection.execute("DROP TABLE IF EXISTS history_image_assets")
+                connection.execute("DROP TABLE IF EXISTS history_agent_details")
                 connection.execute("DROP TABLE IF EXISTS claude_compact_sources")
                 connection.execute("DROP TABLE IF EXISTS claude_compact_records")
                 connection.execute("DROP TABLE IF EXISTS claude_compact_queue")
@@ -972,6 +1670,29 @@ class HistoryIndexStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_turn_details_lru "
                 "ON history_turn_details(accessed_at)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS history_agent_details (
+                    session_id TEXT NOT NULL,
+                    source_token TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    payload_json BLOB NOT NULL,
+                    payload_bytes INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    accessed_at REAL NOT NULL,
+                    PRIMARY KEY (session_id, source_token, run_id)
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS history_agent_details_lookup "
+                "ON history_agent_details(session_id, source_path, run_id, created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS history_agent_details_lru "
+                "ON history_agent_details(accessed_at)"
             )
             connection.execute(
                 """
@@ -1035,6 +1756,7 @@ class HistoryIndexStore:
                     source_offset INTEGER NOT NULL,
                     record_bytes INTEGER NOT NULL,
                     visible_user INTEGER NOT NULL,
+                    public_user_id TEXT,
                     PRIMARY KEY (source_path, source_device, source_inode, uuid)
                 )
                 """
@@ -1059,6 +1781,18 @@ class HistoryIndexStore:
                 )
                 """
             )
+            if 0 < current < 46:
+                # v46 reads public command lifecycle records and source clocks in
+                # Codex rollouts. Rebuild only the derived Codex projections;
+                # native sources, other engines and binary assets stay valid.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine='codex'")
+            if 0 < current < 50:
+                # Return links retain native IDs without becoming process work.
+                # Only rebuild chat projections; preserve binary/image assets,
+                # child detail and the raw Claude compact ancestry index.
+                for table in ("history_pages", "history_turn_details"):
+                    connection.execute(f"DELETE FROM {table} WHERE engine IN ('claude', 'codex', 'dsh')")
             if current != _SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
         try:
@@ -1077,7 +1811,72 @@ class HistoryIndexStore:
         snapshot_size: int | None,
         max_record_bytes: int,
         max_entries: int,
-        visible_user: Callable[[dict[str, Any]], bool],
+        visible_user: Callable[[dict[str, Any]], bool | str | None],
+    ) -> ClaudeCompactChainIndex | None:
+        """Reuse bounded metadata across readers of the exact same snapshot.
+
+        Pagination, delayed-result recovery and native metadata restoration all
+        need this graph. Reconstructing it from SQLite for each reader can cost
+        more than reading the selected turn bodies. No message payloads are
+        cached, and callers receive their own mutable row dictionary.
+        """
+        try:
+            source = HistorySourceFingerprint.capture(source_path)
+        except OSError:
+            return None
+        key = (source, snapshot_size, max_record_bytes, max_entries, id(visible_user))
+        with self._compact_memory_lock:
+            cached = self._compact_memory.get(key)
+            if cached is not None and cached[0] is visible_user:
+                self._compact_memory.move_to_end(key)
+                index = cached[1]
+                return ClaudeCompactChainIndex(
+                    index.leaf, dict(index.rows), index.queued_notifications,
+                    index.indexed_size,
+                )
+        index = self._read_claude_compact_index(
+            source_path, snapshot_size=snapshot_size,
+            max_record_bytes=max_record_bytes, max_entries=max_entries,
+            visible_user=visible_user,
+        )
+        if index is None:
+            return None
+        try:
+            if HistorySourceFingerprint.capture(source_path) != source:
+                return index
+        except OSError:
+            return index
+        # Count referenced strings conservatively even when SQLite reused them.
+        size = sys.getsizeof(index.rows) + sys.getsizeof(index.queued_notifications)
+        size += sum(sys.getsizeof(uid) + sys.getsizeof(row)
+                    + sum(sys.getsizeof(value) for value in row)
+                    for uid, row in index.rows.items())
+        size += sum(sys.getsizeof(row) + sum(sys.getsizeof(value) for value in row)
+                    for row in index.queued_notifications)
+        if size <= _COMPACT_MEMORY_BYTES:
+            saved = ClaudeCompactChainIndex(
+                index.leaf, dict(index.rows), index.queued_notifications,
+                index.indexed_size,
+            )
+            with self._compact_memory_lock:
+                previous = self._compact_memory.pop(key, None)
+                if previous is not None:
+                    self._compact_memory_bytes -= previous[2]
+                self._compact_memory[key] = (visible_user, saved, size)
+                self._compact_memory_bytes += size
+                while (len(self._compact_memory) > _COMPACT_MEMORY_ENTRIES
+                       or self._compact_memory_bytes > _COMPACT_MEMORY_BYTES):
+                    self._compact_memory_bytes -= self._compact_memory.popitem(last=False)[1][2]
+        return index
+
+    def _read_claude_compact_index(
+        self,
+        source_path: str,
+        *,
+        snapshot_size: int | None,
+        max_record_bytes: int,
+        max_entries: int,
+        visible_user: Callable[[dict[str, Any]], bool | str | None],
     ) -> ClaudeCompactChainIndex | None:
         """Incrementally index compact ancestry without retaining row payloads.
 
@@ -1190,6 +1989,12 @@ class HistoryIndexStore:
                         def text_field(name: str) -> str | None:
                             value = row.get(name)
                             return value if isinstance(value, str) else None
+                        visible = visible_user(row)
+                        # Accepted attachment edges use a different UUID from
+                        # the native user echo. Index that public cursor without
+                        # retaining/re-reading potentially large prompt bodies.
+                        public_uid = (visible if isinstance(visible, str)
+                                      else uid if visible else None)
                         new_records.append((
                             resolved, device, inode, uid,
                             text_field("type"), text_field("subtype"),
@@ -1197,7 +2002,7 @@ class HistoryIndexStore:
                             text_field("logicalParentUuid"),
                             (1 if row.get("isSidechain") is True else 0
                              if row.get("isSidechain") is False else None),
-                            offset, len(line), int(bool(visible_user(row))),
+                            offset, len(line), int(bool(visible)), public_uid,
                         ))
                     scan_complete = scan_offset >= target_size
                     if new_records:
@@ -1207,8 +2012,8 @@ class HistoryIndexStore:
                                 source_path, source_device, source_inode, uuid,
                                 row_type, subtype, parent_uuid,
                                 logical_parent_uuid, is_sidechain,
-                                source_offset, record_bytes, visible_user
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                source_offset, record_bytes, visible_user, public_user_id
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT (
                                 source_path, source_device, source_inode, uuid
                             ) DO UPDATE SET
@@ -1219,7 +2024,8 @@ class HistoryIndexStore:
                                 is_sidechain=excluded.is_sidechain,
                                 source_offset=excluded.source_offset,
                                 record_bytes=excluded.record_bytes,
-                                visible_user=excluded.visible_user
+                                visible_user=excluded.visible_user,
+                                public_user_id=excluded.public_user_id
                             """,
                             new_records,
                         )
@@ -1295,6 +2101,8 @@ class HistoryIndexStore:
                     """,
                     (resolved, device, inode, min(target_size, indexed_size)),
                 ).fetchall()
+                if len(rows) > bounded_entries:
+                    return None
                 queued = connection.execute(
                     """
                     SELECT content_length, content_sha256
@@ -1315,6 +2123,7 @@ class HistoryIndexStore:
                          if row["is_sidechain"] == 0 else None),
                         int(row["source_offset"]), bool(row["visible_user"]),
                         int(row["record_bytes"]),
+                        row["public_user_id"],
                     )
                     for row in rows
                 }
@@ -1357,17 +2166,31 @@ class HistoryIndexStore:
         *,
         before: str | None,
         limit: int,
+        summary_only: bool = False,
     ) -> MaterializedHistoryPage | None:
+        parameters = (
+            session_id, engine, source.token,
+            self._cursor(before), int(limit),
+        )
+        raw_sql = """
+            SELECT payload_json FROM history_pages
+            WHERE session_id=? AND engine=? AND source_token=?
+              AND before_cursor=? AND page_limit=?
+        """
         now = time.time()
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json FROM history_pages
-                WHERE session_id=? AND engine=? AND source_token=?
-                  AND before_cursor=? AND page_limit=?
+            row = self._select_page_row(
+                connection,
+                summary_only=summary_only,
+                projected_sql=f"""
+                    SELECT {_SUMMARY_PAGE_PAYLOAD_SQL} AS payload_json
+                    FROM history_pages
+                    WHERE session_id=? AND engine=? AND source_token=?
+                      AND before_cursor=? AND page_limit=?
                 """,
-                (session_id, engine, source.token, self._cursor(before), int(limit)),
-            ).fetchone()
+                raw_sql=raw_sql,
+                parameters=parameters,
+            )
             if row is None:
                 return None
             connection.execute(
@@ -1380,7 +2203,12 @@ class HistoryIndexStore:
                  self._cursor(before), int(limit)),
             )
         try:
-            payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
+            raw_payload = row["payload_json"]
+            payload = json.loads(
+                raw_payload
+                if isinstance(raw_payload, str)
+                else bytes(raw_payload).decode("utf-8")
+            )
             if not isinstance(payload, dict):
                 return None
             return MaterializedHistoryPage.from_payload(payload)
@@ -1396,6 +2224,7 @@ class HistoryIndexStore:
         *,
         before: str | None,
         limit: int,
+        summary_only: bool = False,
     ) -> MaterializedHistoryPage | None:
         """Return a cached page whose source is a verified file prefix.
 
@@ -1403,21 +2232,38 @@ class HistoryIndexStore:
         snapshot. Device/inode/size checks plus both sampled ends of the old
         source reject truncation, replacement and in-place rewrites.
         """
+        parameters = (
+            session_id, engine, source.path, source.device,
+            source.inode, source.size, self._cursor(before), int(limit),
+        )
+        raw_sql = """
+            SELECT payload_json, source_size, source_head_sha256,
+                   source_tail_sha256
+            FROM history_pages
+            WHERE session_id=? AND engine=? AND source_path=?
+              AND source_device=? AND source_inode=?
+              AND source_size<? AND before_cursor=? AND page_limit=?
+            ORDER BY source_size DESC, created_at DESC
+            LIMIT 1
+        """
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT payload_json, source_size, source_head_sha256,
-                       source_tail_sha256
-                FROM history_pages
-                WHERE session_id=? AND engine=? AND source_path=?
-                  AND source_device=? AND source_inode=?
-                  AND source_size<? AND before_cursor=? AND page_limit=?
-                ORDER BY source_size DESC, created_at DESC
-                LIMIT 1
+            row = self._select_page_row(
+                connection,
+                summary_only=summary_only,
+                projected_sql=f"""
+                    SELECT {_SUMMARY_PAGE_PAYLOAD_SQL} AS payload_json,
+                           source_size, source_head_sha256,
+                           source_tail_sha256
+                    FROM history_pages
+                    WHERE session_id=? AND engine=? AND source_path=?
+                      AND source_device=? AND source_inode=?
+                      AND source_size<? AND before_cursor=? AND page_limit=?
+                    ORDER BY source_size DESC, created_at DESC
+                    LIMIT 1
                 """,
-                (session_id, engine, source.path, source.device, source.inode,
-                 source.size, self._cursor(before), int(limit)),
-            ).fetchone()
+                raw_sql=raw_sql,
+                parameters=parameters,
+            )
         if row is None:
             return None
         old_size = int(row["source_size"])
@@ -1440,7 +2286,12 @@ class HistoryIndexStore:
                 != row["source_tail_sha256"]):
             return None
         try:
-            payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
+            raw_payload = row["payload_json"]
+            payload = json.loads(
+                raw_payload
+                if isinstance(raw_payload, str)
+                else bytes(raw_payload).decode("utf-8")
+            )
             if not isinstance(payload, dict):
                 return None
             return MaterializedHistoryPage.from_payload(payload)
@@ -1584,13 +2435,30 @@ class HistoryIndexStore:
             )
             self._prune_details(connection)
 
-    def get_turn_detail(
+    @staticmethod
+    def _decode_turn_detail_payload(
+        payload_json: Any,
+        turn_id: str,
+    ) -> tuple[dict[str, Any], ...] | None:
+        try:
+            payload = json.loads(bytes(payload_json).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return None
+        if (
+            not isinstance(payload, list)
+            or not all(isinstance(event, dict) for event in payload)
+            or _turn_id(payload) != turn_id
+        ):
+            return None
+        return tuple(payload)
+
+    def get_turn_detail_snapshot(
         self,
         session_id: str,
         engine: str,
         source: HistorySourceFingerprint,
         turn_id: str,
-    ) -> tuple[dict[str, Any], ...] | None:
+    ) -> MaterializedTurnDetail | None:
         """Return one materialized turn without reading a complete page.
 
         Prefer the exact source snapshot.  If the transcript only appended
@@ -1610,24 +2478,23 @@ class HistoryIndexStore:
                 (session_id, engine, source.path, turn_id, source.token),
             ).fetchone()
             if row is not None:
-                try:
-                    payload = json.loads(
-                        bytes(row["payload_json"]).decode("utf-8"))
-                    if (isinstance(payload, list)
-                            and all(isinstance(event, dict) for event in payload)
-                            and _turn_id(payload) == turn_id):
-                        connection.execute(
-                            """
-                            UPDATE history_turn_details SET accessed_at=?
-                            WHERE session_id=? AND engine=?
-                              AND source_token=? AND turn_id=?
-                            """,
-                            (now, session_id, engine,
-                             row["source_token"], turn_id),
-                        )
-                        return tuple(payload)
-                except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                    pass
+                events = self._decode_turn_detail_payload(
+                    row["payload_json"], turn_id)
+                if events is not None:
+                    connection.execute(
+                        """
+                        UPDATE history_turn_details SET accessed_at=?
+                        WHERE session_id=? AND engine=?
+                          AND source_token=? AND turn_id=?
+                        """,
+                        (now, session_id, engine,
+                         row["source_token"], turn_id),
+                    )
+                    return MaterializedTurnDetail(
+                        events=events,
+                        turn_id=turn_id,
+                        source_token=str(row["source_token"]),
+                    )
 
                 # A malformed derived row must not mask the canonical page
                 # fallback below.
@@ -1691,8 +2558,173 @@ class HistoryIndexStore:
                         "UPDATE history_pages SET accessed_at=? WHERE rowid=?",
                         (now, page_row["rowid"]),
                     )
-                    return tuple(group)
+                    return MaterializedTurnDetail(
+                        events=tuple(group),
+                        turn_id=turn_id,
+                    )
         return None
+
+    def get_turn_detail(
+        self,
+        session_id: str,
+        engine: str,
+        source: HistorySourceFingerprint,
+        turn_id: str,
+    ) -> tuple[dict[str, Any], ...] | None:
+        """Compatibility wrapper returning only the materialized events."""
+        detail = self.get_turn_detail_snapshot(
+            session_id, engine, source, turn_id)
+        return detail.events if detail is not None else None
+
+    def get_turn_detail_by_snapshot(
+        self,
+        session_id: str,
+        engine: str,
+        source_token: str,
+        turn_hash: str,
+    ) -> MaterializedTurnDetail | None:
+        """Resolve one immutable detail row from an opaque scoped cursor.
+
+        Query turn ids before payloads so a hash collision fails closed without
+        decoding multiple potentially large detail blobs.
+        """
+        if (
+            _DETAIL_SNAPSHOT_TOKEN.fullmatch(source_token) is None
+            or _DETAIL_SNAPSHOT_TURN_HASH.fullmatch(turn_hash) is None
+        ):
+            return None
+        now = time.time()
+        with self._connect() as connection:
+            turn_ids = connection.execute(
+                """
+                SELECT turn_id FROM history_turn_details
+                WHERE session_id=? AND engine=? AND source_token=?
+                """,
+                (session_id, engine, source_token),
+            )
+            matches = [
+                str(row["turn_id"])
+                for row in turn_ids
+                if history_turn_snapshot_hash(str(row["turn_id"])) == turn_hash
+            ]
+            if len(matches) != 1:
+                return None
+            turn_id = matches[0]
+            row = connection.execute(
+                """
+                SELECT payload_json FROM history_turn_details
+                WHERE session_id=? AND engine=?
+                  AND source_token=? AND turn_id=?
+                """,
+                (session_id, engine, source_token, turn_id),
+            ).fetchone()
+            if row is None:
+                return None
+            events = self._decode_turn_detail_payload(
+                row["payload_json"], turn_id)
+            if events is None:
+                connection.execute(
+                    """
+                    DELETE FROM history_turn_details
+                    WHERE session_id=? AND engine=?
+                      AND source_token=? AND turn_id=?
+                    """,
+                    (session_id, engine, source_token, turn_id),
+                )
+                return None
+            connection.execute(
+                """
+                UPDATE history_turn_details SET accessed_at=?
+                WHERE session_id=? AND engine=?
+                  AND source_token=? AND turn_id=?
+                """,
+                (now, session_id, engine, source_token, turn_id),
+            )
+            return MaterializedTurnDetail(
+                events=events,
+                turn_id=turn_id,
+                source_token=source_token,
+            )
+
+    def put_agent_detail(
+        self,
+        session_id: str,
+        source: HistorySourceFingerprint,
+        run_id: str,
+        events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> None:
+        payload = json.dumps(
+            events, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > self.max_bytes:
+            return
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO history_agent_details (
+                    session_id, source_token, source_path, run_id,
+                    payload_json, payload_bytes, created_at, accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (session_id, source_token, run_id) DO UPDATE SET
+                    source_path=excluded.source_path,
+                    payload_json=excluded.payload_json,
+                    payload_bytes=excluded.payload_bytes,
+                    created_at=excluded.created_at,
+                    accessed_at=excluded.accessed_at
+                """,
+                (session_id, source.token, source.path, run_id,
+                 payload, len(payload), now, now),
+            )
+            connection.execute(
+                """
+                DELETE FROM history_agent_details
+                WHERE session_id=? AND run_id=? AND source_path=?
+                  AND source_token<>?
+                """,
+                (session_id, run_id, source.path, source.token),
+            )
+            self._prune_agent_details(connection)
+
+    def get_agent_detail(
+        self,
+        session_id: str,
+        source: HistorySourceFingerprint,
+        run_id: str,
+    ) -> tuple[dict[str, Any], ...] | None:
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM history_agent_details
+                WHERE session_id=? AND source_token=? AND run_id=?
+                """,
+                (session_id, source.token, run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                payload = json.loads(bytes(row["payload_json"]).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                payload = None
+            if not (isinstance(payload, list)
+                    and all(isinstance(event, dict) for event in payload)):
+                connection.execute(
+                    """
+                    DELETE FROM history_agent_details
+                    WHERE session_id=? AND source_token=? AND run_id=?
+                    """,
+                    (session_id, source.token, run_id),
+                )
+                return None
+            connection.execute(
+                """
+                UPDATE history_agent_details SET accessed_at=?
+                WHERE session_id=? AND source_token=? AND run_id=?
+                """,
+                (now, session_id, source.token, run_id),
+            )
+            return tuple(payload)
 
     def get_image_asset(
         self,
@@ -1702,6 +2734,8 @@ class HistoryIndexStore:
         turn_id: str,
         image_id: str,
         variant: str,
+        *,
+        exact_source: bool = False,
     ) -> tuple[str, int, int, bytes] | None:
         now = time.time()
         with self._connect() as connection:
@@ -1711,11 +2745,12 @@ class HistoryIndexStore:
                 FROM history_image_assets
                 WHERE session_id=? AND engine=? AND source_path=?
                   AND turn_id=? AND image_id=? AND variant=?
+                  AND (? = 0 OR source_token = ?)
                 ORDER BY (source_token = ?) DESC, created_at DESC
                 LIMIT 1
                 """,
                 (session_id, engine, source.path, turn_id, image_id,
-                 variant, source.token),
+                 variant, int(exact_source), source.token, source.token),
             ).fetchone()
             if row is None:
                 return None
@@ -1863,7 +2898,37 @@ class HistoryIndexStore:
             entries -= 1
             total_bytes -= int(victim["payload_bytes"])
 
+    def _prune_agent_details(self, connection: sqlite3.Connection) -> None:
+        row = connection.execute(
+            "SELECT COUNT(*) AS entries, COALESCE(SUM(payload_bytes), 0) AS bytes "
+            "FROM history_agent_details"
+        ).fetchone()
+        entries = int(row["entries"])
+        total_bytes = int(row["bytes"])
+        max_entries = self.max_entries * 4
+        while entries > max_entries or total_bytes > self.max_bytes:
+            victim = connection.execute(
+                """
+                SELECT session_id, source_token, run_id, payload_bytes
+                FROM history_agent_details ORDER BY accessed_at ASC LIMIT 1
+                """
+            ).fetchone()
+            if victim is None:
+                break
+            connection.execute(
+                """
+                DELETE FROM history_agent_details
+                WHERE session_id=? AND source_token=? AND run_id=?
+                """,
+                (victim["session_id"], victim["source_token"], victim["run_id"]),
+            )
+            entries -= 1
+            total_bytes -= int(victim["payload_bytes"])
+
     def invalidate_session(self, session_id: str) -> None:
+        with self._compact_memory_lock:
+            self._compact_memory.clear()
+            self._compact_memory_bytes = 0
         with self._connect() as connection:
             connection.execute(
                 "DELETE FROM history_pages WHERE session_id=?", (session_id,))
@@ -1875,6 +2940,10 @@ class HistoryIndexStore:
                 "DELETE FROM history_image_assets WHERE session_id=?",
                 (session_id,),
             )
+            connection.execute(
+                "DELETE FROM history_agent_details WHERE session_id=?",
+                (session_id,),
+            )
 
     def close(self) -> None:
         """Compatibility hook for WrapperMachine shutdown.
@@ -1882,3 +2951,6 @@ class HistoryIndexStore:
         The store uses operation-scoped connections, so there is no live handle
         to close.  Keeping an explicit hook makes future connection pooling safe.
         """
+        with self._compact_memory_lock:
+            self._compact_memory.clear()
+            self._compact_memory_bytes = 0

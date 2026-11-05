@@ -1,0 +1,8 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "cc-remote-harmony",
+  "version": "0.1.0",
+  "description": "HarmonyOS ArkWeb client for cc-remote",
+  "dependencies": {},
+  "devDependencies": {}
+}

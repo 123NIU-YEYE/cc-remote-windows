@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 import type { Turn } from "../domain/conversation";
+import { UserImageButton } from "./UserImageButton";
 import {
   historyImageDisplaySource,
 } from "../turn-image-previews";
@@ -20,15 +21,19 @@ export function HistoryUserImage({
   imageId,
   width,
   height,
+  maxHeight,
   asset,
   fallback,
   onLoad,
   onPreview,
+  label = "用户发送的图片",
+  variant = "thumbnail",
 }: {
   turnId: string;
   imageId: string;
   width: number;
   height: number;
+  maxHeight?: number;
   asset?: HistoryImageAsset;
   fallback?: NonNullable<Turn["images"]>[number];
   onLoad?: (
@@ -37,9 +42,11 @@ export function HistoryUserImage({
     variant: HistoryImageVariant,
   ) => boolean;
   onPreview: () => void;
+  label?: string;
+  variant?: HistoryImageVariant;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const residencyKey = `${turnId}\u0000${imageId}`;
+  const residencyKey = `${turnId}\u0000${imageId}\u0000${variant}`;
   const residencyRef = useRef({
     key: residencyKey,
     observedAsset: false,
@@ -87,6 +94,7 @@ export function HistoryUserImage({
     asset?.status,
     imageId,
     turnId,
+    variant,
   ]);
   useEffect(() => {
     if (!shouldAutoload || !onLoad) {
@@ -95,8 +103,8 @@ export function HistoryUserImage({
       return;
     }
     const node = triggerRef.current;
-    const requestThumbnail = (): boolean => {
-      const accepted = onLoad(turnId, imageId, "thumbnail");
+    const requestImage = (): boolean => {
+      const accepted = onLoad(turnId, imageId, variant);
       // Consume every synchronous begin/cancel mutation caused by this attempt.
       // A failed transport send must not wake the same component into a loop.
       attemptedCacheSnapshotRef.current = historyImageAssetCacheSnapshot();
@@ -105,7 +113,7 @@ export function HistoryUserImage({
     };
     if (!node || typeof IntersectionObserver === "undefined") {
       intersectingRef.current = true;
-      requestThumbnail();
+      requestImage();
       return () => {
         intersectingRef.current = false;
         waitingForCapacityRef.current = false;
@@ -114,7 +122,7 @@ export function HistoryUserImage({
     const observer = new IntersectionObserver((entries) => {
       intersectingRef.current = entries.some((entry) => entry.isIntersecting);
       if (!intersectingRef.current) return;
-      if (requestThumbnail()) observer.disconnect();
+      if (requestImage()) observer.disconnect();
     }, { rootMargin: "500px 0px" });
     observer.observe(node);
     return () => {
@@ -122,7 +130,7 @@ export function HistoryUserImage({
       waitingForCapacityRef.current = false;
       observer.disconnect();
     };
-  }, [asset, imageId, onLoad, shouldAutoload, turnId]);
+  }, [asset, imageId, onLoad, shouldAutoload, turnId, variant]);
 
   // A full cache can reject an otherwise-visible image. Retry at most once for
   // each cache admission wake; failed begin() calls do not publish, so this
@@ -131,7 +139,7 @@ export function HistoryUserImage({
     if (!shouldAutoload || !onLoad || !intersectingRef.current
         || !waitingForCapacityRef.current
         || attemptedCacheSnapshotRef.current === cacheSnapshot) return;
-    const accepted = onLoad(turnId, imageId, "thumbnail");
+    const accepted = onLoad(turnId, imageId, variant);
     attemptedCacheSnapshotRef.current = historyImageAssetCacheSnapshot();
     waitingForCapacityRef.current = !accepted;
   }, [
@@ -141,39 +149,40 @@ export function HistoryUserImage({
     onLoad,
     shouldAutoload,
     turnId,
+    variant,
   ]);
 
   const src = historyImageDisplaySource(asset, fallback);
   const retryable = asset?.status === "error" || stalled || evicted;
   const canRetry = retryable && !!onLoad;
   const retryCanonical = () => {
-    const accepted = !!onLoad?.(turnId, imageId, "thumbnail");
+    const accepted = !!onLoad?.(turnId, imageId, variant);
     attemptedCacheSnapshotRef.current = historyImageAssetCacheSnapshot();
     waitingForCapacityRef.current = !accepted;
     if (accepted) setStalled(false);
   };
   const imageButton = (
-    <button ref={triggerRef} type="button"
-      className="ubub-image-trigger history-image-trigger"
-      style={{ aspectRatio: `${width} / ${height}` }}
-      aria-label={src
-        ? "预览用户发送的图片"
+    <UserImageButton buttonRef={triggerRef}
+      className="history-image-trigger"
+      width={width} height={height} maxHeight={maxHeight}
+      src={src ?? undefined} label={label}
+      title={asset?.status === "error" ? asset.error : undefined}
+      ariaLabel={src
+        ? `预览${label}`
         : canRetry
-        ? "重试加载用户发送的图片"
-        : "预览用户发送的图片"}
+        ? `重试加载${label}`
+        : `预览${label}`}
       disabled={!src && !canRetry}
       onClick={() => {
         if (src) onPreview();
         else if (canRetry) retryCanonical();
       }}>
-      {src
-        ? <img src={src} className="ubub-img" alt="用户发送的图片" />
-        : <span className={`history-image-placeholder${
+      <span className={`history-image-placeholder${
           canRetry ? " retryable" : ""
         }`} aria-hidden="true">
-          {canRetry ? "点击重试" : ""}
-        </span>}
-    </button>
+          {canRetry ? <><span>{asset?.error ?? "图片加载未完成"}</span><span>点击重试</span></> : ""}
+        </span>
+    </UserImageButton>
   );
   if (!src || !canRetry) return imageButton;
   return (

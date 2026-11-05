@@ -2,18 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-import sys
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
 from claude_agent_sdk.types import ResultMessage, SystemMessage
 
 from cc_remote.wrapper import claude_external as claude_external_module
 from cc_remote.wrapper import machine as machine_module
-from cc_remote.protocol import Query, Takeover
+from cc_remote.protocol import Query, Takeover, TurnBinding
 from cc_remote.wrapper.claude_controls import ClaudeControls
 from cc_remote.wrapper.os_compat import current_uid
 from cc_remote.wrapper.claude_external import (
@@ -40,6 +39,20 @@ def _watch(path) -> dict:
     }
 
 
+@pytest.fixture
+def cost_state_row() -> bytes:
+    return (json.dumps({
+        "type": "cost-state",
+        "sessionId": "sid",
+        "totalCostUSD": 0.06,
+        "totalAPIDuration": 1200,
+        "totalDuration": 10000,
+        "modelUsage": {
+            "test-model": {"inputTokens": 12, "outputTokens": 3},
+        },
+    }) + "\n").encode()
+
+
 def _fake_process(
     root: Path,
     pid: int,
@@ -48,6 +61,7 @@ def _fake_process(
     parent_pid: int = 1,
     cwd: Path | None = None,
     cmdline: tuple[str, ...] = (),
+    environ: tuple[str, ...] | None = None,
 ) -> Path:
     proc = root / str(pid)
     proc.mkdir(parents=True)
@@ -57,13 +71,82 @@ def _fake_process(
     (proc / "cmdline").write_bytes(
         b"\0".join(arg.encode() for arg in cmdline) + (b"\0" if cmdline else b""))
     if cwd is not None:
-        try:
-            (proc / "cwd").symlink_to(cwd)
-        except OSError as exc:
-            if sys.platform == "win32":
-                pytest.skip(f"Windows symlink privilege is unavailable: {exc}")
-            raise
+        (proc / "cwd").symlink_to(cwd)
+    if environ is not None:
+        (proc / "environ").write_bytes(
+            b"\0".join(item.encode() for item in environ)
+            + (b"\0" if environ else b"")
+        )
     return proc
+
+
+def test_claude_process_scan_scopes_identical_uuid_by_config_dir(tmp_path):
+    native_id = "11111111-1111-4111-8111-111111111111"
+    personal_sid = f"personal@{native_id}"
+    company_sid = f"company@{native_id}"
+    project = tmp_path / "project"
+    project.mkdir()
+    personal_root = tmp_path / "personal"
+    company_root = tmp_path / "company"
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root,
+        105,
+        1005,
+        cwd=project,
+        cmdline=("/usr/local/bin/claude", "--resume", native_id),
+        environ=(f"CLAUDE_CONFIG_DIR={company_root}",),
+    )
+
+    scan = claude_session_holders(
+        {personal_sid: "personal.jsonl", company_sid: "company.jsonl"},
+        {personal_sid: str(project), company_sid: str(project)},
+        wrapper_pid=900,
+        proc_root=str(proc_root),
+        config_dirs={
+            personal_sid: str(personal_root),
+            company_sid: str(company_root),
+        },
+        native_session_ids={
+            personal_sid: native_id,
+            company_sid: native_id,
+        },
+        default_config_dir=str(personal_root),
+    )
+
+    assert scan.complete is True
+    assert scan.holders[personal_sid] == set()
+    assert scan.holders[company_sid] == {ProcessIdentity(105, 1005)}
+
+
+def test_claude_profile_scan_fails_closed_when_environment_is_unreadable(
+    tmp_path,
+):
+    native_id = "11111111-1111-4111-8111-111111111111"
+    sid = f"personal@{native_id}"
+    project = tmp_path / "project"
+    project.mkdir()
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root,
+        106,
+        1006,
+        cwd=project,
+        cmdline=("claude", "--resume", native_id),
+    )
+
+    scan = claude_session_holders(
+        {sid: "personal.jsonl"},
+        {sid: str(project)},
+        wrapper_pid=900,
+        proc_root=str(proc_root),
+        config_dirs={sid: str(tmp_path / "personal")},
+        native_session_ids={sid: native_id},
+        default_config_dir=str(tmp_path / "personal"),
+    )
+
+    assert scan.complete is False
+    assert scan.holders[sid] == set()
 
 
 def test_claude_process_scan_tracks_explicit_owner_only(tmp_path):
@@ -619,6 +702,10 @@ class _ClaudeRunSdk:
         self.queries = 0
         self.reconnects = 0
         self.reconnect_args = []
+        self.auto_compact_mode = "custom"
+        self.auto_compact_threshold_tokens = 500_000
+        self.applied_auto_compact_mode = "custom"
+        self.applied_auto_compact_threshold_tokens = 500_000
 
     async def query(self, _prompt):
         self.queries += 1
@@ -657,6 +744,40 @@ class _RejectAfterWriteSdk(_ClaudeRunSdk):
         self.queries += 1
         self.path.write_bytes(b'{"type":"ambiguous-write"}\n')
         raise RuntimeError("query rejected after a possible partial send")
+
+
+class _FailedMessagePumpSdk(_ClaudeRunSdk):
+    def __init__(self):
+        super().__init__()
+        self.message_pump_failed = False
+        self.fail_response = True
+
+    async def receive_response(self):
+        if self.fail_response:
+            self.message_pump_failed = True
+            raise RuntimeError("Claude SDK message pump stopped")
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sid",
+        )
+
+    async def force_reconnect(self, **kwargs):
+        await super().force_reconnect(**kwargs)
+        self.message_pump_failed = False
+
+
+class _FailedControlPlaneSdk(_ClaudeRunSdk):
+    def __init__(self):
+        super().__init__()
+        self.control_plane_failed = True
+
+    async def force_reconnect(self, **kwargs):
+        await super().force_reconnect(**kwargs)
+        self.control_plane_failed = False
 
 
 def test_claude_init_upstream_model_never_overwrites_selected_alias():
@@ -760,6 +881,67 @@ def test_only_an_active_wrapper_query_can_attribute_growth_as_own(tmp_path):
     asyncio.run(go())
 
 
+def test_initial_claude_owner_scan_does_not_mirror_active_managed_turn(
+    tmp_path,
+):
+    """The first fail-closed scan may unlock control, not replay partial history."""
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.claude_write_active = True
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        watch["scan_complete"] = False
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert watch["scan_complete"] is True
+        assert machine._is_external("sid") is False
+        assert mirrored == []
+
+    asyncio.run(go())
+
+
+def test_initial_claude_owner_scan_still_mirrors_idle_unlock(tmp_path):
+    """An idle browser must still receive the ownership transition promptly."""
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        watch["scan_complete"] = False
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert machine._is_external("sid") is False
+        assert mirrored == ["sid"]
+
+    asyncio.run(go())
+
+
 def test_delayed_sdk_rows_remain_owned_after_result(tmp_path):
     async def go():
         machine, _ = _mk_machine()
@@ -791,9 +973,13 @@ def test_delayed_sdk_rows_remain_owned_after_result(tmp_path):
         # the metadata belongs to the SDK-authored assistant row above.
         with path.open("ab") as stream:
             stream.write(
-                ("{\"type\":\"last-prompt\","
-                 f"\"leafUuid\":\"{assistant_id}\"}}\n"
-                 "{\"type\":\"mode\",\"mode\":\"normal\"}\n").encode()
+                (
+                    "{\"type\":\"last-prompt\","
+                    f"\"leafUuid\":\"{assistant_id}\"}}\n"
+                    "{\"type\":\"ai-title\","
+                    "\"aiTitle\":\"Owned title\"}\n"
+                    "{\"type\":\"mode\",\"mode\":\"normal\"}\n"
+                ).encode()
             )
         await machine._poll_claude_watch(
             "sid", watch, set(), 1001.0,
@@ -832,9 +1018,384 @@ def test_explicit_cli_row_wins_during_wrapper_write(tmp_path):
     asyncio.run(go())
 
 
+def test_managed_claude_transcript_user_binds_before_sdk_replay(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8512-3cf357fbd542"
+        native_id = "759d1121-1009-4882-8218-b31296d7e20b"
+        client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        rows = [
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": "same prompt",
+                "sessionId": session_id,
+            },
+            {
+                "type": "user",
+                "uuid": native_id,
+                "sessionId": session_id,
+                "entrypoint": "sdk-py",
+                "promptSource": "sdk",
+                "isSidechain": False,
+                "message": {"role": "user", "content": "same prompt"},
+            },
+        ]
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        await machine._poll_claude_watch(
+            session_id,
+            watch,
+            set(),
+            1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert machine._claude_client_messages.get(
+            session_id, path) == {native_id: client_id}
+        bindings = [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+        assert [(item.msg_id, item.turn_id) for item in bindings] == [
+            (client_id, native_id)
+        ]
+        assert ctx.state == "running"
+
+    asyncio.run(go())
+
+
+def test_managed_claude_alias_probe_waits_for_complete_jsonl_row(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8123-111111111111"
+        native_id = "759d1121-1009-4882-8218-222222222222"
+        client_id = "6b09ee37-f861-4422-b98a-333333333333"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        row = (json.dumps({
+            "type": "user",
+            "uuid": native_id,
+            "sessionId": session_id,
+            "entrypoint": "sdk-py",
+            "message": {"role": "user", "content": "hello"},
+        }) + "\n").encode()
+        split = len(row) // 2
+        path.write_bytes(row[:split])
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+        assert machine._claude_client_messages.get(session_id, path) == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+        with path.open("ab") as stream:
+            stream.write(row[split:])
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1001.0,
+            ownership_scan_complete=True,
+        )
+        assert machine._claude_client_messages.get(
+            session_id, path) == {native_id: client_id}
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(go())
+
+
+def test_managed_claude_alias_probe_skips_tool_result_user_envelope(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8123-444444444444"
+        native_id = "759d1121-1009-4882-8218-555555555555"
+        client_id = "6b09ee37-f861-4422-b98a-666666666666"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        tool_result = {
+            "type": "user",
+            "uuid": "tool-result-envelope",
+            "entrypoint": "sdk-py",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1"}],
+            },
+        }
+        path.write_text(json.dumps(tool_result) + "\n", encoding="utf-8")
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+        assert ctx.claude_client_alias_probe is not None
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+        real_user = {
+            "type": "user",
+            "uuid": native_id,
+            "promptSource": "sdk",
+            "message": {"role": "user", "content": "hello"},
+        }
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(real_user) + "\n")
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1001.0,
+            ownership_scan_complete=True,
+        )
+        assert machine._claude_client_messages.get(
+            session_id, path) == {native_id: client_id}
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(go())
+
+
+def test_managed_claude_alias_probe_rejects_transcript_inode_replacement(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8123-777777777777"
+        native_id = "759d1121-1009-4882-8218-888888888888"
+        client_id = "6b09ee37-f861-4422-b98a-999999999999"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        machine._push_mirrored_history = lambda _sid: asyncio.sleep(0)
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        replacement = tmp_path / "replacement.jsonl"
+        replacement.write_text(json.dumps({
+            "type": "user",
+            "uuid": native_id,
+            "entrypoint": "sdk-py",
+            "message": {"role": "user", "content": "hello"},
+        }) + "\n", encoding="utf-8")
+        replacement.replace(path)
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert ctx.claude_client_alias_probe is None
+        assert machine._claude_client_messages.get(session_id, path) == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+    asyncio.run(go())
+
+
 def test_claude_growth_classifier_rejects_partial_jsonl():
     assert classify_claude_growth(
         b'{"type":"assistant","entrypoint":"sdk-py"'
+    ) == ("unknown", ())
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_cost_state_only_growth_is_metadata(cost_state_row, count):
+    assert classify_claude_growth(cost_state_row * count) == ("metadata", ())
+
+
+@pytest.mark.parametrize("row, expected", [
+    ({"type": "assistant", "entrypoint": "sdk-py", "uuid": "sdk-msg"},
+     ("sdk", ("sdk-msg",))),
+    ({"type": "user", "entrypoint": "cli"}, ("external", ())),
+    ({"type": "cost-state", "entrypoint": "cli"}, ("external", ())),
+    ({"type": "cost-state", "promptSource": "cli"}, ("external", ())),
+    ({"type": "user"}, ("unknown", ())),
+    ({"type": "future-metadata"}, ("unknown", ())),
+    ({"type": "ai-title"}, ("unknown", ())),
+    ({"type": "mode"}, ("unknown", ())),
+    ({"type": "permission-mode"}, ("unknown", ())),
+    ({"type": "queue-operation"}, ("unknown", ())),
+])
+def test_cost_state_does_not_hide_other_growth(cost_state_row, row, expected):
+    data = cost_state_row + (json.dumps(row) + "\n").encode() + cost_state_row
+    assert classify_claude_growth(data) == expected
+
+
+@pytest.mark.parametrize("suffix", [b'{"type":"assistant"', b"not-json\n"])
+def test_cost_state_does_not_hide_incomplete_growth(cost_state_row, suffix):
+    assert classify_claude_growth(cost_state_row + suffix) == ("unknown", ())
+    assert classify_claude_growth(cost_state_row[:-1]) == ("unknown", ())
+
+
+@pytest.mark.parametrize("foreign_owner, scan_complete, pending_reload", [
+    (False, True, False),
+    (True, True, False),
+    (False, False, False),
+    (False, True, True),
+])
+def test_cost_state_watch_preserves_ownership_protection(
+    tmp_path, cost_state_row, foreign_owner, scan_complete, pending_reload,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.needs_reload = pending_reload
+        invalidations = []
+        ctx.sdk = SimpleNamespace(
+            invalidate_context_usage_cache=lambda: invalidations.append(True))
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+        path.write_bytes(cost_state_row * 3)
+        holders = {ProcessIdentity(102, 1002)} if foreign_owner else set()
+        await machine._poll_claude_watch(
+            "sid", watch, holders, 1000.0,
+            ownership_scan_complete=scan_complete,
+        )
+
+        assert watch["size"] == path.stat().st_size
+        assert ctx.needs_reload is (foreign_owner or pending_reload)
+        assert machine._is_external("sid") is (foreign_owner or not scan_complete)
+        assert bool(invalidations) is foreign_owner
+        assert bool(mirrored) is (foreign_owner or not scan_complete)
+        assert ctx.external_ts == (1000.0 if foreign_owner else 0.0)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("replace_file", [False, True])
+def test_cost_state_does_not_hide_transcript_replacement(
+    tmp_path, cost_state_row, replace_file,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(cost_state_row * 3)
+        ctx = _mk_ctx("sid", "sid")
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        machine._push_mirrored_history = lambda _sid: asyncio.sleep(0)
+
+        if replace_file:
+            replacement = tmp_path / "replacement.jsonl"
+            replacement.write_bytes(cost_state_row * 3)
+            replacement.replace(path)
+        else:
+            path.write_bytes(cost_state_row)
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert ctx.needs_reload is True
+        assert ctx.claude_native_controls_dirty is True
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("entrypoint, expected", [("sdk-py", "sdk"), ("cli", "external"), (None, "external")])
+def test_injected_system_prompt_keeps_its_native_process_provenance(entrypoint, expected):
+    row = {"type": "user", "uuid": "injected", "entrypoint": entrypoint,
+           "promptSource": "system", "origin": {"kind": "task-notification"}}
+    origin, owned = classify_claude_growth((json.dumps(row) + "\n").encode())
+    assert origin == expected
+    assert owned == (("injected",) if expected == "sdk" else ())
+
+
+def test_claude_growth_classifier_treats_atis_latch_as_neutral_metadata():
+    assistant_id = "11111111-1111-4111-8111-111111111111"
+    origin, owned = classify_claude_growth(
+        (
+            '{"type":"assistant","entrypoint":"sdk-py",'
+            f'"uuid":"{assistant_id}"}}\n'
+            '{"type":"atis-latch","atis":"","sessionId":"sid"}\n'
+        ).encode()
+    )
+
+    assert origin == "sdk"
+    assert owned == (assistant_id,)
+
+
+def test_claude_growth_classifier_treats_ai_title_as_neutral_metadata():
+    assistant_id = "11111111-1111-4111-8111-111111111111"
+    origin, owned = classify_claude_growth(
+        (
+            '{"type":"assistant","entrypoint":"sdk-py",'
+            f'"uuid":"{assistant_id}"}}\n'
+            '{"type":"ai-title","aiTitle":"Generated title",'
+            '"sessionId":"sid"}\n'
+        ).encode()
+    )
+
+    assert origin == "sdk"
+    assert owned == (assistant_id,)
+    assert classify_claude_growth(
+        b'{"type":"ai-title","aiTitle":"Unattributed"}\n'
     ) == ("unknown", ())
 
 
@@ -846,6 +1407,14 @@ def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(
         path = tmp_path / "session.jsonl"
         path.write_bytes(b"")
         ctx = _mk_ctx("sid", "sid")
+        invalidations = 0
+
+        def invalidate_context_usage_cache():
+            nonlocal invalidations
+            invalidations += 1
+
+        ctx.sdk = SimpleNamespace(
+            invalidate_context_usage_cache=invalidate_context_usage_cache)
         # Recreate the removed legacy grace marker: even if a future change
         # restores it, recent turn completion must not hide unknown growth.
         ctx.last_turn_end = time.time()
@@ -864,6 +1433,7 @@ def test_growth_after_a_finished_wrapper_turn_is_never_hidden_by_a_ttl(
         # read-only; it must still reload the externally-advanced transcript.
         assert machine._is_external("sid") is False
         assert ctx.needs_reload is True
+        assert invalidations == 1
 
     asyncio.run(go())
 
@@ -1052,6 +1622,10 @@ def test_claude_takeover_adopts_only_completed_native_controls(
             model="claude-opus-4-6[1m]",
             effort="high",
             permission_mode="bypassPermissions",
+            auto_compact_mode="custom",
+            auto_compact_threshold_tokens=500_000,
+            applied_auto_compact_mode="custom",
+            applied_auto_compact_threshold_tokens=500_000,
         )
         assert any(getattr(event, "type", None) == "model"
                    and event.model == "claude-opus-4-6[1m]"
@@ -1235,6 +1809,62 @@ def test_queued_claude_takeover_unlocks_only_after_exact_owner_exits(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("poll_during_reconnect", [False, True])
+def test_cost_state_during_effort_reconnect_does_not_cancel_query(
+    tmp_path, monkeypatch, cost_state_row, poll_during_reconnect,
+):
+    async def go():
+        machine, transport = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-effort"
+        sdk = _ClaudeRunSdk()
+        sdk.effort = "high"
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+
+        async def probe(_paths, _cwds):
+            return HolderScan({"sid": set()}, True)
+
+        monkeypatch.setattr(machine, "_probe_claude_holders", probe)
+        reconnect = sdk.force_reconnect
+
+        async def reconnect_with_cost_state(**kwargs):
+            await reconnect(**kwargs)
+            with path.open("ab") as stream:
+                stream.write(cost_state_row)
+            if poll_during_reconnect:
+                await machine._poll_claude_watch(
+                    "sid", watch, set(), 1000.0,
+                    ownership_scan_complete=True,
+                )
+
+        monkeypatch.setattr(sdk, "force_reconnect", reconnect_with_cost_state)
+        await machine._run_turn(ctx, "hello")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args[0]["reason"] == "effort change"
+        assert sdk.applied_effort == "high"
+        assert sdk.queries == 1
+        assert ctx.state == "idle"
+        assert ctx.needs_reload is False
+        assert watch["size"] == path.stat().st_size
+        assert mirrored == []
+        assert not [event for event in transport.sent if event.type == "error"]
+
+    asyncio.run(go())
+
+
 def test_short_external_append_is_reloaded_before_claude_query(
     tmp_path, monkeypatch,
 ):
@@ -1257,14 +1887,104 @@ def test_short_external_append_is_reloaded_before_claude_query(
 
         monkeypatch.setattr(
             machine, "_probe_claude_holders", probe, raising=False)
-        path.write_bytes(b'{"type":"external-user"}\n')
+
+        async def completed_controls(_ctx):
+            return ClaudeControls(
+                model="claude-fable-5-1", effort="high")
+
+        monkeypatch.setattr(
+            machine, "_read_claude_handoff_controls", completed_controls)
+        path.write_bytes(
+            b'{"type":"assistant","entrypoint":"cli"}\n')
 
         await machine._run_turn(ctx, "hello")
 
         assert sdk.reconnects == 1
+        assert sdk.reconnect_args == [{
+            "resume_id": "sid",
+            "cwd": ctx.cwd,
+            "reason": "external transcript change at final preflight",
+            "preserve_model": True,
+        }]
+        assert sdk.model == "claude-fable-5-1[1m]"
+        assert sdk.effort == "high"
         assert sdk.queries == 1
         assert ctx.state == "idle"
         assert ctx.needs_reload is False
+
+    asyncio.run(go())
+
+
+def test_unknown_growth_does_not_restore_stale_native_controls(
+    tmp_path, monkeypatch,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-metadata"
+        sdk = _ClaudeRunSdk()
+        sdk.model = "claude-mythos-5-1[1m]"
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        machine._watch["sid"] = watch
+        machine._push_mirrored_history = lambda _sid: asyncio.sleep(0)
+
+        async def probe(_paths, _cwds):
+            return HolderScan({"sid": set()}, True)
+
+        stale_control_reads = 0
+
+        async def stale_completed_controls(_ctx):
+            nonlocal stale_control_reads
+            stale_control_reads += 1
+            return ClaudeControls(model="claude-fable-5-1")
+
+        monkeypatch.setattr(
+            machine, "_probe_claude_holders", probe, raising=False)
+        monkeypatch.setattr(
+            machine,
+            "_read_claude_handoff_controls",
+            stale_completed_controls,
+        )
+        path.write_bytes(b'{"type":"future-metadata"}\n')
+
+        await machine._run_turn(ctx, "hello")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args[0]["preserve_model"] is True
+        assert sdk.model == "claude-mythos-5-1[1m]"
+        assert stale_control_reads == 0
+        assert ctx.claude_native_controls_dirty is False
+        assert sdk.queries == 1
+
+    asyncio.run(go())
+
+
+def test_work_handoff_does_not_promote_native_base_model(monkeypatch):
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.space = "work"
+        sdk = _ClaudeRunSdk()
+        sdk.model = "claude-fable-5-1"
+        ctx.sdk = sdk
+        ctx.claude_native_controls_dirty = True
+
+        async def completed_controls(_ctx):
+            return ClaudeControls(model="claude-fable-5-1")
+
+        monkeypatch.setattr(
+            machine, "_read_claude_handoff_controls", completed_controls)
+
+        model, _effort = await machine._stage_claude_handoff_controls(ctx)
+
+        assert model == "claude-fable-5-1"
+        assert sdk.model == "claude-fable-5-1"
+        assert ctx.claude_native_controls_dirty is False
 
     asyncio.run(go())
 
@@ -1326,6 +2046,89 @@ def test_failed_claude_query_never_rebaselines_an_ambiguous_append(
         assert path.stat().st_size > 0
         assert await machine._prime_claude_ownership("sid") is False
         assert ctx.needs_reload is True
+
+    asyncio.run(go())
+
+
+def test_failed_claude_message_pump_forces_resume_before_next_query(monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-pump-failed"
+        sdk = _FailedMessagePumpSdk()
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner,
+            raising=False,
+        )
+
+        await machine._run_turn(ctx, "first")
+
+        assert ctx.needs_reload is False
+        assert sdk.reconnects == 0
+        assert any(
+            getattr(event, "code", None) == "cc_crash"
+            and event.msg_id == "msg-pump-failed"
+            for event in transport.sent
+        )
+
+        sdk.fail_response = False
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-after-recovery"
+        await machine._run_turn(ctx, "second")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args == [{
+            "resume_id": "sid",
+            "cwd": ctx.cwd,
+            "reason": "message pump failure",
+            "preserve_model": True,
+        }]
+        assert sdk.queries == 2
+        assert sdk.message_pump_failed is False
+        assert ctx.needs_reload is False
+        assert ctx.state == "idle"
+
+    asyncio.run(go())
+
+
+def test_failed_claude_control_plane_forces_resume_before_next_query(
+    monkeypatch,
+):
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.active_msg_id = "msg-control-failed"
+        sdk = _FailedControlPlaneSdk()
+        ctx.sdk = sdk
+        machine.sessions["sid"] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner,
+            raising=False,
+        )
+
+        await machine._run_turn(ctx, "继续")
+
+        assert sdk.reconnects == 1
+        assert sdk.reconnect_args == [{
+            "resume_id": "sid",
+            "cwd": ctx.cwd,
+            "reason": "control plane failure",
+            "preserve_model": True,
+        }]
+        assert sdk.queries == 1
+        assert ctx.state == "idle"
 
     asyncio.run(go())
 

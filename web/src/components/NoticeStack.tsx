@@ -23,7 +23,9 @@ export function NoticeStack({ notices, onDismiss }: {
       className={`notice-bar ${notice.severity === "warning" ? "attention" : "info"}`}
       role="status"
     >
-      <span className="notice-mark" aria-hidden="true" />
+      <span className="notice-icon" aria-hidden="true">
+        <Icon name={notice.severity === "warning" ? "warning" : "info"} size={16} />
+      </span>
       <div className="notice-copy">
         <div className="notice-title">
           <small>{CATEGORY_LABEL[notice.category]}</small>

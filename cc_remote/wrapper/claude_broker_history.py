@@ -23,6 +23,7 @@ _META_USER_PREFIXES = (
     "<local-command-stdout>",
     "<local-command-stderr>",
 )
+_INTERRUPTED_USER_TEXT = "[Request interrupted by user]"
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,17 @@ def _is_real_user_message(row: dict, message: dict) -> bool:
         text = content.lstrip()
         return bool(text) and not text.startswith(_META_USER_PREFIXES)
     if not isinstance(content, list):
+        return False
+    if (
+        len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].strip() == _INTERRUPTED_USER_TEXT
+    ):
+        # Lifecycle metadata from the preceding turn can be flushed after a
+        # replacement query has already frozen its transcript boundary.  It is
+        # SDK-authored but is never the new human prompt.
         return False
     # Tool results are represented as user-role rows but do not start a new
     # human turn.  A genuine multimodal prompt has text/image/document blocks.
@@ -110,6 +122,45 @@ def parse_claude_broker_lifecycle(
         ordered=tuple(ordered),
         partial=trailing,
     )
+
+
+def first_claude_sdk_user_id(data: bytes) -> str | None:
+    """Return the first real top-level user UUID proven to be SDK-authored.
+
+    This is deliberately stricter than text matching: ``promptId`` is native
+    Claude metadata and is unrelated to the browser message id. A tool-result
+    envelope, sidechain, meta row, malformed line, or row without explicit SDK
+    provenance cannot establish the binding.
+    """
+    if not data or not data.endswith(b"\n"):
+        return None
+    rows: list[dict] = []
+    try:
+        for raw in data.splitlines():
+            if not raw.strip():
+                continue
+            row = json.loads(raw)
+            if not isinstance(row, dict):
+                return None
+            rows.append(row)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    for row in rows:
+        if (
+            row.get("entrypoint") != "sdk-py"
+            and row.get("promptSource") != "sdk"
+        ):
+            continue
+        message = row.get("message")
+        if (
+            row.get("type") != "user"
+            or not isinstance(message, dict)
+            or not _is_real_user_message(row, message)
+        ):
+            continue
+        return _wire_id(row.get("uuid"))
+    return None
 
 
 def claude_broker_tail_state(

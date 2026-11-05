@@ -11,7 +11,35 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   Codex app-server ⇄ local CLI. Native CLI ownership is detected and mirrored
   separately.
 
+## Deployment
+
+For deployment, upgrade, verification or recovery, read the repository skill at
+[`.agents/skills/cc-remote-deploy/SKILL.md`](.agents/skills/cc-remote-deploy/SKILL.md)
+even if this client does not discover `.agents/skills` automatically. It routes
+to the maintained [`deploy/README.md`](deploy/README.md) automation contract,
+installation paths and shared-control acceptance; do not invent another flow.
+Use `deploy/cleanup.py` for retention; preserve live cwd/open-file and runtime
+dependencies beyond the rollback count. Incomplete visibility means retain the
+files. Final acceptance, including live Codex config reads, runs after cleanup.
+
+Codex Code acceptance requires the daily CLI and Wrapper to use the same
+official daemon for each account. An online Web UI alone is insufficient. Never
+kill an active CLI or force takeover to satisfy this check. After core checks,
+offer installed macOS Codex App users optional attachment to that account's
+shared daemon; do not change the App without consent. Declining or deferring
+this optional step does not block core deployment. App-control MCP tools require
+a separate choice; sharing alone does not authorize them.
+
 ## Critical constraints / traps
+- **Claude service lifetime**: when `CC_REMOTE_CLAUDE_SERVICE_SOCKET` is set,
+  regular Claude Code/Work SDK processes belong to the separate local service.
+  Wrapper shutdown detaches; never resubmit an accepted query during recovery
+  or restart the service during an ordinary Wrapper deploy. See
+  `docs/claude-session-service.md` for first migration and drain boundaries.
+- **Claude steering**: send `priority="next"` through the sole streaming-input
+  reader and rebind only on the exact native user UUID echo. A Result before
+  an accepted input is consumed is intermediate. Explicit Stop cancels queued
+  inputs when supported, then drains the real terminal Result.
 - **Drain footgun**: after `ClaudeSDKClient.interrupt()`, the SDK does NOT kill
   the session — the current turn's stream still emits a terminal
   `ResultMessage(subtype="error_during_execution")`. You MUST keep consuming
@@ -24,27 +52,33 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **cwd must match resume**: a session's jsonl lives at
   `~/.claude/projects/<cwd-with-/-as->/<uuid>.jsonl`. `ClaudeAgentOptions.cwd`
   MUST equal the original session's cwd or `resume` can't find it.
-- **SDK pinned to `claude-agent-sdk==0.2.128`**: message-type shapes and the
-  interrupt/drain contract can shift between minor versions. Re-run the
+- **SDK pinned to `claude-agent-sdk==0.2.157`**: message-type shapes and the
+  interrupt/drain contract can shift between patch versions. Re-run the
   interrupt+drain verification after any upgrade (`SdkHandle.preflight()` guards
-  the major/minor at startup).
-- **Claude Code is the user's daily CLI, not the SDK bundle**: the wrapper
+  the exact verified patch at startup).
+- **Claude Code is the user's daily CLI, not the SDK bundle**: Claude Code
+  `>=2.1.258` is required and checked before a Claude session starts. The wrapper
   defaults `CLAUDE_BIN` to `~/.local/bin/claude` and passes that path explicitly
   to the SDK. An empty value keeps this default; only another absolute path may
   override it. Keep that CLI updated and signed in before starting the wrapper.
 - **`include_partial_messages`** is a `ClaudeAgentOptions` field (set at
   construction, not on `query()`). Streaming events arrive as `StreamEvent`
   (`.event` = raw Anthropic API stream-event dict) — NOT
-  `SDKPartialAssistantMessage` (doesn't exist in 0.2.128). Extract
+  `SDKPartialAssistantMessage` (doesn't exist in 0.2.157). Extract
   `content_block_delta` → `delta.text` from `StreamEvent.event`.
 - **tool_use is batched, not streamed**: emit one `tool_use` event from the
   assembled `AssistantMessage` (full `input`), never as JSON-fragment deltas.
   Text deltas still stream live via `StreamEvent`.
-- **Claude only — don't set `setting_sources=[]`**: we WANT `~/.claude/settings.json` loaded so
-  `claude` inherits the model link (`ANTHROPIC_BASE_URL`), model id, and
-  `bypassPermissions`. Note: settings.json's `env` block overrides the process
-  env, so redirecting the model backend from cc-remote is not possible — it's
-  the user's `settings.json` that decides.
+- **Claude only — don't set `setting_sources=[]` for Code**: single-account Code
+  intentionally loads the user's native settings. Explicit multi-account
+  profiles load only the selected user settings source. The per-user `~/.claude`
+  profile leaves `CLAUDE_CONFIG_DIR` unset so native `~/.claude.json` and keychain
+  identity are preserved; other directories set it explicitly. Inherited account
+  selectors are cleared in either case. Project/local settings cannot replace
+  the selected model
+  link, and the complete user file is never promoted through `--settings`.
+  Single-account Code retains Claude's normal source precedence. Work remains
+  isolated with one wrapper-owned settings policy and `setting_sources=[]`.
 - **Auth is URL-secret-free**: the wrapper uses `Authorization: Bearer <token>`
   at WS upgrade. Web clients POST `LOGIN_PASSWORD` to `/api/login` and receive a
   short-lived HttpOnly/SameSite cookie; `/ws` enforces exact `PUBLIC_ORIGIN`.
@@ -66,7 +100,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `useLayoutEffect` is deliberately dependency-free — late virtualizer/image
   measurements settle without a React render, and constraining it to its read
   set reintroduces a full-viewport jump on touch release.
-- **Protocol version gate**: current wire protocol v29 is declared by
+- **Protocol version gate**: current wire protocol v81 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -128,7 +162,12 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   hello sends lightweight resident `Snapshot`s; reconnect cursors replay only
   the bounded missing live tail. Source fingerprints invalidate appended pages,
   and rollback explicitly invalidates both server and browser projections. These
-  reads never spawn/resume an engine or create a model turn.
+  reads never spawn/resume an engine or create a model turn. Codex
+  `History.terminal_fences` is a separate bounded lifecycle projection: only a
+  real app-server terminal or a source-validated rollout marker may enter it;
+  local synthetic failures may not. The browser applies a fence only to its
+  exact native turn identity and never changes completion receipts or guesses
+  from the last open row.
 - **Token-aware residency**: resuming an evicted Claude SDK session may rebuild
   a cold prompt cache, so it only happens on first spawn / re-focus after
   eviction; raising the cap trades RAM for fewer cold re-sends. Codex context is

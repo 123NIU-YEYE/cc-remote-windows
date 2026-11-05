@@ -8,24 +8,37 @@ wrapper when an externally-produced transcript must be reloaded.
 """
 from __future__ import annotations
 
+import glob
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import sys
-import glob
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Callable, Iterable, Mapping
 
+from cc_remote.wrapper.codex_delegation import (
+    normalize_codex_delegation_item, parse_codex_delegation,
+)
+
+from cc_remote.protocol import (
+    MAX_SAFE_WIRE_INTEGER,
+    MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
+)
 from cc_remote.wrapper.process_scan import (
+    DarwinProcessInfo,
     MAX_PROC_SCAN,
     ProcessIdentity,
     _darwin_process_info,
     _process_cmdline,
     _process_start_ticks,
     _process_stat,
+    darwin_process_snapshot,
+    process_command,
+    process_command_environment_value,
 )
 
 MAX_FDS_PER_PROCESS = 8192
@@ -42,9 +55,15 @@ _THREAD_ID_RE = re.compile(
 _ROLLOUT_SID_RE = re.compile(
     r"rollout-[^\s\"']*-([0-9a-fA-F-]{36})\.jsonl"
 )
+_LOADED_THREAD_RESUME_SID_RE = re.compile(
+    r"\bthread/resume overrides ignored for loaded thread "
+    r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b"
+)
 _TERMINAL_EVENTS = frozenset({
-    "task_complete", "turn_aborted", "task_failed", "task_cancelled",
+    "task_complete", "task_completed", "turn_aborted", "task_failed", "turn_failed",
+    "task_error", "task_cancelled",
 })
+_SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _RESUME_OPTIONS_WITH_VALUE = frozenset({
     b"-c", b"--config", b"--enable", b"--disable", b"--remote",
     b"--remote-auth-token-env", b"-m", b"--model", b"--local-provider",
@@ -54,12 +73,40 @@ _RESUME_OPTIONS_WITH_VALUE = frozenset({
 
 
 @dataclass(frozen=True)
+class RolloutTerminalMarker:
+    turn_id: str
+    status: str
+    duration_ms: int | None = None
+    completed_at: float | None = None
+
+
+@dataclass(frozen=True)
 class TurnMarkers:
     started: frozenset[str]
     finished: frozenset[str]
     partial: bytes
     ordered: tuple[tuple[str, str], ...] = ()
     has_visible_user_message: bool = False
+    terminals: tuple[RolloutTerminalMarker, ...] = ()
+    automatic_started: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class CodexRolloutUserMessage:
+    """One normalized user boundary from a persisted Codex rollout.
+
+    Older Codex releases persisted ``event_msg/user_message`` while 0.147
+    persists ``event_msg/item_completed`` with a ``UserMessage`` item.  Keep
+    the source identities separate from the visible prompt so callers can use
+    the official item id without treating internal envelopes as user input.
+    """
+
+    raw_text: str
+    prompt: str | None
+    source_thread_id: str | None = None
+    message_id: str | None = None
+    client_id: str | None = None
+    turn_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +126,18 @@ class HolderScan:
     # foreign active turn to App; merely opening/subscribing to a rollout is not
     # ownership and must not make an idle Remote session read-only.
     private_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
+    # Interactive TUIs may name a resumed thread in argv without holding the
+    # rollout FD.  Keep that weaker evidence separate so multi-profile callers
+    # can attribute the process to its CODEX_HOME/socket before accepting it.
+    logical_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
+    # Machine-level multi-profile aggregation may fail closed for only the
+    # sessions touched by ambiguous weak evidence. Low-level scans leave this
+    # empty and continue to use ``complete`` for their whole input set.
+    incomplete_sids: set[str] = field(default_factory=set)
+    # Transient, probe-local Darwin snapshot. The machine reuses it across
+    # profile buckets so 12 accounts do not perform 12 kernel-wide PID scans.
+    darwin_snapshot: tuple[list[DarwinProcessInfo], bool] | None = field(
+        default=None, repr=False, compare=False)
 
 
 class CodexTuiLogTracker:
@@ -106,7 +165,11 @@ class CodexTuiLogTracker:
 
     @staticmethod
     def _thread_id(body: str) -> str | None:
-        match = _THREAD_ID_RE.search(body) or _ROLLOUT_SID_RE.search(body)
+        match = (
+            _THREAD_ID_RE.search(body)
+            or _ROLLOUT_SID_RE.search(body)
+            or _LOADED_THREAD_RESUME_SID_RE.search(body)
+        )
         return match.group(1).lower() if match is not None else None
 
     def bindings(
@@ -240,6 +303,90 @@ def _is_app_server_proxy(
     )
 
 
+def _codex_app_server_proxy_socket_from_args(
+    args: tuple[bytes, ...] | None,
+) -> str | None:
+    if not args or b"app-server" not in args or b"proxy" not in args:
+        return None
+    sockets: list[bytes] = []
+    for index, arg in enumerate(args):
+        if arg == b"--sock":
+            if index + 1 >= len(args):
+                return None
+            sockets.append(args[index + 1])
+        elif arg.startswith(b"--sock="):
+            sockets.append(arg.removeprefix(b"--sock="))
+    if len(sockets) != 1:
+        return None
+    try:
+        socket_path = os.fsdecode(sockets[0])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not os.path.isabs(socket_path)
+        or "\x00" in socket_path
+        or len(os.fsencode(socket_path)) > 4096
+    ):
+        return None
+    return os.path.realpath(socket_path)
+
+
+def codex_app_server_proxy_socket(
+    identity: ProcessIdentity,
+) -> str | None:
+    """Return the exact proxy socket without weakening process identity.
+
+    Multiple CODEX_HOME profiles run independent app-server daemons. A proxy
+    whose socket is missing or ambiguous cannot be assigned to any account's
+    TUI log tracker; doing so would make one account appear to own a sibling
+    account's thread.
+    """
+    return _codex_app_server_proxy_socket_from_args(process_command(identity))
+
+
+def codex_app_server_client_socket(
+    identity: ProcessIdentity,
+    *,
+    default_codex_home: str,
+) -> tuple[bool, str | None]:
+    """Resolve the daemon socket used by one exact TUI/proxy process.
+
+    Official local TUIs and remote proxies may omit ``--sock`` and select the
+    daemon through ``CODEX_HOME`` (or the invoking user's standard ``~/.codex``
+    when that variable is absent). ``default_codex_home`` is that process-level
+    default, not the registry's designated default Profile. Multi-profile
+    ownership must recover the client's real selection instead of dropping it
+    or assigning it to every account. The boolean distinguishes a successful
+    non-match from an unreadable/ambiguous candidate, which must make the owner
+    scan incomplete.
+    """
+    environment_complete, args, home = process_command_environment_value(
+        identity, "CODEX_HOME")
+    if args is None:
+        return False, None
+    is_proxy = bool(b"app-server" in args and b"proxy" in args)
+    if is_proxy and any(
+        arg == b"--sock" or arg.startswith(b"--sock=") for arg in args
+    ):
+        socket_path = _codex_app_server_proxy_socket_from_args(args)
+        return socket_path is not None, socket_path
+    if not is_proxy and not _is_interactive_codex_tui(args, 1):
+        return True, None
+    if not environment_complete:
+        return False, None
+    if home is None:
+        home = default_codex_home
+    if (
+        not isinstance(home, str)
+        or not os.path.isabs(home)
+        or "\x00" in home
+        or len(os.fsencode(home)) > 4096
+    ):
+        return False, None
+    return True, os.path.realpath(os.path.join(
+        home, "app-server-control", "app-server-control.sock"))
+
+
 def _codex_resume_sids(
     args: tuple[bytes, ...] | None,
     sid_by_arg: Mapping[bytes, str],
@@ -298,6 +445,95 @@ def _is_interactive_codex_tui(
             b"app-server", b"mcp-server", b"exec", b"execpolicy",
         )
     )
+
+
+def _fold_npm_tui_launchers(
+    scan: HolderScan,
+    processes: Iterable[DarwinProcessInfo],
+    *,
+    read_process: Callable[[int], DarwinProcessInfo | None],
+) -> set[ProcessIdentity]:
+    """Count npm's Node launcher and its native child as one terminal client.
+
+    Only fold a direct, unique native TUI child with the same terminal and
+    forwarded arguments. Re-read both complete process identities before
+    suppressing the launcher's weak evidence; PID reuse, exit/exec races and
+    ambiguous or independent TUIs must remain unknown rather than fail open.
+    Actual writable rollout FDs are never discarded, even on a launcher.
+    """
+    rows = list(processes)
+    children: dict[int, list[DarwinProcessInfo]] = {}
+    for row in rows:
+        _identity, ppid, tty_nr, args = row
+        if (args and args[0].rsplit(b"/", 1)[-1] in {b"codex", b"codex.exe"}
+                and _is_interactive_codex_tui(args, tty_nr)):
+            children.setdefault(ppid, []).append(row)
+
+    folded: set[ProcessIdentity] = set()
+    for parent in rows:
+        identity, _ppid, tty_nr, args = parent
+        if (len(args) < 2
+                or args[0].rsplit(b"/", 1)[-1] not in {
+                    b"node", b"nodejs", b"node.exe"}
+                or args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+                or not _is_interactive_codex_tui(args, tty_nr)):
+            continue
+        candidates = children.get(identity.pid, [])
+        if len(candidates) != 1:
+            continue
+        child = candidates[0]
+        child_identity, _child_ppid, child_tty, child_args = child
+        if (child_tty != tty_nr
+                or child_identity.start_ticks < identity.start_ticks
+                or child_args[1:] != args[2:]):
+            continue
+        if (read_process(identity.pid) != parent
+                or read_process(child_identity.pid) != child):
+            continue
+        folded.add(identity)
+        scan.client_proxies.pop(identity, None)
+        for sid, logical in scan.logical_holders.items():
+            if identity in logical:
+                logical.discard(identity)
+                scan.holders[sid].discard(identity)
+    return folded
+
+
+def _is_owned_npm_app_server_child(
+    child: DarwinProcessInfo,
+    own_roots: Mapping[int, ProcessIdentity],
+    *,
+    read_process: Callable[[int], DarwinProcessInfo | None],
+) -> bool:
+    """Recognize the native server behind an exact wrapper-owned npm launcher.
+
+    ``CodexHandle.proc`` is Node for npm installs, not the native server/proxy.
+    Exclude only its direct headless Codex child with identical forwarded argv.
+    This is not recursive descendant ownership: shells, TUIs, shared daemons
+    and other clients started by a model must still be scanned independently.
+    Re-read the whole parent/child/parent chain to reject PID reuse, exec and
+    reparenting races instead of trusting names or a stale parent PID alone.
+    """
+    identity, ppid, tty_nr, args = child
+    root = own_roots.get(ppid)
+    if (root is None or tty_nr != 0 or not args
+            or args[0].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.exe"}
+            or args[1:3] not in {
+                (b"app-server", b"proxy"), (b"app-server", b"--stdio")}):
+        return False
+    parent = read_process(ppid)
+    if parent is None:
+        return False
+    parent_identity, _parent_ppid, parent_tty, parent_args = parent
+    if (parent_identity != root or parent_tty != 0 or len(parent_args) < 3
+            or parent_args[0].rsplit(b"/", 1)[-1] not in {
+                b"node", b"nodejs", b"node.exe"}
+            or parent_args[1].rsplit(b"/", 1)[-1] not in {b"codex", b"codex.js"}
+            or identity.start_ticks < root.start_ticks
+            or args[1:] != parent_args[2:]):
+        return False
+    return (read_process(identity.pid) == child
+            and read_process(ppid) == parent)
 
 
 def _rollout_cwd(path: str) -> str | None:
@@ -387,6 +623,8 @@ def _fd_is_writable(proc_dir: Path, fd_name: str) -> bool | None:
 def _darwin_writable_rollout_holders(
     paths: Mapping[str, str],
     own_processes: Iterable[ProcessIdentity],
+    *,
+    process_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
 ) -> HolderScan:
     """Use lsof to detect exact rollout writers on macOS.
 
@@ -397,7 +635,9 @@ def _darwin_writable_rollout_holders(
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
     private = {sid: set() for sid in paths}
+    logical = {sid: set() for sid in paths}
     client_proxies: dict[ProcessIdentity, int] = {}
+    sid_by_arg = {sid.encode(): sid for sid in paths}
     filenames: list[str] = []
     for sid, path in paths.items():
         try:
@@ -407,7 +647,8 @@ def _darwin_writable_rollout_holders(
         by_inode.setdefault((stat.st_dev, stat.st_ino), set()).add(sid)
         filenames.append(path)
     if not filenames:
-        return HolderScan(result, True, passive, client_proxies, private)
+        return HolderScan(result, True, passive, client_proxies, private,
+                          logical_holders=logical)
     try:
         completed = subprocess.run(
             [
@@ -425,36 +666,30 @@ def _darwin_writable_rollout_holders(
     if completed.returncode not in (0, 1):
         return HolderScan(result, False, passive, client_proxies, private)
 
-    # Native Codex TUIs connect through a short headless proxy which does not
-    # open the rollout. Preserve the existing log-based exact thread binding on
-    # macOS instead of regressing the terminal-attached indicator.
-    try:
-        proxies = subprocess.run(
-            ["/usr/bin/pgrep", "-f", "codex.*app-server.*proxy"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        proxies = None
-        complete = False
-    else:
-        complete = proxies.returncode in (0, 1)
-    if proxies is not None and proxies.returncode == 0:
-        for value in proxies.stdout.split():
-            try:
-                proxy_pid = int(value)
-            except ValueError:
-                complete = False
-                continue
-            info = _darwin_process_info(proxy_pid)
-            if info is None:
-                complete = False
-                continue
-            identity, _ppid, tty_nr, args = info
-            if _is_app_server_proxy(args, tty_nr):
-                client_proxies[identity] = identity.start_ticks * 1_000_000_000
+    own = set(own_processes)
+    # Shared-daemon TUIs do not open the rollout. Include both their local
+    # interactive process and remote/headless proxies in the structured log
+    # binding pool; the caller then filters each identity to its CODEX_HOME.
+    snapshot = process_snapshot or darwin_process_snapshot()
+    processes, process_scan_complete = snapshot
+    complete = process_scan_complete
+    own_roots = {identity.pid: identity for identity in own}
+    for row in processes:
+        if row[0] not in own and _is_owned_npm_app_server_child(
+            row, own_roots, read_process=_darwin_process_info,
+        ):
+            own.add(row[0])
+    for identity, _ppid, tty_nr, args in processes:
+        if identity in own:
+            continue
+        interactive_tui = _is_interactive_codex_tui(args, tty_nr)
+        if _is_app_server_proxy(args, tty_nr) or interactive_tui:
+            client_proxies[identity] = (
+                identity.start_ticks)
+        if interactive_tui:
+            for sid in _codex_resume_sids(args, sid_by_arg):
+                result[sid].add(identity)
+                logical[sid].add(identity)
 
     pid: int | None = None
     access = ""
@@ -491,7 +726,6 @@ def _darwin_writable_rollout_holders(
                 matches.setdefault(pid, set()).update(
                     by_inode.get((device, inode), ()))
 
-    own = set(own_processes)
     for holder_pid, sids in matches.items():
         before = _darwin_process_info(holder_pid)
         if before is None:
@@ -506,11 +740,23 @@ def _darwin_writable_rollout_holders(
             continue
         for sid in sids:
             result[sid].add(identity)
+            # Match Linux semantics: an exact writable rollout FD is stronger
+            # than argv-only evidence and must survive profile filtering.
+            logical[sid].discard(identity)
             if _is_passive_app_server(Path(), tty_nr, args):
                 passive[sid].add(identity)
                 if not _is_managed_shared_app_server(args):
                     private[sid].add(identity)
-    return HolderScan(result, complete, passive, client_proxies, private)
+    scan = HolderScan(
+        result, complete, passive, client_proxies, private,
+        logical_holders=logical,
+        darwin_snapshot=snapshot,
+    )
+    _fold_npm_tui_launchers(
+        scan, (row for row in processes if row[0] not in own),
+        read_process=_darwin_process_info,
+    )
+    return scan
 
 
 def writable_rollout_holders(
@@ -519,6 +765,7 @@ def writable_rollout_holders(
     *,
     proc_root: str = "/proc",
     shell_snapshot_root: str | None = None,
+    darwin_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
 ) -> HolderScan:
     """Return writable holders of each rollout, excluding exact wrapper children.
 
@@ -527,12 +774,14 @@ def writable_rollout_holders(
     before and after the FD walk to reject PID/FD reuse races.
     """
     if sys.platform == "darwin" and proc_root == "/proc":
-        return _darwin_writable_rollout_holders(paths, own_processes)
+        return _darwin_writable_rollout_holders(
+            paths, own_processes, process_snapshot=darwin_snapshot)
 
     by_inode: dict[tuple[int, int], set[str]] = {}
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
     private = {sid: set() for sid in paths}
+    logical = {sid: set() for sid in paths}
     client_proxies: dict[ProcessIdentity, int] = {}
     sid_by_arg = {sid.encode(): sid for sid in paths}
     for sid, path in paths.items():
@@ -545,12 +794,24 @@ def writable_rollout_holders(
         return HolderScan(result, True, passive, client_proxies, private)
 
     own = set(own_processes)
+    own_roots = {identity.pid: identity for identity in own}
     root = Path(proc_root)
+
+    def read_process(pid: int) -> DarwinProcessInfo | None:
+        proc_dir = root / str(pid)
+        before = _process_stat(proc_dir)
+        args = _process_cmdline(proc_dir)
+        if before is None or args is None or _process_stat(proc_dir) != before:
+            return None
+        ppid, start, tty_nr = before
+        return ProcessIdentity(pid, start), ppid, tty_nr, args
+
     if shell_snapshot_root is None:
         codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
         shell_snapshot_root = os.path.join(codex_home, "shell_snapshots")
     snapshots = _shell_snapshot_rows(paths, shell_snapshot_root)
     unresolved_tuis: list[tuple[ProcessIdentity, int, str]] = []
+    tui_processes: list[DarwinProcessInfo] = []
     if own:
         own_fd_visible = False
         for identity in own:
@@ -576,19 +837,24 @@ def writable_rollout_holders(
             proc_stat = _process_stat(proc_dir)
             if proc_stat is None:
                 continue
-            _, start, tty_nr = proc_stat
+            ppid, start, tty_nr = proc_stat
             identity = ProcessIdentity(pid, start)
             if identity in own:
                 continue
             args = _process_cmdline(proc_dir)
-            if _is_app_server_proxy(args, tty_nr):
+            if args and _is_owned_npm_app_server_child(
+                (identity, ppid, tty_nr, args), own_roots,
+                read_process=read_process,
+            ):
+                continue
+            interactive_tui = _is_interactive_codex_tui(args, tty_nr)
+            if _is_app_server_proxy(args, tty_nr) or interactive_tui:
                 try:
                     client_proxies[identity] = proc_dir.stat().st_ctime_ns
                 except OSError:
                     complete = False
             logical_sids = (
                 _codex_resume_sids(args, sid_by_arg) if tty_nr != 0 else set())
-            interactive_tui = _is_interactive_codex_tui(args, tty_nr)
             matched: set[str] = set()
             try:
                 fds = proc_dir.joinpath("fd").iterdir()
@@ -626,6 +892,8 @@ def writable_rollout_holders(
             # its descriptors/cmdline were scanned. Only accept a stable identity.
             if _process_start_ticks(proc_dir) != start:
                 continue
+            if interactive_tui and args:
+                tui_processes.append((identity, ppid, tty_nr, args))
             if not logical_sids and interactive_tui:
                 try:
                     cwd = os.path.realpath(os.readlink(proc_dir / "cwd"))
@@ -636,6 +904,8 @@ def writable_rollout_holders(
                     unresolved_tuis.append((identity, started_ns, cwd))
             for sid in logical_sids:
                 result[sid].add(identity)
+                if sid not in matched:
+                    logical[sid].add(identity)
             for sid in matched:
                 result[sid].add(identity)
                 if _is_passive_app_server(proc_dir, tty_nr, args):
@@ -644,11 +914,16 @@ def writable_rollout_holders(
                         private[sid].add(identity)
     except OSError:
         return HolderScan(result, False, passive, client_proxies, private)
+
+    scan = HolderScan(result, complete, passive, client_proxies, private,
+                      logical_holders=logical)
+    folded = _fold_npm_tui_launchers(
+        scan, tui_processes, read_process=read_process)
     for identity, sid in _snapshot_tui_bindings(
-        unresolved_tuis, snapshots,
+        [row for row in unresolved_tuis if row[0] not in folded], snapshots,
     ).items():
         result[sid].add(identity)
-    return HolderScan(result, complete, passive, client_proxies, private)
+    return scan
 
 
 def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
@@ -670,11 +945,13 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
     started: set[str] = set()
     finished: set[str] = set()
     ordered: list[tuple[str, str]] = []
+    terminals: list[RolloutTerminalMarker] = []
+    automatic_started: set[str] = set()
     has_visible_user_message = False
     for line in lines:
         try:
             record = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             continue
         if not isinstance(record, dict) or record.get("type") != "event_msg":
             continue
@@ -682,23 +959,86 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         if not isinstance(payload, dict):
             continue
         kind = payload.get("type")
-        if kind == "user_message":
-            message = payload.get("message")
-            if visible_codex_user_message(message):
-                has_visible_user_message = True
+        user = codex_rollout_user_message(payload)
+        if user is not None and user.prompt:
+            has_visible_user_message = True
         turn_id = payload.get("turn_id")
-        if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
+        if not isinstance(turn_id, str) or not _SAFE_WIRE_ID.fullmatch(turn_id):
             continue
         if kind == "task_started":
             started.add(turn_id)
             ordered.append((kind, turn_id))
+            root_id = payload.get("root_turn_id")
+            if (isinstance(root_id, str) and _SAFE_WIRE_ID.fullmatch(root_id)
+                    and root_id != turn_id):
+                automatic_started.add(turn_id)
         elif kind in _TERMINAL_EVENTS:
             finished.add(turn_id)
             ordered.append((kind, turn_id))
+            reason = str(payload.get("reason") or "").lower()
+            status = (
+                "completed"
+                if kind in {"task_complete", "task_completed"} and payload.get("error") is None
+                else "interrupted"
+                if kind == "task_cancelled" or (
+                    kind == "turn_aborted"
+                    and reason not in {"error", "failed", "crash"}
+                )
+                else "failed"
+            )
+            duration = payload.get("duration_ms")
+            duration_ms = (
+                int(duration)
+                if isinstance(duration, (int, float))
+                and not isinstance(duration, bool)
+                and (not isinstance(duration, float) or math.isfinite(duration))
+                and duration > 0
+                and duration <= MAX_SAFE_WIRE_INTEGER
+                else None
+            )
+            completed = payload.get("completed_at")
+            completed_at = (
+                float(completed)
+                if isinstance(completed, (int, float))
+                and not isinstance(completed, bool)
+                and (not isinstance(completed, float) or math.isfinite(completed))
+                and completed >= 0
+                and completed <= MAX_SAFE_WIRE_TIMESTAMP_SECONDS
+                else None
+            )
+            terminals.append(RolloutTerminalMarker(
+                turn_id=turn_id,
+                status=status,
+                duration_ms=duration_ms,
+                completed_at=completed_at,
+            ))
     return TurnMarkers(
         frozenset(started), frozenset(finished), carry, tuple(ordered),
-        has_visible_user_message,
+        has_visible_user_message, tuple(terminals),
+        frozenset(automatic_started),
     )
+
+
+def codex_active_goal_turn(path: str, *, max_bytes: int) -> str | None:
+    """Return only the latest unfinished, explicitly rooted continuation.
+
+    This is a bounded candidate read, never proof that a writer is alive. The
+    caller must validate the exact id against the owning shared app-server.
+    """
+    with open(path, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        start = max(0, size - max_bytes)
+        stream.seek(start)
+        data = stream.read(max_bytes)
+    if start:
+        _, _, data = data.partition(b"\n")
+    markers = parse_turn_markers(data)
+    if not markers.ordered:
+        return None
+    kind, turn_id = markers.ordered[-1]
+    if kind == "task_started" and turn_id in markers.automatic_started:
+        return turn_id
+    return None
 
 
 _CODEX_REQUEST_MARKER = "## My request for Codex:"
@@ -737,6 +1077,9 @@ def visible_codex_user_message(message: object) -> str | None:
     text = message.strip()
     if not text:
         return None
+    delegation = parse_codex_delegation(text)
+    if delegation is not None:
+        return delegation.prompt
     marker = text.rfind(_CODEX_REQUEST_MARKER)
     if marker >= 0:
         request = text[marker + len(_CODEX_REQUEST_MARKER):].strip()
@@ -745,3 +1088,64 @@ def visible_codex_user_message(message: object) -> str | None:
     if lowered.startswith(_INTERNAL_CODEX_USER_PREFIXES):
         return None
     return text
+
+
+def codex_user_item_text(item: object) -> str | None:
+    """Extract text from an official Codex user item without interpreting it."""
+    if not isinstance(item, dict):
+        return None
+    direct = item.get("text")
+    if isinstance(direct, str):
+        return direct
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        part.get("text")
+        for part in content
+        if (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    ]
+    return "".join(parts) if parts else None
+
+
+def codex_rollout_user_message(
+    payload: object,
+) -> CodexRolloutUserMessage | None:
+    """Normalize legacy and current persisted user-message records."""
+    if not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    message_id: str | None = None
+    client_id = payload.get("client_id")
+    turn_id = payload.get("turn_id")
+    if payload_type == "user_message":
+        raw_text = payload.get("message")
+    elif payload_type == "item_completed":
+        item = payload.get("item")
+        if isinstance(item, dict):
+            item = normalize_codex_delegation_item(item)
+        if (
+            not isinstance(item, dict)
+            or str(item.get("type") or "").lower() != "usermessage"
+        ):
+            return None
+        raw_text = codex_user_item_text(item)
+        message_id = item.get("id")
+        client_id = item.get("clientId") or item.get("client_id") or client_id
+    else:
+        return None
+    if not isinstance(raw_text, str):
+        return None
+    delegation = parse_codex_delegation(raw_text)
+    return CodexRolloutUserMessage(
+        source_thread_id=delegation.source_thread_id if delegation else None,
+        raw_text=raw_text,
+        prompt=visible_codex_user_message(raw_text),
+        message_id=message_id if isinstance(message_id, str) else None,
+        client_id=client_id if isinstance(client_id, str) else None,
+        turn_id=turn_id if isinstance(turn_id, str) else None,
+    )

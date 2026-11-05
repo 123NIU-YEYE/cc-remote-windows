@@ -10,6 +10,7 @@ import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +35,106 @@ from cc_remote.protocol import (
 from cc_remote.wrapper.git_diff import read_git_diff
 from cc_remote.wrapper.preview_capabilities import PreviewCapabilityStore
 from tests.test_multisession import _mk_ctx, _mk_machine
+
+
+@pytest.mark.parametrize("extension", ["mmd", "MERMAID"])
+def test_mermaid_artifact_reads_exact_source_as_text(tmp_path, extension):
+    source = "flowchart TD\n  camera[双目相机] --> decoder[硬件解码]\n"
+    path = tmp_path / f"camera_navigation_pipeline.{extension}"
+    path.write_text(source, encoding="utf-8")
+    preview = machine_module.WrapperMachine._read_file_preview(str(tmp_path), path.name)
+    assert preview["format"] == "text"
+    assert preview["content"] == source
+    assert preview["truncated"] is False
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+@pytest.mark.parametrize("foreign_owner", [False, True])
+def test_code_open_reads_os_readable_files_outside_session(
+        tmp_path, monkeypatch, engine, foreign_owner):
+    root = tmp_path / "session"
+    root.mkdir()
+    target = tmp_path / "CLAUDE.md"
+    target.write_text("# readable project instructions", encoding="utf-8")
+    real_fstat = os.fstat
+    target_stat = target.stat()
+
+    def file_stat(fd):
+        result = real_fstat(fd)
+        if foreign_owner and result.st_ino == target_stat.st_ino:
+            values = {key: getattr(result, key) for key in dir(result)
+                      if key.startswith("st_")}
+            values["st_uid"] = os.geteuid() + 1
+            return SimpleNamespace(**values)
+        return result
+
+    monkeypatch.setattr(os, "fstat", file_stat)
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        ctx.engine = engine
+        ctx.space = "code"
+        machine.sessions[ctx.key] = ctx
+        for path in [str(target), "../CLAUDE.md"]:
+            response = await machine._handle_get_file_preview(GetFilePreview(
+                sid=ctx.key, client_id="client-1", path=path,
+                request_id="open-file"))
+            assert isinstance(response, FilePreview)
+            assert response.error is None
+            assert response.content == "# readable project instructions"
+            assert response.writable is False
+            assert response.to == "client-1"
+            assert response.sid == ctx.key
+        assert not any(isinstance(event, PreviewAuthorizationRequired)
+                       for event in transport.sent)
+        assert ctx.buffer.tail_seq == 0
+        capability = machine._preview_capabilities(ctx)[str(target)]
+        with target.open("rb") as handle:
+            assert capability.matches(os.fstat(handle.fileno()))
+            assert not capability.matches(
+                os.fstat(handle.fileno()), require_write=True)
+        assert len(machine._preview_capabilities(ctx)) == 1
+        if foreign_owner:
+            with pytest.raises(preview_capabilities.PreviewCapabilityError,
+                               match="只允许编辑"):
+                machine._preview_capability_store.grant_path(
+                    engine, "code", ctx.key, str(target),
+                    mode="read_write", source="user_approved")
+
+    asyncio.run(run())
+
+
+def test_code_open_reports_os_permission_denial(tmp_path, monkeypatch):
+    root = tmp_path / "session"
+    root.mkdir()
+    target = tmp_path / "private.md"
+    target.write_text("private", encoding="utf-8")
+    original_open = os.open
+
+    def deny_target(path, *args, **kwargs):
+        if str(path) == str(target):
+            raise PermissionError("denied by operating system")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_target)
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.cwd = str(root)
+        ctx.space = "code"
+        machine.sessions[ctx.key] = ctx
+        response = await machine._handle_get_file_preview(GetFilePreview(
+            sid=ctx.key, client_id="client-1", path=str(target),
+            request_id="denied-file"))
+        assert isinstance(response, FilePreview)
+        assert response.error == "没有权限读取该文件"
+        assert response.content == ""
+        assert machine._preview_capabilities(ctx) == {}
+
+    asyncio.run(run())
 
 
 def test_markdown_preview_reads_utf8_and_normalizes_paths(tmp_path):
@@ -152,12 +253,14 @@ def test_rendered_artifacts_read_html_images_and_pdf_without_persistence(tmp_pat
     )
     (tmp_path / "diagram.svg").write_bytes(svg_bytes)
     (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x1a\npreview")
+    (tmp_path / "animation.gif").write_bytes(b"GIF89a\x01\x00\x01\x00preview")
     (tmp_path / "report.pdf").write_bytes(b"%PDF-1.7\npreview")
     machine, _ = _mk_machine()
 
     html = machine._read_file_preview(str(tmp_path), "page.html")
     svg = machine._read_file_preview(str(tmp_path), "diagram.svg")
     image = machine._read_file_preview(str(tmp_path), "image.png")
+    animation = machine._read_file_preview(str(tmp_path), "animation.gif")
     pdf = machine._read_file_preview(str(tmp_path), "report.pdf")
 
     assert html["format"] == "html" and "<h1>Report</h1>" in html["content"]
@@ -166,10 +269,13 @@ def test_rendered_artifacts_read_html_images_and_pdf_without_persistence(tmp_pat
     assert svg["data"] == svg_bytes
     assert image["format"] == "image" and image["media_type"] == "image/png"
     assert image["data"] == b"\x89PNG\r\n\x1a\npreview"
+    assert animation["format"] == "image"
+    assert animation["media_type"] == "image/gif"
+    assert animation["data"] == b"GIF89a\x01\x00\x01\x00preview"
     assert pdf["format"] == "pdf" and pdf["media_type"] == "application/pdf"
     assert pdf["data"] == b"%PDF-1.7\npreview"
     assert sorted(path.name for path in tmp_path.iterdir()) == [
-        "diagram.svg", "image.png", "page.html", "report.pdf",
+        "animation.gif", "diagram.svg", "image.png", "page.html", "report.pdf",
     ]
 
 
@@ -179,6 +285,101 @@ def test_rendered_artifact_rejects_mismatched_content_type(tmp_path):
 
     with pytest.raises(ValueError, match="格式不匹配"):
         machine._read_file_preview(str(tmp_path), "fake.png")
+
+
+@pytest.mark.parametrize("prolog", [
+    '<!-- Exported diagram -->\n',
+    '\ufeff<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
+    '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"\n'
+    ' "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n'
+    '<!-- Generated by graphviz version 14.1.2\n -->\n'
+    '<!-- Title: runtime Pages: 1 -->\n',
+    '<?xml version="1.0"?>\n<!-- Before DTD -->\n'
+    '<!DOCTYPE svg>\n<!-- After DTD -->\n',
+    '<!-- Text containing > and <svg> is only a comment -->\n',
+])
+@pytest.mark.parametrize("root", [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">'
+    '<text x="1" y="12">图</text></svg>',
+    '<svg/>',
+])
+def test_svg_preview_accepts_exporter_prologs_without_changing_bytes(tmp_path, prolog, root):
+    data = (prolog + root).encode("utf-8")
+    path = tmp_path / "diagram.svg"
+    path.write_bytes(data)
+    before = path.stat()
+    machine, _ = _mk_machine()
+
+    preview = machine._read_file_preview(str(tmp_path), path.name)
+
+    assert preview["format"] == "image"
+    assert preview["media_type"] == "image/svg+xml"
+    assert preview["data"] == data
+    assert machine._read_preview_asset(str(tmp_path), path.name) == (
+        path.name, "image/svg+xml", data,
+    )
+    assert path.read_bytes() == data
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("document", [
+    '<!-- <svg/> --> <html/>',
+    '<!-- unfinished <svg/>',
+    '<!-- a comment --> not xml <svg/>',
+    '<!-- a comment --> <svg-script/>',
+    '<!DOCTYPE html><!-- <svg/> --><html><svg/></html>',
+    '<!-- only a comment -->',
+])
+def test_svg_preview_does_not_find_a_root_inside_comments_or_other_content(
+    tmp_path, document,
+):
+    (tmp_path / "invalid.svg").write_text(document, encoding="utf-8")
+    machine, _ = _mk_machine()
+    for read in (machine._read_file_preview, machine._read_preview_asset):
+        with pytest.raises(ValueError, match="SVG 文件根元素无效"):
+            read(str(tmp_path), "invalid.svg")
+
+
+@pytest.mark.parametrize("actual,media_type", [
+    ("JPEG", "image/jpeg"), ("PNG", "image/png"),
+    ("GIF", "image/gif"), ("WEBP", "image/webp"),
+])
+def test_misnamed_rasters_use_content_type_without_changing_file(tmp_path, actual, media_type):
+    from PIL import Image
+    import io
+
+    output = io.BytesIO()
+    Image.new("RGB", (16, 8), "red").save(output, format=actual)
+    data = output.getvalue()
+    name = "export.jpg" if actual == "PNG" else "export.png"
+    path = tmp_path / name
+    path.write_bytes(data)
+    before = path.stat()
+    machine, _ = _mk_machine()
+    preview = machine._read_file_preview(str(tmp_path), name)
+    assert preview["format"] == "image" and preview["media_type"] == media_type
+    assert preview["data"] == data
+    assert machine._read_preview_asset(str(tmp_path), name) == (name, media_type, data)
+    assert path.read_bytes() == data and path.stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("payload", [b"<html>hi</html>", b"<svg></svg>", b"%PDF-1.7", b"unknown"])
+def test_raster_sniffing_does_not_enable_active_or_unrecognized_formats(tmp_path, payload):
+    (tmp_path / "fake.png").write_bytes(payload)
+    machine, _ = _mk_machine()
+    for read in (machine._read_file_preview, machine._read_preview_asset):
+        with pytest.raises(ValueError, match="格式不匹配"):
+            read(str(tmp_path), "fake.png")
+
+
+def test_raster_detection_preserves_external_authorization(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "misnamed.png"
+    outside.write_bytes(b"\xff\xd8\xffjpeg")
+    machine, _ = _mk_machine()
+    with pytest.raises(ValueError):
+        machine._read_file_preview(str(root), str(outside))
 
 
 def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch):
@@ -366,14 +567,15 @@ def test_successful_write_grants_exact_cross_cwd_preview_and_edit(tmp_path):
         assert preview.path == str(outside.resolve())
         assert preview.content == "# created"
 
-        required = await machine._handle_get_file_preview(GetFilePreview(
+        neighbor_preview = await machine._handle_get_file_preview(GetFilePreview(
             sid=ctx.key,
             client_id="client-1",
             path=str(neighbor),
             request_id="preview-neighbor",
         ))
-        assert isinstance(required, PreviewAuthorizationRequired)
-        assert required.resolved_path == str(neighbor.resolve())
+        assert isinstance(neighbor_preview, FilePreview)
+        assert neighbor_preview.content == "secret"
+        assert neighbor_preview.writable is False
 
         saved = await machine._handle_save_markdown(SaveMarkdown(
             sid=ctx.key,
@@ -430,6 +632,7 @@ def test_history_write_replay_never_rebinds_a_replaced_external_file(tmp_path):
     outside.write_text("# original", encoding="utf-8")
     machine, _ = _mk_machine()
     ctx = _mk_ctx("session-1", session_id="session-1")
+    ctx.space = "work"
     ctx.cwd = str(root)
     machine.sessions[ctx.key] = ctx
 
@@ -482,7 +685,7 @@ def test_history_write_replay_never_rebinds_a_replaced_external_file(tmp_path):
     asyncio.run(require_confirmation())
 
 
-def test_unknown_external_preview_requires_explicit_read_only_authorization(
+def test_work_external_preview_requires_explicit_read_only_authorization(
         tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -492,6 +695,7 @@ def test_unknown_external_preview_requires_explicit_read_only_authorization(
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.space = "work"
         ctx.cwd = str(root)
         machine.sessions[ctx.key] = ctx
         machine.focused_sid = ctx.key
@@ -564,8 +768,10 @@ def test_preview_authorization_is_client_session_and_identity_bound(tmp_path):
     async def run():
         machine, _ = _mk_machine()
         first = _mk_ctx("session-1", session_id="session-1")
+        first.space = "work"
         first.cwd = str(root)
         second = _mk_ctx("session-2", session_id="session-2")
+        second.space = "work"
         second.cwd = str(root)
         machine.sessions[first.key] = first
         machine.sessions[second.key] = second
@@ -643,6 +849,7 @@ def test_preview_authorization_expires_and_deny_never_inspects_file(
     async def run():
         machine, _ = _mk_machine()
         ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.space = "work"
         ctx.cwd = str(root)
         machine.sessions[ctx.key] = ctx
         store = machine._preview_capability_store
@@ -715,6 +922,7 @@ def test_preview_authorization_ttl_uses_a_monotonic_clock(
     async def run():
         machine, _ = _mk_machine()
         ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.space = "work"
         ctx.cwd = str(root)
         machine.sessions[ctx.key] = ctx
         required = await machine._handle_get_file_preview(GetFilePreview(
@@ -749,6 +957,7 @@ def test_authorize_preview_duplicate_replays_granted_result(tmp_path):
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("session-1", session_id="session-1")
+        ctx.space = "work"
         ctx.cwd = str(root)
         machine.sessions[ctx.key] = ctx
         required = await machine._handle_get_file_preview(GetFilePreview(
@@ -1257,10 +1466,11 @@ def test_machine_preview_rekey_and_delete_migrate_then_clear_state(tmp_path):
     async def run():
         machine, _ = _mk_machine()
         ctx = _mk_ctx("temp-session", session_id=None)
+        ctx.space = "work"
         ctx.cwd = str(root)
         machine.sessions[ctx.key] = ctx
         machine._preview_capability_store.grant_path(
-            "claude", "code", ctx.key, str(outside),
+            "claude", "work", ctx.key, str(outside),
             mode="read", source="user_approved",
         )
 
@@ -1275,9 +1485,11 @@ def test_machine_preview_rekey_and_delete_migrate_then_clear_state(tmp_path):
         ))
         assert isinstance(required, PreviewAuthorizationRequired)
 
-        await machine._rekey_preview_session(ctx, ctx.key, "real-session")
-        assert machine._preview_capabilities(ctx) == {}
-        ctx.session_id = "real-session"
+        old_key = ctx.key
+        await machine._capture_session_id(ctx, "real-session")
+        assert machine._preview_capability_store.snapshot(
+            "claude", "work", old_key,
+        ) == {}
         assert str(outside.resolve()) in machine._preview_capabilities(ctx)
         assert machine._preview_challenges[
             required.authorization_id
@@ -1287,6 +1499,7 @@ def test_machine_preview_rekey_and_delete_migrate_then_clear_state(tmp_path):
         # runtime for the same durable sid must retain its exact capabilities.
         machine.sessions.pop(ctx.key)
         resumed = _mk_ctx("real-session", session_id="real-session")
+        resumed.space = "work"
         resumed.cwd = str(root)
         machine.sessions[resumed.key] = resumed
         assert str(outside.resolve()) in machine._preview_capabilities(resumed)
@@ -1494,7 +1707,9 @@ def test_markdown_preview_rejects_invalid_utf8(tmp_path):
 
 
 def test_preview_asset_is_type_limited_and_bounded(tmp_path):
-    (tmp_path / "image.png").write_bytes(b"png")
+    png = b"\x89PNG\r\n\x1a\npreview"
+    (tmp_path / "image.png").write_bytes(png)
+    (tmp_path / "fake.gif").write_bytes(b"not-a-gif")
     vector = (
         b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4 4">'
         b'<circle cx="2" cy="2" r="2"/></svg>'
@@ -1506,12 +1721,14 @@ def test_preview_asset_is_type_limited_and_bounded(tmp_path):
 
     path, media_type, data = machine._read_preview_asset(
         str(tmp_path), "image.png")
-    assert (path, media_type, data) == ("image.png", "image/png", b"png")
+    assert (path, media_type, data) == ("image.png", "image/png", png)
     assert machine._read_preview_asset(str(tmp_path), "vector.svg") == (
         "vector.svg", "image/svg+xml", vector,
     )
     with pytest.raises(ValueError, match="SVG"):
         machine._read_preview_asset(str(tmp_path), "invalid.svg")
+    with pytest.raises(ValueError, match="格式不匹配"):
+        machine._read_preview_asset(str(tmp_path), "fake.gif")
     with pytest.raises(ValueError, match="4 MiB"):
         machine._read_preview_asset(str(tmp_path), "large.webp")
 

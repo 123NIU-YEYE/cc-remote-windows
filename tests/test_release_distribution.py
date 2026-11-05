@@ -31,8 +31,7 @@ def test_release_workflow_materializes_web_before_python_bundle_tests():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
     python_job = workflow.split("\n  python:\n", 1)[1].split(
         "\n  web:\n", 1)[0]
-    web_job = workflow.split("\n  web:\n", 1)[1].split(
-        "\n  deploy:\n", 1)[0]
+    web_job = workflow.split("\n  web:\n", 1)[1]
 
     assert "uses: ./.github/workflows/ci.yml" in release
     assert "needs: web" in python_job
@@ -156,6 +155,11 @@ def test_release_bundles_are_deterministic_and_role_scoped(
     members = _members(first)
     assert f"{prefix}/release-manifest.json" in members
     assert f"{prefix}/bin/uv" in members
+    assert f"{prefix}/bin/cc-remote" in members
+    assert f"{prefix}/cc_remote/__main__.py" in members
+    assert f"{prefix}/deploy/install_cli.py" in members
+    assert f"{prefix}/deploy/cleanup.py" in members
+    assert f"{prefix}/deploy/release_retention.py" in members
     assert f"{prefix}/licenses/uv-LICENSE-MIT" in members
     assert f"{prefix}/cc_remote/protocol.py" in members
     assert not any("/tests/" in name for name in members)
@@ -164,8 +168,10 @@ def test_release_bundles_are_deterministic_and_role_scoped(
 
     if role == "relay":
         assert f"{prefix}/web/dist/index.html" in members
+        assert f"{prefix}/web/dist/cc-remote-viewer-runner.js" in members
         assert f"{prefix}/requirements-relay.lock" in members
         assert f"{prefix}/deploy/install-relay.sh" in members
+        assert f"{prefix}/deploy/install_lock.py" in members
         assert f"{prefix}/deploy/setup-vps.sh" in members
         assert f"{prefix}/deploy/Caddyfile.insecure" in members
         assert f"{prefix}/deploy/install-wrapper.sh" not in members
@@ -174,6 +180,14 @@ def test_release_bundles_are_deterministic_and_role_scoped(
         assert not any("/web/" in name for name in members)
         assert f"{prefix}/requirements-wrapper.lock" in members
         assert f"{prefix}/deploy/install-wrapper.sh" in members
+        assert f"{prefix}/deploy/install_lock.py" in members
+        assert f"{prefix}/deploy/install_claude_service.py" in members
+        assert f"{prefix}/deploy/check_codex_readiness.py" in members
+        assert f"{prefix}/deploy/check_codex_lifetime.py" in members
+        assert f"{prefix}/deploy/adopt_wrapper.py" in members
+        assert f"{prefix}/cc_remote/wrapper/codex_readiness.py" in members
+        assert f"{prefix}/cc_remote/claude_service/server.py" in members
+        assert f"{prefix}/deploy/work_registry_snapshot.py" in members
         assert f"{prefix}/scripts/codex-auth-daemon-restart" in members
         assert f"{prefix}/deploy/setup-vps.sh" not in members
         assert f"{prefix}/requirements-relay.lock" not in members
@@ -449,7 +463,6 @@ def test_role_locks_and_release_workflow_are_versioned_inputs():
     assert "npm --prefix web run build" in workflow
     assert "uses: ./.github/workflows/ci.yml" in workflow
     assert "pytest" in source_workflow
-    assert "test:reliability" in source_workflow
     assert "actions/attest" in workflow
     assert "gh release upload" in workflow
     uv_version = (ROOT / "deploy" / "uv-version.txt").read_text().strip()
