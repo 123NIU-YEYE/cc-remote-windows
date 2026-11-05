@@ -513,7 +513,9 @@ def _windows_psutil():
     return psutil
 
 
-def windows_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
+def windows_process_snapshot(
+    *, names: Collection[str] | None = None,
+) -> tuple[list[DarwinProcessInfo], bool]:
     """Windows analogue of :func:`darwin_process_snapshot`.
 
     ``start_ticks`` carries the creation time in whole milliseconds so a
@@ -524,15 +526,29 @@ def windows_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
     if psutil is None:
         return [], False
     result: list[DarwinProcessInfo] = []
-    for proc in psutil.process_iter(
-            ["pid", "ppid", "create_time", "name", "cmdline"]):
+    complete = True
+    fields = (["pid", "name"] if names is not None
+              else ["pid", "ppid", "create_time", "name", "cmdline"])
+    selected_names = {name.casefold() for name in names} if names is not None else None
+    for index, proc in enumerate(psutil.process_iter(fields)):
+        if index >= MAX_PROC_SCAN:
+            return result, False
         try:
             info = proc.info
             pid = int(info["pid"])
-            ppid = int(info["ppid"] or 0)
-            created = float(info["create_time"] or 0.0)
             name = info.get("name") or ""
-            raw_args = info.get("cmdline") or []
+            if selected_names is not None and name.casefold() not in selected_names:
+                continue
+            ppid = int((proc.ppid() if selected_names is not None else info["ppid"]) or 0)
+            created = float((proc.create_time() if selected_names is not None else info["create_time"]) or 0.0)
+            if selected_names is None:
+                raw_args = info.get("cmdline") or []
+            else:
+                try:
+                    raw_args = proc.cmdline()
+                except psutil.AccessDenied:
+                    complete = False
+                    raw_args = []
             args = tuple(
                 str(arg).encode("utf-8", "surrogatepass") for arg in raw_args
             ) or ((name.encode("utf-8", "surrogatepass"),) if name else ())
@@ -542,7 +558,11 @@ def windows_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
                 0,                       # no controlling terminal on Windows
                 args,
             ))
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            if selected_names is not None:
+                complete = False
             # Vanished processes are irrelevant; processes we may not inspect
             # cannot be this user's Claude CLI either, because the scan only
             # ever matches the account's own processes.
@@ -551,7 +571,7 @@ def windows_process_snapshot() -> tuple[list[DarwinProcessInfo], bool]:
             continue
         if len(result) >= MAX_PROC_SCAN:
             return result, False
-    return result, True
+    return result, complete
 
 
 def windows_process_cwds(
