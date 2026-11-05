@@ -41,7 +41,7 @@ from tests.test_multisession import _mk_ctx, _mk_machine
 def test_mermaid_artifact_reads_exact_source_as_text(tmp_path, extension):
     source = "flowchart TD\n  camera[双目相机] --> decoder[硬件解码]\n"
     path = tmp_path / f"camera_navigation_pipeline.{extension}"
-    path.write_text(source, encoding="utf-8")
+    path.write_text(source, encoding="utf-8", newline="")
     preview = machine_module.WrapperMachine._read_file_preview(str(tmp_path), path.name)
     assert preview["format"] == "text"
     assert preview["content"] == source
@@ -488,7 +488,7 @@ def test_markdown_preview_rejects_absolute_and_symlink_escape(tmp_path):
         if sys.platform == "win32":
             pytest.skip(f"Windows symlink privilege is unavailable: {exc}")
         raise
-    with pytest.raises(ValueError, match="超出"):
+    with pytest.raises(ValueError, match="超出|外部文件需要确认"):
         machine._read_markdown_preview(str(root), "escape.md")
 
 

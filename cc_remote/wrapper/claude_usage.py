@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import signal
 import stat
+import sys
 import time
 
 from cc_remote.claude_profiles import ClaudeProfile
@@ -37,8 +38,13 @@ class ClaudeUsageReader:
             with self.path.open("rb") as stream:
                 info = os.fstat(stream.fileno())
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                        or info.st_mode & 0o077 or info.st_size > MAX_BYTES):
+                        or (sys.platform != "win32" and info.st_mode & 0o077)
+                        or info.st_size > MAX_BYTES):
                     raise ValueError()
+                if sys.platform == "win32":
+                    from cc_remote.windows_privacy import owned_path
+                    if not owned_path(self.path, private=True):
+                        raise ValueError()
                 raw = json.loads(stream.read(MAX_BYTES + 1))
             if not isinstance(raw, dict) or raw.get("version") != 1:
                 raise ValueError()
@@ -125,7 +131,11 @@ class ClaudeUsageReader:
         finally:
             if process is not None and process.returncode is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    if sys.platform == "win32":
+                        from cc_remote.wrapper.os_compat import kill_process_tree
+                        await asyncio.to_thread(kill_process_tree, process.pid)
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 await process.wait()

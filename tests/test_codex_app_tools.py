@@ -17,6 +17,8 @@ from cc_remote.wrapper.process_scan import ProcessIdentity
 
 
 def test_private_socket_rejects_world_access_and_symlinks():
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("macOS private socket integration requires native AF_UNIX")
     # Darwin sockaddr_un cannot hold pytest's long per-test directory paths.
     with tempfile.TemporaryDirectory(prefix="cc-app-", dir="/tmp") as root:
         path = Path(root) / "app.sock"
@@ -70,6 +72,8 @@ def test_discovery_requires_exact_shared_profile(monkeypatch, tmp_path, home, en
 ])
 @pytest.mark.parametrize("protected_alias", [False, True])
 def test_shared_app_requires_profile_bound_bridge_and_both_connection_ends(monkeypatch, failure, protected_alias):
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("macOS bridge integration requires native AF_UNIX")
     with tempfile.TemporaryDirectory(prefix="cc-bridge-", dir="/tmp") as root:
         profile = Path(root).resolve()
         directory = profile / "app-server-control"
@@ -155,9 +159,11 @@ def test_changed_official_policy_cannot_use_old_approval_rules(monkeypatch, tmp_
 
 
 def test_discovery_rejects_two_matching_apps_and_pid_reuse(monkeypatch, tmp_path):
+    node = tmp_path / "node"
+    node.write_bytes(b"runtime")
     monkeypatch.setattr(tools.sys, "platform", "darwin")
     monkeypatch.setattr(tools, "socket_identity", lambda _path: (0, 0, 0))
-    monkeypatch.setattr(tools, "app_paths", lambda _app: (tmp_path, tmp_path, tmp_path, "test"))
+    monkeypatch.setattr(tools, "app_paths", lambda _app: (tmp_path, node, tmp_path, "test"))
     monkeypatch.setattr(tools, "_signed", lambda _path: None)
     monkeypatch.setattr(tools, "_matching_app_pids", lambda _exe: [41, 42])
     monkeypatch.setattr(tools, "process_identity", lambda pid: ProcessIdentity(pid, 1))
@@ -174,6 +180,8 @@ def test_discovery_rejects_two_matching_apps_and_pid_reuse(monkeypatch, tmp_path
 
 
 def test_open_log_marker_must_be_an_app_owned_socket(monkeypatch, tmp_path):
+    if os.name == "nt":
+        pytest.skip("macOS App tools parse native POSIX log/socket paths")
     root = tmp_path / "Library/Logs/com.openai.codex"
     root.mkdir(parents=True)
     log = root / "codex-desktop-test-42-t0-i1.log"
@@ -233,6 +241,8 @@ def _ready_app(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("failure", [None, "cross_account", "shared_directory", "shared_socket"])
 def test_discovery_validates_protected_daemon_alias(monkeypatch, failure):
+    if not hasattr(socket, "AF_UNIX"):
+        pytest.skip("macOS protected socket integration requires native AF_UNIX")
     with tempfile.TemporaryDirectory(prefix="cc-app-", dir="/tmp") as root:
         profile = Path(root).resolve()
         control = profile / "app-server-control"

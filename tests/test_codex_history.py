@@ -2498,7 +2498,7 @@ def test_legacy_rollout_user_pair_reuses_live_item_identity(tmp_path):
         },
     ]
     encoded_rows = [json.dumps(row) + "\n" for row in rows]
-    rollout.write_text("".join(encoded_rows), encoding="utf-8")
+    rollout.write_bytes("".join(encoded_rows).encode("utf-8"))
 
     events, _model = codex_translate_history(str(rollout), 64 * 1024)
     users = [event for event in events if isinstance(event, UserMsg)]
@@ -2587,7 +2587,7 @@ def test_native_user_page_cursor_accepts_previous_task_cursor(tmp_path):
         },
     ]
     encoded_rows = [json.dumps(row) + "\n" for row in rows]
-    rollout.write_text("".join(encoded_rows), encoding="utf-8")
+    rollout.write_bytes("".join(encoded_rows).encode("utf-8"))
     current_offset = sum(len(row.encode()) for row in encoded_rows[:3])
 
     native_page = codex_history_window(
@@ -2635,7 +2635,7 @@ def test_rollout_history_applies_segment_and_native_message_aliases(tmp_path):
         },
     ]
     encoded_rows = [json.dumps(row) + "\n" for row in rows]
-    rollout.write_text("".join(encoded_rows), encoding="utf-8")
+    rollout.write_bytes("".join(encoded_rows).encode("utf-8"))
 
     events, _model = codex_translate_history(
         str(rollout),

@@ -55,7 +55,10 @@ def test_readmes_use_safe_markdown_for_navigation_and_images():
         assert '<p align="center">' not in document
         assert "<img " not in document
         assert "<a href=" not in document
-        assert document.count("](assets/") == 6
+        # The Windows guide may use a different number of screenshots; all
+        # illustrations and navigation still use Markdown rather than raw HTML.
+        for target in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", document):
+            assert target.startswith(("assets/", "https://"))
 
     assert "[English](README_en.md)" in readme
     assert "[中文](README.md)" in readme_en

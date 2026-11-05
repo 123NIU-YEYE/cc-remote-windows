@@ -13,6 +13,7 @@ import tarfile
 
 import pytest
 
+
 from cc_remote import __version__
 from cc_remote.protocol import PROTOCOL_VERSION
 from deploy.build_release import BuildError, _copy_tree, build_bundle
@@ -20,6 +21,8 @@ from deploy.release_manifest import (
     ReleaseManifestError,
     validate_release_directory,
 )
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="Unix immutable-release installer and rollback contract")
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +43,7 @@ def test_release_workflow_materializes_web_before_python_bundle_tests():
     assert web_job.index("npm --prefix web run build") < web_job.index(
         "name: ci-web-dist")
     assert python_job.index("name: ci-web-dist") < python_job.index(
-        ".venv/bin/python -m pytest")
+        "${{ matrix.python }} -m pytest")
 
 
 def _fake_uv(tmp_path: Path) -> Path:

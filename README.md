@@ -1,5 +1,9 @@
 # cc-remote-windows
 
+[English](README_en.md) · 产品版本：v4.0.29 · protocol v81
+
+终端界面说明见 [TUI 使用指南](docs/tui_zh.md)，按 `Space e` 打开会话树。
+
 **cc-remote 的 Windows 移植分支。** 在本机跑一个 Wrapper，把 **DeepSeek Harness 桌面版 / Codex / Claude Code** 的会话、工具过程和文件改动带到手机或任意浏览器的 cc-remote 界面里。
 
 > 上游项目与完整产品文档见 [`README.upstream.md`](README.upstream.md) 和 [`docs/`](docs/)。

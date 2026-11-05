@@ -60,6 +60,8 @@ async def test_image_zoom_pan_fit_and_close_are_local(monkeypatch, custom):
             app.client, "s", PreviewRef("board.png", "image"), FakeImage,
         ))
         await pilot.pause()
+        await app.screen.worker.wait()
+        await pilot.pause()
         canvas = app.screen.query_one(ImageCanvas)
         assert canvas.source.size == (1980, 2052)
         assert canvas.size.height > 9

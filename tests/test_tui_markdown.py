@@ -112,7 +112,8 @@ def test_tables_keep_all_columns_values_and_link_targets(width):
     assert "---" not in text.plain and "**" not in text.plain
     assert url in text.plain  # Not only wrapped fragments in a cell.
     if width == 70:
-        assert "╭" in text.plain and "╰" in text.plain
+        assert any(corner in text.plain for corner in ("╭", "┌"))
+        assert any(corner in text.plain for corner in ("╰", "└"))
         assert all(
             cell_len(line) <= width
             for line in text.plain.splitlines()
@@ -337,7 +338,8 @@ async def test_folded_markdown_progress_keeps_tool_styles_and_navigation():
         app.paint()  # Do not race the workspace's 100 ms presentation timer.
         await pilot.pause()
         assert "**progress explanation**" not in reader.text
-        assert "progress explanation" in reader.text and "╭" in reader.text
+        assert "progress explanation" in reader.text
+        assert any(corner in reader.text for corner in ("╭", "┌"))
         assert body_style(reader, "progress explanation") == ""
         assert "echo test" not in reader.text
         start = next(i for i, b in app.starts if b.role == "tool_group")

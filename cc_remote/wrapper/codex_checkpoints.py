@@ -17,7 +17,6 @@ checkpoint boundary.  Empty directories are not representable in Git trees.
 """
 
 from __future__ import annotations
-import shutil
 
 import copy
 from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
@@ -251,7 +250,8 @@ def cleanup_codex_checkpoint_session(
                 f".{candidate.name}.delete-{uuid.uuid4().hex}"
             )
             try:
-                os.replace(candidate, tombstone)
+                if sys.platform != "win32":
+                    os.replace(candidate, tombstone)
             except FileNotFoundError:
                 tombstone = None
                 continue
@@ -265,7 +265,9 @@ def cleanup_codex_checkpoint_session(
                 os.close(lock_fd)
         if tombstone is not None:
             try:
-                shutil.rmtree(tombstone, ignore_errors=False)
+                if sys.platform == "win32":
+                    os.replace(candidate, tombstone)
+                force_rmtree(tombstone)
             except OSError as exc:
                 raise CheckpointError(
                     "Unable to remove Codex checkpoint journal"

@@ -48,6 +48,7 @@ def test_unknown_service_hierarchy_never_falls_back(monkeypatch):
         codex_service.needs_isolation()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Linux service-user isolation contract")
 def test_account_environment_is_private_and_exact(monkeypatch, tmp_path):
     env = {"HOME": str(tmp_path), "CODEX_HOME": str(tmp_path / "sibling"),
            "MODEL_TEST_SECRET": "not-a-real-key", "PATH": os.defpath}
@@ -78,6 +79,7 @@ def test_account_environment_is_private_and_exact(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("failure", ["missing-runner", "missing-manager", "timeout"])
+@pytest.mark.skipif(os.name == "nt", reason="Linux service-user isolation contract")
 def test_isolation_failure_never_launches_directly(monkeypatch, tmp_path, failure):
     calls = []
     monkeypatch.setattr(codex_daemon, "needs_isolation", lambda: True)

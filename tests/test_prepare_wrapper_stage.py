@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 from pathlib import Path
 import stat
 
 import pytest
+
 
 from deploy import prepare_wrapper_stage as stage_module
 from deploy.prepare_wrapper_stage import (
@@ -16,6 +18,8 @@ from deploy.prepare_wrapper_stage import (
     prepare_stage,
     select_uv_command,
 )
+
+pytestmark = pytest.mark.skipif(os.name == "nt", reason="Unix immutable-release installer and rollback contract")
 
 
 def _release_tree(

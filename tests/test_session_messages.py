@@ -78,7 +78,8 @@ def test_store_survives_restart_conflicts_and_caller_isolation(tmp_path):
     store.settle(original["message_id"], "accepted")
     store.settle(original["message_id"], "unknown")
     assert store.get(SOURCE, "r")["status"] == "accepted"
-    assert os.stat(store.root).st_mode & 0o077 == 0
+    from tests.platform_capabilities import assert_private
+    assert_private(store.root, 0o700)
 
 
 def backend(monkeypatch, target_engine="claude"):
@@ -234,6 +235,7 @@ async def test_claude_bound_mcp_and_live_echo(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="native Unix messaging transport")
 async def test_real_stdio_mcp_binds_codex_metadata_and_private_socket(monkeypatch):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
@@ -291,6 +293,7 @@ async def test_real_stdio_mcp_binds_codex_metadata_and_private_socket(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not hasattr(asyncio, "start_unix_server"), reason="native Unix messaging transport")
 async def test_corrupt_ack_is_unknown_not_a_rejection():
     with tempfile.TemporaryDirectory(prefix="crm-ack-", dir="/tmp") as folder:
         path = Path(folder) / "control.sock"

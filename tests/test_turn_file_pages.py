@@ -1,7 +1,9 @@
 """File-index pagination reads immutable native evidence, never the worktree."""
 import asyncio
+import os
 import json
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 from pydantic import ValidationError
@@ -44,10 +46,11 @@ def test_all_321_files_are_paged_with_one_file_diff_read(tmp_path, monkeypatch):
     archive.put(*scope[:2], payload, final=True)
     statements = []
     connect = archive._connect
+    @contextmanager
     def traced():
-        db = connect()
-        db.set_trace_callback(statements.append)
-        return db
+        with connect() as db:
+            db.set_trace_callback(statements.append)
+            yield db
     monkeypatch.setattr(archive, "_connect", traced)
     files, offset = [], 0
     while offset is not None:
@@ -72,13 +75,13 @@ def test_file_pages_and_diffs_are_scoped_and_immutable_after_later_edits(tmp_pat
     reopened = TurnChangeArchive(tmp_path)
     identity = ("codex:one@session", "first", original["revision"])
     assert reopened.page(*identity, 128)["next_offset"] is None
-    assert "+later" not in reopened.file(*identity, "src/file-129.py")["diff"]
+    assert "+later" not in reopened.file(*identity, os.path.normpath("src/file-129.py"))["diff"]
     for scope in (("claude:one@session", *identity[1:]),
                   ("codex:two@session", *identity[1:]),
                   (identity[0], "second", identity[2]),
                   (identity[0], identity[1], "missing")):
         assert reopened.page(*scope, 64) is None
-        assert reopened.file(*scope, "src/file-129.py") is None
+        assert reopened.file(*scope, os.path.normpath("src/file-129.py")) is None
     assert reopened.file(*identity, "../../secrets") is None
     for offset, limit in ((-1, 64), (True, 64), (131, 64), (0, 0), (0, 65)):
         with pytest.raises(ValueError):
@@ -95,7 +98,7 @@ def test_pre_normalization_archives_still_support_pages_and_rekey_cleanup(tmp_pa
                    ("codex:old", "turn", payload["revision"], json.dumps(payload)))
     identity = ("codex:old", "turn", payload["revision"])
     assert len(archive.page(*identity, 64)["files"]) == 64
-    assert archive.file(*identity, "src/file-129.py")["state"] == "available"
+    assert archive.file(*identity, os.path.normpath("src/file-129.py"))["state"] == "available"
     current = capture(321)
     archive.put("codex:old", "new-turn", current, final=True)
     archive.rekey("codex:old", "codex:renamed")

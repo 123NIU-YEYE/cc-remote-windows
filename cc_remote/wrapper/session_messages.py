@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import sys
 from uuid import uuid4
 
 from cc_remote.log import logger
@@ -29,9 +30,14 @@ class MessageStore:
 
     @contextmanager
     def db(self):
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(self.root)
+        else:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or (sys.platform != "win32" and info.st_mode & 0o077)):
             raise ValueError("Message state must be a private directory owned by this user")
         path = self.root / "receipts.sqlite3"
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)

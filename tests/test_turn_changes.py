@@ -1,5 +1,6 @@
 import json
 import asyncio
+import os
 import difflib
 import random
 
@@ -116,7 +117,7 @@ def test_native_claude_structured_patch_not_substring_guess():
 def test_native_write_uses_proven_before_image_not_a_creation_guess():
     update = native_claude_diff({"type": "update", "filePath": "src/code.py",
                                 "originalFile": "A\n", "content": "B\n", "structuredPatch": []})
-    assert "--- src/code.py" in update and "-A\n+B" in update
+    assert f"--- {os.path.normpath('src/code.py')}" in update and "-A\n+B" in update
     created = native_claude_diff({"type": "create", "filePath": "src/new.py",
                                  "originalFile": None, "content": "new\n", "structuredPatch": []})
     assert "--- /dev/null" in created
@@ -144,7 +145,7 @@ def test_relative_paths_are_cwd_scoped_and_renames_do_not_duplicate_files():
     rename = edit("two", "--- src/code.py\n+++ src/renamed.py\n@@ -1 +1 @@\n-B\n+C\n",
                   path="/repo/src/renamed.py")
     file, = project_turn_changes(original + rename, "/repo")["files"]
-    assert file["path"] == "/repo/src/renamed.py"
+    assert file["path"] == os.path.normpath("/repo/src/renamed.py")
     assert "-A\n+C" in file["diff"]
     # No suffix matching across distinct absolute directories.
     other = edit("three", patch("X", "Y", "/elsewhere/src/renamed.py"), path="/elsewhere/src/renamed.py")
@@ -163,7 +164,7 @@ def test_random_sequential_insert_delete_replace_composes_to_original_result():
             after[start:start + rng.randrange(3)] = [f"new-{step}-{index}" for index in range(rng.randrange(3))]
             if after == current:
                 continue
-            raw = "\n".join(difflib.unified_diff(current, after, fromfile="src/code.py", tofile="src/code.py", lineterm="")) + "\n"
+            raw = "\n".join(difflib.unified_diff(current, after, fromfile=os.path.normpath("src/code.py"), tofile=os.path.normpath("src/code.py"), lineterm="")) + "\n"
             events += edit(str(step), raw)
             current = after
         file, = project_turn_changes(events)["files"]
@@ -199,6 +200,7 @@ def test_archived_diff_request_is_immutable_scoped_and_never_reads_worktree():
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("profile@session", "session")
+        ctx.cwd = os.path.abspath(ctx.cwd)
         ctx.engine = "claude"
         ctx.active_msg_id = "logical-turn"
         machine.sessions[ctx.key] = ctx
@@ -214,7 +216,7 @@ def test_archived_diff_request_is_immutable_scoped_and_never_reads_worktree():
         await machine._emit(ctx, terminal)
         changes = [event for event in transport.sent if isinstance(event, TurnFileChanges)][-1]
         assert transport.sent[0].type == "tool_use"  # owner source frame always precedes the sidecar
-        path = ctx.cwd + "/src/code.py"
+        path = os.path.join(ctx.cwd, "src", "code.py")
         command = GetDiff(sid=ctx.key, file=path, turn_id="native-user", revision=changes.changes.revision,
                           engine="claude", cmd_id="read", client_id="browser")
         machine.sessions.clear()  # cold read must not spawn or consult an engine

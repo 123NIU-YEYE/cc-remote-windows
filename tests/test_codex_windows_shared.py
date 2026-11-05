@@ -1,7 +1,6 @@
 """Desktop sharing requires live identity-bound connections, not history files."""
 from types import SimpleNamespace
 
-import psutil
 import pytest
 
 from cc_remote import codex_windows_shared as shared
@@ -10,6 +9,7 @@ from cc_remote.wrapper.process_scan import ProcessIdentity
 
 @pytest.mark.parametrize("failure", [None, "home", "url", "reverse", "disconnected", "reused", "daemon"])
 def test_app_acceptance_requires_same_profile_and_both_live_connection_ends(tmp_path, monkeypatch, failure):
+    psutil = pytest.importorskip("psutil", reason="Windows Desktop bridge dependency")
     home = tmp_path.resolve()
     executable = (home / "Official.exe").resolve()
     value = {"pid": 20, "daemon_pid": 30}

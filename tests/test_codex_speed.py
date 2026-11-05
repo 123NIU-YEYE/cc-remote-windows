@@ -151,7 +151,9 @@ def test_catalog_reads_later_pages_and_rejects_cursor_loops(monkeypatch, repeat_
                               "nextCursor": "next" if repeat_cursor else None}
             replies.feed_data((json.dumps({"id": request["id"], "result": result}) + "\n").encode())
 
+        monkeypatch.setattr(models, "kill_process_tree", lambda _pid: None)
         process = SimpleNamespace(
+            pid=99999999,
             stdin=SimpleNamespace(write=write, drain=lambda: asyncio.sleep(0),
                                   close=lambda: closed.append(True)),
             stdout=replies, terminate=lambda: None, wait=lambda: asyncio.sleep(0),

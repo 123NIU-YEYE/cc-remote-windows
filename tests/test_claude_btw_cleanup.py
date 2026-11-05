@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -16,7 +17,7 @@ from tests.test_multisession import _mk_machine, _StubTransport
 
 
 SID = "11111111-1111-4111-8111-111111111111"
-CWD = "/workspace/project"
+CWD = str(Path("/workspace/project").absolute())
 
 
 def write_transcript(root, sid):

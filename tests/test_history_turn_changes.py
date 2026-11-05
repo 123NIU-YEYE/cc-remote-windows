@@ -1,6 +1,7 @@
 """History/file-list regressions: all I/O is private fixtures, no engine calls."""
 import asyncio
 import json
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -109,7 +110,7 @@ def test_official_idle_history_recovers_file_lists_without_expanding_tools(tmp_p
         )
         first, second = history.turns
         assert all(not turn.blocks for turn in history.turns)
-        assert first.fileChanges.files[0].path == "/repo/src/code.py"
+        assert first.fileChanges.files[0].path == str(Path("/repo/src/code.py"))
         assert first.fileChanges.files[0].state == "available"
         assert first.fileChanges.total_files == count
         assert len(first.fileChanges.files) == min(count, 64)
@@ -117,7 +118,7 @@ def test_official_idle_history_recovers_file_lists_without_expanding_tools(tmp_p
         assert first.fileChanges.revision != second.fileChanges.revision
         await machine._handle_get_diff(GetDiff(
             sid=ctx.key, engine="codex", turn_id=first.id,
-            revision=first.fileChanges.revision, file="/repo/src/code.py",
+            revision=first.fileChanges.revision, file=str(Path("/repo/src/code.py")),
         ))
         assert "-A\n+B" in transport.sent[-1].diff
         assert "+C" not in transport.sent[-1].diff
@@ -218,7 +219,7 @@ def test_history_copies_exact_live_alias_but_not_shared_native_task(tmp_path):
     summary = archive.history_summary("codex:session", {
         "id": "official-user", "clientMsgId": "client-message", "done": True,
     }, [], "/repo")
-    assert summary["files"][0]["path"] == "/repo/README.md"
+    assert summary["files"][0]["path"] == str(Path("/repo/README.md"))
     assert archive.get("codex:session", "official-user", summary["revision"]) == payload
     assert not archive.history_summary("codex:other", {
         "id": "official-user", "clientMsgId": "client-message", "done": True,
@@ -294,9 +295,9 @@ def test_missing_native_diff_keeps_markdown_list_and_storage_failure_keeps_paths
     machine, _ = _mk_machine()
     turn = {"id": "claude-old", "done": True}
     summary = machine._history_file_changes("session", "claude", [turn], {turn["id"]: events}, cwd="/repo")
-    assert summary[turn["id"]]["files"][0]["path"] == "/repo/README.md"
+    assert summary[turn["id"]]["files"][0]["path"] == str(Path("/repo/README.md"))
     assert summary[turn["id"]]["files"][0]["state"] == "unavailable"
     monkeypatch.setattr(machine._turn_change_archive, "put", lambda *_a, **_k: (_ for _ in ()).throw(OSError("full")))
     summary = machine._history_file_changes("session", "claude", [turn], {turn["id"]: events}, cwd="/repo")
-    assert summary[turn["id"]]["files"][0]["path"] == "/repo/README.md"
+    assert summary[turn["id"]]["files"][0]["path"] == str(Path("/repo/README.md"))
     assert summary[turn["id"]]["files"][0]["state"] == "unavailable"

@@ -184,6 +184,9 @@ def test_connect_honors_explicit_http_proxy_and_bypass(
     import os
     import urllib.request
 
+    if os.name == "nt" and len({key.lower() for key in environment}) < len(environment):
+        pytest.skip("Windows environment variables cannot represent distinct case-sensitive aliases")
+
     import cc_remote.wrapper.transport as transport_module
 
     for key in list(os.environ):

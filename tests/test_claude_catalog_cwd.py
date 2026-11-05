@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import os
+import io
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -21,6 +23,7 @@ from cc_remote.protocol import SwitchSession
 from cc_remote.wrapper import claude_catalog
 from tests.test_attachments import _complete_png
 from tests.test_multisession import _mk_machine
+from tests.platform_capabilities import require_path
 
 
 SID = "11111111-1111-4111-8111-111111111111"
@@ -31,6 +34,7 @@ EMOJI_PREFIX = ("----workspace-" + "long-project-component-" * 12)[:200]
 
 def write_image_transcript(root, cwd="/original-project", *, image_sizes=(100_000,), bucket=None, parent_uuid=None):
     path = root / "projects" / (bucket or _sanitize_path(cwd)) / f"{SID}.jsonl"
+    require_path(path)
     path.parent.mkdir(parents=True)
     metadata = b"Comment\x00"
     overhead = len(base64.b64decode(_complete_png((b"tEXt", metadata))))
@@ -133,12 +137,29 @@ def test_image_session_recovers_full_cwd_from_hashed_project_bucket(tmp_path, cw
 ])
 def test_cwd_recovery_rejects_invalid_buckets_and_later_prefix_collisions(tmp_path, bucket, cwd, parent_uuid):
     path = tmp_path / bucket / f"{SID}.jsonl"
+    require_path(path)
     path.parent.mkdir()
     row = {"type": "user", "uuid": "human", "parentUuid": parent_uuid,
            "sessionId": SID, "cwd": cwd, "message": {"role": "user", "content": "fixture"}}
     path.write_text(json.dumps(row) + "\n")
     info = SDKSessionInfo(session_id=SID, summary="fixture", last_modified=0)
     assert claude_catalog.recover_session_cwd(info, path).cwd is None
+
+
+@pytest.mark.parametrize("cwd,bucket,parent", [
+    (LONG_CWD, LONG_PREFIX + "-qyxukm", "earlier-turn"),
+    (LONG_CWD + "/🧪", LONG_PREFIX + "-ljv3l7", "earlier-turn"),
+    ("/🧪" + LONG_CWD, EMOJI_PREFIX + "-q5e8nz", "earlier-turn"),
+    (LONG_CWD, LONG_PREFIX + "-1legacyhash", None),
+])
+def test_native_bucket_recovery_logic_does_not_depend_on_host_path_limit(monkeypatch, cwd, bucket, parent):
+    from pathlib import Path
+    row = {"type": "user", "uuid": "human", "sessionId": SID,
+           "parentUuid": parent, "cwd": cwd, "message": {"role": "user", "content": "fixture"}}
+    payload = (json.dumps(row) + "\n").encode()
+    monkeypatch.setattr(Path, "open", lambda *_args, **_kw: io.BytesIO(payload))
+    info = SDKSessionInfo(session_id=SID, summary="fixture", last_modified=0)
+    assert claude_catalog.recover_session_cwd(info, Path(bucket) / f"{SID}.jsonl").cwd == cwd
 
 
 def test_long_cwd_legacy_hash_requires_explicit_native_root(tmp_path):
@@ -192,7 +213,9 @@ def test_catalog_hides_metadata_stub_without_removing_real_history(
     tmp_path, monkeypatch, explicit, directory,
 ):
     root = tmp_path / "profile"
-    path = write_image_transcript(root)
+    native_cwd = str(Path("/original-project").absolute())
+    directory = native_cwd if directory else None
+    path = write_image_transcript(root, cwd=native_cwd)
     original = path.read_bytes()
     stub_sid = "22222222-2222-4222-8222-222222222222"
     stub = path.with_name(f"{stub_sid}.jsonl")
@@ -230,14 +253,16 @@ def test_catalog_limit_counts_real_sessions_after_metadata_filter(
     tmp_path, monkeypatch, explicit, directory, limit,
 ):
     root = tmp_path / "profile"
-    image = write_image_transcript(root)
+    native_cwd = str(Path("/original-project").absolute())
+    directory = native_cwd if directory else None
+    image = write_image_transcript(root, cwd=native_cwd)
     os.utime(image, (1_700_000_002, 1_700_000_002))
     newer_sid, older_sid = str(UUID(int=1)), str(UUID(int=2))
     for sid, modified in [(newer_sid, 1_700_000_003), (older_sid, 1_700_000_001)]:
         path = image.with_name(f"{sid}.jsonl")
         path.write_text(json.dumps({
             "type": "user", "uuid": "human", "parentUuid": None,
-            "sessionId": sid, "cwd": "/original-project",
+            "sessionId": sid, "cwd": native_cwd,
             "message": {"role": "user", "content": "real conversation"},
         }) + "\n")
         os.utime(path, (modified, modified))
@@ -268,7 +293,7 @@ def test_catalog_limit_counts_real_sessions_after_metadata_filter(
     )
     expected = [newer_sid, SID, older_sid]
     assert [info.session_id for info in listed] == (expected[:limit] if limit > 0 else expected)
-    assert all(info.cwd == "/original-project" for info in listed)
+    assert all(info.cwd == native_cwd for info in listed)
     assert {path: path.read_bytes() for path in image.parent.iterdir()} == originals
 
 

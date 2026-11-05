@@ -20,6 +20,8 @@ if sys.platform == "win32":
         same contract ``fcntl.flock`` gives Unix callers that poll with their
         own retry loop). Without it, this blocks with internal retries.
         """
+        if hasattr(fd, "fileno"):
+            fd = fd.fileno()
         non_blocking = bool(operation & LOCK_NB)
         base_operation = operation & ~LOCK_NB
         if base_operation not in {LOCK_EX, LOCK_UN}:

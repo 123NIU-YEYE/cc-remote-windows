@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import sys
 import time
 from uuid import UUID, uuid4
 
@@ -67,14 +68,26 @@ class TaskStore:
         self.home = home.expanduser().resolve(strict=True)
         if not self.home.is_dir() or self.home.stat().st_uid != os.getuid():
             raise ValueError("Codex home must be an existing directory owned by this user")
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(self.home):
+                raise ValueError("Codex home must be owned by this user")
         self.root = self.home / "cc-remote-async-tasks"
         self.path = self.root / "tasks.sqlite3"
 
     @contextmanager
     def db(self):
-        self.root.mkdir(mode=0o700, exist_ok=True)
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            try:
+                private_directory(self.root)
+            except PermissionError as exc:
+                raise ValueError("Task state directory must be private and owned by this user") from exc
+        else:
+            self.root.mkdir(mode=0o700, exist_ok=True)
         info = self.root.lstat()
-        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or (sys.platform != "win32" and info.st_mode & 0o077)):
             raise ValueError("Task state directory must be private and owned by this user")
         if self.path.exists() or self.path.is_symlink():
             info = self.path.lstat()
@@ -183,14 +196,20 @@ class TaskStore:
         except FileNotFoundError:
             return []
         if (not stat.S_ISDIR(root.st_mode) or root.st_uid != os.getuid()
-                or root.st_mode & 0o077):
+                or (sys.platform != "win32" and root.st_mode & 0o077)):
             raise ValueError("Invalid task state directory")
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(self.root, private=True):
+                raise ValueError("Invalid task state directory")
         try:
             info = self.path.lstat()
         except FileNotFoundError:
             return []
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or info.st_mode & 0o077):
+                or (sys.platform != "win32" and info.st_mode & 0o077)):
+            raise ValueError("Invalid task database")
+        if sys.platform == "win32" and not owned_path(self.path, private=True):
             raise ValueError("Invalid task database")
         db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
         db.row_factory = sqlite3.Row

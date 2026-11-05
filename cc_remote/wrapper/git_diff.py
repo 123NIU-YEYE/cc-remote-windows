@@ -332,8 +332,10 @@ async def bounded_process_output(
 
     timed_out = False
 
-    def stop_group(sig: signal.Signals) -> None:
+    async def stop_group(sig: signal.Signals) -> None:
         if sys.platform == "win32":
+            from cc_remote.wrapper.os_compat import kill_process_tree
+            await asyncio.to_thread(kill_process_tree, proc.pid)
             try:
                 if proc.returncode is None:
                     proc.kill()
@@ -345,27 +347,35 @@ async def bounded_process_output(
         except ProcessLookupError:
             pass
 
+    async def reap() -> None:
+        try:
+            await asyncio.wait_for(discard_stdout_and_wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            await stop_group(_SIGKILL)
+            # A detached descendant can retain stdout after its parent exits.
+            # Close only our pipe, rather than waiting indefinitely for EOF.
+            transport = getattr(proc.stdout, "_transport", None)
+            if transport is not None:
+                transport.close()
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+
+    _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
     reaped = False
     try:
         try:
             await asyncio.wait_for(read_stdout(), timeout=timeout)
         except asyncio.TimeoutError:
             timed_out = True
-        _SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
         if timed_out:
-            stop_group(_SIGKILL)
+            await stop_group(_SIGKILL)
         elif truncated:
-            stop_group(signal.SIGTERM)
-        try:
-            await asyncio.wait_for(discard_stdout_and_wait(), timeout=2.0)
-        except asyncio.TimeoutError:
-            stop_group(_SIGKILL)
-            await discard_stdout_and_wait()
+            await stop_group(signal.SIGTERM)
+        await reap()
         reaped = True
     finally:
         if not reaped:
-            stop_group(_SIGKILL)
-            await discard_stdout_and_wait()
+            await stop_group(_SIGKILL)
+            await reap()
     if timed_out:
         raise asyncio.TimeoutError("diff command exceeded its time limit")
     text = b"".join(chunks).decode(errors="replace")

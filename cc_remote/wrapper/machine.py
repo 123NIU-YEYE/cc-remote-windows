@@ -4912,8 +4912,8 @@ class WrapperMachine:
                 control_turn_id,
                 stream_turn_id,
                 native_message_id,
-                source_device=source.device,
-                source_inode=source.inode,
+                source_device=source.device & ((1 << 64) - 1),
+                source_inode=source.inode & ((1 << 64) - 1),
                 expected_msg_id=ctx.codex_owned_msg_id,
                 daemon_epoch=(
                     None
@@ -5679,8 +5679,8 @@ class WrapperMachine:
         )
         persisted_stream_ids = (
             lease.stream_task_ids(
-                source_device=source.device,
-                source_inode=source.inode,
+                source_device=source.device & ((1 << 64) - 1),
+                source_inode=source.inode & ((1 << 64) - 1),
             )
             if source is not None else frozenset()
         )
@@ -5900,8 +5900,8 @@ class WrapperMachine:
                                 lease.turn_id,
                                 active_stream_id,
                                 native_message_id,
-                                source_device=source.device,
-                                source_inode=source.inode,
+                                source_device=source.device & ((1 << 64) - 1),
+                                source_inode=source.inode & ((1 << 64) - 1),
                                 expected_msg_id=lease.msg_id,
                                 daemon_epoch=lease.daemon_epoch,
                             )

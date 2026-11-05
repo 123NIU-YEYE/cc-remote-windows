@@ -101,7 +101,8 @@ def test_process_clock_store_is_private_and_fails_closed(tmp_path):
     store = CodexProcessClockStore(tmp_path / "state")
     store.observe_start(source, "browser-message", "native-turn", 10_000)
 
-    assert store.path.stat().st_mode & 0o077 == 0
+    from tests.platform_capabilities import assert_private
+    assert_private(store.path)
     payload = json.loads(store.path.read_text())
     payload["sources"][0]["clocks"][0]["started_ms"] = -1
     store.path.write_text(json.dumps(payload))

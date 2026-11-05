@@ -444,8 +444,9 @@ def test_one_explicit_profile_preserves_native_session_ids(tmp_path: Path) -> No
 
 
 def test_single_and_multi_profile_machines_require_shared_daemons(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
+    monkeypatch.setenv("CC_REMOTE_CODEX_DAEMON", "auto")
     multi, _transport = _machine(tmp_path)
     assert {
         profile_id: manager.require_shared

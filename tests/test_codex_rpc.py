@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 
 import pytest
@@ -194,6 +195,7 @@ def test_ephemeral_codex_pages_do_not_consume_the_public_catalog_limit(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX RLIMIT_NOFILE contract")
 def test_codex_rpc_can_raise_only_the_isolated_child_nofile_limit(
     monkeypatch,
     tmp_path,

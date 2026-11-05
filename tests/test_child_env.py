@@ -80,7 +80,14 @@ def test_claude_sdk_options_override_inherited_control_secrets(monkeypatch):
     for key in CONTROL_PLANE_SECRET_KEYS:
         monkeypatch.setenv(key, f"secret-{key}")
     options = SdkHandle(WrapperConfig())._options(None, "/tmp")
-    assert options.env == {key: "" for key in CONTROL_PLANE_SECRET_KEYS}
+    assert all(options.env[key] == "" for key in CONTROL_PLANE_SECRET_KEYS)
+    # The SDK also tombstones inherited proxy variables so the
+    # Wrapper's relay transport cannot redirect the user's model connection.
+    allowed = set(CONTROL_PLANE_SECRET_KEYS)
+    allowed.update({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                    "NODE_USE_ENV_PROXY"})
+    assert set(options.env) <= allowed
     assert options.settings is None
 
 

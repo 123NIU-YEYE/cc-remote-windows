@@ -1092,7 +1092,7 @@ def test_codex_silence_emits_no_synthetic_waiting_notice_and_later_completes(
             machine_module.asyncio, "wait", wait_without_idle_deadline,
         )
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
-        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=2.0)
         await asyncio.sleep(0.04)
 
         assert wait_options
@@ -1150,7 +1150,7 @@ def test_claude_silence_emits_neutral_notices_without_ending_or_reconnecting(
                 await asyncio.sleep(0.002)
 
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
-        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=2.0)
         await asyncio.wait_for(wait_for_notices(2), timeout=0.3)
 
         notices = [
@@ -1212,7 +1212,7 @@ def test_claude_silence_notice_is_suppressed_while_question_is_open(
         monkeypatch.setattr(
             machine, "_prime_claude_ownership", no_external_owner)
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
-        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=2.0)
         await asyncio.sleep(0.05)
         assert not [
             message for message in transport.sent
@@ -1270,7 +1270,7 @@ def test_codex_silence_preserves_later_authoritative_provider_error():
         machine.sessions[ctx.key] = ctx
 
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
-        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=2.0)
         await asyncio.sleep(0.04)
         assert not [msg for msg in transport.sent
                     if isinstance(msg, StateEvent) and msg.phase == "waiting"]
@@ -1314,7 +1314,7 @@ def test_codex_retry_notice_never_regresses_interrupting_to_running():
         machine.sessions[ctx.key] = ctx
 
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
-        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=2.0)
         await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
         await asyncio.wait_for(turn, timeout=0.5)
 

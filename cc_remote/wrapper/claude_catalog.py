@@ -159,7 +159,9 @@ def _directory_candidates(
 ) -> list[tuple[Path, str]]:
     """Return exact/prefix project dirs using the pinned SDK's path mapping."""
     canonical = _canonicalize_path(directory)
-    roots = [canonical]
+    # A copied native transcript retains its original cwd spelling. Include
+    # that exact bucket before host canonicalization (e.g. /repo on Windows).
+    roots = list(dict.fromkeys((directory, canonical)))
     if include_worktrees:
         try:
             for worktree in _get_worktree_paths(canonical):

@@ -1,4 +1,5 @@
 import json
+from contextlib import closing
 import os
 import sqlite3
 import sys
@@ -46,7 +47,7 @@ class WorkRegistryTests(unittest.TestCase):
     def test_legacy_schema_migration_is_safe_under_concurrent_initialize(self):
         store = WorkRegistry(self.root, "codex")
         self.root.mkdir(parents=True)
-        with sqlite3.connect(store.db_path) as db:
+        with closing(sqlite3.connect(store.db_path)) as db, db:
             db.execute(
                 """CREATE TABLE work_sessions (
                     work_id TEXT PRIMARY KEY,
@@ -71,7 +72,7 @@ class WorkRegistryTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(lambda _index: initialize(), range(workers)))
 
-        with sqlite3.connect(store.db_path) as db:
+        with closing(sqlite3.connect(store.db_path)) as db, db:
             columns = [row[1] for row in db.execute(
                 "PRAGMA table_info(work_sessions)"
             )]
@@ -432,7 +433,7 @@ class WorkRegistryTests(unittest.TestCase):
         store = WorkRegistry(self.root / "legacy-codex", "codex")
         store.initialize()
         now = time.time()
-        with sqlite3.connect(store.db_path) as db:
+        with closing(sqlite3.connect(store.db_path)) as db, db:
             db.execute(
                 """INSERT INTO work_schedules
                    (schedule_id, title, prompt, next_run_at, enabled,
@@ -452,7 +453,7 @@ class WorkRegistryTests(unittest.TestCase):
         # A second startup remains a no-op even though no topology revision was
         # created for this schema-only ownership migration.
         self.assertEqual(store.assign_legacy_codex_profile("primary"), 0)
-        with sqlite3.connect(store.db_path) as db:
+        with closing(sqlite3.connect(store.db_path)) as db, db:
             schedule_owner = db.execute(
                 "SELECT codex_profile_id FROM work_schedules "
                 "WHERE schedule_id = 'legacy'",
@@ -479,7 +480,7 @@ class WorkRegistryTests(unittest.TestCase):
                 run["run_id"], "session-finished", None, now=now + 1),
             "succeeded",
         )
-        with sqlite3.connect(self.store.db_path) as db:
+        with closing(sqlite3.connect(self.store.db_path)) as db, db:
             self.assertIsNone(db.execute(
                 "SELECT 1 FROM work_schedules WHERE schedule_id = ?",
                 (schedule_id,),
@@ -573,7 +574,8 @@ class WorkRegistryTests(unittest.TestCase):
         workspace = Path(record.cwd)
 
         self.assertTrue((workspace / "uploads").is_dir())
-        self.assertEqual((workspace / "uploads").stat().st_mode & 0o777, 0o700)
+        from tests.platform_capabilities import assert_private
+        assert_private(workspace / "uploads", 0o700)
         self.assertTrue(
             (workspace / "uploads" / ".cc-remote-upload-root").is_file())
         self.assertFalse((workspace.parent / "uploads").exists())
@@ -633,7 +635,7 @@ class WorkRegistryTests(unittest.TestCase):
 
     def test_repeated_initialize_does_not_rebuild_profile_identity_index(self):
         self.store.initialize()
-        with sqlite3.connect(self.store.db_path) as db:
+        with closing(sqlite3.connect(self.store.db_path)) as db, db:
             before = db.execute("PRAGMA schema_version").fetchone()[0]
             index_sql = db.execute(
                 "SELECT sql FROM sqlite_master "
@@ -642,7 +644,7 @@ class WorkRegistryTests(unittest.TestCase):
 
         self.store.initialize()
 
-        with sqlite3.connect(self.store.db_path) as db:
+        with closing(sqlite3.connect(self.store.db_path)) as db, db:
             after = db.execute("PRAGMA schema_version").fetchone()[0]
         self.assertIn("claude_profile_id", index_sql)
         self.assertEqual(after, before)

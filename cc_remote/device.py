@@ -12,6 +12,7 @@ import platform
 import socket
 import sys
 import tempfile
+from uuid import uuid4
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -51,8 +52,13 @@ def _write_private_text(path: Path, content: str, *, replace: bool) -> None:
         raise FileExistsError(
             f"device config already exists: {path} (pass --replace to replace it)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, staged_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    staged = Path(staged_name)
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import create_private_file
+        staged = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        fd = create_private_file(staged)
+    else:
+        fd, staged_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        staged = Path(staged_name)
     try:
         fchmod(fd, staged, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:

@@ -1,6 +1,7 @@
 """Slow native startup must isolate sessions without creating duplicate writers."""
 
 import asyncio
+import socket
 
 import pytest
 
@@ -8,6 +9,9 @@ from cc_remote.claude_service.server import Service
 from cc_remote.claude_service import server as service_module
 from cc_remote.claude_service.wire import ControllerLeaseConflict
 from tests.test_claude_service import FakeClient
+
+pytestmark = pytest.mark.skipif(not hasattr(socket, "AF_UNIX"),
+                               reason="persistent Claude service requires native Unix transport")
 
 
 def params(sid):

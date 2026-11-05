@@ -25,7 +25,8 @@ def test_private_atomic_tabs_exclude_transient_ids_and_secrets(tmp_path):
     saved.save(["a", "a", "b", "tmp-new", "btw-aside"], "b", ("claude", "work"))
     assert saved.load() == {
         "tabs": ["a", "b"], "active": "b", "scope": ["claude", "work"]}
-    assert saved.path.stat().st_mode & 0o777 == 0o600
+    from tests.platform_capabilities import assert_private
+    assert_private(saved.path)
     assert "localhost" not in saved.path.read_text()
     assert len(list(tmp_path.glob(".tabs-*"))) == 0
 

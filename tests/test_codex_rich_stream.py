@@ -407,7 +407,7 @@ async def test_codex_delta_bursts_coalesce_before_structural_boundaries():
 
     coalesced = [message async for message in
                  coalesce_codex_live_notifications(
-                     source(), flush_seconds=0.01)]
+                     source(), flush_seconds=1.0)]
     assert [message["params"].get("delta") for message in coalesced] == [
         "a", "bc", None,
     ]

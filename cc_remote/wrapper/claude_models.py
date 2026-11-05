@@ -11,6 +11,7 @@ from collections import OrderedDict
 from contextlib import ExitStack
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import time
@@ -84,11 +85,18 @@ async def _read_catalog(
         if work_only:
             # Match Work's sole policy source and provider allowlist. Never load
             # user/project customizations or put provider credentials in argv.
-            settings = scope.enter_context(tempfile.NamedTemporaryFile(
-                mode="w+", prefix="cc-remote-models-", suffix=".json"))
-            json.dump(_claude_runtime_settings(config_dir), settings)
-            settings.flush()
-            args.extend(["--setting-sources", "", "--settings", settings.name])
+            directory = Path(scope.enter_context(tempfile.TemporaryDirectory(prefix="cc-remote-models-"))) / "policy"
+            if sys.platform == "win32":
+                from cc_remote.windows_privacy import private_directory
+                private_directory(directory)
+            else:
+                directory.mkdir(mode=0o700)
+            settings = directory / "settings.json"
+            with os.fdopen(os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+                json.dump(_claude_runtime_settings(config_dir), stream)
+            # Close before spawning: Windows temporary handles otherwise prevent
+            # the daily CLI from opening its policy file.
+            args.extend(["--setting-sources", "", "--settings", str(settings)])
         elif isolate_account_env:
             args.extend(["--setting-sources", "user"])
         return await _initialize_catalog(args, cwd, env)

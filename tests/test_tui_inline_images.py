@@ -124,6 +124,10 @@ async def test_scroll_clips_images_and_never_covers_input(monkeypatch):
         reader.scroll_home(animate=False, immediate=True)
         await pilot.pause()
         await pilot.pause()
+        for _ in range(100):
+            if viewport.cache and viewport.pictures:
+                break
+            await pilot.pause(0.01)
         assert viewport.cache and viewport.pictures
         picture = viewport.query_one(InlinePicture)
         region = app.screen.find_widget(picture).visible_region

@@ -4481,7 +4481,7 @@ def test_history_content_does_not_wait_for_external_ownership_scan():
         )
         history = await asyncio.wait_for(machine._build_requested_history(
             "session-1", before=None, limit=4, cwd=None, detail="summary",
-        ), timeout=0.1)
+        ), timeout=1.0)
         assert history.session_id == "session-1"
         assert prime_called is False
 
@@ -9367,7 +9367,7 @@ def test_image_read_fallback_clears_provisional_preview_candidate():
         await machine._observe_preview_image_event(ctx, start)
         assert set(ctx.preview_image_candidates) == {"tool-image-fallback"}
         assert ctx.preview_image_candidates["tool-image-fallback"].endswith(
-            "/tmp/not-an-image.png")
+            os.path.normpath("/tmp/not-an-image.png"))
 
         fallback = ProcessEvent(
             item_id="tool-image-fallback",

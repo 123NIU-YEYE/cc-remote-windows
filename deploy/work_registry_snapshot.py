@@ -26,6 +26,13 @@ import tempfile
 import time
 from typing import Any
 
+if os.name == "nt":
+    # Direct script entrypoints need the same byte-exact descriptor support as
+    # the Wrapper. No account configuration or credentials are imported.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from cc_remote.wrapper.os_compat import install_windows_shims
+    install_windows_shims()
+
 
 SNAPSHOT_VERSION = 3
 _SUPPORTED_SNAPSHOT_VERSIONS = frozenset({1, 2, SNAPSHOT_VERSION})
@@ -76,7 +83,7 @@ def _regular_file(path: Path, *, optional: bool = False) -> bool:
         if optional:
             return False
         raise WorkRegistrySnapshotError(f"missing file: {path}") from None
-    if not stat.S_ISREG(info.st_mode):
+    if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
         raise WorkRegistrySnapshotError(f"expected a regular file: {path}")
     return True
 
@@ -283,10 +290,14 @@ def _backup_database(source: Path, destination: Path) -> dict[str, Any]:
 def _backup_private_file(
     source: Path, destination: Path, *, max_bytes: int,
 ) -> dict[str, Any]:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(source, flags)
     try:
         info = os.fstat(descriptor)
+        if os.name == "nt":
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(source, private=True):
+                raise WorkRegistrySnapshotError(f"wrapper state must be private: {source}")
         if (
             not stat.S_ISREG(info.st_mode)
             or stat.S_IMODE(info.st_mode) & ~0o700
@@ -344,6 +355,8 @@ def _backup_checkpoints(state_dir: Path, snapshot: Path) -> dict[str, Any]:
     def add(archive: tarfile.TarFile, parent_fd: int, name: str, relative: str) -> None:
         nonlocal count, total
         info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if getattr(info, "st_file_attributes", 0) & 0x400:
+            raise WorkRegistrySnapshotError("checkpoint reparse points are not supported")
         count += 1
         total += info.st_size if stat.S_ISREG(info.st_mode) else 0
         if (count > _MAX_CHECKPOINT_ENTRIES or total > _MAX_CHECKPOINT_BYTES
@@ -360,12 +373,17 @@ def _backup_checkpoints(state_dir: Path, snapshot: Path) -> dict[str, Any]:
                 if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
                     raise WorkRegistrySnapshotError("checkpoint directory changed during snapshot")
                 archive.addfile(member)
-                for child in sorted(os.listdir(fd)):
+                with os.scandir(fd) as entries:
+                    children = sorted(entry.name for entry in entries)
+                for child in children:
                     add(archive, fd, child, f"{relative}/{child}")
+                after = os.fstat(fd)
+                if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                    raise WorkRegistrySnapshotError("checkpoint directory changed during snapshot")
             finally:
                 os.close(fd)
         elif stat.S_ISREG(info.st_mode):
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=parent_fd)
             with os.fdopen(fd, "rb") as stream:
                 opened = os.fstat(fd)
                 if (opened.st_dev, opened.st_ino, opened.st_size) != (
@@ -477,7 +495,7 @@ def _restore_checkpoints(
 
 
 def _checkpoint_permissions(path: Path, member: tarfile.TarInfo) -> None:
-    if os.geteuid() == 0:
+    if os.name != "nt" and os.geteuid() == 0:
         os.chown(path, member.uid, member.gid)
     path.chmod(member.mode)
 
@@ -515,7 +533,14 @@ def create_snapshot(
                 f"snapshot destination is not empty: {destination}"
             )
     else:
-        destination.mkdir(mode=0o700, parents=True)
+        if os.name == "nt":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(destination)
+        else:
+            destination.mkdir(mode=0o700, parents=True)
+    if os.name == "nt":
+        from cc_remote.windows_privacy import private_directory
+        private_directory(destination)
     destination.chmod(0o700)
 
     manifest: dict[str, Any] = {
@@ -744,7 +769,7 @@ def _restore_private_file(
             stream.flush()
             os.fsync(stream.fileno())
         temporary.chmod(entry["mode"])
-        if os.geteuid() == 0:
+        if os.name != "nt" and os.geteuid() == 0:
             os.chown(temporary, entry["uid"], entry["gid"])
         _fsync_file(temporary)
         if destination.exists() or destination.is_symlink():
@@ -808,7 +833,7 @@ def _restore_database(backup: Path, database: Path, entry: dict[str, Any]) -> No
         if not all(isinstance(value, int) for value in (mode, uid, gid)):
             raise WorkRegistrySnapshotError("snapshot file metadata is invalid")
         temporary.chmod(mode)
-        if os.geteuid() == 0:
+        if os.name != "nt" and os.geteuid() == 0:
             os.chown(temporary, uid, gid)
         _fsync_file(temporary)
         _unlink_database_file(Path(f"{database}-wal"))
