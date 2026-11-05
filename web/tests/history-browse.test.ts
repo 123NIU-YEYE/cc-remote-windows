@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import {
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
   createHistoryBrowse,
   markBrowseDetail,
@@ -19,6 +20,7 @@ import {
 } from "../src/history-merge.ts";
 import { protectedHistoryTurnIds } from "../src/history-selection-guard.ts";
 import {
+  nextActiveDetailRequest,
   installTurnDetailProjectionPage,
   nextAutoLoadDetailTurn,
 } from "../src/history-detail-projection.ts";
@@ -88,6 +90,74 @@ assert.equal(canonicalTurnId(turn("optimistic", {
   historyTurnId: "native-user-message",
 })), "native-user-message");
 assert.equal(canonicalTurnId(turn("plain")), "plain");
+
+const sharedDisplayIdOlder = turn("shared-display", {
+  historyTurnId: "canonical-older",
+  prompt: "older legitimate row",
+});
+const sharedDisplayIdNewer = turn("shared-display", {
+  historyTurnId: "canonical-newer",
+  prompt: "newer legitimate row",
+});
+const compactionNativeId = "cross-page-compaction-native";
+const compactionOwner = turn("compaction-owner", {
+  forkPointId: compactionNativeId,
+  prompt: "canonical compaction owner",
+  blocks: [{
+    kind: "process",
+    item_id: "canonical-compaction",
+    processKind: "compaction",
+    phase: "end",
+    status: "succeeded",
+    turn_id: compactionNativeId,
+    title: "压缩上下文",
+    done: true,
+  }],
+});
+const compactionOrphan = turn("compaction-orphan", {
+  prompt: "",
+  blocks: [{
+    kind: "process",
+    item_id: "stale-compaction",
+    processKind: "compaction",
+    phase: "end",
+    status: "succeeded",
+    turn_id: compactionNativeId,
+    title: "压缩上下文",
+    done: true,
+  }],
+});
+const displayAliasRepair = createHistoryBrowse({
+  scopeKey,
+  sid: "display-alias-repair",
+  revision: "display-alias-revision",
+  generation: "display-alias-generation",
+  viewId: "display-alias-view",
+  baseTurns: [sharedDisplayIdNewer, compactionOwner],
+  basePageKey: "display-alias-head",
+  hasOlder: true,
+  olderCursor: "display-alias-cursor",
+  olderPage: {
+    pageKey: "display-alias-older",
+    turns: [sharedDisplayIdOlder, compactionOrphan],
+    hasOlder: false,
+    olderCursor: null,
+    newerPageKey: "display-alias-head",
+  },
+  limits: limits(10),
+});
+assert.deepEqual(
+  displayAliasRepair.projection.turns.map((item) => [
+    item.id, item.historyTurnId, item.prompt,
+  ]),
+  [
+    ["shared-display", "canonical-older", "older legitimate row"],
+    ["compaction-orphan", undefined, ""],
+    ["shared-display", "canonical-newer", "newer legitimate row"],
+    ["compaction-owner", undefined, "canonical compaction owner"],
+  ],
+  "cross-page reconciliation preserves display collisions and distinct compactions",
+);
 assert.deepEqual(nextAutoLoadDetailTurn([
   turn("complete", {
     detailAutoLoad: true,
@@ -114,6 +184,87 @@ assert.equal(nextAutoLoadDetailTurn([
     detailOldestCursor: "manual-only",
   }),
 ]), null, "manual/cancelled detail cannot restart automatic paging");
+
+const activeDetail = turn("active-native", {
+  clientMsgId: "active-browser",
+  done: false,
+  detailLoaded: false,
+});
+assert.deepEqual(nextActiveDetailRequest(
+  [turn("older-open", { done: false }), activeDetail],
+  "active-browser",
+  true,
+), { turnId: "active-native" },
+"the exact authoritative unfinished head requests its initial detail page");
+assert.equal(nextActiveDetailRequest(
+  [activeDetail, { ...activeDetail, id: "duplicate-active" }],
+  "active-browser",
+  true,
+), null, "ambiguous aliases cannot trigger an authoritative detail read");
+assert.equal(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailProjection: {
+      segments: [{
+        pageKey: "latest", before: null, events: [], hasMore: false,
+        oldestCursor: null, hasNewer: false, newerCursor: null,
+        encodedChars: 0,
+      }],
+      blocks: [], capped: false, hasMore: false, oldestCursor: null,
+      hasNewer: false, newerCursor: null,
+    },
+  }],
+  "active-browser",
+  true,
+), null, "an installed canonical page suppresses duplicate initial loading");
+assert.equal(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailAutoLoad: false,
+    detailProjection: {
+      segments: [{
+        pageKey: "latest", before: null, events: [], hasMore: true,
+        oldestCursor: "active-detail-before", hasNewer: false,
+        newerCursor: null, encodedChars: 0,
+      }],
+      blocks: [], capped: false, hasMore: true,
+      oldestCursor: "active-detail-before", hasNewer: false,
+      newerCursor: null,
+    },
+  }],
+  "active-browser",
+  true,
+), null,
+"an installed active detail page leaves older pages to explicit pagination");
+assert.deepEqual(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailHasMore: true,
+    detailOldestCursor: "stale-active-detail-before",
+  }],
+  "active-browser",
+  true,
+), { turnId: "active-native" },
+"active recovery starts from the bounded newest page without a projection");
+assert.equal(nextActiveDetailRequest(
+  [{
+    ...activeDetail,
+    detailProjection: {
+      segments: [{
+        pageKey: "latest", before: null, events: [], hasMore: true,
+        oldestCursor: "capped-before", hasNewer: false, newerCursor: null,
+        encodedChars: 0,
+      }],
+      blocks: [], capped: true, hasMore: true,
+      oldestCursor: "capped-before", hasNewer: false, newerCursor: null,
+    },
+  }],
+  "active-browser",
+  true,
+), null, "a capped active projection cannot start an automatic paging loop");
+assert.equal(nextActiveDetailRequest(
+  [activeDetail], "active-browser", false,
+), null, "an idle runtime cannot infer activity from an open-looking row");
 
 const olderPage: HistoryBrowsePage = {
   pageKey: "page-older",
@@ -175,6 +326,87 @@ const overlap = createHistoryBrowse({
 assert.deepEqual(overlap.turns.map((item) => item.id), [
   "1", "optimistic-2", "3",
 ]);
+
+// Claude live rows use browser ids; native summary pages carry the mapping in
+// clientMsgId. Only the first greeting and the newest four rows have already
+// been reconciled when an older page overlaps the still-resident live turns.
+const claudeHistory = Array.from({ length: 10 }, (_, index) => turn(
+  `claude-native-${index + 1}`, {
+    clientMsgId: `claude-browser-${index + 1}`,
+    prompt: index === 0 ? "hi claude" : `Claude question ${index + 1}`,
+    ts: 1_000 + index * 1_000,
+    blocks: [{
+      kind: "text", message_id: `claude-answer-${index + 1}`,
+      channel: "final", text: `answer ${index + 1}`, done: true,
+    }],
+  },
+));
+const claudeLive = claudeHistory.map((item, index) =>
+  index === 0 || index >= 6 ? item : {
+    ...item, id: item.clientMsgId!, clientMsgId: undefined,
+  });
+claudeLive[1] = {
+  ...claudeLive[1],
+  detailLoaded: true,
+  blocks: [{
+    kind: "tool", tool_use_id: "claude-tool", message_id: "claude-tool-message",
+    tool: "Read", input: { path: "example.txt" }, done: true,
+  }, ...claudeLive[1].blocks],
+};
+const claudeOlderPage: HistoryBrowsePage = {
+  pageKey: "claude-older", turns: claudeHistory.slice(0, 6),
+  hasOlder: false, olderCursor: claudeHistory[0].id,
+  newerPageKey: "claude-latest",
+};
+const claudeOverlap = createHistoryBrowse({
+  scopeKey: "machine-a\u0000code\u0000claude",
+  sid: "claude-session", revision: "claude-revision", viewId: "claude-view",
+  baseTurns: claudeLive, basePageKey: "claude-latest", hasOlder: true,
+  olderCursor: claudeHistory[6].id, olderPage: claudeOlderPage,
+  limits: limits(20),
+}).projection;
+assert.deepEqual(claudeOverlap.turns.map((item) => item.prompt),
+  claudeHistory.map((item) => item.prompt),
+  "overlapping Claude pages keep ten unique turns with the greeting first");
+assert.deepEqual(claudeOverlap.turns.map((item) => item.id),
+  claudeLive.map((item) => item.id), "existing display ids stay mounted");
+assert.equal(claudeOverlap.turns[1].historyTurnId, claudeHistory[1].id,
+  "the merged row retains its native detail lookup id");
+assert.equal(claudeOverlap.turns[1].blocks.filter((block) =>
+  block.kind === "tool" && block.tool_use_id === "claude-tool").length, 1,
+  "already expanded process detail survives the summary overlap");
+assert.deepEqual(prependOlderPage(claudeOverlap, claudeOlderPage).projection.turns,
+  claudeOverlap.turns, "loading the same older page again is idempotent");
+
+const ambiguousBrowserRows = createHistoryBrowse({
+  scopeKey, sid: "ambiguous-browser", revision: "r", viewId: "v",
+  baseTurns: [turn("shared-browser", { prompt: "repeat", ts: 3 })],
+  basePageKey: "latest", hasOlder: true, olderCursor: "cursor",
+  olderPage: {
+    pageKey: "older", turns: [
+      turn("native-a", { clientMsgId: "shared-browser", prompt: "repeat", ts: 1 }),
+      turn("native-b", { clientMsgId: "shared-browser", prompt: "repeat", ts: 2 }),
+    ], hasOlder: false,
+  },
+}).projection;
+assert.equal(ambiguousBrowserRows.turns.length, 3,
+  "ambiguous client aliases and repeated prompts never erase distinct turns");
+
+const claudeRunning = createHistoryBrowse({
+  scopeKey, sid: "claude-running", revision: "r", viewId: "v",
+  baseTurns: [{ ...claudeLive[1], done: false, doneTs: undefined }],
+  basePageKey: "latest", hasOlder: true, olderCursor: "cursor",
+  olderPage: {
+    pageKey: "older", turns: [{ ...claudeHistory[1], interrupted: true, error: "old terminal" }],
+    hasOlder: false,
+  },
+}).projection;
+assert.equal(claudeRunning.turns.length, 1);
+assert.equal(claudeRunning.turns[0].done, false);
+assert.equal(claudeRunning.turns[0].interrupted, undefined);
+assert.equal(claudeRunning.turns[0].error, undefined);
+assert.equal(claudeRunning.turns[0].doneTs, undefined,
+  "an older browse page never supplies a terminal to the newer open copy");
 
 // Loading older rows evicts completed rows from the newer edge down to the low
 // water mark and returns the complete pre-eviction segment for IndexedDB.
@@ -766,6 +998,14 @@ const dirty = markBrowseLatestDirty(detailed, {
   expectedScopeKey: scopeKey,
 });
 assert.equal(dirty.latestDirty, true);
+assert.equal(cachedLatestRequiresLiveRuntime(dirty, { isLatest: true }), true);
+assert.equal(cachedLatestRequiresLiveRuntime(dirty, { isLatest: false }), false);
+assert.equal(cachedLatestRequiresLiveRuntime(detailed, { isLatest: true }), false);
+assert.equal(cachedLatestRequiresLiveRuntime(
+  { ...dirty, newerPageKey: `latest:${dirty.viewId}` },
+  null,
+  `latest:${dirty.viewId}`,
+), true, "a dirty latest link survives an IndexedDB write/read race");
 assert.equal(markBrowseLatestDirty(dirty, {
   expectedScopeKey: scopeKey,
 }), dirty);

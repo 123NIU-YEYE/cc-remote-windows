@@ -6,6 +6,7 @@ __pycache__/
 web/node_modules/
 web/dist/
 web/test-results/
+.vite/
 *.log
 
 # Local runtime state: the DSH supervisor's lock, logs, and the live public
@@ -137,3 +138,41 @@ work/
 /scripts/live/s2s_layered_benchmark.py
 /scripts/live/voice_bargein_benchmark.py
 /scripts/live/voice_pipeline_benchmark.py
+.codex-deploy/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/**/build/
+android/*.jks
+android/*.keystore
+android/test-results/
+harmony/.hvigor/
+harmony/.idea/
+harmony/oh_modules/
+harmony/**/oh_modules/
+harmony/**/build/
+harmony/local.properties
+harmony/build-profile.json5
+harmony/entry/build-profile.json5
+harmony/test-results/
+harmony/artifacts/
+harmony/*.p12
+harmony/*.p7b
+harmony/*.cer
+harmony/*.csr
+
+# Windows port: local dependency tree and diagnostics
+.pydeps/
+*.log.err
+cloudflared-linux-amd64
+ccremote-v81.tar.gz
+
+# One-off diagnostics and scratch output from the porting session
+_*.py
+_*.json
+cf-local-*.txt
+cloudflared-url.txt
+cf-local-url.txt
+
+# Headless smoke-test screenshots
+_shot-*.png

@@ -14,9 +14,17 @@ import json
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from itertools import islice
+from typing import Callable
+
+from pydantic import ValidationError
+
+from cc_remote.wrapper.codex_delegation import (
+    normalize_codex_delegation_item, parse_codex_delegation,
+)
+from cc_remote.wrapper.codex_tasks import task_receipt_event
 
 from cc_remote.attachments import (
     ALLOWED_IMAGE_TYPES,
@@ -28,14 +36,21 @@ from cc_remote.attachments import (
 )
 from cc_remote.protocol import (
     AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult, AssistantMsgEnd,
-    ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, UserMsg, Error,
+    AsyncQuestionSpec,
+    ProcessEvent, TurnPlan, TurnDiff, TurnEnd, TurnResult, TurnBinding, TurnUsage, UserMsg, Error,
     StateEvent, ERR_CC_CRASH,
 )
 from cc_remote.wrapper.codex_external import (
+    codex_rollout_user_message,
+    codex_user_item_text,
     is_codex_account_switch_message,
     visible_codex_user_message,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
+from cc_remote.wrapper.turn_changes import (
+    MAX_FILES, MAX_DIFF, MAX_TURN_DIFF, turn_change_event_data,
+)
+from cc_remote.wrapper.usage_limit import usage_limit_failure
 
 _TOOL_TYPES = {
     "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall",
@@ -45,8 +60,10 @@ _PROCESS_ITEM_TYPES = {
     "plan", "reasoning", "collabAgentToolCall", "subAgentActivity",
     "contextCompaction", "imageView", "sleep", "imageGeneration",
     "enteredReviewMode", "exitedReviewMode",
+    "functionCallOutput",
 }
 _MAX_HISTORY_RECORD_CHARS = 16 * 1024 * 1024
+_MAX_FILE_CHANGE_ITEMS = 64
 _SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _CREDENTIAL_EXACT_KEYS = frozenset({"env", "environment"})
 _CREDENTIAL_KEY_FRAGMENTS = (
@@ -87,6 +104,153 @@ _REVERSE_HISTORY_CHUNK_BYTES = 1024 * 1024
 _MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
+_MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES = 64 * 1024 * 1024
+_MAX_STREAM_BINDING_SCAN_BYTES = 64 * 1024 * 1024
+_MAX_STREAM_BINDING_MESSAGE_IDS = 64
+MIN_PROCESS_DURATION_MS = 500
+
+
+def _async_message_fields(item: dict) -> dict:
+    """Project only native async metadata, never infer a question from prose.
+
+    Keep oversized/unrecognized payloads readable as text instead of failing an
+    entire stream. Do not partially truncate a question or its selectable labels.
+    """
+    if item.get("delivery") != "async":
+        return {}
+    fields: dict = {"delivery": "async"}
+    questions = item.get("questions")
+    if not isinstance(questions, list) or not 1 <= len(questions) <= 16:
+        return fields
+    if len(json.dumps(questions, ensure_ascii=False)) > 16 * 1024:
+        return fields
+    try:
+        parsed = [AsyncQuestionSpec.model_validate(q) for q in questions]
+        if len(json.dumps([q.model_dump() for q in parsed],
+                          ensure_ascii=False)) <= 16 * 1024:
+            fields["questions"] = parsed
+    except ValidationError:
+        pass
+    return fields
+
+
+@dataclass(frozen=True)
+class CodexLiveUserMessage:
+    """A visible user boundary carried by the app-server live protocol."""
+
+    message_id: str
+    turn_id: str
+    prompt: str
+    client_id: str | None = None
+    source_thread_id: str | None = None
+
+
+def codex_live_user_message(message: object) -> CodexLiveUserMessage | None:
+    """Normalize one live ``userMessage`` item without accepting foreign shapes."""
+    if not isinstance(message, dict) or message.get("method") not in {
+        "item/started", "item/completed",
+    }:
+        return None
+    params = message.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    if isinstance(item, dict):
+        item = normalize_codex_delegation_item(item)
+    if not isinstance(item, dict) or item.get("type") != "userMessage":
+        return None
+    message_id = item.get("id")
+    turn_id = params.get("turnId")
+    if (
+        not isinstance(message_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(message_id)
+        or not isinstance(turn_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(turn_id)
+    ):
+        return None
+    prompt = visible_codex_user_message(codex_user_item_text(item))
+    if not prompt:
+        return None
+    client_id = item.get("clientId")
+    if not isinstance(client_id, str) or not _SAFE_WIRE_ID.fullmatch(client_id):
+        client_id = None
+    delegation = parse_codex_delegation(codex_user_item_text(item))
+    return CodexLiveUserMessage(
+        source_thread_id=delegation.source_thread_id if delegation else None,
+        message_id=message_id,
+        turn_id=turn_id,
+        prompt=prompt,
+        client_id=client_id,
+    )
+
+
+def codex_rollout_task_bindings(
+    path: str,
+    native_message_ids: set[str] | frozenset[str] | tuple[str, ...],
+    *,
+    max_scan_bytes: int = _MAX_STREAM_BINDING_SCAN_BYTES,
+) -> dict[str, str]:
+    """Resolve official user-item ids to exact rollout task ids.
+
+    This is deliberately an identity lookup, not a history heuristic.  It only
+    accepts a ``response_item`` user message whose exact native item id carries
+    Codex's own ``internal_chat_message_metadata_passthrough.turn_id``. Prompt
+    text, timestamps, ordering and file size never participate in attribution.
+    """
+    targets = {
+        value
+        for value in native_message_ids
+        if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value)
+    }
+    if (
+        not targets
+        or len(targets) > _MAX_STREAM_BINDING_MESSAGE_IDS
+        or isinstance(max_scan_bytes, bool)
+        or not isinstance(max_scan_bytes, int)
+        or max_scan_bytes <= 0
+    ):
+        return {}
+    bindings: dict[str, str] = {}
+    try:
+        records = _reverse_jsonl_records(
+            path, max_scan_bytes=max_scan_bytes)
+        for _offset, line in records:
+            # Avoid decoding unrelated large tool/result records.
+            if b'"response_item"' not in line or b'"message"' not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(row, dict) or row.get("type") != "response_item":
+                continue
+            payload = row.get("payload")
+            if (
+                not isinstance(payload, dict)
+                or payload.get("type") != "message"
+                or payload.get("role") != "user"
+            ):
+                continue
+            native_message_id = payload.get("id")
+            if native_message_id not in targets:
+                continue
+            metadata = payload.get(
+                "internal_chat_message_metadata_passthrough")
+            task_id = (
+                metadata.get("turn_id")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if (
+                not isinstance(task_id, str)
+                or not _SAFE_WIRE_ID.fullmatch(task_id)
+            ):
+                continue
+            bindings[native_message_id] = task_id
+            if len(bindings) == len(targets):
+                break
+    except OSError:
+        return {}
+    return bindings
+_GOAL_TURN_CORRELATION_SECONDS = 5.0
 _MAX_PENDING_HISTORY_COMPACTIONS = 32
 _MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT = 128
 _MAX_HISTORY_IMAGE_BYTES_PER_SEGMENT = 64 * 1024 * 1024
@@ -106,6 +270,266 @@ class CodexHistoryImageView:
     width: int | None = None
     height: int | None = None
     data: bytes | None = None
+    source_complete: bool = False
+
+
+@dataclass(frozen=True)
+class CodexAutomaticUserRecovery:
+    """Goal prompts plus proof of which native task boundaries were inspected."""
+
+    users: dict[str, UserMsg] = field(default_factory=dict)
+    seen_turn_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class CodexHistoryProcessWitness:
+    """Lightweight proof that one visible rollout segment had public work.
+
+    Only small lifecycle records participate.  Large tool inputs/results and
+    private reasoning are never decoded merely to decide whether the collapsed
+    ``已处理`` row exists.  Equal/missing timestamps still prove presence,
+    but callers must not turn them into a synthetic ``0s`` duration.
+    """
+
+    started_ms: int | None = None
+    done_ms: int | None = None
+    generated_images: bool = False
+    # Only byte offsets, never patch bodies, live in the process/page LRU.
+    file_change_offsets: tuple[int, ...] = ()
+    file_changes_truncated: bool = False
+    # Offset, next native final-message id, compact receipt. No task output.
+    task_receipts: tuple[tuple[int, str | None, dict], ...] = ()
+
+
+@dataclass(frozen=True)
+class CodexHistoryNativeWitness:
+    """Bounded rollout evidence for the visible native-turn projection.
+
+    ``turn_ids`` are newest first and de-duplicated so a native turn containing
+    multiple steered user segments is compared with exactly one official
+    ``thread/turns/list`` row. ``scanned_to_start`` is true only when the byte
+    budget covered the complete frozen rollout; ``has_more_turns`` records a
+    native boundary beyond the bounded id tuple without retaining every id.
+    """
+
+    turn_ids: tuple[str, ...] = ()
+    scanned_to_start: bool = False
+    has_more_turns: bool = False
+    process_by_visible_id: dict[str, CodexHistoryProcessWitness] = field(
+        default_factory=dict,
+    )
+    offset_by_visible_id: dict[str, int] = field(default_factory=dict)
+    process_by_native_segment: dict[
+        tuple[str, int], CodexHistoryProcessWitness
+    ] = field(default_factory=dict)
+    offset_by_native_segment: dict[tuple[str, int], int] = field(
+        default_factory=dict,
+    )
+
+
+@dataclass(frozen=True)
+class CodexHistoryProcessPageWitness:
+    """Process proof and reusable source offsets for one older native page."""
+
+    process_by_visible_id: dict[str, CodexHistoryProcessWitness] = field(
+        default_factory=dict,
+    )
+    offset_by_visible_id: dict[str, int] = field(default_factory=dict)
+    process_by_native_segment: dict[
+        tuple[str, int], CodexHistoryProcessWitness
+    ] = field(default_factory=dict)
+    offset_by_native_segment: dict[tuple[str, int], int] = field(
+        default_factory=dict,
+    )
+    scanned_to_start: bool = False
+    # Only an exact newest native task/user segment can absorb an ordinary
+    # append. Goal continuations and pages behind the physical head cannot.
+    append_segment: tuple[str, int] | None = None
+
+
+@dataclass(frozen=True)
+class _CodexHistoryBoundary:
+    offset: int
+    cursor: str
+    native_turn_id: str | None
+    compatibility_cursor: str | None = None
+    process: CodexHistoryProcessWitness | None = None
+    # Stable within one native task: the oldest user segment is zero and the
+    # newest steer is ``segment_count - 1``. Official history exposes different
+    # visible item ids, so this private coordinate is the cross-source join key.
+    segment_index: int = 0
+    segment_count: int = 1
+    appendable: bool = False
+
+
+@dataclass(frozen=True)
+class CodexHistoryWindow:
+    """One bounded rollout page plus exact metadata from its boundary scan.
+
+    The legacy five-tuple exposed by :func:`codex_history_window` deliberately
+    omits native ownership.  Callers which need to persist source-bound facts
+    must use this richer result rather than reopening one boundary record and
+    guessing its enclosing task: a later steer boundary can be a paired
+    ``response_item`` which does not carry ``turn_id`` itself.
+    """
+
+    start_offset: int
+    end_offset: int
+    has_older: bool
+    forced_oldest_cursor: str | None = None
+    forced_boundary_offset: int | None = None
+    forced_native_turn_id: str | None = None
+    forced_segment_index: int | None = None
+    newest_boundary_offset: int | None = None
+    newest_cursor: str | None = None
+    newest_native_turn_id: str | None = None
+    newest_segment_index: int | None = None
+
+    def legacy(self) -> tuple[int, int, bool, str | None, int | None]:
+        return (
+            self.start_offset,
+            self.end_offset,
+            self.has_older,
+            self.forced_oldest_cursor,
+            self.forced_boundary_offset,
+        )
+
+
+@dataclass
+class _HistoryProcessAccumulator:
+    """Mutable reverse-scan accumulator for one visible user segment."""
+
+    present: bool = False
+    started_ms: int | None = None
+    done_ms: int | None = None
+    generated_images: bool = False
+    file_change_offsets: set[int] = field(default_factory=set)
+    file_changes_truncated: bool = False
+    task_receipts: dict[int, tuple[str | None, dict]] = field(default_factory=dict)
+    next_answer_id: str | None = None
+    next_answer_unknown: bool = False
+
+    def observe_task_receipt(self, offset: int, line: bytes) -> None:
+        # Read only bounded native envelopes. The following final-message id
+        # anchors a receipt between answers even when native summaries omit all
+        # tools. Never infer order from equal clocks or assistant prose.
+        header = line[:1024]
+        answer_hint = b'"message"' in header and b'"assistant"' in header
+        if b'"response_item"' not in header or not (b'"cc_remote_tasks"' in header or answer_hint):
+            return
+        if len(line) > _MAX_HISTORY_REVERSE_RECORD_BYTES:
+            self.next_answer_unknown |= answer_hint
+            return
+        try:
+            row = json.loads(line)
+        except (ValueError, TypeError):
+            self.next_answer_unknown |= answer_hint
+            return
+        if not isinstance(row, dict) or row.get("type") != "response_item":
+            return
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            return
+        if payload.get("type") == "message" and payload.get("role") == "assistant":
+            if _assistant_channel(payload.get("phase")) != "commentary":
+                key = payload.get("id")
+                self.next_answer_id = key if isinstance(key, str) and _SAFE_WIRE_ID.fullmatch(key) else None
+                self.next_answer_unknown = self.next_answer_id is None
+            return
+        if (payload.get("type") != "function_call_output" or len(self.task_receipts) >= 16
+                or self.next_answer_unknown):
+            return
+        key = payload.get("id")
+        if not isinstance(key, str) or not _SAFE_WIRE_ID.fullmatch(key):
+            return
+        receipt = task_receipt_event(
+            payload, item_id=key, turn_id=None, detail_limit=0)
+        if receipt is None:
+            return
+        stamp = _history_record_timestamp(line)
+        block = {
+            "kind": "process", "item_id": receipt.item_id, "processKind": "task",
+            "phase": "end", "done": True, "status": receipt.status,
+            "server": receipt.server, "tool": receipt.tool,
+            "title": receipt.title, "summary": receipt.summary,
+        }
+        if stamp is not None:
+            block["startedTs"] = int(stamp * 1000)
+        self.present = True
+        self.task_receipts[offset] = (self.next_answer_id, block)
+
+    def observe_file_change(self, offset: int, line: bytes) -> None:
+        # Match the native envelope, not a type string inside arbitrary tool
+        # output/reasoning. Only offsets enter the cache; bodies are read later.
+        header = line[:4096]
+        envelope = re.search(rb'"payload"\s*:\s*\{\s*"type"\s*:\s*"(patch_apply_end|fileChange|item_completed)"', header, re.I)
+        if envelope is None or not re.search(
+            rb'"type"\s*:\s*"(?:event_msg|response_item)"', header[:envelope.start()],
+        ):
+            return
+        if envelope[1] == b"item_completed" and not re.search(
+            rb'"item"\s*:\s*\{[^{}]*"type"\s*:\s*"fileChange"', header[envelope.end():], re.I,
+        ):
+            return
+        self.present = True
+        if len(self.file_change_offsets) < 512:
+            self.file_change_offsets.add(offset)
+        else:
+            self.file_changes_truncated = True
+
+    def observe(self, stamp_ms: int | None) -> None:
+        self.present = True
+        if stamp_ms is None:
+            return
+        self.started_ms = (
+            stamp_ms if self.started_ms is None
+            else min(self.started_ms, stamp_ms)
+        )
+        self.done_ms = (
+            stamp_ms if self.done_ms is None
+            else max(self.done_ms, stamp_ms)
+        )
+
+    def merge(self, witness: CodexHistoryProcessWitness | None) -> None:
+        if witness is None:
+            return
+        self.present = True
+        self.generated_images |= witness.generated_images
+        offsets = self.file_change_offsets.union(witness.file_change_offsets)
+        self.file_changes_truncated |= witness.file_changes_truncated or len(offsets) > 512
+        self.file_change_offsets = set(sorted(offsets)[:512])
+        self.task_receipts.update({offset: (anchor, block)
+                                   for offset, anchor, block in witness.task_receipts})
+        self.task_receipts = dict(sorted(self.task_receipts.items())[-16:])
+        for stamp_ms in (witness.started_ms, witness.done_ms):
+            if stamp_ms is not None:
+                self.observe(stamp_ms)
+
+    def take(self) -> CodexHistoryProcessWitness | None:
+        witness = self.snapshot()
+        self.present = False
+        self.started_ms = None
+        self.done_ms = None
+        self.generated_images = False
+        self.file_change_offsets.clear()
+        self.file_changes_truncated = False
+        self.task_receipts.clear()
+        self.next_answer_id = None
+        self.next_answer_unknown = False
+        return witness
+
+    def snapshot(self) -> CodexHistoryProcessWitness | None:
+        if not self.present:
+            return None
+        return CodexHistoryProcessWitness(
+            started_ms=self.started_ms,
+            done_ms=self.done_ms,
+            generated_images=self.generated_images,
+            file_change_offsets=tuple(sorted(self.file_change_offsets)),
+            file_changes_truncated=self.file_changes_truncated,
+            task_receipts=tuple((offset, anchor, block) for offset, (anchor, block)
+                                in sorted(self.task_receipts.items())),
+        )
 
 
 def _bounded_jsonl_records(file, *, end_offset: int | None = None):
@@ -142,7 +566,13 @@ def _bounded_jsonl_records(file, *, end_offset: int | None = None):
             line = file.readline(read_limit)
 
 
-def _reverse_jsonl_records(path: str):
+def _reverse_jsonl_records(
+    path: str,
+    *,
+    max_scan_bytes: int | None = None,
+    end_offset: int | None = None,
+    max_record_bytes: int = _MAX_HISTORY_REVERSE_RECORD_BYTES,
+):
     """Yield ``(byte_offset, line)`` from newest to oldest without buffering.
 
     Fixed-size reverse reads avoid mmap implementations faulting a large part
@@ -150,14 +580,23 @@ def _reverse_jsonl_records(path: str):
     the cross-chunk carry remain bounded.
     """
     with open(path, "rb") as source:
-        size = os.fstat(source.fileno()).st_size
+        source_size = os.fstat(source.fileno()).st_size
+        size = source_size
+        if end_offset is not None:
+            size = min(source_size, max(0, int(end_offset)))
         if size <= 0:
             return
+        floor = 0
+        if max_scan_bytes is not None:
+            floor = max(0, size - max(0, int(max_scan_bytes)))
         position = size
         carry = b""
         dropping_oversized = False
-        while position > 0:
-            read_size = min(_REVERSE_HISTORY_CHUNK_BYTES, position)
+        while position > floor:
+            read_size = min(
+                _REVERSE_HISTORY_CHUNK_BYTES,
+                position - floor,
+            )
             position -= read_size
             source.seek(position)
             chunk = source.read(read_size)
@@ -165,7 +604,7 @@ def _reverse_jsonl_records(path: str):
             parts = data.split(b"\n")
             if len(parts) == 1:
                 if (dropping_oversized
-                        or len(data) > _MAX_HISTORY_REVERSE_RECORD_BYTES):
+                        or len(data) > max_record_bytes):
                     carry = b""
                     dropping_oversized = True
                 else:
@@ -181,15 +620,15 @@ def _reverse_jsonl_records(path: str):
                 if dropping_oversized and index == len(parts) - 1:
                     continue
                 line = parts[index]
-                if line and len(line) <= _MAX_HISTORY_REVERSE_RECORD_BYTES:
+                if line and len(line) <= max_record_bytes:
                     yield starts[index], line
             carry = parts[0]
-            dropping_oversized = len(carry) > _MAX_HISTORY_REVERSE_RECORD_BYTES
+            dropping_oversized = len(carry) > max_record_bytes
             if dropping_oversized:
                 carry = b""
 
-        if (not dropping_oversized and carry
-                and len(carry) <= _MAX_HISTORY_REVERSE_RECORD_BYTES):
+        if (floor == 0 and not dropping_oversized and carry
+                and len(carry) <= max_record_bytes):
             yield 0, carry
 
 
@@ -237,10 +676,122 @@ def _previous_jsonl_record_offset(path: str, offset: int) -> int:
     return 0
 
 
+def _legacy_response_user_item_id(payload: object) -> str | None:
+    """Return the native id from one legacy persisted user response item.
+
+    Older Codex rollouts persist a visible user input twice: first as a
+    ``response_item/message`` carrying the app-server item id, then immediately
+    as an ``event_msg/user_message`` carrying the clean prompt.  The latter is
+    the row history translates, but the former is the identity emitted by the
+    live app-server stream.  Keep this helper deliberately structural; callers
+    must additionally prove that the two records are adjacent.
+    """
+    if (
+        not isinstance(payload, dict)
+        or payload.get("type") != "message"
+        or payload.get("role") != "user"
+    ):
+        return None
+    item_id = payload.get("id")
+    if isinstance(item_id, str) and _SAFE_WIRE_ID.fullmatch(item_id):
+        return item_id
+    return None
+
+
+def _legacy_user_item_before(
+    path: str,
+    offset: int,
+) -> tuple[int, str | None]:
+    """Include a preceding legacy user envelope, never a preceding tool row."""
+    if offset <= 0:
+        return 0, None
+    try:
+        previous = _previous_jsonl_record_offset(path, offset)
+        record_bytes = offset - previous
+        if record_bytes > _MAX_HISTORY_REVERSE_RECORD_BYTES + 2:
+            return previous, None
+        with open(path, "rb") as source:
+            source.seek(previous)
+            raw = source.read(record_bytes).rstrip(b"\r\n")
+    except OSError:
+        # A disappearing/replaced source must not turn a mid-file boundary into
+        # offset zero and accidentally request the entire rollout.
+        return offset, None
+    if not raw or len(raw) > _MAX_HISTORY_REVERSE_RECORD_BYTES:
+        return previous, None
+    try:
+        row = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return previous, None
+    if not isinstance(row, dict) or row.get("type") != "response_item":
+        return offset, None
+    payload = row.get("payload")
+    if (not isinstance(payload, dict) or payload.get("type") != "message"
+            or payload.get("role") != "user"):
+        return offset, None
+    return previous, _legacy_response_user_item_id(payload)
+
+
 def _fallback_history_id(path: str, kind: str, offset: int, raw_ts: str,
                          identity: str) -> str:
     seed = "\0".join((path, kind, identity, str(offset), raw_ts))
     return hashlib.sha256(seed.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def _history_user_cursors(
+    path: str,
+    offset: int,
+    line: bytes,
+) -> tuple[str, str, str | None, int] | None:
+    """Return paging identities and source boundary for one visible user row."""
+    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+            or (
+                b'"user_message"' not in line
+                and b'"UserMessage"' not in line
+                and b'"FunctionCallOutput"' not in line
+                and b'"functionCallOutput"' not in line
+            )):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(row, dict):
+        return None
+    payload = row.get("payload")
+    if row.get("type") != "event_msg":
+        return None
+    user = codex_rollout_user_message(payload)
+    if user is None or not user.prompt:
+        return None
+    native_cursor = None
+    if isinstance(user.message_id, str) and _SAFE_WIRE_ID.fullmatch(
+            user.message_id):
+        native_cursor = user.message_id
+    previous_offset, paired_cursor = _legacy_user_item_before(path, offset)
+    if native_cursor is None:
+        native_cursor = paired_cursor
+    turn_id = user.turn_id
+    raw_ts = row.get("timestamp", "")
+    fallback_cursor = _fallback_history_id(
+        path, "user", offset, str(raw_ts), type(turn_id).__name__)
+    per_message_cursor = native_cursor or fallback_cursor
+    preferred_cursor = (
+        native_cursor
+        or (
+            turn_id
+            if isinstance(turn_id, str)
+            and _SAFE_WIRE_ID.fullmatch(turn_id)
+            else None
+        )
+        or fallback_cursor
+    )
+    return (
+        preferred_cursor,
+        per_message_cursor,
+        native_cursor,
+        previous_offset,
+    )
 
 
 def _history_user_cursor(
@@ -250,27 +801,10 @@ def _history_user_cursor(
     *,
     prefer_turn_id: bool = True,
 ) -> str | None:
-    if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
-            or (b'"type":"user_message"' not in line
-                and b'"type": "user_message"' not in line)):
+    cursors = _history_user_cursors(path, offset, line)
+    if cursors is None:
         return None
-    try:
-        row = json.loads(line)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    payload = row.get("payload") if isinstance(row, dict) else None
-    if (row.get("type") != "event_msg" or not isinstance(payload, dict)
-            or payload.get("type") != "user_message"):
-        return None
-    if not visible_codex_user_message(payload.get("message")):
-        return None
-    turn_id = payload.get("turn_id")
-    if (prefer_turn_id and isinstance(turn_id, str)
-            and _SAFE_WIRE_ID.fullmatch(turn_id)):
-        return turn_id
-    raw_ts = row.get("timestamp", "")
-    return _fallback_history_id(
-        path, "user", offset, str(raw_ts), type(turn_id).__name__)
+    return cursors[0] if prefer_turn_id else cursors[1]
 
 
 def _history_turn_cursor(line: bytes) -> str | None:
@@ -319,6 +853,129 @@ def _history_terminal_marker(line: bytes) -> bool:
     )
 
 
+_HISTORY_VISIBLE_PROCESS_RESPONSE_TYPES = (
+    frozenset({
+        "function_call",
+        "custom_tool_call",
+        "function_call_output",
+        "custom_tool_call_output",
+    })
+    | _TOOL_TYPES
+    | (_PROCESS_ITEM_TYPES - {"reasoning"})
+)
+_HISTORY_VISIBLE_PROCESS_EVENT_TYPES = frozenset({
+    "image_generation_end",
+    "exec_command_end",
+    "mcp_tool_call_end",
+    "patch_apply_end",
+    "web_search_end",
+    "sub_agent_activity",
+    "context_compacted",
+})
+_HISTORY_VISIBLE_PROCESS_MARKERS = tuple(
+    marker.encode()
+    for marker in (
+        *_HISTORY_VISIBLE_PROCESS_RESPONSE_TYPES,
+        *_HISTORY_VISIBLE_PROCESS_EVENT_TYPES,
+        "agent_message",
+        "item_completed",
+        "commentary",
+        '"plan"',
+    )
+)
+
+
+def _history_generated_image_record(line: bytes) -> bool:
+    """Cheap positive hint; the exact image reader validates the full record.
+
+    Native image payloads exceed the ordinary process-record budget. Inspect
+    only their envelope, never decode the base64 while counting process rows.
+    """
+    header = line[:1024]
+    return bool(
+        re.search(rb'"type"\s*:\s*"image_generation_end"', header)
+        or (
+            re.search(rb'"type"\s*:\s*"item_completed"', header)
+            and re.search(rb'"type"\s*:\s*"Extension"', header)
+            and re.search(rb'"kind"\s*:\s*"image_gen\.generation"', header)
+        )
+    )
+
+
+def _history_visible_process_stamp(line: bytes) -> tuple[bool, int | None]:
+    """Return bounded public-process evidence from one persisted record.
+
+    This intentionally mirrors the history translator's public surface rather
+    than treating every hidden item as work.  Reasoning, final answers, token
+    counts and ordinary successful plumbing therefore cannot recreate the old
+    empty ``已处理`` disclosure for direct replies.
+    """
+    if (
+        len(line) > _MAX_HISTORY_REVERSE_RECORD_BYTES
+        or not any(marker in line for marker in _HISTORY_VISIBLE_PROCESS_MARKERS)
+    ):
+        return False, None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return False, None
+    if not isinstance(row, dict):
+        return False, None
+    payload = row.get("payload")
+    if not isinstance(payload, dict):
+        return False, None
+    row_type = row.get("type")
+    payload_type = payload.get("type")
+    visible = False
+    if row_type == "response_item":
+        visible = payload_type in _HISTORY_VISIBLE_PROCESS_RESPONSE_TYPES
+        if (
+            not visible
+            and payload_type == "message"
+            and payload.get("role") == "assistant"
+            and _assistant_channel(payload.get("phase")) == "commentary"
+        ):
+            visible = any(
+                isinstance(part, dict)
+                and part.get("type") in {"output_text", "text"}
+                and isinstance(part.get("text"), str)
+                and bool(part.get("text"))
+                for part in payload.get("content") or []
+            )
+    elif row_type == "event_msg":
+        visible = payload_type in _HISTORY_VISIBLE_PROCESS_EVENT_TYPES
+        if payload_type == "agent_message":
+            visible = bool(
+                _assistant_channel(payload.get("phase")) == "commentary"
+                and isinstance(payload.get("message"), str)
+                and payload.get("message")
+            )
+        elif payload_type == "item_completed":
+            item = payload.get("item")
+            visible = bool(
+                isinstance(item, dict)
+                and (
+                    item.get("type") in _TOOL_TYPES
+                    or item.get("type") == "FileChange"
+                    or item.get("type") in (
+                        _PROCESS_ITEM_TYPES - {"reasoning"}
+                    )
+                )
+            )
+    if not visible:
+        return False, None
+    raw_ts = row.get("timestamp")
+    if not isinstance(raw_ts, str):
+        return True, None
+    try:
+        stamp = datetime.fromisoformat(
+            raw_ts.replace("Z", "+00:00"),
+        ).timestamp()
+    except (TypeError, ValueError):
+        return True, None
+    return True, max(0, int(round(stamp * 1000)))
+
+
 def _history_account_switch_marker(line: bytes) -> bool:
     if (
         len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
@@ -330,20 +987,290 @@ def _history_account_switch_marker(line: bytes) -> bool:
     except (json.JSONDecodeError, ValueError):
         return False
     payload = row.get("payload") if isinstance(row, dict) else None
+    user = codex_rollout_user_message(payload)
     return bool(
         row.get("type") == "event_msg"
-        and isinstance(payload, dict)
-        and payload.get("type") == "user_message"
-        and is_codex_account_switch_message(payload.get("message"))
+        and user is not None
+        and is_codex_account_switch_message(user.raw_text)
     )
 
 
-def _history_boundaries(path: str, *, use_turns: bool):
+def _history_goal_record(
+    line: bytes,
+) -> tuple[
+    str, str | None, float | None, float | None, str | None,
+] | None:
+    """Return the public Goal state carried by one bounded rollout record."""
+    if (
+        len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+        or b"thread_goal_" not in line
+    ):
+        return None
+    try:
+        row = json.loads(line)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if row.get("type") != "event_msg" or not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    if payload_type == "thread_goal_cleared":
+        return ("cleared", None, None, None, None)
+    if payload_type != "thread_goal_updated":
+        return None
+    goal = payload.get("goal")
+    if not isinstance(goal, dict):
+        return None
+    objective = goal.get("objective")
+    if not isinstance(objective, str) or not objective:
+        return None
+    created_at = goal.get("createdAt")
+    updated_at = goal.get("updatedAt")
+    status = goal.get("status")
+    return (
+        "updated",
+        objective,
+        float(created_at)
+        if isinstance(created_at, (int, float))
+        and not isinstance(created_at, bool) else None,
+        float(updated_at)
+        if isinstance(updated_at, (int, float))
+        and not isinstance(updated_at, bool) else None,
+        status if isinstance(status, str) else None,
+    )
+
+
+def _history_record_timestamp(line: bytes) -> float | None:
+    try:
+        row = json.loads(line)
+        return datetime.fromisoformat(
+            str(row.get("timestamp", "")).replace("Z", "+00:00")
+        ).timestamp()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _goal_turn_correlated(
+    goal_timestamp: float | None,
+    turn_timestamp: float | None,
+) -> bool:
+    return bool(
+        goal_timestamp is not None
+        and turn_timestamp is not None
+        and 0 <= turn_timestamp - goal_timestamp
+        <= _GOAL_TURN_CORRELATION_SECONDS
+    )
+
+
+def _history_goal_prompt_before_boundary(
+    path: str,
+    boundary_offset: int,
+    *,
+    max_scan_bytes: int = 4 * 1024 * 1024,
+) -> tuple[str, float | None] | None:
+    """Find a changed Goal objective immediately preceding one task start.
+
+    The lookup is bounded and reads backwards from the already-authoritative
+    native task boundary. A status-only Goal update repeats the previous
+    objective and therefore remains an assistant-only continuation.
+    """
+    if boundary_offset < 0:
+        return None
+    start = max(0, boundary_offset - max_scan_bytes)
+    try:
+        with open(path, "rb") as source:
+            source.seek(start)
+            data = source.read(boundary_offset - start)
+            source.seek(boundary_offset)
+            boundary_line = source.readline(
+                _MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1,
+            )
+    except OSError:
+        return None
+    boundary_timestamp = _history_record_timestamp(
+        boundary_line.rstrip(b"\r\n"))
+    candidate: tuple[
+        str, float | None, float | None, float | None,
+    ] | None = None
+    boundary_record = _history_goal_record(boundary_line.rstrip(b"\r\n"))
+    if (
+        boundary_record is not None
+        and boundary_record[0] == "updated"
+        and boundary_record[4] == "active"
+    ):
+        _kind, objective, created_at, updated_at, _status = boundary_record
+        if objective is not None:
+            timestamp = boundary_timestamp
+            candidate = (objective, created_at, updated_at, timestamp)
+    for raw in reversed(data.splitlines()):
+        if len(raw) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES:
+            continue
+        record = _history_goal_record(raw)
+        if record is not None:
+            kind, objective, created_at, updated_at, status = record
+            if candidate is None:
+                if kind == "cleared" or objective is None or status != "active":
+                    return None
+                timestamp = _history_record_timestamp(raw)
+                candidate = (
+                    objective, created_at, updated_at, timestamp)
+                continue
+            previous_objective = objective if kind == "updated" else None
+            return (
+                (candidate[0], candidate[3])
+                if candidate[0] != previous_objective
+                and _goal_turn_correlated(
+                    candidate[3], boundary_timestamp)
+                else None
+            )
+        if candidate is None:
+            if _history_turn_cursor(raw) is not None:
+                return None
+            user_cursor = _history_user_cursor(path, 0, raw)
+            if user_cursor is not None:
+                return None
+    if candidate is None:
+        return None
+    # At the beginning of a rollout, creation time equality is the only
+    # authoritative proof that this is a new objective rather than a resumed
+    # pre-existing Goal whose earlier state lies outside the bounded window.
+    return (
+        (candidate[0], candidate[3])
+        if candidate[1] is not None and candidate[1] == candidate[2]
+        and _goal_turn_correlated(candidate[3], boundary_timestamp)
+        else None
+    )
+
+
+def _history_goal_prompt_after_boundary(
+    path: str,
+    boundary_offset: int,
+    *,
+    max_scan_bytes: int = 4 * 1024 * 1024,
+) -> tuple[tuple[str, float | None] | None, bool]:
+    """Find a new Goal written just after one native task boundary.
+
+    The app-server may persist ``task_started`` before the correlated
+    ``thread_goal_updated`` record.  Scan only this task's bounded forward
+    segment and report whether a terminal/next boundary proves an empty result
+    is stable.  Reaching a growing rollout's EOF is deliberately not proof: a
+    later append must be allowed to repair the missing prompt.
+    """
+    if boundary_offset < 0:
+        return (None, False)
+    baseline_known, baseline_objective = (
+        _history_goal_objective_before_offset(path, boundary_offset)
+    )
+    try:
+        size = os.path.getsize(path)
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return (None, False)
+    end_offset = min(size, boundary_offset + max_scan_bytes)
+    with source:
+        source.seek(boundary_offset)
+        boundary_line = source.readline(
+            _MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1,
+        )
+        boundary_raw = boundary_line.rstrip(b"\r\n")
+        if _history_turn_cursor(boundary_raw) is None:
+            return (None, False)
+        boundary_timestamp = _history_record_timestamp(boundary_raw)
+        for offset, line in _bounded_jsonl_records(
+            source, end_offset=end_offset,
+        ):
+            raw = line.encode("utf-8", "replace").rstrip(b"\r\n")
+            if _history_turn_cursor(raw) is not None:
+                return (None, True)
+            if _history_user_cursor(path, offset, raw) is not None:
+                return (None, True)
+            record = _history_goal_record(raw)
+            if record is not None:
+                kind, objective, created_at, updated_at, status = record
+                if kind == "cleared" or objective is None:
+                    baseline_known = True
+                    baseline_objective = None
+                    continue
+                changed = bool(
+                    objective != baseline_objective
+                    and (
+                        baseline_known
+                        or (
+                            created_at is not None
+                            and created_at == updated_at
+                        )
+                    )
+                )
+                baseline_known = True
+                baseline_objective = objective
+                goal_timestamp = _history_record_timestamp(raw)
+                if (
+                    changed
+                    and status == "active"
+                    and goal_timestamp is not None
+                    and boundary_timestamp is not None
+                    and 0 <= goal_timestamp - boundary_timestamp
+                    <= _GOAL_TURN_CORRELATION_SECONDS
+                ):
+                    return ((objective, goal_timestamp), True)
+                continue
+            if _history_terminal_marker(raw):
+                return (None, True)
+    return (None, False)
+
+
+def _history_goal_prompt_for_boundary(
+    path: str,
+    boundary_offset: int,
+) -> tuple[tuple[str, float | None] | None, bool]:
+    prompt = _history_goal_prompt_before_boundary(path, boundary_offset)
+    if prompt is not None:
+        return (prompt, True)
+    return _history_goal_prompt_after_boundary(path, boundary_offset)
+
+
+def _history_goal_objective_before_offset(
+    path: str,
+    offset: int,
+    *,
+    max_scan_bytes: int = 4 * 1024 * 1024,
+) -> tuple[bool, str | None]:
+    """Return the nearest bounded Goal baseline before a history page."""
+    if offset <= 0:
+        return (False, None)
+    start = max(0, offset - max_scan_bytes)
+    try:
+        with open(path, "rb") as source:
+            source.seek(start)
+            data = source.read(offset - start)
+    except OSError:
+        return (False, None)
+    for raw in reversed(data.splitlines()):
+        record = _history_goal_record(raw)
+        if record is None:
+            continue
+        kind, objective, _created_at, _updated_at, _status = record
+        return (True, objective if kind == "updated" else None)
+    return (False, None)
+
+
+def _history_boundary_records(
+    path: str,
+    *,
+    use_turns: bool,
+    max_scan_bytes: int | None = None,
+    end_offset: int | None = None,
+    include_process: bool = False,
+):
     if not use_turns:
-        for offset, line in _reverse_jsonl_records(path):
+        for offset, line in _reverse_jsonl_records(
+            path,
+            max_scan_bytes=max_scan_bytes,
+            end_offset=end_offset,
+        ):
             cursor = _history_user_cursor(path, offset, line)
             if cursor is not None:
-                yield offset, cursor
+                yield _CodexHistoryBoundary(offset, cursor, None)
         return
 
     # A task_started without a user_message is ambiguous. It is an independent
@@ -352,62 +1279,534 @@ def _history_boundaries(path: str, *, use_turns: bool):
     # the same visible reply. Resolve that relationship while walking backwards
     # so pagination counts visible chat turns, not internal app-server turns.
     # Multiple user messages may be steered into one still-running Codex task.
-    # The oldest message keeps the authoritative task cursor; every newer
-    # message is an independent visible chat boundary with its own fallback id.
+    # A message with a native app-server item id uses it as the visible cursor,
+    # matching live replay. Older rows without that identity retain the task
+    # cursor for the oldest message; every newer steer gets its own fallback id.
     # Delaying emission until task_started preserves reverse chronological order
-    # while retaining the long-standing task cursor for ordinary one-user turns.
-    segment_users: list[tuple[int, str, str]] = []
+    # and keeps the separate native task id available for ownership evidence.
+    segment_users: list[
+        tuple[
+            int,
+            str,
+            str,
+            str | None,
+            CodexHistoryProcessWitness | None,
+        ]
+    ] = []
     segment_account_switch = False
-    pending_assistant_only: tuple[int, str] | None = None
-    for offset, line in _reverse_jsonl_records(path):
+    pending_assistant_only: tuple[
+        int,
+        str,
+        CodexHistoryProcessWitness | None,
+    ] | None = None
+    # A private account-switch query resumes the preceding visible prompt under
+    # a new native task.  The forward history translator deliberately hides
+    # that internal user row and merges its output into the preceding turn, so
+    # the lightweight reverse witness must carry its public process evidence
+    # across the interrupted terminal boundary as well.
+    pending_account_switch = _HistoryProcessAccumulator()
+    process = _HistoryProcessAccumulator()
+    saw_native_start = False
+    for offset, line in _reverse_jsonl_records(
+        path,
+        max_scan_bytes=max_scan_bytes,
+        end_offset=end_offset,
+        # Inspect only the short event header below. The image payload is never
+        # JSON-decoded here; existing total scan and per-record bounds remain.
+        max_record_bytes=(12 * 1024 * 1024 if include_process
+                          else _MAX_HISTORY_REVERSE_RECORD_BYTES),
+    ):
+        if include_process:
+            process.observe_file_change(offset, line)
+            process.observe_task_receipt(offset, line)
+            if _history_generated_image_record(line):
+                process.observe(None)
+                process.generated_images = True
+            visible_process, process_stamp = _history_visible_process_stamp(line)
+            if visible_process:
+                process.observe(process_stamp)
         if _history_account_switch_marker(line):
             segment_account_switch = True
             continue
-        user_cursor = _history_user_cursor(path, offset, line)
-        if user_cursor is not None:
-            fallback_cursor = _history_user_cursor(
-                path, offset, line, prefer_turn_id=False)
-            if fallback_cursor is None:
-                continue
-            segment_users.append((
-                _previous_jsonl_record_offset(path, offset),
+        user_cursors = _history_user_cursors(path, offset, line)
+        if user_cursors is not None:
+            (
                 user_cursor,
                 fallback_cursor,
+                native_cursor,
+                previous_offset,
+            ) = user_cursors
+            segment_users.append((
+                previous_offset,
+                user_cursor,
+                fallback_cursor,
+                native_cursor,
+                process.take(),
             ))
             continue
 
         turn_cursor = _history_turn_cursor(line)
         if turn_cursor is not None:
+            is_native_head = not saw_native_start
+            saw_native_start = True
             # An unresolved newer no-user start had no terminal boundary
             # between it and this older start, so it merely continued this turn.
-            pending_assistant_only = None
+            if pending_assistant_only is not None:
+                # The newer assistant-only task had no separating terminal, so
+                # its public work belongs to the newest visible user segment of
+                # this task. This is the persisted automatic-continuation shape.
+                _offset, _turn, continuation = pending_assistant_only
+                if segment_users:
+                    current = _HistoryProcessAccumulator()
+                    current.merge(segment_users[0][4])
+                    current.merge(continuation)
+                    segment_users[0] = (
+                        *segment_users[0][:4], current.snapshot(),
+                    )
+                else:
+                    process.merge(continuation)
+                pending_assistant_only = None
+            account_switch_continuation = (
+                pending_account_switch.take()
+            )
+            if account_switch_continuation is not None:
+                if segment_users:
+                    current = _HistoryProcessAccumulator()
+                    current.merge(segment_users[0][4])
+                    current.merge(account_switch_continuation)
+                    segment_users[0] = (
+                        *segment_users[0][:4], current.snapshot(),
+                    )
+                else:
+                    process.merge(account_switch_continuation)
             if segment_users:
+                # A compact/process marker between task_started and the oldest
+                # user row is flushed onto that row by the forward translator.
+                process.merge(segment_users[-1][4])
+                segment_users[-1] = (
+                    *segment_users[-1][:4], process.take(),
+                )
                 # Reverse scan order is newest -> oldest. Extra steered messages
-                # need stable per-record cursors; the oldest message keeps the
-                # task id so existing pagination cursors remain compatible.
-                for boundary, _cursor, extra_cursor in segment_users[:-1]:
-                    yield boundary, extra_cursor
-                yield offset, turn_cursor
+                # need stable per-record cursors. The oldest message also uses
+                # its native item id when available, while the task id remains
+                # an accepted compatibility cursor for rolling upgrades.
+                segment_count = len(segment_users)
+                for reverse_index, (
+                    boundary, _cursor, extra_cursor, _native_cursor,
+                    process_witness,
+                ) in enumerate(segment_users[:-1]):
+                    yield _CodexHistoryBoundary(
+                        boundary, extra_cursor, turn_cursor,
+                        process=process_witness,
+                        segment_index=segment_count - reverse_index - 1,
+                        segment_count=segment_count,
+                        appendable=is_native_head and reverse_index == 0,
+                    )
+                oldest_native_cursor = segment_users[-1][3]
+                yield _CodexHistoryBoundary(
+                    offset,
+                    oldest_native_cursor or turn_cursor,
+                    turn_cursor,
+                    (
+                        turn_cursor
+                        if oldest_native_cursor is not None
+                        else None
+                    ),
+                    process=segment_users[-1][4],
+                    segment_index=0,
+                    segment_count=segment_count,
+                    appendable=is_native_head and segment_count == 1,
+                )
             elif not segment_account_switch:
-                pending_assistant_only = (offset, turn_cursor)
+                pending_assistant_only = (
+                    offset, turn_cursor, process.take(),
+                )
+            else:
+                pending_account_switch.merge(process.take())
             segment_users = []
             segment_account_switch = False
             continue
 
         if (pending_assistant_only is not None
                 and _history_terminal_marker(line)):
-            yield pending_assistant_only
+            offset, turn_cursor, process_witness = pending_assistant_only
+            yield _CodexHistoryBoundary(
+                offset, turn_cursor, turn_cursor,
+                process=process_witness,
+            )
             pending_assistant_only = None
+    if (
+        pending_assistant_only is not None
+        and _history_goal_prompt_for_boundary(
+            path, pending_assistant_only[0],
+        )[0] is not None
+    ):
+        offset, turn_cursor, process_witness = pending_assistant_only
+        yield _CodexHistoryBoundary(
+            offset, turn_cursor, turn_cursor,
+            process=process_witness,
+        )
 
 
-def codex_history_window(
+def _history_boundaries(
+    path: str,
+    *,
+    use_turns: bool,
+    max_scan_bytes: int | None = None,
+):
+    """Compatibility iterator exposing only the stable paging cursor pair."""
+    for boundary in _history_boundary_records(
+        path,
+        use_turns=use_turns,
+        max_scan_bytes=max_scan_bytes,
+    ):
+        yield boundary.offset, boundary.cursor
+
+
+def codex_history_native_witness(
+    path: str,
+    *,
+    max_turns: int,
+    max_scan_bytes: int | None = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
+    required_turn_ids: tuple[str, ...] = (),
+) -> CodexHistoryNativeWitness:
+    """Return bounded, native-turn evidence without translating the rollout.
+
+    Boundary records are deliberately the only decoded payloads. Large tool,
+    token-count, reasoning, or malformed records therefore cannot recreate the
+    upstream app-server projection failure this witness is meant to detect.
+    """
+    bounded_turns = max(1, int(max_turns))
+    byte_budget = (
+        None if max_scan_bytes is None
+        else max(1024 * 1024, int(max_scan_bytes))
+    )
+    required = {
+        turn_id for turn_id in required_turn_ids
+        if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id)
+    }
+    source_size = os.path.getsize(path)
+    turn_ids: list[str] = []
+    seen: set[str] = set()
+    retained: set[str] = set()
+    process_by_visible_id: dict[str, CodexHistoryProcessWitness] = {}
+    offset_by_visible_id: dict[str, int] = {}
+    process_by_native_segment: dict[
+        tuple[str, int], CodexHistoryProcessWitness
+    ] = {}
+    offset_by_native_segment: dict[tuple[str, int], int] = {}
+    has_more_turns = False
+    stopped_early = False
+    completed_required_group: str | None = None
+    for boundary in _history_boundary_records(
+        path,
+        use_turns=True,
+        max_scan_bytes=byte_budget,
+        include_process=True,
+    ):
+        turn_id = boundary.native_turn_id
+        if (
+            turn_id is None
+        ):
+            continue
+        if turn_id not in seen:
+            if (
+                completed_required_group is not None
+                and turn_id != completed_required_group
+            ):
+                has_more_turns = True
+                stopped_early = True
+                break
+            seen.add(turn_id)
+            if len(turn_ids) >= bounded_turns:
+                has_more_turns = True
+            else:
+                retained.add(turn_id)
+                turn_ids.append(turn_id)
+        if turn_id in retained and boundary.process is not None:
+            process_by_visible_id[boundary.cursor] = boundary.process
+            process_by_native_segment[
+                (turn_id, boundary.segment_index)
+            ] = boundary.process
+        if turn_id in retained:
+            offset_by_visible_id[boundary.cursor] = boundary.offset
+            offset_by_native_segment[
+                (turn_id, boundary.segment_index)
+            ] = boundary.offset
+            if boundary.compatibility_cursor is not None:
+                offset_by_visible_id[
+                    boundary.compatibility_cursor
+                ] = boundary.offset
+        if required and required.issubset(seen):
+            completed_required_group = turn_id
+    return CodexHistoryNativeWitness(
+        turn_ids=tuple(turn_ids),
+        scanned_to_start=(
+            not stopped_early
+            and (
+                byte_budget is None
+                or source_size <= byte_budget
+            )
+        ),
+        has_more_turns=has_more_turns,
+        process_by_visible_id=process_by_visible_id,
+        offset_by_visible_id=offset_by_visible_id,
+        process_by_native_segment=process_by_native_segment,
+        offset_by_native_segment=offset_by_native_segment,
+    )
+
+
+def codex_history_process_witnesses(
+    path: str,
+    *,
+    before: str,
+    max_turns: int,
+    before_offset: int | None = None,
+    native_turn_ids: tuple[str, ...] = (),
+    source_end_offset: int | None = None,
+) -> CodexHistoryProcessPageWitness:
+    """Return positive process proof for one requested official-history page.
+
+    Official item ids need not occur anywhere in the rollout. Prefer the exact
+    native ids from the requested official page; a cached source offset only
+    accelerates that lookup. Legacy callers without native coordinates may
+    still use a source-visible cursor. Retain every steer segment belonging to
+    the requested native rows. The bounded head witness remains the completeness
+    check; this metadata-only read fills page rows outside its tail budget
+    without translating tools or expanding turn details.
+    """
+    if (
+        not isinstance(before, str)
+        or not _SAFE_WIRE_ID.fullmatch(before)
+        or isinstance(max_turns, bool)
+        or not isinstance(max_turns, int)
+        or max_turns <= 0
+    ):
+        return CodexHistoryProcessPageWitness()
+    if before_offset is not None and (
+        isinstance(before_offset, bool)
+        or not isinstance(before_offset, int)
+        or before_offset < 0
+    ):
+        return CodexHistoryProcessPageWitness()
+    if source_end_offset is not None and (
+        isinstance(source_end_offset, bool)
+        or not isinstance(source_end_offset, int)
+        or source_end_offset < 0
+    ):
+        return CodexHistoryProcessPageWitness()
+    if any(
+        not isinstance(turn_id, str) or not _SAFE_WIRE_ID.fullmatch(turn_id)
+        for turn_id in native_turn_ids
+    ) or len(set(native_turn_ids)) > max_turns:
+        return CodexHistoryProcessPageWitness()
+    requested = set(native_turn_ids)
+    target_found = before_offset is not None
+    retained: set[str] = set()
+    process_by_visible_id: dict[str, CodexHistoryProcessWitness] = {}
+    offset_by_visible_id: dict[str, int] = {}
+    process_by_native_segment: dict[
+        tuple[str, int], CodexHistoryProcessWitness
+    ] = {}
+    offset_by_native_segment: dict[tuple[str, int], int] = {}
+    stopped_early = False
+    append_segment = None
+    scan_end = source_end_offset
+    if before_offset is not None:
+        scan_end = before_offset if scan_end is None else min(before_offset, scan_end)
+    for boundary in _history_boundary_records(
+        path,
+        use_turns=True,
+        end_offset=scan_end,
+        include_process=True,
+    ):
+        native_turn_id = boundary.native_turn_id
+        if requested:
+            if native_turn_id not in requested:
+                if requested.issubset(retained):
+                    stopped_early = True
+                    break
+                continue
+            target_found = True
+        elif not target_found:
+            if (
+                boundary.cursor == before
+                or boundary.compatibility_cursor == before
+            ):
+                target_found = True
+            continue
+        if native_turn_id is None:
+            continue
+        if boundary.appendable and before_offset is None:
+            append_segment = (native_turn_id, boundary.segment_index)
+        if native_turn_id not in retained:
+            if len(retained) >= max_turns:
+                stopped_early = True
+                break
+            retained.add(native_turn_id)
+        offset_by_visible_id[boundary.cursor] = boundary.offset
+        offset_by_native_segment[
+            (native_turn_id, boundary.segment_index)
+        ] = boundary.offset
+        if boundary.compatibility_cursor is not None:
+            offset_by_visible_id[
+                boundary.compatibility_cursor
+            ] = boundary.offset
+        if boundary.process is not None:
+            process_by_visible_id[boundary.cursor] = boundary.process
+            process_by_native_segment[
+                (native_turn_id, boundary.segment_index)
+            ] = boundary.process
+        if requested and requested.issubset(retained) and boundary.segment_index == 0:
+            # Every steer of the oldest requested task has now been emitted.
+            # Do not walk an unrelated (possibly huge) older task just to find
+            # its next boundary and discover that the page is complete.
+            stopped_early = boundary.offset > 0
+            break
+    return CodexHistoryProcessPageWitness(
+        process_by_visible_id=process_by_visible_id,
+        offset_by_visible_id=offset_by_visible_id,
+        process_by_native_segment=process_by_native_segment,
+        offset_by_native_segment=offset_by_native_segment,
+        scanned_to_start=target_found and not stopped_early,
+        append_segment=append_segment,
+    )
+
+
+def codex_history_process_append(
+    path: str,
+    *,
+    previous: CodexHistoryProcessPageWitness,
+    start_offset: int,
+    end_offset: int,
+) -> CodexHistoryProcessPageWitness | None:
+    """Extend positive metadata by reading only a source-validated append.
+
+    The caller verifies the old file prefix. New user/task boundaries require
+    the full ownership parser, as do partial JSONL records; never guess which
+    steer/automatic continuation should own their process evidence.
+    """
+    segment = previous.append_segment
+    if segment is None or start_offset <= 0 or end_offset <= start_offset:
+        return None
+    with open(path, "rb") as source:
+        source.seek(start_offset - 1)
+        if source.read(1) != b"\n":
+            return None
+        source.seek(end_offset - 1)
+        if source.read(1) != b"\n":
+            return None
+    process = _HistoryProcessAccumulator()
+    process.merge(previous.process_by_native_segment.get(segment))
+    if process.task_receipts:
+        # A formerly answer-less receipt may gain its exact following anchor.
+        # Rebuild this requested segment instead of retaining a stale end slot.
+        return None
+    for offset, line in _reverse_jsonl_records(
+        # Include the preceding newline so the reverse reader can emit the
+        # first appended record rather than dropping it as a partial carry.
+        path, max_scan_bytes=end_offset - start_offset + 1,
+        end_offset=end_offset, max_record_bytes=12 * 1024 * 1024,
+    ):
+        if (any(marker in line for marker in (
+            b'"task_started"', b'"user_message"', b'"session_meta"',
+            b'"thread_goal_updated"', b'"thread_goal_cleared"',
+        )) or re.search(rb'"usermessage"|"functioncalloutput"|"role"\s*:\s*"user"', line, re.I)):
+            return None
+        if _history_generated_image_record(line):
+            process.observe(None)
+            process.generated_images = True
+        process.observe_file_change(offset, line)
+        process.observe_task_receipt(offset, line)
+        if process.task_receipts:
+            # Narrative boundaries need the complete segment's message order.
+            return None
+        visible, stamp = _history_visible_process_stamp(line)
+        if visible:
+            process.observe(stamp)
+    updated = process.snapshot()
+    if updated is None:
+        return previous
+    native = {**previous.process_by_native_segment, segment: updated}
+    visible = dict(previous.process_by_visible_id)
+    segment_offset = previous.offset_by_native_segment[segment]
+    for cursor, offset in previous.offset_by_visible_id.items():
+        if offset == segment_offset:
+            visible[cursor] = updated
+    return replace(previous, process_by_native_segment=native,
+                   process_by_visible_id=visible)
+
+
+def codex_history_file_changes(
+    path: str, offsets_by_turn: dict[str, tuple[int, ...]], *, end_offset: int,
+) -> tuple[dict[str, list[dict]], set[str]]:
+    """Read only witnessed mutation records on the requested history page.
+
+    No full turn hydration, command output or worktree reads. The caller binds
+    offsets to a validated source fingerprint and exact native steer segment.
+    A bounded/incomplete read may expose paths, never a misleading partial diff.
+    """
+    sources: dict[str, list[dict]] = {}
+    incomplete: set[str] = set()
+    remaining = 16 * 1024 * 1024
+    with open(path, "rb") as source:
+        for turn_id, offsets in offsets_by_turn.items():
+            events = sources[turn_id] = []
+            for offset in sorted(set(offsets)):
+                if not 0 <= offset < end_offset or remaining <= 0:
+                    incomplete.add(turn_id)
+                    continue
+                source.seek(offset)
+                limit = min(8 * 1024 * 1024, remaining, end_offset - offset)
+                raw = source.readline(limit)
+                remaining -= len(raw)
+                if not raw.endswith(b"\n"):
+                    incomplete.add(turn_id)
+                    continue
+                try:
+                    record = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    incomplete.add(turn_id)
+                    continue
+                payload = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(payload, dict):
+                    incomplete.add(turn_id)
+                    continue
+                if record.get("type") == "event_msg" and payload.get("type") == "patch_apply_end":
+                    item = {"type": "fileChange", "id": payload.get("call_id"),
+                            "changes": payload.get("changes"),
+                            "status": "failed" if payload.get("success") is False else "completed"}
+                elif record.get("type") == "response_item" and str(payload.get("type")).lower() == "filechange":
+                    item = payload
+                elif record.get("type") == "event_msg" and payload.get("type") == "item_completed":
+                    item = payload.get("item")
+                    if not isinstance(item, dict) or str(item.get("type")).lower() != "filechange":
+                        continue
+                else:
+                    continue
+                if not isinstance(item.get("id"), str) or not item["id"]:
+                    incomplete.add(turn_id)
+                    continue
+                # Rollouts use PascalCase / path->change maps; app-server v2
+                # notifications use camelCase / change arrays. Both describe
+                # the same native edit and share the existing safe translator.
+                item = {**item, "type": "fileChange"}
+                translator = CodexStreamTranslator(64 * 1024)
+                use = turn_change_event_data(translator._tool_update(item))
+                if item.get("status") not in {"completed", "failed", "declined", "cancelled", "interrupted"}:
+                    events.append(use)
+                    continue
+                result = turn_change_event_data(translator._tool_result(item))
+                events.extend((use, result))
+    return sources, incomplete
+
+
+def codex_history_window_info(
     path: str, *, before: str | None, limit: int | None,
     max_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
-) -> tuple[int, int, bool, str | None, int | None]:
-    """Select a bounded Codex history page by scanning user turns backwards.
+) -> CodexHistoryWindow:
+    """Select a bounded Codex history page and retain exact boundary identity.
 
-    Returns ``(start_offset, end_offset, has_older, forced_oldest_cursor,
-    forced_boundary_offset)``.
     The rollout can be many gigabytes: only boundary records are decoded while
     locating the latest page, and the forward translator sees at most the
     configured source window.  ``forced_oldest_cursor`` preserves pagination
@@ -417,7 +1816,7 @@ def codex_history_window(
     """
     size = os.path.getsize(path)
     if size <= 0 or not isinstance(limit, int) or limit <= 0:
-        return 0, size, False, None, None
+        return CodexHistoryWindow(0, size, False)
     byte_budget = max(1024 * 1024, int(max_bytes))
 
     # Current app-server rollouts have an authoritative task_started boundary
@@ -426,37 +1825,182 @@ def codex_history_window(
     for use_turns in (True, False):
         end_offset = size
         target_found = before is None
-        boundaries: list[tuple[int, str]] = []
+        boundaries: list[_CodexHistoryBoundary] = []
+        newest_boundary: _CodexHistoryBoundary | None = None
         saw_boundary = False
-        for offset, cursor in _history_boundaries(path, use_turns=use_turns):
+        for boundary in _history_boundary_records(path, use_turns=use_turns):
+            offset = boundary.offset
+            cursor = boundary.cursor
             saw_boundary = True
             if not target_found:
-                if cursor == before:
+                if (
+                    cursor == before
+                    or boundary.compatibility_cursor == before
+                ):
                     target_found = True
                     end_offset = offset
                 continue
-            boundaries.append((offset, cursor))
+            boundaries.append(boundary)
+            if newest_boundary is None:
+                newest_boundary = boundary
             if end_offset - offset > byte_budget:
                 if len(boundaries) > 1:
-                    start_offset, _ = boundaries[-2]
-                    return start_offset, end_offset, True, None, None
-                # Preserve the recent tail of a pathological single turn. The
-                # true task cursor remains the paging cursor for older history.
+                    return CodexHistoryWindow(
+                        start_offset=boundaries[-2].offset,
+                        end_offset=end_offset,
+                        has_older=True,
+                        newest_boundary_offset=newest_boundary.offset,
+                        newest_cursor=newest_boundary.cursor,
+                        newest_native_turn_id=newest_boundary.native_turn_id,
+                        newest_segment_index=newest_boundary.segment_index,
+                    )
+                # Preserve the recent tail of a pathological single turn. Its
+                # visible boundary cursor remains available for older history.
                 start_offset = _next_jsonl_offset(
                     path, max(0, end_offset - byte_budget), end_offset)
-                return start_offset, end_offset, True, cursor, offset
+                return CodexHistoryWindow(
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    has_older=True,
+                    forced_oldest_cursor=cursor,
+                    forced_boundary_offset=offset,
+                    forced_native_turn_id=boundary.native_turn_id,
+                    forced_segment_index=boundary.segment_index,
+                    newest_boundary_offset=newest_boundary.offset,
+                    newest_cursor=newest_boundary.cursor,
+                    newest_native_turn_id=newest_boundary.native_turn_id,
+                    newest_segment_index=newest_boundary.segment_index,
+                )
             if len(boundaries) > limit:
-                start_offset, _ = boundaries[limit - 1]
-                return start_offset, end_offset, True, None, None
+                return CodexHistoryWindow(
+                    start_offset=boundaries[limit - 1].offset,
+                    end_offset=end_offset,
+                    has_older=True,
+                    newest_boundary_offset=newest_boundary.offset,
+                    newest_cursor=newest_boundary.cursor,
+                    newest_native_turn_id=newest_boundary.native_turn_id,
+                    newest_segment_index=newest_boundary.segment_index,
+                )
         if saw_boundary:
             if before is not None and not target_found:
-                return 0, 0, False, None, None
-            return 0, end_offset, False, None, None
+                return CodexHistoryWindow(0, 0, False)
+            return CodexHistoryWindow(
+                start_offset=0,
+                end_offset=end_offset,
+                has_older=False,
+                newest_boundary_offset=(
+                    newest_boundary.offset if newest_boundary is not None
+                    else None
+                ),
+                newest_cursor=(
+                    newest_boundary.cursor if newest_boundary is not None
+                    else None
+                ),
+                newest_native_turn_id=(
+                    newest_boundary.native_turn_id
+                    if newest_boundary is not None else None
+                ),
+                newest_segment_index=(
+                    newest_boundary.segment_index
+                    if newest_boundary is not None else None
+                ),
+            )
     if size > byte_budget:
         start_offset = _next_jsonl_offset(
             path, size - byte_budget, size)
-        return start_offset, size, True, None, None
-    return 0, size, False, None, None
+        return CodexHistoryWindow(start_offset, size, True)
+    return CodexHistoryWindow(0, size, False)
+
+
+def codex_history_window(
+    path: str, *, before: str | None, limit: int | None,
+    max_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
+) -> tuple[int, int, bool, str | None, int | None]:
+    """Compatibility five-tuple for callers which need only page offsets."""
+    return codex_history_window_info(
+        path,
+        before=before,
+        limit=limit,
+        max_bytes=max_bytes,
+    ).legacy()
+
+
+def codex_history_boundary_process_start(
+    path: str,
+    boundary_offset: int,
+    *,
+    max_scan_bytes: int = _MAX_HISTORY_BOUNDARY_FORWARD_BYTES,
+) -> int | None:
+    """Recover the first public-process timestamp omitted by a tail window.
+
+    ``codex_history_window`` can retain only the recent tail of one enormous
+    native turn. The tail may begin at a late compaction record even though a
+    commentary/tool event was persisted near the original user boundary. Scan
+    forward from that already-proven boundary and stop at the first visible
+    process event belonging to that exact user segment. A direct final answer,
+    private reasoning, and ordinary lifecycle plumbing remain non-evidence, so
+    this helper cannot recreate an empty ``已处理`` disclosure.
+
+    The scan is byte-bounded and oversized JSONL records are skipped by
+    ``_bounded_jsonl_records``. A timestamp is returned only after the segment's
+    real visible user row has also been observed; assistant-only boundaries are
+    therefore never attached to an unrelated prompt.
+    """
+    if (
+        isinstance(boundary_offset, bool)
+        or not isinstance(boundary_offset, int)
+        or boundary_offset < 0
+        or isinstance(max_scan_bytes, bool)
+        or not isinstance(max_scan_bytes, int)
+        or max_scan_bytes <= 0
+    ):
+        return None
+    try:
+        size = os.path.getsize(path)
+        end_offset = min(
+            size,
+            boundary_offset + max(1024 * 1024, max_scan_bytes),
+        )
+        source = open(path, "rb")
+    except (OSError, TypeError, ValueError):
+        return None
+
+    saw_user = False
+    process_before_user: int | None = None
+    with source:
+        source.seek(boundary_offset)
+        for _offset, line in _bounded_jsonl_records(
+            source, end_offset=end_offset,
+        ):
+            if len(line) <= _MAX_HISTORY_REVERSE_RECORD_BYTES:
+                visible_process, stamp_ms = _history_visible_process_stamp(
+                    line.encode("utf-8"),
+                )
+                if visible_process and stamp_ms is not None:
+                    if saw_user:
+                        return stamp_ms
+                    if process_before_user is None:
+                        process_before_user = stamp_ms
+
+            # Avoid decoding ordinary output, token and large compact rows just
+            # to discover the one visible user boundary.
+            if "user_message" not in line and "item_completed" not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = row.get("payload") if isinstance(row, dict) else None
+            user = codex_rollout_user_message(payload)
+            if user is None or not user.prompt:
+                continue
+            if saw_user:
+                # Any later public work belongs to this newer steer segment.
+                return None
+            saw_user = True
+            if process_before_user is not None:
+                return process_before_user
+    return None
 
 
 def codex_history_boundary_user(
@@ -473,9 +2017,10 @@ def codex_history_boundary_user(
     after one or more ``compacted`` records.  Reading only its recent tail keeps
     memory bounded but otherwise leaves the browser with tool/assistant events
     that have no prompt.  Scan forward from the already-discovered turn boundary
-    only until the requested visible user record and reuse the paging cursor as
-    its stable id.  ``user_index`` also lets the official-history adapter recover
-    images from later steer messages without translating the whole rollout.
+    only until the requested visible user record. Reuse its adjacent native
+    item id when present, otherwise retain the paging cursor as the stable id.
+    ``user_index`` also lets the official-history adapter recover images from
+    later steer messages without translating the whole rollout.
     Oversized JSONL records are skipped by ``_bounded_jsonl_records`` rather than
     materialized.
     """
@@ -499,6 +2044,7 @@ def codex_history_boundary_user(
 
     saw_task_start = False
     pending_images: list = []
+    pending_legacy_user_item_id: str | None = None
     with source:
         source.seek(boundary_offset)
         for _offset, line in _bounded_jsonl_records(
@@ -506,20 +2052,32 @@ def codex_history_boundary_user(
             try:
                 row = json.loads(line)
             except (json.JSONDecodeError, ValueError):
+                pending_legacy_user_item_id = None
                 continue
             payload = row.get("payload") if isinstance(row, dict) else None
+            row_type = row.get("type") if isinstance(row, dict) else None
+            payload_type = (
+                payload.get("type") if isinstance(payload, dict) else None
+            )
+            paired_legacy_user_item_id = None
+            if pending_legacy_user_item_id is not None:
+                if row_type == "event_msg" and payload_type == "user_message":
+                    paired_legacy_user_item_id = pending_legacy_user_item_id
+                # Pairing is valid for exactly one adjacent persisted record.
+                pending_legacy_user_item_id = None
             if not isinstance(payload, dict):
                 continue
-            row_type = row.get("type")
-            payload_type = payload.get("type")
             if row_type == "event_msg" and payload_type == "task_started":
                 if saw_task_start:
-                    return None
+                    break
                 saw_task_start = True
                 continue
             if (row_type == "response_item"
                     and payload_type == "message"
                     and payload.get("role") == "user"):
+                pending_legacy_user_item_id = (
+                    _legacy_response_user_item_id(payload)
+                )
                 for item in payload.get("content") or []:
                     if (isinstance(item, dict)
                             and item.get("type") == "input_image"):
@@ -527,17 +2085,37 @@ def codex_history_boundary_user(
                         if image:
                             pending_images.append(image)
                 continue
-            if row_type != "event_msg" or payload_type != "user_message":
+            if row_type != "event_msg":
                 continue
-            prompt = visible_codex_user_message(payload.get("message"))
-            if not prompt:
+            user = codex_rollout_user_message(payload)
+            if user is None:
+                continue
+            if not user.prompt:
                 pending_images = []
                 continue
             if user_index:
                 user_index -= 1
                 pending_images = []
                 continue
-            event = UserMsg(msg_id=cursor, prompt=prompt)
+            message_id = (
+                user.message_id
+                if isinstance(user.message_id, str)
+                and _SAFE_WIRE_ID.fullmatch(user.message_id)
+                else paired_legacy_user_item_id or cursor
+            )
+            client_id = (
+                user.client_id
+                if isinstance(user.client_id, str)
+                and _SAFE_WIRE_ID.fullmatch(user.client_id)
+                else None
+            )
+            event = UserMsg(
+                msg_id=message_id,
+                client_msg_id=client_id,
+                prompt=user.prompt,
+                source_thread_id=user.source_thread_id,
+                ts=0,
+            )
             if pending_images:
                 event.images = pending_images
             raw_ts = row.get("timestamp")
@@ -548,7 +2126,15 @@ def codex_history_boundary_user(
                 except (TypeError, ValueError):
                     pass
             return event
-    return None
+    goal_prompt, _stable = _history_goal_prompt_for_boundary(
+        path, boundary_offset)
+    if goal_prompt is None or user_index != 0:
+        return None
+    prompt, timestamp = goal_prompt
+    event = UserMsg(msg_id=cursor, prompt=prompt, ts=0)
+    if timestamp is not None:
+        event.ts = timestamp
+    return event
 
 
 def codex_history_turn_user(
@@ -556,13 +2142,18 @@ def codex_history_turn_user(
     turn_id: str,
     cursor: str,
     user_index: int = 0,
+    *,
+    max_reverse_scan_bytes: int | None = None,
+    boundary_offset: int | None = None,
 ) -> UserMsg | None:
     """Recover one visible user row for one native Codex turn.
 
     Official summary items retain expired ``localImage`` paths rather than the
     inline image bytes persisted in the rollout. Locate only the requested
     native turn boundary, then reuse the bounded forward reader above so image
-    thumbnails remain available without translating the whole rollout.
+    thumbnails remain available without translating the whole rollout. Live
+    recovery may bound the reverse search to the recent tail; history detail
+    reads retain the existing unbounded exact-turn lookup by default.
     """
     if (
         not isinstance(turn_id, str)
@@ -575,13 +2166,75 @@ def codex_history_turn_user(
     ):
         return None
     try:
-        for offset, boundary in _history_boundaries(path, use_turns=True):
-            if boundary == turn_id:
+        if (isinstance(boundary_offset, int)
+                and not isinstance(boundary_offset, bool) and boundary_offset >= 0):
+            # The caller binds this coordinate to a verified source snapshot.
+            # Still require the exact native task marker before using it.
+            with open(path, "rb") as source:
+                source.seek(boundary_offset)
+                boundary = source.readline(_MAX_HISTORY_REVERSE_RECORD_BYTES + 1)
+            if _history_turn_cursor(boundary) == turn_id:
+                return codex_history_boundary_user(
+                    path, boundary_offset, cursor, user_index=user_index)
+        for offset, line in _reverse_jsonl_records(
+            path,
+            max_scan_bytes=max_reverse_scan_bytes,
+        ):
+            if _history_turn_cursor(line) == turn_id:
                 return codex_history_boundary_user(
                     path, offset, cursor, user_index=user_index)
     except OSError:
         return None
     return None
+
+
+def codex_history_turn_users(
+    path: str,
+    turn_ids: tuple[str, ...],
+    *,
+    max_scan_bytes: int = _MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES,
+) -> CodexAutomaticUserRecovery:
+    """Recover a bounded set of assistant-only Goal prompts in one reverse pass.
+
+    Official summary pages must never walk a multi-gigabyte rollout once per
+    row.  The live projection fills misses authoritatively; this compatibility
+    lookup inspects only a bounded recent tail for sessions created before that
+    live overlay existed.
+    """
+    targets = {
+        turn_id for turn_id in turn_ids
+        if isinstance(turn_id, str) and _SAFE_WIRE_ID.fullmatch(turn_id)
+    }
+    if not targets:
+        return CodexAutomaticUserRecovery()
+    recovered: dict[str, UserMsg] = {}
+    seen: set[str] = set()
+    try:
+        for offset, line in _reverse_jsonl_records(
+            path, max_scan_bytes=max_scan_bytes,
+        ):
+            boundary = _history_turn_cursor(line)
+            if boundary not in targets:
+                continue
+            goal_prompt, stable = _history_goal_prompt_for_boundary(
+                path, offset)
+            if stable:
+                seen.add(boundary)
+            if goal_prompt is not None:
+                prompt, timestamp = goal_prompt
+                user = UserMsg(msg_id=boundary, prompt=prompt)
+                if timestamp is not None:
+                    user.ts = timestamp
+                recovered[boundary] = user
+            targets.remove(boundary)
+            if not targets:
+                break
+    except OSError:
+        pass
+    return CodexAutomaticUserRecovery(
+        users=recovered,
+        seen_turn_ids=frozenset(seen),
+    )
 
 
 def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
@@ -614,18 +2267,16 @@ def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
             except (json.JSONDecodeError, ValueError):
                 continue
             payload = row.get("payload") if isinstance(row, dict) else None
-            if (
-                row.get("type") != "event_msg"
-                or not isinstance(payload, dict)
-                or payload.get("type") != "user_message"
-            ):
+            if row.get("type") != "event_msg":
                 continue
-            message = payload.get("message")
-            if is_codex_account_switch_message(message):
+            user = codex_rollout_user_message(payload)
+            if user is None:
+                continue
+            if is_codex_account_switch_message(user.raw_text):
                 if groups:
                     groups[-1] += 1
                 continue
-            if visible_codex_user_message(message):
+            if user.prompt:
                 groups.append(1)
                 if len(groups) > logical_turns:
                     del groups[0]
@@ -796,6 +2447,7 @@ class CodexStreamTranslator:
         self._started: set[str] = set()
         self._text_seen: set[str] = set()
         self._message_channels: dict[str, str] = {}
+        self._async_messages: set[str] = set()
         self._tools_started: set[str] = set()
         self._tool_message_ids: dict[str, str] = {}
         self._reasoning_started: set[str] = set()
@@ -819,12 +2471,30 @@ class CodexStreamTranslator:
         self._live_items_truncated = False
         self._turn_closed = False
 
-    def feed(self, msg: dict) -> list:
+    def feed(
+        self,
+        msg: dict,
+        *,
+        authoritative_terminal: bool = True,
+    ) -> list:
+        """Translate one app-server notification.
+
+        ``authoritative_terminal=False`` is reserved for the few callers which
+        feed a locally synthesized ``turn/completed`` only to close translator
+        blocks.  Its TurnEnd remains useful on the live wire, but cannot be
+        persisted as an engine-owned lifecycle fact.
+        """
         method = msg.get("method")
         p = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         out: list = []
 
-        if method == "item/agentMessage/delta":
+        if method == "thread/tokenUsage/updated":
+            owner = _optional_wire_id(p.get("turnId"), "turn")
+            usage = msg.get("_cc_remote_usage")
+            if owner and isinstance(usage, dict) and not self._turn_closed:
+                out.append(TurnUsage(turn_id=owner, usage=usage))
+
+        elif method == "item/agentMessage/delta":
             iid = _live_id(p.get("itemId"), "agent-message")
             if not self._admit_live_item(iid, out):
                 return out
@@ -840,7 +2510,7 @@ class CodexStreamTranslator:
             if isinstance(delta, str) and delta:
                 self._text_seen.add(iid)
                 self._visible_output = True
-                if channel == "final":
+                if channel == "final" and iid not in self._async_messages:
                     self._final_output = True
                 out.append(Delta(message_id=iid, text=delta, channel=channel))
 
@@ -853,6 +2523,8 @@ class CodexStreamTranslator:
                     return out
                 channel = _assistant_channel(item.get("phase"))
                 self._message_channels[iid] = channel
+                if item.get("delivery") == "async":
+                    self._async_messages.add(iid)
                 if iid not in self._started:
                     if self._open_msg is not None and self._open_msg != iid:
                         self._close_open(out)
@@ -902,11 +2574,18 @@ class CodexStreamTranslator:
                     self._visible_output = True
                     out.append(Delta(
                         message_id=iid, text=text, channel=channel))
-                if text and channel == "final":
+                if item.get("delivery") == "async":
+                    self._async_messages.add(iid)
+                    self._final_output = any(
+                        mid not in self._async_messages
+                        and self._message_channels.get(mid) == "final"
+                        for mid in self._text_seen)
+                elif text and channel == "final":
                     self._final_output = True
                 if iid in self._started:
                     out.append(AssistantMsgEnd(
-                        message_id=iid, channel=channel))
+                        message_id=iid, channel=channel,
+                        **_async_message_fields(item)))
                     if self._open_msg == iid:
                         self._open_msg = None
                         self._open_channel = "unknown"
@@ -1299,6 +2978,8 @@ class CodexStreamTranslator:
             self._close_open(out)
             turn = p.get("turn") or {}
             st = turn.get("status") or "completed"
+            if st == "completed" and turn.get("error") is not None:
+                st = "failed"
             # A failed turn may carry provider diagnostics in turn.error. Keep
             # those on the local engine boundary and emit only stable product
             # copy (the error notification above may not fire for every mode).
@@ -1338,18 +3019,20 @@ class CodexStreamTranslator:
                        else "error_during_execution" if st == "interrupted"
                        else "error")
             completed_turn_id = turn.get("id")
-            out.append(TurnEnd(result=TurnResult(
+            terminal = TurnEnd(result=TurnResult(
                 subtype=subtype,
                 duration_ms=int(turn.get("durationMs") or 0),
                 is_error=(st != "completed"),
             ), turn_id=(completed_turn_id
-                        if isinstance(completed_turn_id, str) else None)))
+                        if isinstance(completed_turn_id, str) else None))
+            terminal._codex_authoritative_terminal = authoritative_terminal
+            out.append(terminal)
             self._clear_all_delta_budgets()
             self._completed_plan = None
             self._turn_closed = True
 
         # everything else (raw reasoning, userMessage, mcpServer/startupStatus,
-        # thread/status, account/rateLimits, tokenUsage, remoteControl…) -> skip.
+        # thread/status, account/rateLimits, remoteControl…) -> skip.
         return out
 
     # ---- helpers ----
@@ -1489,13 +3172,15 @@ class CodexStreamTranslator:
             title=title,
             server=server,
         ))
+        if item_type == "fileChange":
+            _attach_change_source(out[-1], item.get("changes"))
         return out
 
     def _tool_update(self, item: dict) -> ToolUse:
         item_type = str(item.get("type") or "tool")
         iid = _live_id(item.get("id"), f"{item_type}-tool")
         tool, category, title, server = _tool_presentation(item)
-        return ToolUse(
+        event = ToolUse(
             message_id=self._tool_message_ids.get(iid, iid),
             tool_use_id=iid,
             tool=tool,
@@ -1505,17 +3190,20 @@ class CodexStreamTranslator:
             title=title,
             server=server,
         )
+        if item_type == "fileChange":
+            _attach_change_source(event, item.get("changes"))
+        return event
 
     def _tool_result(self, item: dict) -> ToolResult:
         item_type = item.get("type")
         status = _process_status(item.get("status"))
         code = _nonnegative_or_signed_int(item.get("exitCode"))
         diff = None
+        diff_truncated = None
         summary = None
         raw_content = item.get("aggregatedOutput") or item.get("output") or ""
         if item_type == "fileChange":
-            diff, diff_truncated = bounded_text(
-                _changes_diff(item.get("changes")), 2 * 1024 * 1024)
+            diff, diff_truncated = _bounded_changes_diff(item.get("changes"))
             paths = _change_paths(item.get("changes"))
             summary = _file_summary(paths, status)
             raw_content = summary
@@ -1546,7 +3234,7 @@ class CodexStreamTranslator:
             status in {"failed", "declined", "cancelled", "interrupted"}
             or (code is not None and code != 0)
         )
-        return ToolResult(
+        event = ToolResult(
             tool_use_id=_live_id(item.get("id"), f"{item_type}-tool"),
             content=text,
             is_error=is_error,
@@ -1554,9 +3242,14 @@ class CodexStreamTranslator:
             status=status,
             summary=summary or None,
             diff=diff or None,
+            diff_source="native" if item_type == "fileChange" else None,
+            diff_truncated=diff_truncated,
             exit_code=code,
             duration_ms=_duration_ms(item.get("durationMs")),
         )
+        if item_type == "fileChange":
+            _attach_change_source(event, item.get("changes"))
+        return event
 
     def _ensure_reasoning(self, iid: str, params: dict):
         if iid in self._reasoning_started:
@@ -1577,6 +3270,10 @@ class CodexStreamTranslator:
         turn_id = _optional_wire_id(params.get("turnId"), "turn")
         phase = "end" if completed else "start"
         status = "succeeded" if completed else "running"
+        if item_type == "functionCallOutput":
+            return task_receipt_event(
+                item, item_id=iid, turn_id=turn_id,
+                detail_limit=self.tool_result_max)
         if item_type == "reasoning":
             summary = _reasoning_summary(item)
             if not summary:
@@ -1634,6 +3331,11 @@ class CodexStreamTranslator:
             prompt, prompt_truncated = bounded_text(
                 item.get("revisedPrompt"), 64 * 1024)
             path, _ = bounded_text(item.get("savedPath"), 16 * 1024)
+            image = (_generated_image_payload(item.get("result"))
+                     if completed and generated_status == "succeeded" else None)
+            image_input: dict = {"file_path": path} if path else {}
+            if image is not None and turn_id:
+                image_input["history_image"] = codex_generated_image_ref(turn_id, image)
             # `result` may be a full base64 image. The saved file is previewable
             # through the existing authenticated artifact route; never duplicate
             # the binary payload into replay history or relay buffers.
@@ -1641,7 +3343,7 @@ class CodexStreamTranslator:
                 item_id=iid, kind="server_tool", phase=phase,
                 status=generated_status, turn_id=turn_id, title="生成图片",
                 summary=prompt or (path if path else None),
-                input={"file_path": path} if path else None,
+                input=image_input or None, tool="image_generation",
                 truncated=True if prompt_truncated else None,
             )
         if item_type in {"enteredReviewMode", "exitedReviewMode"}:
@@ -1726,7 +3428,11 @@ def _retry_detail(error: dict) -> str:
     status_match = re.search(r"\b([45]\d\d)\b", combined)
     status = status_match.group(1) if status_match else _structured_http_status(error)
     attempt = re.search(r"\b(\d+\s*/\s*\d+)\b", combined)
-    if status:
+    if usage_limit_failure(error) is not None:
+        text = "账号额度已用完，Codex 正在重试"
+    elif _is_model_capacity_error(error):
+        text = "当前模型繁忙，Codex 正在重试"
+    elif status:
         text = f"上游服务返回 HTTP {status}，Codex 正在重试"
     else:
         text = "Codex 上游请求暂时失败，正在重试"
@@ -1744,12 +3450,38 @@ _RATE_LIMIT_TURN_FAILURE = "请求过于频繁或当前额度受限，请稍后�
 _TIMEOUT_TURN_FAILURE = "请求超时，请重新尝试。"
 _UPSTREAM_TURN_FAILURE = "Codex 上游服务暂时不可用，请稍后重试。"
 _NETWORK_TURN_FAILURE = "网络连接异常，请检查网络后重试。"
+_POLICY_TURN_FAILURE = (
+    "上游模型因安全策略拒绝了本次请求（cyber_policy）。"
+    "这不是本地权限或网络错误；请核实并说明任务背景与授权范围，"
+    "若属误判请向服务提供方反馈。"
+)
+
+_CAPACITY_TURN_FAILURE = "当前模型繁忙，请稍后重试或切换模型。"
+
+
+def _is_model_capacity_error(error: dict) -> bool:
+    # Live app-server errors use camelCase; durable rollout errors use snake_case.
+    for key in ("codexErrorInfo", "codex_error_info"):
+        info = error.get(key)
+        if isinstance(info, str) and info in {"serverOverloaded", "server_overloaded"}:
+            return True
+        if isinstance(info, dict) and any(
+            tag in info for tag in ("serverOverloaded", "server_overloaded")
+        ):
+            return True
+    message = error.get("message")
+    return isinstance(message, str) and (
+        "selected model is at capacity" in message[:8192].lower()
+    )
 
 
 def _provider_failure_message(error: object) -> str:
     """Map one provider terminal to bounded, user-actionable product copy."""
     if not isinstance(error, dict):
         return _GENERIC_TURN_FAILURE
+    quota_failure = usage_limit_failure(error)
+    if quota_failure is not None:
+        return quota_failure
     message = error.get("message") if isinstance(error.get("message"), str) else ""
     details = (
         error.get("additionalDetails")
@@ -1757,6 +3489,12 @@ def _provider_failure_message(error: object) -> str:
         else ""
     )
     combined = f"{message} {details}"[:8192].lower()
+    info = error.get("codexErrorInfo", error.get("codex_error_info"))
+    if info in ("cyberPolicy", "cyber_policy") or (
+        isinstance(info, dict)
+        and ("cyberPolicy" in info or "cyber_policy" in info)
+    ):
+        return _POLICY_TURN_FAILURE
     status = _structured_http_status(error)
     if status is None:
         status_match = re.search(r"\b([45]\d\d)\b", combined)
@@ -1767,6 +3505,8 @@ def _provider_failure_message(error: object) -> str:
         return _RATE_LIMIT_TURN_FAILURE
     if status == "408":
         return _TIMEOUT_TURN_FAILURE
+    if _is_model_capacity_error(error):
+        return _CAPACITY_TURN_FAILURE
     if status is not None:
         if status.startswith("5"):
             return _UPSTREAM_TURN_FAILURE
@@ -1814,14 +3554,14 @@ def _bounded_model_list(value) -> list[str]:
 
 def _structured_http_status(error: dict) -> str | None:
     """Find a bounded codexErrorInfo.httpStatusCode without exposing details."""
-    stack = [error.get("codexErrorInfo")]
+    stack = [error.get("codexErrorInfo"), error.get("codex_error_info")]
     seen = 0
     while stack and seen < 32:
         value = stack.pop()
         seen += 1
         if not isinstance(value, dict):
             continue
-        status = value.get("httpStatusCode")
+        status = value.get("httpStatusCode", value.get("http_status_code"))
         if isinstance(status, int) and 400 <= status <= 599:
             return str(status)
         stack.extend(list(value.values())[:16])
@@ -2060,7 +3800,7 @@ def _tool_presentation(item: dict) -> tuple[str, str, str | None, str | None]:
 def _change_descriptors(changes) -> list[dict]:
     descriptors: list[dict] = []
     if isinstance(changes, list):
-        iterable = changes[:64]
+        iterable = changes[:_MAX_FILE_CHANGE_ITEMS]
         for entry in iterable:
             if not isinstance(entry, dict):
                 continue
@@ -2075,7 +3815,7 @@ def _change_descriptors(changes) -> list[dict]:
                 descriptor["move_path"] = move_path[:16 * 1024]
             descriptors.append(descriptor)
     elif isinstance(changes, dict):
-        for path, change in list(changes.items())[:64]:
+        for path, change in islice(changes.items(), _MAX_FILE_CHANGE_ITEMS):
             kind = change.get("type") if isinstance(change, dict) else "update"
             descriptor = {
                 "path": str(path)[:16 * 1024],
@@ -2087,6 +3827,44 @@ def _change_descriptors(changes) -> list[dict]:
                 descriptor["move_path"] = move_path[:16 * 1024]
             descriptors.append(descriptor)
     return descriptors
+
+
+def _attach_change_source(event: ToolUse | ToolResult, changes) -> None:
+    """Keep archive evidence separate from the small, serialized tool card.
+
+    Index every admitted file even when its patch is too large. A missing patch
+    is represented by None, never by a clipped but syntactically valid hunk.
+    """
+    entries = (islice(changes.items(), MAX_FILES) if isinstance(changes, dict)
+               else ((entry.get("path") if isinstance(entry, dict) else None, entry)
+                     for entry in islice(changes, MAX_FILES))
+               if isinstance(changes, list) else ())
+    files, paths = [], []
+    remaining = MAX_TURN_DIFF
+    omitted = isinstance(changes, (dict, list)) and len(changes) > MAX_FILES
+    for path, entry in entries:
+        if not isinstance(entry, dict):
+            entry = {}
+        names = [name for name in (path, _change_move_path(entry))
+                 if isinstance(name, str) and name and len(name) <= 4096
+                 and not any(char in name for char in "\x00\r\n")]
+        if not names or path not in names:
+            omitted = True
+            continue
+        paths.extend(names)
+        if isinstance(event, ToolResult):
+            raw_size = sum(len(entry[key]) for key in (
+                "diff", "unified_diff", "old_content", "content")
+                if isinstance(entry.get(key), str))
+            diff = _change_diff(path, entry) if raw_size <= min(MAX_DIFF, remaining) else None
+            if not diff or len(diff) > min(MAX_DIFF, remaining):
+                diff = None
+            remaining -= len(diff or "")
+            files.append({"file_paths": names, "diff": diff})
+    event._turn_change_source = (
+        {"input": {"file_paths": list(dict.fromkeys(paths))}}
+        if isinstance(event, ToolUse) else
+        {"_file_diffs": files, "_files_truncated": omitted})
 
 
 def _change_paths(changes) -> list[str]:
@@ -2109,20 +3887,31 @@ def _changes_diff(changes) -> str:
     """Normalize v2 FileUpdateChange arrays and legacy path->change maps."""
     parts: list[str] = []
     if isinstance(changes, list):
-        for entry in changes[:64]:
+        for entry in changes[:_MAX_FILE_CHANGE_ITEMS]:
             if not isinstance(entry, dict):
                 continue
             diff = _change_diff(str(entry.get("path") or "file"), entry)
             if isinstance(diff, str) and diff:
                 parts.append(diff)
     elif isinstance(changes, dict):
-        for path, entry in list(changes.items())[:64]:
+        for path, entry in islice(changes.items(), _MAX_FILE_CHANGE_ITEMS):
             if not isinstance(entry, dict):
                 continue
             diff = _change_diff(str(path), entry)
             if isinstance(diff, str) and diff:
                 parts.append(diff)
     return "\n".join(parts)
+
+
+def _bounded_changes_diff(changes) -> tuple[str, bool]:
+    """Keep text clipping and omitted native file entries explicit.
+
+    A clipped final line (or a subset of complete file patches) can still parse
+    as valid unified diff. Syntax alone cannot prove this evidence is complete.
+    """
+    diff, truncated = bounded_text(_changes_diff(changes), 2 * 1024 * 1024)
+    omitted = isinstance(changes, (dict, list)) and len(changes) > _MAX_FILE_CHANGE_ITEMS
+    return diff, truncated or omitted
 
 
 def _change_move_path(entry: dict) -> str | None:
@@ -2244,6 +4033,9 @@ def _collab_event(item: dict, turn_id: str | None, completed: bool):
         "receivers": item.get("receiverThreadIds"),
         "agents": safe_states,
     }, 64 * 1024)
+    receivers = item.get("receiverThreadIds")
+    if isinstance(receivers, list) and len(receivers) == 1 and isinstance(receivers[0], str):
+        input_value["agent_run_id"] = f"codex-agent:{receivers[0]}"
     return ProcessEvent(
         item_id=_live_id(item.get("id"), "collab-agent"),
         kind="agent",
@@ -2275,9 +4067,14 @@ def _subagent_event(item: dict, turn_id: str | None, completed: bool):
         title={
             "started": "协作代理已启动",
             "interacted": "协作代理有新进展",
+            "completed": "协作代理已完成",
             "interrupted": "协作代理已中断",
         }.get(kind, "协作代理"),
         summary=path or None,
+        server="cc_remote" if kind in {"completed", "interrupted"} and completed else None,
+        tool="agent_return" if kind in {"completed", "interrupted"} and completed else None,
+        input={"agent_run_id": f"codex-agent:{item['agentThreadId']}"}
+        if isinstance(item.get("agentThreadId"), str) else None,
     )
 
 
@@ -2325,6 +4122,43 @@ def is_turn_terminal(msg: dict) -> bool:
 
 # ---- on-disk Codex rollout -> wire events (session history) ----
 
+def codex_next_user_boundary_ts(
+    path: str, offset: int, native_turn_id: str | None, *, end_offset: int | None = None,
+) -> float | None:
+    """Read only an adjacent user boundary, never infer completion from EOF.
+
+    Page ends can also be arbitrary source windows or frozen active tails.
+    Only an actual following user record proves a visible segment is closed.
+    Legacy response_item/user must be paired with its immediately next replay.
+    """
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(offset)
+            for index in range(2):
+                limit = _MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1
+                if end_offset is not None:
+                    limit = min(limit, max(0, end_offset - stream.tell()))
+                if limit == 0:
+                    return None
+                line = stream.readline(limit)
+                if not line.endswith(b"\n") or len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES:
+                    return None
+                row = json.loads(line)
+                payload = row.get("payload") or {}
+                if (index == 0 and row.get("type") == "response_item"
+                        and payload.get("type") == "message" and payload.get("role") == "user"):
+                    continue
+                user = codex_rollout_user_message(payload) if row.get("type") == "event_msg" else None
+                if (user is None or not user.prompt
+                        or is_codex_account_switch_message(user.raw_text)
+                        or (user.turn_id and native_turn_id and user.turn_id != native_turn_id)):
+                    return None
+                return datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).timestamp() - 0.001
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
 def codex_translate_history(
     path: str,
     tool_result_max: int,
@@ -2332,12 +4166,17 @@ def codex_translate_history(
     start_offset: int = 0,
     end_offset: int | None = None,
     source_continuation: str | None = None,
+    source_turn_id: str | None = None,
+    segment_end_ts: float | None = None,
     snapshot_in_progress: bool = False,
+    active_task_ids: set[str] | frozenset[str] | tuple[str, ...] = (),
+    client_message_ids: dict[str, str] | None = None,
+    segment_client_message_ids: dict[tuple[str, int], str] | None = None,
 ) -> tuple[list, str | None]:
     """Translate a Codex rollout .jsonl into wire events (same vocabulary as the
     live stream) + the model used. Codex analog of stream.translate_history.
 
-    A turn = event_msg/user_message -> (function_call/reasoning...) -> agent_message.
+    A turn = persisted user boundary -> (function_call/reasoning...) -> agent_message.
     Skips the <environment_context>/<permissions> developer/user envelope messages;
     uses the clean event_msg user_message / agent_message text. Returns
     (events, model)."""
@@ -2346,7 +4185,7 @@ def codex_translate_history(
     turn_open = False
     active_turn_id: str | None = None
     active_msg_id: str | None = None
-    pending_turn_id: str | None = None
+    pending_turn_id: str | None = source_turn_id
     turn_visible = False
     turn_text_visible = False
     turn_final_visible = False
@@ -2358,14 +4197,33 @@ def codex_translate_history(
     cur_mid: str | None = None
     cur_channel = "unknown"
     last_ts = None
+    source_stamp = 0.0
     pending_images: list = []   # input_image blocks seen before the next user_message
-    pending_user_message_id: str | None = None
+    pending_legacy_user_item_id: str | None = None
     pending_compactions: list[
         tuple[str, float | None, str | None]
     ] = []
     pending_agent_message: tuple[dict, int, str] | None = None
+    goal_baseline_known, goal_objective = (
+        _history_goal_objective_before_offset(path, start_offset)
+    )
+    pending_goal_prompt: tuple[str, float | None] | None = None
+    pending_task_goal_prompt: tuple[
+        str, float | None, str, int, str,
+    ] | None = None
+    pending_task_started: tuple[str, float | None, int, str] | None = None
     completed_plan: tuple[str, str] | None = None
     task_has_user = False
+    # Ordinal aliases are safe only after this bounded read has observed the
+    # native task/start marker. A window which begins mid-turn must not mistake
+    # its first visible steer for segment zero.
+    task_segment_index: int | None = None
+    known_active_task_ids = {
+        value for value in active_task_ids
+        if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value)
+    }
+    native_client_aliases = client_message_ids or {}
+    segment_client_aliases = segment_client_message_ids or {}
     seen_tool_uses: set[str] = set()
     seen_tool_results: set[str] = set()
     seen_authoritative_results: set[str] = set()
@@ -2373,6 +4231,7 @@ def codex_translate_history(
     seen_process_items: set[str] = set()
     history_tools: dict[str, tuple[str, str, str | None, str | None, dict]] = {}
     seen_agent_messages: set[tuple[str, str, str]] = set()
+    seen_agent_item_ids: set[str] = set()
     seen_reasoning: set[tuple[str, str]] = set()
 
     def _ts(iso: str):
@@ -2380,6 +4239,14 @@ def codex_translate_history(
             return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
         except Exception:
             return None
+
+    def append_event(event) -> None:
+        # History is a projection of source time, never reconstruction time.
+        # Explicit timestamps (users, deferred messages and native terminals)
+        # win; other events inherit their current JSONL record's timestamp.
+        if "ts" not in event.model_fields_set:
+            event.ts = source_stamp
+        events.append(event)
 
     def _stable_id(kind: str, line_no: int, raw_ts: str = "", identity=None) -> str:
         """Deterministic fallback for rollout records that carry no item id."""
@@ -2425,14 +4292,15 @@ def codex_translate_history(
             cur_mid = _history_id(item_id, "assistant", line_no, raw_ts)
             assistant_open = True
             cur_channel = channel
-            events.append(AssistantMsgStart(
-                message_id=cur_mid, channel=channel))
+            append_event(AssistantMsgStart(
+                message_id=cur_mid, channel=channel,
+                ts=_ts(raw_ts) if _ts(raw_ts) is not None else source_stamp))
 
-    def close_assistant():
+    def close_assistant(**message_fields):
         nonlocal assistant_open, cur_mid, cur_channel
         if assistant_open and cur_mid:
-            events.append(AssistantMsgEnd(
-                message_id=cur_mid, channel=cur_channel))
+            append_event(AssistantMsgEnd(
+                message_id=cur_mid, channel=cur_channel, **message_fields))
         assistant_open = False
         cur_mid = None
         cur_channel = "unknown"
@@ -2452,7 +4320,7 @@ def codex_translate_history(
         )
         if stamp is not None:
             event.ts = stamp
-        events.append(event)
+        append_event(event)
         turn_visible = True
 
     def flush_pending_compactions(target_owner: str | None) -> None:
@@ -2486,18 +4354,19 @@ def codex_translate_history(
         nonlocal turn_visible
         history_tools[tool_id] = (
             tool, category, title, server, tool_input)
-        for event in reversed(events):
-            if isinstance(event, ToolUse) and event.tool_use_id == tool_id:
-                event.tool = tool
-                event.category = category
-                event.title = title
-                event.server = server
-                event.input = tool_input
-                seen_tool_uses.add(tool_id)
-                turn_visible = True
-                return
+        if tool_id in seen_tool_uses:
+            for event in reversed(events):
+                if isinstance(event, ToolUse) and event.tool_use_id == tool_id:
+                    event.tool = tool
+                    event.category = category
+                    event.title = title
+                    event.server = server
+                    event.input = tool_input
+                    seen_tool_uses.add(tool_id)
+                    turn_visible = True
+                    return
         ensure_assistant(line_no, raw_ts)
-        events.append(ToolUse(
+        append_event(ToolUse(
             message_id=cur_mid or "",
             tool_use_id=tool_id,
             tool=tool,
@@ -2511,17 +4380,62 @@ def codex_translate_history(
 
     def upsert_tool_result(result: ToolResult) -> None:
         nonlocal turn_visible
-        for index in range(len(events) - 1, -1, -1):
-            event = events[index]
-            if (isinstance(event, ToolResult)
-                    and event.tool_use_id == result.tool_use_id):
-                events[index] = result
-                seen_tool_results.add(result.tool_use_id)
-                turn_visible = True
-                return
-        events.append(result)
+        if "ts" not in result.model_fields_set:
+            result.ts = source_stamp
+        if result.tool_use_id in seen_tool_results:
+            for index in range(len(events) - 1, -1, -1):
+                event = events[index]
+                if (isinstance(event, ToolResult)
+                        and event.tool_use_id == result.tool_use_id):
+                    events[index] = result
+                    seen_tool_results.add(result.tool_use_id)
+                    turn_visible = True
+                    return
+        append_event(result)
         seen_tool_results.add(result.tool_use_id)
         turn_visible = True
+
+    def materialize_pending_goal_turn() -> bool:
+        """Create a Goal user anchor only after its native turn is visible.
+
+        ``thread_goal_updated`` and ``task_started`` are metadata, not proof
+        that a model turn ran.  A real assistant/tool/terminal record calls
+        this helper; a following ordinary ``user_message`` discards the
+        candidate before it can steal that prompt.
+        """
+        nonlocal pending_task_goal_prompt, turn_open, active_turn_id
+        nonlocal active_msg_id, pending_turn_id, turn_visible
+        nonlocal turn_text_visible, turn_final_visible, turn_has_user
+        nonlocal turn_continuation_reason, source_continuation_available
+        nonlocal task_has_user
+        candidate = pending_task_goal_prompt
+        if candidate is None:
+            return False
+        pending_task_goal_prompt = None
+        prompt, prompt_ts, turn_id, line_no, raw_ts = candidate
+        if turn_open:
+            close_turn(
+                "error", 0, True,
+                authoritative_boundary=False,
+            )
+        active_turn_id = turn_id
+        pending_turn_id = turn_id
+        uid = _history_id(turn_id, "user", line_no, raw_ts)
+        active_msg_id = uid
+        user = UserMsg(msg_id=uid, prompt=prompt)
+        if prompt_ts is not None:
+            user.ts = prompt_ts
+        append_event(user)
+        turn_open = True
+        turn_visible = False
+        turn_text_visible = False
+        turn_final_visible = False
+        turn_has_user = True
+        turn_continuation_reason = None
+        source_continuation_available = False
+        task_has_user = True
+        flush_pending_compactions(active_turn_id)
+        return True
 
     def open_assistant_only_turn(
         reason: str | None = None,
@@ -2537,6 +4451,7 @@ def codex_translate_history(
         nonlocal turn_visible, turn_text_visible, turn_final_visible
         nonlocal turn_has_user, turn_continuation_reason
         nonlocal source_continuation_available
+        materialize_pending_goal_turn()
         if turn_open:
             if (not turn_has_user and reason is not None
                     and turn_continuation_reason is None):
@@ -2549,6 +4464,17 @@ def codex_translate_history(
         turn_open = True
         active_turn_id = turn_id or pending_owner or pending_turn_id
         active_msg_id = None
+        if (pending_task_started is not None
+                and active_turn_id == pending_task_started[0]
+                and _history_optional_turn_id(active_turn_id) is not None):
+            # A real task_started plus visible output proves a new native
+            # continuation. Bind it before its terminal arrives so history
+            # cannot invent a message id or a parser-time start timestamp.
+            active_msg_id = str(active_turn_id)
+            append_event(TurnBinding(
+                msg_id=active_msg_id, turn_id=active_msg_id,
+                ts=pending_task_started[1] or 0,
+            ))
         turn_visible = False
         turn_text_visible = False
         turn_final_visible = False
@@ -2563,6 +4489,7 @@ def codex_translate_history(
         flush_pending_compactions(active_turn_id)
 
     def materialize_pending_terminal(value) -> None:
+        materialize_pending_goal_turn()
         if not pending_compactions or turn_open:
             return
         terminal_owner = _history_optional_turn_id(value)
@@ -2581,16 +4508,22 @@ def codex_translate_history(
         item_id=None,
     ) -> None:
         nonlocal turn_visible, turn_text_visible, turn_final_visible
+        native_id = item_id or payload.get("id") or payload.get("message_id")
+        if isinstance(native_id, str) and native_id in seen_agent_item_ids:
+            return
         open_assistant_only_turn()
         text = payload.get("message") or ""
         channel = _assistant_channel(payload.get("phase"))
         key = (
             str(active_turn_id or pending_turn_id or ""),
-            channel,
+            (f"async:{channel}:{item_id or payload.get('id') or line_no}"
+             if payload.get("delivery") == "async" else channel),
             text,
         )
-        if not text or key in seen_agent_messages:
+        if not text or (native_id is None and key in seen_agent_messages):
             return
+        if isinstance(native_id, str):
+            seen_agent_item_ids.add(native_id)
         seen_agent_messages.add(key)
         close_assistant()
         ensure_assistant(
@@ -2601,11 +4534,13 @@ def codex_translate_history(
         )
         turn_visible = True
         turn_text_visible = True
-        if channel == "final":
+        if channel == "final" and payload.get("delivery") != "async":
             turn_final_visible = True
-        events.append(Delta(
-            message_id=cur_mid, text=text, channel=channel))
-        close_assistant()
+        append_event(Delta(
+            message_id=cur_mid, text=text, channel=channel,
+            ts=_ts(raw_ts) if _ts(raw_ts) is not None else source_stamp))
+        close_assistant(ts=_ts(raw_ts) if _ts(raw_ts) is not None else source_stamp,
+                        **_async_message_fields(payload))
 
     def emit_completed_plan_answer(
         line_no: int,
@@ -2624,7 +4559,7 @@ def codex_translate_history(
             channel="final",
             force_new=True,
         )
-        events.append(Delta(
+        append_event(Delta(
             message_id=cur_mid, text=text, channel="final"))
         close_assistant()
         seen_agent_messages.add((turn_key, "final", text))
@@ -2671,7 +4606,8 @@ def codex_translate_history(
         nonlocal turn_open, active_turn_id, active_msg_id, pending_turn_id
         nonlocal assistant_open, cur_mid, turn_visible, turn_text_visible
         nonlocal turn_final_visible, turn_has_user, turn_continuation_reason
-        nonlocal completed_plan
+        nonlocal completed_plan, pending_task_goal_prompt
+        nonlocal pending_task_started
         if not turn_open:
             return
         close_assistant()
@@ -2692,7 +4628,7 @@ def codex_translate_history(
         terminal_ts = completed_ts if completed_ts is not None else last_ts
         if terminal_ts is not None:
             te.ts = terminal_ts
-        events.append(te)
+        append_event(te)
         turn_open = False
         pending_turn_id = None
         active_turn_id = None
@@ -2703,6 +4639,8 @@ def codex_translate_history(
         turn_has_user = False
         turn_continuation_reason = None
         completed_plan = None
+        pending_task_goal_prompt = None
+        pending_task_started = None
         pending_compactions.clear()
 
     try:
@@ -2716,6 +4654,7 @@ def codex_translate_history(
             try:
                 d = json.loads(line)
             except Exception:
+                pending_legacy_user_item_id = None
                 if pending_agent_message is not None:
                     payload, pending_line, pending_ts = pending_agent_message
                     emit_agent_message(
@@ -2726,7 +4665,14 @@ def codex_translate_history(
             p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
             raw_ts = d.get("timestamp", "")
             ts = _ts(raw_ts)
+            source_stamp = ts if ts is not None else last_ts or 0.0
             payload_type = p.get("type")
+            paired_legacy_user_item_id = None
+            if pending_legacy_user_item_id is not None:
+                if t == "event_msg" and payload_type == "user_message":
+                    paired_legacy_user_item_id = pending_legacy_user_item_id
+                # Never carry a native id across an intervening rollout row.
+                pending_legacy_user_item_id = None
 
             consumed_paired_agent = False
             if pending_agent_message is not None:
@@ -2757,16 +4703,76 @@ def codex_translate_history(
                     # turn, so only a real user_message creates a boundary.
                     pending_turn_id = context_turn_id
             elif t == "response_item" and p.get("type") == "message" and p.get("role") == "user":
-                # The raw response item carries uploaded image bodies. Its id is
-                # a native rollout identity, not turn/steer's browser
-                # clientUserMessageId; that authoritative alias is preserved on
-                # the following event_msg/user_message as payload.client_id.
+                # Legacy Codex writes this native app-server item immediately
+                # before the clean event_msg/user_message. Keep its id for that
+                # one adjacent record only; clientUserMessageId remains a
+                # separate browser alias.
+                pending_legacy_user_item_id = (
+                    _legacy_response_user_item_id(p)
+                )
                 for it in (p.get("content") or []):
                     if isinstance(it, dict) and it.get("type") == "input_image":
                         img = _data_uri_to_img(it.get("image_url"))
                         if img:
                             pending_images.append(img)
+            elif t == "event_msg" and payload_type == "thread_goal_updated":
+                goal = p.get("goal")
+                if isinstance(goal, dict):
+                    objective = goal.get("objective")
+                    created_at = goal.get("createdAt")
+                    updated_at = goal.get("updatedAt")
+                    status = goal.get("status")
+                    if isinstance(objective, str) and objective:
+                        objective_changed = bool(
+                            objective != goal_objective
+                            and (
+                                goal_baseline_known
+                                or (
+                                    isinstance(created_at, (int, float))
+                                    and not isinstance(created_at, bool)
+                                    and created_at == updated_at
+                                )
+                            )
+                        )
+                        goal_objective = objective
+                        goal_baseline_known = True
+                        if status != "active":
+                            pending_goal_prompt = None
+                            pending_task_goal_prompt = None
+                        if objective_changed and status == "active":
+                            pending_goal_prompt = (objective, ts)
+                            if (
+                                pending_task_started is not None
+                                and not task_has_user
+                            ):
+                                (
+                                    task_turn_id,
+                                    task_ts,
+                                    task_line_no,
+                                    task_raw_ts,
+                                ) = pending_task_started
+                                if (
+                                    ts is not None
+                                    and task_ts is not None
+                                    and 0 <= ts - task_ts
+                                    <= _GOAL_TURN_CORRELATION_SECONDS
+                                ):
+                                    pending_task_goal_prompt = (
+                                        objective,
+                                        ts,
+                                        task_turn_id,
+                                        task_line_no,
+                                        task_raw_ts,
+                                    )
+                                    pending_goal_prompt = None
+            elif t == "event_msg" and payload_type == "thread_goal_cleared":
+                goal_objective = None
+                goal_baseline_known = True
+                pending_goal_prompt = None
+                pending_task_goal_prompt = None
             elif t == "event_msg" and payload_type == "task_started":
+                pending_task_goal_prompt = None
+                pending_task_started = None
                 next_turn_id = p.get("turn_id")
                 if next_turn_id:
                     next_turn_id = str(next_turn_id)
@@ -2780,19 +4786,39 @@ def codex_translate_history(
                         pending_compactions.clear()
                     pending_turn_id = next_turn_id
                 task_has_user = False
-            elif t == "event_msg" and payload_type == "user_message":
-                raw_client_id = p.get("client_id")
-                pending_user_message_id = (
-                    raw_client_id
-                    if isinstance(raw_client_id, str)
-                    and _SAFE_WIRE_ID.fullmatch(raw_client_id)
+                task_segment_index = 0
+                if pending_turn_id:
+                    pending_task_started = (
+                        str(pending_turn_id), ts, line_no, raw_ts,
+                    )
+                if pending_goal_prompt is not None and pending_task_started:
+                    prompt, prompt_ts = pending_goal_prompt
+                    if _goal_turn_correlated(prompt_ts, ts):
+                        pending_task_goal_prompt = (
+                            prompt,
+                            prompt_ts if prompt_ts is not None else ts,
+                            pending_task_started[0],
+                            line_no,
+                            raw_ts,
+                        )
+                pending_goal_prompt = None
+            elif (
+                t == "event_msg"
+                and (user_record := codex_rollout_user_message(p)) is not None
+            ):
+                pending_goal_prompt = None
+                pending_task_goal_prompt = None
+                pending_task_started = None
+                user_client_id = (
+                    user_record.client_id
+                    if isinstance(user_record.client_id, str)
+                    and _SAFE_WIRE_ID.fullmatch(user_record.client_id)
                     else None
                 )
-                raw_message = p.get("message")
                 account_switch_continuation = (
-                    is_codex_account_switch_message(raw_message)
+                    is_codex_account_switch_message(user_record.raw_text)
                 )
-                msg = visible_codex_user_message(raw_message)
+                msg = user_record.prompt
                 if (
                     account_switch_continuation
                     and events
@@ -2804,7 +4830,7 @@ def codex_translate_history(
                     # replacement terminal below becomes its sole boundary.
                     events.pop()
                 if msg:
-                    next_turn_id = p.get("turn_id") or pending_turn_id
+                    next_turn_id = user_record.turn_id or pending_turn_id
                     if turn_open:
                         # Codex accepts another user message while the same
                         # app-server task is still running.  That is steering,
@@ -2813,6 +4839,13 @@ def codex_translate_history(
                         # the Web projection stores one user prompt per turn,
                         # but it must be a neutral non-error boundary.
                         steered_same_task = task_has_user and turn_has_user
+                        active_mid_task_steer = bool(
+                            snapshot_in_progress
+                            and turn_open
+                            and not turn_has_user
+                            and isinstance(next_turn_id, str)
+                            and next_turn_id in known_active_task_ids
+                        )
                         # No terminal record proved where the previous visible
                         # reply ended. In particular, pending_turn_id now often
                         # belongs to this NEW user turn; never attach it to the
@@ -2827,9 +4860,10 @@ def codex_translate_history(
                                 "authoritative_page",
                             }
                         )
-                        if steered_same_task:
+                        if steered_same_task or active_mid_task_steer:
                             close_turn(
                                 "steered", 0, False,
+                                completed_ts=ts - 0.001 if ts is not None else last_ts,
                                 authoritative_boundary=False)
                         else:
                             close_turn(
@@ -2838,7 +4872,18 @@ def codex_translate_history(
                                 authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
-                    if task_has_user:
+                    source_message_id = (
+                        user_record.message_id
+                        if isinstance(user_record.message_id, str)
+                        and _SAFE_WIRE_ID.fullmatch(user_record.message_id)
+                        else paired_legacy_user_item_id
+                    )
+                    if source_message_id is not None:
+                        # 0.147 persists the same authoritative item id returned
+                        # by official History and the live app-server stream;
+                        # legacy double records now retain that identity too.
+                        uid = source_message_id
+                    elif task_has_user:
                         # A steered message inside the same app-server task has
                         # no fresh turn id. Reusing active_turn_id would make the
                         # reducer drop it as a duplicate of the first user row.
@@ -2852,25 +4897,38 @@ def codex_translate_history(
                     else:
                         uid = _history_id(
                             active_turn_id, "user", line_no, raw_ts)
+                    if user_client_id is None:
+                        user_client_id = native_client_aliases.get(uid)
+                    if (
+                        user_client_id is None
+                        and isinstance(active_turn_id, str)
+                        and task_segment_index is not None
+                    ):
+                        user_client_id = segment_client_aliases.get((
+                            active_turn_id,
+                            task_segment_index,
+                        ))
                     active_msg_id = uid
                     um = UserMsg(
                         msg_id=uid,
-                        client_msg_id=pending_user_message_id,
+                        client_msg_id=user_client_id,
+                        source_thread_id=user_record.source_thread_id,
                         prompt=msg,
                     )
                     if pending_images:
                         um.images = pending_images
                     if ts is not None:
                         um.ts = ts
-                    events.append(um)
+                    append_event(um)
                     turn_open = True
                     turn_has_user = True
                     turn_continuation_reason = None
                     source_continuation_available = False
                     flush_pending_compactions(active_turn_id)
                     task_has_user = True
+                    if task_segment_index is not None:
+                        task_segment_index += 1
                 pending_images = []   # consume (per user turn)
-                pending_user_message_id = None
             elif (t == "response_item"
                   and payload_type in {"function_call", "custom_tool_call"}):
                 open_assistant_only_turn()
@@ -2890,7 +4948,7 @@ def codex_translate_history(
                     plan_tool_ids.add(tool_id)
                     seen_tool_uses.add(tool_id)
                     turn_visible = True
-                    events.append(plan_event)
+                    append_event(plan_event)
                 else:
                     ensure_assistant(line_no, raw_ts)
                     tool, category, title, server = _hist_tool_presentation(
@@ -2900,7 +4958,7 @@ def codex_translate_history(
                     if tool_id not in seen_tool_uses:
                         seen_tool_uses.add(tool_id)
                         turn_visible = True
-                        events.append(ToolUse(
+                        append_event(ToolUse(
                             message_id=cur_mid or "",
                             tool_use_id=tool_id,
                             tool=tool,
@@ -2913,6 +4971,16 @@ def codex_translate_history(
                   and payload_type in {
                       "function_call_output", "custom_tool_call_output"}):
                 open_assistant_only_turn()
+                receipt = task_receipt_event(
+                    p,
+                    item_id=_history_id(p.get("id"), "task-receipt", line_no, raw_ts),
+                    turn_id=_history_optional_turn_id(active_turn_id or pending_turn_id),
+                    detail_limit=tool_result_max,
+                )
+                if receipt is not None:
+                    turn_visible = True
+                    append_event(receipt)
+                    continue
                 tool_id = _history_id(
                     p.get("call_id"), "tool", line_no, raw_ts)
                 tool_meta = history_tools.get(
@@ -2924,7 +4992,7 @@ def codex_translate_history(
                         ensure_assistant(line_no, raw_ts)
                         tool, category, title, server, hist_input = tool_meta
                         seen_tool_uses.add(tool_id)
-                        events.append(ToolUse(
+                        append_event(ToolUse(
                             message_id=cur_mid or "", tool_use_id=tool_id,
                             tool=tool, input=hist_input, category=category,
                             title=title, server=server))
@@ -2956,7 +5024,7 @@ def codex_translate_history(
                             raw_output, tool_result_max)
                         exit_code = _history_exit_code(output)
                         is_error = structured_error or _exit_is_error(output)
-                        events.append(ToolResult(
+                        append_event(ToolResult(
                             tool_use_id=tool_id,
                             content=output,
                             is_error=is_error,
@@ -2964,7 +5032,21 @@ def codex_translate_history(
                             status="failed" if is_error else "succeeded",
                             exit_code=exit_code,
                         ))
-            elif t == "event_msg" and payload_type == "exec_command_end":
+            elif t == "event_msg" and (
+                payload_type == "exec_command_end"
+                or (payload_type == "item_completed" and isinstance(p.get("item"), dict)
+                    and str(p["item"].get("type")).replace("_", "").lower() == "commandexecution")
+            ):
+                if payload_type == "item_completed":
+                    native_turn = active_turn_id or pending_turn_id
+                    if p.get("turn_id") is not None and p["turn_id"] != native_turn:
+                        continue
+                    item = p["item"]
+                    p = {**item, "call_id": item.get("id"),
+                         "parsed_cmd": item.get("parsed_cmd", item.get("commandActions")),
+                         "process_id": item.get("process_id", item.get("processId")),
+                         "aggregated_output": item.get("aggregated_output", item.get("aggregatedOutput")),
+                         "exit_code": item.get("exit_code", item.get("exitCode"))}
                 open_assistant_only_turn()
                 tool_id = _history_id(
                     p.get("call_id"), "tool", line_no, raw_ts)
@@ -3005,7 +5087,9 @@ def codex_translate_history(
                         truncated=True if truncated else None,
                         status=status,
                         exit_code=exit_code,
-                        duration_ms=_legacy_duration_ms(p.get("duration")),
+                        duration_ms=(_duration_ms(p.get("durationMs"))
+                                     if p.get("durationMs") is not None
+                                     else _legacy_duration_ms(p.get("duration"))),
                     ))
             elif t == "event_msg" and payload_type == "mcp_tool_call_end":
                 open_assistant_only_turn()
@@ -3038,9 +5122,103 @@ def codex_translate_history(
                         status="failed" if is_error else "succeeded",
                         duration_ms=_legacy_duration_ms(p.get("duration")),
                     ))
+            elif (t == "event_msg"
+                  and (generated_item := _rollout_generated_image_item(p)) is not None):
+                open_assistant_only_turn()
+                native_turn = active_turn_id or pending_turn_id
+                if (p.get("turn_id") is not None
+                        and p.get("turn_id") != native_turn):
+                    continue
+                item_id = _history_id(generated_item.get("id"), "image", line_no, raw_ts)
+                if item_id not in seen_process_items:
+                    seen_process_items.add(item_id)
+                    image_event = CodexStreamTranslator(tool_result_max)._process_item(
+                        {**generated_item, "id": item_id},
+                        {"turnId": _history_optional_turn_id(native_turn)},
+                        completed=True,
+                    )
+                    if image_event is not None:
+                        image_event.ts = ts if ts is not None else 0
+                        append_event(image_event)
+                        turn_visible = True
+            elif (
+                (t == "response_item" and str(payload_type).lower() == "filechange")
+                or (t == "event_msg" and payload_type == "item_completed"
+                    and isinstance(p.get("item"), dict)
+                    and str(p["item"].get("type")).lower() == "filechange")
+            ):
+                # The rollout fallback must expose the same native edits as
+                # official paged history, including newer PascalCase items.
+                native_turn = active_turn_id or pending_turn_id
+                if p.get("turn_id") is not None and p["turn_id"] != native_turn:
+                    continue
+                item = p["item"] if payload_type == "item_completed" else p
+                tool_id = _history_id(item.get("id"), "tool", line_no, raw_ts)
+                item = {**item, "type": "fileChange", "id": tool_id}
+                open_assistant_only_turn()
+                translator = CodexStreamTranslator(tool_result_max)
+                use = translator._tool_update(item)
+                upsert_tool_use(
+                    tool_id, use.tool, use.category, use.title, use.server,
+                    use.input, line_no, raw_ts,
+                )
+                if item.get("status") in {"completed", "failed", "declined", "cancelled", "interrupted"}:
+                    result = translator._tool_result(item)
+                    if (isinstance(item.get("changes"), (dict, list))
+                            and len(item["changes"]) > 64):
+                        result.truncated = True
+                        result.diff = None
+                    upsert_tool_result(result)
             elif t == "event_msg" and payload_type == "item_completed":
                 item = p.get("item") if isinstance(p.get("item"), dict) else {}
-                if str(item.get("type") or "").lower() == "plan":
+                item_type = str(item.get("type") or "").replace("_", "").lower()
+                if item_type == "agentmessage":
+                    # New rollouts persist the public message here, using
+                    # PascalCase Text parts. Raw response_item messages also
+                    # contain private compaction summaries and are NOT a
+                    # substitute for this public lifecycle record.
+                    text = item.get("text")
+                    if not isinstance(text, str):
+                        content = item.get("content")
+                        text = "".join(
+                            part["text"] for part in (content if isinstance(content, list) else [])
+                            if isinstance(part, dict)
+                            and str(part.get("type", "")).lower() == "text"
+                            and isinstance(part.get("text"), str)
+                        )
+                    emit_agent_message({
+                        **item, "message": text,
+                    }, line_no, raw_ts, item.get("id"))
+                elif item_type == "contextcompaction":
+                    marker = (
+                        _history_id(item.get("id"), "compaction", line_no, raw_ts),
+                        ts,
+                        _history_optional_turn_id(p.get("turn_id") or active_turn_id or pending_turn_id),
+                    )
+                    if turn_open:
+                        append_compaction(marker)
+                    else:
+                        pending_compactions.append(marker)
+                        if len(pending_compactions) > _MAX_PENDING_HISTORY_COMPACTIONS:
+                            del pending_compactions[0]
+                elif item_type == "subagentactivity":
+                    open_assistant_only_turn()
+                    append_event(_subagent_event({
+                        **item, "agentThreadId": item.get("agentThreadId") or item.get("agent_thread_id"),
+                        "agentPath": item.get("agentPath") or item.get("agent_path"),
+                    }, _history_optional_turn_id(p.get("turn_id") or active_turn_id or pending_turn_id), True))
+                    turn_visible = True
+                elif item_type == "collabagenttoolcall":
+                    open_assistant_only_turn()
+                    append_event(_collab_event({
+                        **item,
+                        "receiverThreadIds": item.get("receiverThreadIds") or item.get("receiver_thread_ids"),
+                        "senderThreadId": item.get("senderThreadId") or item.get("sender_thread_id"),
+                        "agentsStates": item.get("agentsStates") or item.get("agents_states"),
+                        "reasoningEffort": item.get("reasoningEffort") or item.get("reasoning_effort"),
+                    }, _history_optional_turn_id(p.get("turn_id") or active_turn_id or pending_turn_id), True))
+                    turn_visible = True
+                elif item_type == "plan":
                     open_assistant_only_turn()
                     item_id = _history_id(
                         item.get("id"), "plan-detail", line_no, raw_ts)
@@ -3051,7 +5229,7 @@ def codex_translate_history(
                     )
                     if item_id not in seen_process_items:
                         seen_process_items.add(item_id)
-                        events.append(ProcessEvent(
+                        append_event(ProcessEvent(
                             item_id=item_id,
                             kind="plan",
                             phase="end",
@@ -3070,7 +5248,7 @@ def codex_translate_history(
                 if summary and key not in seen_reasoning:
                     seen_reasoning.add(key)
                     open_assistant_only_turn()
-                    events.append(ProcessEvent(
+                    append_event(ProcessEvent(
                         item_id=_history_id(
                             p.get("id"), "reasoning", line_no, raw_ts),
                         kind="reasoning",
@@ -3087,7 +5265,7 @@ def codex_translate_history(
                 if summary and key not in seen_reasoning:
                     seen_reasoning.add(key)
                     open_assistant_only_turn()
-                    events.append(ProcessEvent(
+                    append_event(ProcessEvent(
                         item_id=_history_id(
                             p.get("id") or p.get("event_id"),
                             "reasoning", line_no, raw_ts),
@@ -3111,7 +5289,7 @@ def codex_translate_history(
                 if tool_id not in seen_tool_uses:
                     seen_tool_uses.add(tool_id)
                     turn_visible = True
-                    events.append(ToolUse(
+                    append_event(ToolUse(
                         message_id=cur_mid or "",
                         tool_use_id=tool_id,
                         tool="apply_patch",
@@ -3122,16 +5300,16 @@ def codex_translate_history(
                         category="file",
                         title=_file_summary(paths, "running"),
                     ))
+                    _attach_change_source(events[-1], p.get("changes"))
                 if tool_id not in seen_tool_results:
                     seen_tool_results.add(tool_id)
                     turn_visible = True
                     success = p.get("success") is not False
-                    diff, diff_truncated = bounded_text(
-                        _changes_diff(p.get("changes")), 2 * 1024 * 1024)
+                    diff, diff_truncated = _bounded_changes_diff(p.get("changes"))
                     output, output_truncated = bounded_text(
                         p.get("stdout") or p.get("stderr") or "",
                         tool_result_max)
-                    events.append(ToolResult(
+                    append_event(ToolResult(
                         tool_use_id=tool_id,
                         content=output,
                         is_error=not success,
@@ -3141,7 +5319,10 @@ def codex_translate_history(
                         summary=_file_summary(
                             paths, "succeeded" if success else "failed"),
                         diff=diff or None,
+                        diff_source="native",
+                        diff_truncated=diff_truncated,
                     ))
+                    _attach_change_source(events[-1], p.get("changes"))
             elif t == "event_msg" and payload_type == "web_search_end":
                 open_assistant_only_turn()
                 ensure_assistant(line_no, raw_ts)
@@ -3151,7 +5332,7 @@ def codex_translate_history(
                 if tool_id not in seen_tool_uses:
                     seen_tool_uses.add(tool_id)
                     turn_visible = True
-                    events.append(ToolUse(
+                    append_event(ToolUse(
                         message_id=cur_mid or "",
                         tool_use_id=tool_id,
                         tool="webSearch",
@@ -3163,7 +5344,7 @@ def codex_translate_history(
                     ))
                 if tool_id not in seen_tool_results:
                     seen_tool_results.add(tool_id)
-                    events.append(ToolResult(
+                    append_event(ToolResult(
                         tool_use_id=tool_id,
                         content="",
                         is_error=False,
@@ -3177,7 +5358,7 @@ def codex_translate_history(
                     "agentThreadId": p.get("agent_thread_id"),
                     "agentPath": p.get("agent_path"),
                 }
-                events.append(_subagent_event(
+                append_event(_subagent_event(
                     item,
                     _history_optional_turn_id(
                         active_turn_id or pending_turn_id),
@@ -3203,7 +5384,9 @@ def codex_translate_history(
             elif t == "event_msg" and payload_type == "task_complete":
                 materialize_pending_terminal(p.get("turn_id"))
                 last = p.get("last_agent_message")
-                if (not turn_open and isinstance(last, str) and last):
+                if not turn_open and (
+                    (isinstance(last, str) and last) or p.get("error") is not None
+                ):
                     open_assistant_only_turn()
                 if turn_open:
                     turn_key = str(active_turn_id or pending_turn_id or "")
@@ -3215,25 +5398,36 @@ def codex_translate_history(
                         close_assistant()
                         ensure_assistant(
                             line_no, raw_ts, channel="final", force_new=True)
-                        events.append(Delta(
+                        append_event(Delta(
                             message_id=cur_mid, text=last, channel="final"))
                         close_assistant()
                         seen_agent_messages.add((turn_key, "final", last))
                         turn_visible = True
                         turn_text_visible = True
                         turn_final_visible = True
-                    emit_completed_plan_answer(line_no, raw_ts)
-                    if turn_visible:
+                    terminal_error = p.get("error")
+                    if terminal_error is None:
+                        emit_completed_plan_answer(line_no, raw_ts)
+                    if terminal_error is not None:
+                        append_event(Error(
+                            code=ERR_CC_CRASH,
+                            message=_provider_failure_message(terminal_error),
+                            msg_id=active_msg_id,
+                        ))
+                        close_turn("error", _duration(p), True,
+                                   _completed_ts(p, ts), p.get("turn_id"))
+                    elif turn_visible:
                         close_turn("success", _duration(p), False,
                                    _completed_ts(p, ts), p.get("turn_id"))
                     else:
-                        events.append(Error(
+                        append_event(Error(
                             code=ERR_CC_CRASH,
                             message=_EMPTY_COMPLETED_MESSAGE,
                             msg_id=active_msg_id,
                         ))
                         close_turn("error", _duration(p), True,
                                    _completed_ts(p, ts), p.get("turn_id"))
+                task_segment_index = None
             elif t == "event_msg" and payload_type == "turn_aborted":
                 materialize_pending_terminal(p.get("turn_id"))
                 if turn_open:
@@ -3246,22 +5440,28 @@ def codex_translate_history(
                         "error_during_execution" if interrupted else "error",
                         _duration(p), True, _completed_ts(p, ts),
                         p.get("turn_id"))
+                task_segment_index = None
             elif t == "event_msg" and payload_type in {
                     "task_failed", "turn_failed", "task_error"}:
                 materialize_pending_terminal(p.get("turn_id"))
                 if turn_open:
                     close_turn("error", _duration(p), True,
                                _completed_ts(p, ts), p.get("turn_id"))
+                task_segment_index = None
             # session_meta / world_state / token_count / private reasoning : skipped
             if ts is not None:
                 last_ts = ts
-    if pending_agent_message is not None and not snapshot_in_progress:
+    if pending_agent_message is not None and (not snapshot_in_progress or segment_end_ts is not None):
         payload, pending_line, pending_ts = pending_agent_message
         emit_agent_message(payload, pending_line, pending_ts)
     # A file can be read while Codex is still appending the current turn. Close
     # only its current text block; deliberately omit TurnEnd so the reducer keeps
     # the turn not-done instead of fabricating a completed status.
     close_assistant()
+    if segment_end_ts is not None:
+        # A following user record closes this visible segment, not the native
+        # task. Never emit a native terminal id/fork point for this boundary.
+        close_turn("steered", 0, False, segment_end_ts, authoritative_boundary=False)
     return events, model
 
 
@@ -3511,9 +5711,10 @@ def _record_containing_offset(
     *,
     file_size: int,
     offset: int,
+    max_record_bytes: int = _MAX_HISTORY_BOUNDARY_RECORD_BYTES,
 ) -> tuple[int, bytes] | None:
     """Read one bounded JSONL record around a byte match."""
-    prefix_start = max(0, offset - _MAX_HISTORY_BOUNDARY_RECORD_BYTES)
+    prefix_start = max(0, offset - max_record_bytes)
     source.seek(prefix_start)
     prefix = source.read(offset - prefix_start)
     newline = prefix.rfind(b"\n")
@@ -3526,9 +5727,9 @@ def _record_containing_offset(
     if record_start is None:
         return None
     source.seek(record_start)
-    line = source.readline(_MAX_HISTORY_BOUNDARY_RECORD_BYTES + 1)
+    line = source.readline(max_record_bytes + 1)
     if (
-        len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
+        len(line) > max_record_bytes
         or (
             not line.endswith(b"\n")
             and record_start + len(line) < file_size
@@ -3538,13 +5739,18 @@ def _record_containing_offset(
     return record_start, line.rstrip(b"\r\n")
 
 
-def _codex_native_turn_window(
+def _codex_history_record_window(
     path: str,
-    native_turn_id: str,
+    identity: str,
+    accept: Callable[[bytes], bool],
+    *,
+    max_record_bytes: int = _MAX_HISTORY_BOUNDARY_RECORD_BYTES,
 ) -> tuple[int, int] | None:
-    """Locate a native task by exact id without walking every JSONL record."""
-    needle = native_turn_id.encode("ascii")
+    """Locate one structurally verified record using bounded byte searches."""
+    if not isinstance(identity, str) or not _SAFE_WIRE_ID.fullmatch(identity):
+        return None
     try:
+        needle = identity.encode("ascii")
         with open(path, "rb") as source:
             file_size = os.fstat(source.fileno()).st_size
             left = 0
@@ -3566,6 +5772,7 @@ def _codex_native_turn_window(
                         source,
                         file_size=file_size,
                         offset=absolute_match,
+                        max_record_bytes=max_record_bytes,
                     )
                     if record is not None:
                         record_start, line = record
@@ -3573,7 +5780,7 @@ def _codex_native_turn_window(
                             checked_records.add(record_start)
                             if len(checked_records) > _MAX_HISTORY_TURN_MATCHES:
                                 return None
-                            if _history_turn_cursor(line) == native_turn_id:
+                            if accept(line):
                                 return record_start, file_size
                     cursor = match if reverse else match + len(needle)
 
@@ -3603,6 +5810,51 @@ def _codex_native_turn_window(
     except (OSError, UnicodeEncodeError):
         return None
     return None
+
+
+def _codex_native_turn_window(
+    path: str,
+    native_turn_id: str,
+) -> tuple[int, int] | None:
+    return _codex_history_record_window(
+        path, native_turn_id,
+        lambda line: _history_turn_cursor(line) == native_turn_id,
+    )
+
+
+def codex_history_user_images(path: str, message_id: str) -> list[dict]:
+    """Recover inline uploads by exact native user-item id, never a nearby turn.
+
+    Browser history can outlive both the official reader's locator LRU and the
+    rebuildable detail index. The original response item is still authoritative;
+    no app-server resume, full-history translation or localImage path is needed.
+    """
+    images: list[dict] = []
+
+    def accept(line: bytes) -> bool:
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(row, dict) or row.get("type") != "response_item":
+            return False
+        payload = row.get("payload")
+        if _legacy_response_user_item_id(payload) != message_id:
+            return False
+        content = payload.get("content")
+        if not isinstance(content, list):
+            return False
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "input_image":
+                image = _data_uri_to_img(item.get("image_url"))
+                if image is not None:
+                    images.append(image)
+        return True
+
+    _codex_history_record_window(
+        path, message_id, accept, max_record_bytes=_MAX_HISTORY_RECORD_CHARS,
+    )
+    return images
 
 
 def _history_image_payload(
@@ -3641,13 +5893,57 @@ def _history_image_payload(
     return normalized, width, height, data
 
 
+def _rollout_generated_image_item(payload: dict) -> dict | None:
+    """Normalize the two native persisted image-generation envelopes only."""
+    if payload.get("type") == "image_generation_end":
+        return {
+            "type": "imageGeneration", "id": payload.get("call_id"),
+            "status": payload.get("status"), "result": payload.get("result"),
+            "savedPath": payload.get("saved_path"),
+            "revisedPrompt": payload.get("revised_prompt"),
+        }
+    item = payload.get("item")
+    if (payload.get("type") == "item_completed"
+            and isinstance(item, dict)
+            and item.get("type") == "Extension"
+            and item.get("kind") == "image_gen.generation"):
+        return {**item, "type": "imageGeneration"}
+    return None
+
+
+def _generated_image_payload(result: object) -> tuple[str, int, int, bytes] | None:
+    # Native imageGeneration.result is PNG base64 (or an image data URL).
+    # Reject oversize bodies before decoding/copying; use the same image limits
+    # as the existing authenticated history-image route.
+    if not isinstance(result, str) or len(result) > (
+            (MAX_SINGLE_ATTACHMENT_BYTES + 2) // 3 * 4 + 128):
+        return None
+    return _history_image_payload(
+        result if result.startswith("data:") else "data:image/png;base64," + result)
+
+
+def codex_generated_image_ref(
+    turn_id: str, image: tuple[str, int, int, bytes],
+) -> dict[str, object]:
+    media_type, width, height, data = image
+    # Public item ids and raw rollout call ids need not use the same spelling.
+    # Content identity is stable across both projections, scoped to this task.
+    digest = hashlib.sha256(data).hexdigest()
+    identity = f"imageGeneration\0{turn_id}\0{digest}"
+    return {
+        "image_id": "img-" + hashlib.sha256(identity.encode()).hexdigest()[:24],
+        "media_type": media_type, "width": width, "height": height,
+        "byte_size": len(data),
+    }
+
+
 def codex_history_image_views(
     path: str,
     native_turn_id: str,
     *,
     segment_index: int = 0,
 ) -> tuple[CodexHistoryImageView, ...]:
-    """Recover only ``view_image`` activities from one native rollout turn.
+    """Recover image reads/generation from one exact native rollout segment.
 
     Official app-server 0.147 can return a successful full turn while omitting
     ``imageView`` items. This deliberately narrow supplement never translates
@@ -3674,6 +5970,7 @@ def codex_history_image_views(
     image_bytes = 0
     last_anchor_id: str | None = None
     awaiting_next_anchor: list[dict[str, object]] = []
+    source_complete = False
     try:
         source = open(path, "rb")
     except OSError:
@@ -3699,11 +5996,21 @@ def codex_history_image_views(
                     isinstance(turn_id, str)
                     and turn_id != native_turn_id
                 ):
+                    source_complete = True
                     break
                 continue
 
-            if row_type == "event_msg" and payload_type == "user_message":
-                if not visible_codex_user_message(payload.get("message")):
+            if (row_type == "event_msg" and payload_type in {
+                    "task_complete", "turn_aborted"}
+                    and payload.get("turn_id") == native_turn_id):
+                source_complete = True
+
+            if row_type == "event_msg":
+                user = codex_rollout_user_message(payload)
+            else:
+                user = None
+            if user is not None:
+                if not user.prompt:
                     continue
                 if saw_visible_user:
                     if current_segment == segment_index:
@@ -3712,6 +6019,40 @@ def codex_history_image_views(
                     current_segment += 1
                 else:
                     saw_visible_user = True
+                continue
+
+            generated_item = (_rollout_generated_image_item(payload)
+                              if row_type == "event_msg" else None)
+            if generated_item is not None:
+                if (current_segment != segment_index
+                        or len(calls) >= _MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT):
+                    continue
+                if (payload.get("turn_id") is not None
+                        and payload.get("turn_id") != native_turn_id):
+                    continue
+                raw_call_id = generated_item.get("id")
+                if (not isinstance(raw_call_id, str)
+                        or not _SAFE_WIRE_ID.fullmatch(raw_call_id)
+                        or raw_call_id in by_call_id):
+                    continue
+                status = _process_status(generated_item.get("status"))
+                if status != "succeeded":
+                    continue
+                image = _generated_image_payload(generated_item.get("result"))
+                if image is None or image_bytes + len(image[3]) > (
+                        _MAX_HISTORY_IMAGE_BYTES_PER_SEGMENT):
+                    continue
+                image_bytes += len(image[3])
+                image_path, _ = bounded_text(generated_item.get("savedPath"), 16 * 1024)
+                record = {
+                    "call_id": raw_call_id, "item_id": raw_call_id,
+                    "path": image_path, "timestamp": row.get("timestamp"),
+                    "output_seen": True, "image": image, "generated": True,
+                    "previous_item_id": last_anchor_id, "next_item_id": None,
+                }
+                calls.append(record)
+                by_call_id[raw_call_id] = record
+                awaiting_next_anchor.append(record)
                 continue
 
             if (
@@ -3839,6 +6180,8 @@ def codex_history_image_views(
                 "height": height,
                 "byte_size": len(data),
             }
+            if record.get("generated"):
+                image_ref = codex_generated_image_ref(native_turn_id, image)
         image_path = str(record.get("path") or "")
         event_input: dict[str, object] = {}
         if image_path:
@@ -3852,10 +6195,10 @@ def codex_history_image_views(
             phase="end",
             status="succeeded" if succeeded else "interrupted",
             turn_id=native_turn_id,
-            title="查看图片",
+            title="生成图片" if record.get("generated") else "查看图片",
             summary=image_path or None,
             input=event_input or None,
-            tool="view_image",
+            tool="image_generation" if record.get("generated") else "view_image",
         )
         timestamp = record.get("timestamp")
         if isinstance(timestamp, str):
@@ -3881,5 +6224,6 @@ def codex_history_image_views(
             width=width,
             height=height,
             data=data,
+            source_complete=source_complete,
         ))
     return tuple(views)

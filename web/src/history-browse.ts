@@ -1,6 +1,8 @@
 import {
   installAuthoritativeTurnDetailPage,
   mergeAuthoritativeTurnDetail,
+  mergeHistoryPageCopies,
+  reconcileProvenCompactionOrphans,
 } from "./history-merge.ts";
 import {
   MAX_RUNTIME_COMPLETED_UNITS,
@@ -140,6 +142,20 @@ export function acceptsCachedNewerPage(
     && projection.newerPageKey === guard.pageKey;
 }
 
+/** A cached latest page is only a navigation link after live output changed.
+ * Installing its stale rows would hide the active tail. Reaching that link by
+ * an explicit downward gesture must switch to SessionRuntime instead. */
+export function cachedLatestRequiresLiveRuntime(
+  projection: HistoryBrowseProjection,
+  page: Pick<HistoryBrowsePage, "isLatest"> | null | undefined,
+  latestPageKey?: string,
+): boolean {
+  return projection.latestDirty && (
+    !!page?.isLatest
+    || (!!latestPageKey && projection.newerPageKey === latestPageKey)
+  );
+}
+
 export function canonicalTurnId(turn: Pick<Turn, "id" | "historyTurnId">): string {
   return turn.historyTurnId || turn.id;
 }
@@ -171,24 +187,14 @@ function segmentToPage(segment: HistoryBrowseSegment): HistoryBrowsePage {
 /** Newer segments win canonical overlap so an optimistic live id stays mounted
  * after its native history row materializes. */
 function dedupeSegments(segments: readonly HistoryBrowseSegment[]): HistoryBrowseSegment[] {
-  const next = segments.map((segment) => ({
-    ...segment,
-    turns: [...segment.turns],
-  }));
-  const seen = new Set<string>();
-  for (let segmentIndex = next.length - 1; segmentIndex >= 0; segmentIndex -= 1) {
-    const segment = next[segmentIndex];
-    const retained: Turn[] = [];
-    for (let turnIndex = segment.turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
-      const turn = segment.turns[turnIndex];
-      const key = canonicalTurnId(turn);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      retained.unshift(turn);
-    }
-    segment.turns = retained;
-  }
-  return next;
+  const copies = mergeHistoryPageCopies(flattenSegments(segments));
+  let offset = 0;
+  return segments.map((segment) => {
+    const turns = copies.slice(offset, offset + segment.turns.length)
+      .filter((turn): turn is Turn => turn != null);
+    offset += segment.turns.length;
+    return { ...segment, turns };
+  });
 }
 
 function flattenSegments(segments: readonly HistoryBrowseSegment[]): Turn[] {
@@ -197,13 +203,36 @@ function flattenSegments(segments: readonly HistoryBrowseSegment[]): Turn[] {
   return turns;
 }
 
+/** Persist a canonical compaction repair in its owning page segment. Keeping
+ * empty segments is intentional: page keys and cursors remain the authority
+ * for walking back to an evicted neighbour even when the only polluted row in
+ * one byte-window page was absorbed by the adjacent canonical page. */
+function reconcileCompactionSegments(
+  segments: readonly HistoryBrowseSegment[],
+): HistoryBrowseSegment[] {
+  const source = flattenSegments(segments);
+  const repaired = reconcileProvenCompactionOrphans(source);
+  if (repaired.length === source.length) return [...segments];
+  // The repair is deletion-only and preserves the exact source objects.
+  // Display ids are not unique across every cache migration: two legitimate
+  // rows can share an optimistic id while carrying distinct historyTurnId
+  // authorities. Filtering by object identity avoids replacing both with the
+  // last Map entry for that display id.
+  const retained = new Set(repaired);
+  return segments.map((segment) => ({
+    ...segment,
+    turns: segment.turns.filter((turn) => retained.has(turn)),
+  }));
+}
+
 function materializeProjection(
   projection: Omit<
     HistoryBrowseProjection,
     "turns" | "loadedPageKeys" | "oldestPageKey" | "newestPageKey"
   >,
 ): HistoryBrowseProjection {
-  const segments = dedupeSegments(projection.segments);
+  const segments = reconcileCompactionSegments(
+    dedupeSegments(projection.segments));
   return {
     ...projection,
     segments,
@@ -423,7 +452,8 @@ export function prependOlderPage(
   const withoutSamePage = projection.segments.filter(
     (segment) => segment.pageKey !== incoming.pageKey,
   );
-  const normalized = dedupeSegments([incoming, ...withoutSamePage]);
+  const normalized = reconcileCompactionSegments(
+    dedupeSegments([incoming, ...withoutSamePage]));
   const bounded = boundSegments(
     normalized,
     "tail",
@@ -463,7 +493,8 @@ export function appendNewerPage(
   const withoutSamePage = projection.segments.filter(
     (segment) => segment.pageKey !== incoming.pageKey,
   );
-  const normalized = dedupeSegments([...withoutSamePage, incoming]);
+  const normalized = reconcileCompactionSegments(
+    dedupeSegments([...withoutSamePage, incoming]));
   const bounded = boundSegments(
     normalized,
     "head",
@@ -533,6 +564,7 @@ export function markBrowseDetailLoading(
     before: string | null;
     direction: "initial" | "older" | "newer";
   } | null,
+  resetPending?: boolean,
 ): HistoryBrowseProjection {
   if (!guardMatches(projection, guard)) return projection;
   let changed = false;
@@ -549,7 +581,9 @@ export function markBrowseDetailLoading(
             || (turn.detailRetryBefore === (
               retry === null ? undefined : retry.before)
               && turn.detailRetryDirection === (
-                retry === null ? undefined : retry.direction)))) return turn;
+                retry === null ? undefined : retry.direction)))
+          && (resetPending === undefined
+            || !!turn.detailResetPending === resetPending)) return turn;
       changed = true;
       return {
         ...turn,
@@ -561,6 +595,8 @@ export function markBrowseDetailLoading(
           ? turn.detailRetryBefore : retry?.before,
         detailRetryDirection: retry === undefined
           ? turn.detailRetryDirection : retry?.direction,
+        detailResetPending:
+          resetPending ?? turn.detailResetPending,
       };
     }),
   }));

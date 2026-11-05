@@ -1,0 +1,264 @@
+"""Native streaming-input steering, shared by the SDK owner and its controller."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+
+
+class ClaudeSteerRejected(RuntimeError):
+    """The instruction was definitely not written to the native input stream."""
+
+
+def steer_message(prompt, native_id: str) -> dict:
+    # `next` is consumed at the next safe input boundary. `now` interrupts a
+    # running tool; omitting the priority leaves that policy to the CLI default.
+    return {"type": "user", "message": {"role": "user", "content": prompt},
+            "parent_tool_use_id": None, "uuid": native_id, "priority": "next"}
+
+
+def _origin_key(origin: dict) -> str:
+    kind = origin.get("kind")
+    for field in ("taskId", "task_id", "senderTaskId", "fromSession", "verifiedPeerPid", "from", "server", "name"):
+        value = origin.get(field)
+        if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+            return json.dumps([kind, "task" if field in {"taskId", "task_id"} else field, str(value).strip()])
+    return json.dumps(origin, sort_keys=True)
+
+
+def _main_activity(value: dict) -> bool:
+    if value.get("parent_tool_use_id") or value.get("parentToolUseID"):
+        return False
+    kind = value.get("type")
+    if kind == "assistant":
+        return True
+    if kind == "stream_event":
+        return value.get("event", {}).get("type") == "message_start"
+    return (kind == "system" and value.get("subtype") == "status"
+            and value.get("status") in {"requesting", "compacting"})
+
+
+def background_end_ids(value: dict) -> tuple[str, ...]:
+    """Exact native continuations settled by this journaled boundary."""
+    return tuple(value.get("__cc_background_ends") or (
+        [value["__cc_background_end"]] if value.get("__cc_background_end") else []))
+
+
+def is_synthetic_user(value: dict) -> bool:
+    """Native compaction/context rows are not human consumption receipts."""
+    return value.get("type") == "user" and (
+        value.get("isSynthetic") is True or value.get("isCompactSummary") is True)
+
+
+def is_managed_input(value: dict, *, pending_compact: bool = False) -> bool:
+    """Native consumption evidence, excluding child output and tool results.
+
+    Manual /compact may report its boundary before replaying its user input.
+    Only a controller with that exact command pending may claim those frames.
+    """
+    origin = value.get("origin")
+    if (is_synthetic_user(value)
+            or value.get("parent_tool_use_id") or value.get("parentToolUseID")
+            or (isinstance(origin, dict) and origin.get("kind") not in (None, "human"))):
+        return False
+    if value.get("type") == "user":
+        content = value.get("message", {}).get("content")
+        return not (isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") in {"tool_result", "server_tool_result"}
+            for part in content))
+    if pending_compact and value.get("type") == "system":
+        if value.get("subtype") == "status":
+            return value.get("status") == "compacting"
+        if value.get("subtype") == "compact_boundary":
+            metadata = value.get("compact_metadata", value.get("compactMetadata"))
+            return isinstance(metadata, dict) and metadata.get("trigger") == "manual"
+    return False
+
+
+def is_human_result(value: dict) -> bool:
+    """Use an exact consumption receipt before falling back to legacy origin."""
+    if (value.get("type") != "result" or value.get("parent_tool_use_id")
+            or value.get("parentToolUseID")):
+        return False
+    if "__cc_managed_result" in value:
+        return value["__cc_managed_result"] is True
+    origin = value.get("origin")
+    return not isinstance(origin, dict) or origin.get("kind") in (None, "human")
+
+
+class PendingSteers:
+    """Fence accepted inputs against their exact replayed human UUIDs.
+
+    A Result already in flight can precede a just-written input. It ends a
+    physical response, but cannot retire the controller's accepted work. The
+    service journals these annotations so reattachment has the same boundary.
+    """
+
+    def __init__(self):
+        self.pending: dict[str, dict] = {}
+        self.capabilities: set[str] = set()
+        self.background_id: str | None = None
+        self.background_origin: str | None = None
+        self.background_origin_data: dict | None = None
+        self._backgrounds: dict[str, dict] = {}
+        self._consumed_user_id: str | None = None
+
+    def begin_turn(self) -> None:
+        self._consumed_user_id = None
+
+    def handoff_background(self, identity: str | None) -> None:
+        self._backgrounds.pop(identity, None)
+        self.background_id = next(reversed(self._backgrounds), None)
+        current = self._backgrounds.get(self.background_id, {})
+        self.background_origin = current.get("origin_key")
+        self.background_origin_data = current.get("origin")
+
+    def add(self, native_id: str, metadata: dict) -> None:
+        if len(self.pending) >= 32 or native_id in self.pending:
+            raise ClaudeSteerRejected("Claude steering capacity reached")
+        self.pending[native_id] = metadata
+
+    def annotate(self, value: dict, *, managed_active: bool = False,
+                 result_receipts: bool = True) -> dict:
+        origin = value.get("origin")
+        kind = origin.get("kind") if isinstance(origin, dict) else None
+        child = value.get("parent_tool_use_id") or value.get("parentToolUseID")
+        uid = value.get("uuid")
+        if (is_managed_input(value) and value.get("type") == "user"
+                and isinstance(uid, str) and uid
+                and (managed_active or uid in self.pending or value.get("__cc_steer"))):
+            self._consumed_user_id = uid
+            # Service/controller routes activate after this exact steering echo
+            # is annotated. Adopt its pre-echo request now, including on replay,
+            # so the human Result also retires that implicit activity claim.
+            managed_active = True
+        if value.get("type") == "result" and not child:
+            receipts = value.get("user_message_uuids")
+            receipts = receipts if isinstance(receipts, list) else []
+            receipts = [uid for uid in receipts if isinstance(uid, str) and uid]
+            receipt = value.get("user_message_uuid")
+            if isinstance(receipt, str) and receipt:
+                receipts.append(receipt)
+            if receipts and result_receipts and "__cc_managed_result" not in value:
+                # Task notifications can be absorbed into the human response.
+                # The Result must consume the latest echoed input, not merely
+                # an older input in the same session. Preserve this decision in
+                # the journal: the pinned SDK parser drops the receipt fields.
+                value = {**value, "__cc_managed_result":
+                         self._consumed_user_id is not None
+                         and self._consumed_user_id in receipts}
+        if not child:
+            if managed_active and is_managed_input(value, pending_compact=True):
+                # A native request can precede its replayed human input. That
+                # anonymous activity now belongs to the consumed human response
+                # and must settle at its Result. Keep explicit task origins;
+                # they can still have their own, later terminal boundary.
+                for entry in self._backgrounds.values():
+                    if entry["implicit"]:
+                        entry["managed"] = True
+            message = value.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            tool_result = isinstance(content, list) and any(
+                isinstance(part, dict) and part.get("type") == "tool_result" for part in content)
+            injected = (value.get("type") == "user" and not is_synthetic_user(value) and not tool_result
+                        and kind not in (None, "human"))
+            start = value.get("__cc_background_start")
+            # Code can omit replay of an internal task-notification user row.
+            # An unsolicited top-level request/output still proves a main turn;
+            # task edges and forwarded child output do not.
+            if start or injected or (not managed_active and not self.background_id
+                                     and _main_activity(value)):
+                if start:
+                    identity = start["id"]
+                    origin_key, origin_data = start.get("origin_key"), start.get("origin")
+                    managed = start.get("managed", managed_active)
+                    # Older journals do not record implicit provenance. Their
+                    # retained request prefix still establishes it before any
+                    # subsequent annotation refines the same identity.
+                    implicit = start.get("implicit", self._backgrounds.get(identity, {}).get(
+                        "implicit", origin_key is None))
+                else:
+                    origin_key = _origin_key(origin) if injected else None
+                    origin_data = origin if injected else None
+                    managed = managed_active
+                    # Several task inputs may feed one physical response. A
+                    # repeated origin refines its existing claim, not a second
+                    # response for which the CLI may never send a Result.
+                    identity = next((key for key, entry in self._backgrounds.items()
+                                     if entry["managed"] == managed
+                                     and (entry["implicit"] or entry["origin_key"] == origin_key)), None)
+                    implicit = self._backgrounds.get(identity, {}).get("implicit", not injected)
+                    identity = identity or "background-" + hashlib.sha256(json.dumps(
+                        [value.get("uuid"), origin_key], sort_keys=True).encode()).hexdigest()[:32]
+                self._backgrounds[identity] = {
+                    "origin_key": origin_key, "origin": origin_data, "managed": managed,
+                    "implicit": implicit,
+                }
+                self.background_id = identity
+                self.background_origin = origin_key
+                self.background_origin_data = origin_data
+                value = {**value, "__cc_background_start": {
+                    "id": identity, "origin_key": self.background_origin,
+                    "origin": self.background_origin_data, "managed": managed, "implicit": implicit,
+                }}
+            elif value.get("type") == "result":
+                ended = background_end_ids(value)
+                local_ends = ()
+                if is_human_result(value):
+                    # An unattributed Result closes the physical response,
+                    # including its in-turn task inputs. An older autonomous
+                    # response must not be consumed by a new human terminal.
+                    if managed_active:
+                        local_ends = tuple(key for key, entry in self._backgrounds.items()
+                                           if entry["managed"])
+                    elif kind is None:
+                        local_ends = tuple(self._backgrounds)
+                elif isinstance(origin, dict) and kind not in (None, "human"):
+                    # An implicit main response has no replayed original input.
+                    # Mid-response task inputs describe absorbed notifications,
+                    # not a replacement owner: the Result can name the omitted
+                    # original run. Explicit unrelated origins still stay open.
+                    local_ends = tuple(key for key, entry in self._backgrounds.items()
+                                       if entry["implicit"] or entry["origin_key"] == _origin_key(origin))
+                # An older service can journal some ends without knowing about
+                # the controller's implicit pre-input claim. Retain its exact
+                # boundaries and include locally established consumption too.
+                ended = tuple(dict.fromkeys((*ended, *local_ends)))
+                if ended:
+                    value = {**value, "__cc_background_ends": list(ended)}
+                    if len(ended) == 1:
+                        value["__cc_background_end"] = ended[0]
+                    for identity in ended:
+                        self.handoff_background(identity)
+        cancelled = value.get("__cc_steer_cancelled")
+        if cancelled:
+            self.pending = {uid: data for uid, data in self.pending.items()
+                            if data.get("id") != cancelled.get("id")}
+        if value.get("type") == "system" and value.get("subtype") == "init":
+            self.capabilities = set(value.get("capabilities") or [])
+        if value.get("type") == "command_lifecycle" and value.get("state") == "cancelled":
+            metadata = self.pending.pop(value.get("command_uuid"), None)
+            if metadata is not None:
+                return {**value, "type": "system", "subtype": "cc_remote_steer_cancelled",
+                        "__cc_steer_cancelled": metadata}
+        if value.get("type") == "result" and is_human_result(value):
+            self._consumed_user_id = None
+            if self.pending:
+                return {**value, "__cc_steer_intermediate": True}
+        if kind not in (None, "human") or child:
+            return value
+        if value.get("type") == "user" and is_managed_input(value):
+            metadata = self.pending.pop(value.get("uuid"), None)
+            if metadata is not None:
+                return {**value, "__cc_steer": value.get("__cc_steer", metadata)}
+        return value
+
+    async def interrupt(self, client) -> None:
+        if self.pending and "interrupt_cancel_queued_v1" in self.capabilities:
+            # Ordinary interrupt leaves async inputs queued. Native cancellation
+            # emits exact lifecycle frames before Result, so both controller and
+            # journal can retire only the cancelled inputs without guessing.
+            await client._query._send_control_request(
+                {"subtype": "interrupt", "cancel_queued": True})
+        else:
+            await client.interrupt()

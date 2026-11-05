@@ -26,31 +26,42 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import re
 import signal
+import sys
+import time
 from collections import OrderedDict, deque
 from typing import Any, Awaitable, Callable, Optional
 
 from cc_remote import __version__
 from cc_remote.log import logger
+from cc_remote.wrapper.token_usage import CodexUsageTracker
+from cc_remote.wrapper.os_compat import kill_process_tree
+from cc_remote.wrapper.btw_history import CodexBtwCompletions
 from cc_remote.protocol import (
     MAX_SAFE_WIRE_INTEGER,
+    MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
+    MAX_STATUS_RESET_CREDITS,
     MAX_STATUS_USAGE_BUCKETS,
     Notice,
+    Fast,
     RateLimitUpdate,
     ThreadGoal,
 )
 from cc_remote.wrapper.codex_daemon import (
+    CodexServerIdentity,
     CodexDaemonUpgradeRequired,
     CodexDaemonManager,
     codex_daemon_mode,
     default_codex_daemon_manager,
 )
+from cc_remote.wrapper.codex_context_settings import NativeContextSettings, model_context_bounds
 from cc_remote.wrapper.codex_sessions import (
     codex_approval,
     codex_context_window,
     codex_effort,
-    codex_fast_enabled,
+    codex_service_tier,
     codex_model,
     codex_rollout_path,
     codex_web_search,
@@ -66,10 +77,15 @@ from cc_remote.wrapper.codex_runtime import (
     resolve_codex_bin as _runtime_resolve_codex_bin,
 )
 from cc_remote.wrapper.codex_permissions import normalize_permission_profiles
+from cc_remote.wrapper.codex_models import (
+    codex_catalog, normalize_service_tier, resolve_service_tier,
+)
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
 )
+from cc_remote.wrapper.work_context import recover_codex_context_usage
+from cc_remote.wrapper.codex_context_usage import read_codex_context_estimate
 
 log = logger("cc_remote.wrapper.codex_handle")
 
@@ -77,11 +93,23 @@ _REQ_TIMEOUT = 60.0
 _APPROVAL_TIMEOUT = 5 * 60.0
 _MAX_SERVER_REQUEST_TASKS = 32
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
+_CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS = 30.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
 _STATUS_USAGE_BUCKET_SCAN_MAX = 4096
 _RUNTIME_EVENT_PENDING_MAX = 32
 _RUNTIME_EVENT_SEEN_MAX = 128
+_THREAD_DELETE_NOTIFY_MAX = 512
+_THREAD_DELETE_NOTIFY_TIMEOUT = 1.0
+_APP_SERVER_NOFILE_SOFT_LIMIT = 4096
+_RLIMIT_EXEC = str(Path(__file__).with_name("rlimit_exec.py"))
+_THREAD_ARCHIVE_NOTIFY_MAX = 512
+_THREAD_ARCHIVE_NOTIFY_TIMEOUT = 1.0
+_THREAD_DELETE_LIST_PAGE_SIZE = 100
+_THREAD_DELETE_LIST_MAX_PAGES = 20
+_THREAD_DELETE_LIST_MAX_IDS = 4096
+_PENDING_STEER_USER_IDENTITIES_MAX = 512
+_ACTIVE_STREAM_TURN_IDS_MAX = 8
 _NOTICE_MESSAGE_MAX = 2 * 1024
 _NOTICE_DETAIL_MAX = 4 * 1024
 _NOTICE_PATH_MAX = 1024
@@ -96,9 +124,14 @@ _WORK_SKILL_LIMIT = 512
 _WORK_MCP_SERVER_LIMIT = 128
 _WORK_PATH_MAX = 4096
 _WORK_NAME_MAX = 256
+_COMPACTION_CONTINUATION_GRACE_SECONDS = 5.0
+_COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS = 1.0
+_GOAL_PROMPT_CANDIDATE_TTL_SECONDS = 30.0
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
 _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
+_DAEMON_GENERATION_CONNECT_ATTEMPTS = 2
+_TURN_START_RECONCILE_PAGE_SIZE = 8
 _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
 # The managed shared daemon intentionally follows Codex's standalone release
 # channel.  The desktop app can temporarily bundle a newer official app-server
@@ -140,17 +173,162 @@ _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
     "turn/completed",
     "turn/started",
 })
+_EXTERNAL_THREAD_STARTED_SOURCES = frozenset({"cli", "vscode", "exec"})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
-RuntimeEvent = Notice | RateLimitUpdate
+ThreadStartedCallback = Callable[[str], None]
+RuntimeEvent = Notice | RateLimitUpdate | Fast
 RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
 
 class CodexProxyProtocolError(RuntimeError):
     """The local proxy stream violated its RFC 6455 boundary."""
+
+
+class CodexDaemonProxyClosed(RuntimeError):
+    """A shared app-server proxy closed without a native turn terminal.
+
+    This is an internal lifecycle signal, not an authoritative Codex terminal.
+    Machine uses the previous initialized app-server version only after one
+    bounded reconnect to distinguish an official daemon upgrade from an
+    ordinary transport interruption. Raw proxy/daemon diagnostics are never
+    carried to the browser.
+    """
+
+    __slots__ = ("app_server_version", "generation", "close_kind")
+
+    def __init__(
+        self,
+        app_server_version: Optional[str],
+        generation: int,
+        *,
+        close_kind: str,
+    ) -> None:
+        self.app_server_version = (
+            app_server_version
+            if isinstance(app_server_version, str) and app_server_version
+            else None
+        )
+        self.generation = generation
+        self.close_kind = close_kind
+        super().__init__("Codex shared app-server proxy closed")
+
+
+class CodexAppServerDisconnected(RuntimeError):
+    """A resident JSON-RPC request lost its app-server transport."""
+
+    __slots__ = ("app_server_version", "generation")
+
+    def __init__(
+        self,
+        app_server_version: Optional[str],
+        generation: int,
+    ) -> None:
+        self.app_server_version = (
+            app_server_version
+            if isinstance(app_server_version, str) and app_server_version
+            else None
+        )
+        self.generation = generation
+        super().__init__("codex app-server disconnected")
+
+
+class CodexTurnStartDisconnected(RuntimeError):
+    """``turn/start`` lost its response after the submission boundary.
+
+    ``accepted`` is true only when the old generation emitted an exact
+    ``clientUserMessageId`` user item before disconnecting.  False means the
+    outcome is unknown, not that replay is safe.
+    """
+
+    __slots__ = (
+        "accepted",
+        "app_server_version",
+        "client_message_id",
+        "generation",
+        "native_turn_id",
+        "native_message_id",
+    )
+
+    def __init__(
+        self,
+        app_server_version: Optional[str],
+        generation: int,
+        *,
+        accepted: bool,
+        client_message_id: Optional[str] = None,
+        native_turn_id: Optional[str] = None,
+        native_message_id: Optional[str] = None,
+    ) -> None:
+        self.accepted = bool(accepted)
+        self.app_server_version = (
+            app_server_version
+            if isinstance(app_server_version, str) and app_server_version
+            else None
+        )
+        self.generation = generation
+        self.client_message_id = client_message_id
+        self.native_turn_id = native_turn_id
+        self.native_message_id = native_message_id
+        super().__init__("Codex turn/start outcome interrupted by disconnect")
+
+
+class CodexTurnStartReconciliation:
+    """Bounded authoritative state for one interrupted ``turn/start``.
+
+    ``matched_turn_id`` is populated only when the replacement app-server
+    exposes the exact registered client id/native user item (or the already
+    proven native task id).  ``thread_active`` without a match is deliberately
+    not ownership proof; Machine keeps the session blocked and polls instead of
+    adopting or replaying somebody else's concurrent turn.
+    """
+
+    __slots__ = (
+        "active_turn_id",
+        "latest_turn_id",
+        "matched_turn_active",
+        "matched_turn_id",
+        "matched_turn_is_latest",
+        "newer_turns_present",
+        "page_truncated",
+        "thread_active",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_active: bool,
+        active_turn_id: Optional[str],
+        matched_turn_id: Optional[str],
+        matched_turn_active: bool,
+        latest_turn_id: Optional[str] = None,
+        matched_turn_is_latest: bool = False,
+        newer_turns_present: bool = False,
+        page_truncated: bool = False,
+    ) -> None:
+        self.thread_active = bool(thread_active)
+        self.active_turn_id = active_turn_id
+        self.matched_turn_id = matched_turn_id
+        self.matched_turn_active = bool(matched_turn_active)
+        self.latest_turn_id = latest_turn_id
+        self.matched_turn_is_latest = bool(matched_turn_is_latest)
+        self.newer_turns_present = bool(newer_turns_present)
+        self.page_truncated = bool(page_truncated)
+
+
+class _CodexDaemonGenerationChanged(RuntimeError):
+    """The managed daemon child changed while a proxy was initializing."""
+
+
+class CodexEphemeralThreadGone(RuntimeError):
+    """The exact in-memory fork no longer exists; never silently re-fork it."""
+
+    def __init__(self, thread_id: str):
+        self.thread_id = thread_id
+        super().__init__("Codex ephemeral thread has been destroyed")
 
 
 class CodexAppServerError(RuntimeError):
@@ -228,6 +406,57 @@ class CodexSteerOutcomeUnknown(RuntimeError):
     """turn/steer was written but no authoritative response was observed."""
 
 
+class CodexArchiveOutcomeUnknown(RuntimeError):
+    """thread/archive was submitted without an authoritative response."""
+
+
+def _restore_nullable_explicit_effort(
+    handle: Any,
+    effort: object,
+    *,
+    thread_id: object,
+    model: object,
+    cwd: object,
+) -> bool:
+    """Restore one previously confirmed explicit effort after nullable resume.
+
+    The new app-server's concrete value always wins. A nullable response may
+    reuse the old explicit value only when the native thread, model and cwd all
+    still match. Display projections and catalog/config defaults are never
+    accepted as restoration sources.
+    """
+    if (
+        not isinstance(effort, str)
+        or not effort.strip()
+        or not isinstance(thread_id, str)
+        or not thread_id
+        or not isinstance(model, str)
+        or not model
+        or not isinstance(cwd, str)
+        or not cwd
+        or getattr(handle, "effort", None) is not None
+        or getattr(handle, "thread_id", None) != thread_id
+        or getattr(handle, "model", None) != model
+    ):
+        return False
+    current_cwd = getattr(handle, "_cwd", None) or getattr(handle, "cwd", None)
+    if not isinstance(current_cwd, str) or not current_cwd:
+        return False
+    expected_cwd = os.path.realpath(cwd)
+    if os.path.realpath(current_cwd) != expected_cwd:
+        return False
+
+    restored = effort.strip()[:64]
+    handle.effort = restored
+    handle.applied_effort = restored
+    handle.display_effort = restored
+    handle.display_effort_model = model
+    handle.display_effort_cwd = expected_cwd
+    handle.display_effort_generation = getattr(handle, "_generation", None)
+    handle._display_effort_retry_at = None
+    return True
+
+
 def _websocket_client_frame(
     payload: bytes, *, opcode: int = 0x1, fin: bool = True,
 ) -> bytes:
@@ -294,6 +523,98 @@ class CodexSteerFence:
         self.release.set()
 
 
+class CodexSteerUserIdentityProof:
+    """Content-free proof that one official user item is a Remote input.
+
+    Shared app-server notifications can flush either ``turn/start`` or a steer
+    under a different native task from the control turn returned to this handle.
+    The foreign frame must remain filtered, but its exact upstream ``clientId``
+    is safe to use as an identity bridge when this generation registered it.
+    """
+
+    __slots__ = (
+        "thread_id",
+        "expected_turn_id",
+        "native_turn_id",
+        "native_message_id",
+        "client_message_id",
+        "generation",
+        "kind",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: Optional[str],
+        native_turn_id: str,
+        native_message_id: str,
+        client_message_id: str,
+        generation: int,
+        kind: str = "steer",
+    ) -> None:
+        self.thread_id = thread_id
+        self.expected_turn_id = expected_turn_id
+        self.native_turn_id = native_turn_id
+        self.native_message_id = native_message_id
+        self.client_message_id = client_message_id
+        self.generation = generation
+        self.kind = kind
+
+
+class CodexOwnedTurnProbe:
+    """Content-free official proof for one active control turn."""
+
+    __slots__ = ("turn_id", "native_user_message_ids")
+
+    def __init__(
+        self,
+        *,
+        turn_id: str,
+        native_user_message_ids: tuple[str, ...],
+    ) -> None:
+        self.turn_id = turn_id
+        self.native_user_message_ids = native_user_message_ids
+
+
+class _PendingSteerUserIdentity:
+    """One bounded, generation-owned client id awaiting official identity."""
+
+    __slots__ = (
+        "thread_id",
+        "expected_turn_id",
+        "client_message_id",
+        "generation",
+        "queue",
+        "state",
+        "proof",
+        "delivered",
+        "completed_seen",
+        "kind",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: Optional[str],
+        client_message_id: str,
+        generation: int,
+        queue: Any,
+        kind: str = "steer",
+    ) -> None:
+        self.thread_id = thread_id
+        self.expected_turn_id = expected_turn_id
+        self.client_message_id = client_message_id
+        self.generation = generation
+        self.queue = queue
+        self.state = "pending"
+        self.proof: Optional[CodexSteerUserIdentityProof] = None
+        self.delivered = False
+        self.completed_seen = False
+        self.kind = kind
+
+
 class CodexNoActiveTurnFence:
     """In-order barrier after an authoritative inactive thread/read response."""
 
@@ -305,6 +626,107 @@ class CodexNoActiveTurnFence:
 
     def release_now(self) -> None:
         self.release.set()
+
+
+class _GoalPromptCandidate:
+    """One short-lived Goal objective awaiting its spontaneous native turn."""
+
+    __slots__ = ("objective", "generation", "revision", "deadline")
+
+    def __init__(
+        self,
+        objective: str,
+        generation: int,
+        revision: int,
+        deadline: float,
+    ):
+        self.objective = objective
+        self.generation = generation
+        self.revision = revision
+        self.deadline = deadline
+
+
+class _GoalReplacementFence:
+    """Track Goal objectives still draining behind newer replacements."""
+
+    __slots__ = (
+        "objective",
+        "current_turn_ids",
+        "retired_turn_ids",
+        "generation",
+        "authoritative",
+    )
+
+    def __init__(
+        self,
+        objective: str,
+        current_turn_ids: set[str],
+        retired_turn_ids: dict[str, set[str]],
+        generation: int,
+    ):
+        self.objective = objective
+        self.current_turn_ids = current_turn_ids
+        self.retired_turn_ids = retired_turn_ids
+        self.generation = generation
+        self.authoritative = False
+
+
+class _CodexCompactionContinuation:
+    """One managed compaction turn spanning native compact turn ids.
+
+    ``logical_turn_id`` is frozen for the response consumer. ``native_turn_id``
+    follows app-server so interrupt and rollout ownership always target the real
+    active task. The queue/process/thread fences prevent another subscribed
+    daemon turn from inheriting this narrow continuation right.
+    """
+
+    __slots__ = (
+        "thread_id",
+        "native_turn_id",
+        "logical_turn_id",
+        "generation",
+        "queue",
+        "awaiting_replacement",
+        "interruption_consumed",
+        "suppression_enabled",
+        "deadline",
+        "suppressed_terminal",
+        "suppressed_size",
+        "candidate_turn_id",
+        "candidate_started",
+        "candidate_size",
+        "probing",
+        "settled",
+        "expiry_task",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        native_turn_id: str,
+        logical_turn_id: str,
+        generation: int,
+        queue: Any,
+    ):
+        self.thread_id = thread_id
+        self.native_turn_id = native_turn_id
+        self.logical_turn_id = logical_turn_id
+        self.generation = generation
+        self.queue = queue
+        self.awaiting_replacement = False
+        self.interruption_consumed = False
+        self.suppression_enabled = True
+        self.deadline = 0.0
+        self.suppressed_terminal: Optional[dict] = None
+        self.suppressed_size: Optional[int] = None
+        self.candidate_turn_id: Optional[str] = None
+        self.candidate_started: Optional[dict] = None
+        self.candidate_size: Optional[int] = None
+        self.probing = False
+        self.settled = asyncio.Event()
+        self.settled.set()
+        self.expiry_task: Optional[asyncio.Task] = None
 
 
 class CodexNoActiveTurnConfirmation:
@@ -348,16 +770,37 @@ class CodexSteerAcceptance(str):
 class _CodexSteerResponseBoundary:
     """Mutable response-dispatch handoff for one exact turn/steer RPC."""
 
-    __slots__ = ("thread_id", "turn_id", "fence")
+    __slots__ = ("thread_id", "turn_id", "client_message_id", "fence")
 
-    def __init__(self, thread_id: str, turn_id: str):
+    def __init__(
+        self,
+        thread_id: str,
+        turn_id: str,
+        client_message_id: Optional[str] = None,
+    ):
         self.thread_id = thread_id
         self.turn_id = turn_id
+        self.client_message_id = client_message_id
         self.fence: Optional[CodexSteerFence] = None
 
     def release(self) -> None:
         if self.fence is not None:
             self.fence.release_now()
+
+
+class _CodexTurnStartResponseBoundary:
+    """Bind a pending Remote input at the exact ``turn/start`` response."""
+
+    __slots__ = ("thread_id", "client_message_id")
+
+    def __init__(self, thread_id: str, client_message_id: Optional[str]):
+        self.thread_id = thread_id
+        self.client_message_id = client_message_id
+
+    def release(self) -> None:
+        # Query owns cleanup of the registered identity.  This common hook keeps
+        # request/disconnect cleanup polymorphic with the steer fence.
+        return
 
 
 class _SpontaneousNotificationQueue:
@@ -421,6 +864,70 @@ class _SpontaneousNotificationQueue:
         self._items.append((item, 0))
         self._ready.set()
 
+    def put_control_first_nowait(self, item: object) -> None:
+        """Prepend one zero-byte identity proof before buffered model frames."""
+        self._items.appendleft((item, 0))
+        self._ready.set()
+
+    def remap_turn_id(self, native_turn_id: str, control_turn_id: str) -> bool:
+        """Rewrite already-buffered frames after ``turn/start`` returns.
+
+        The stdout reader can receive an exact client-id user item and a few
+        following frames before the request coroutine wakes up.  They belong to
+        this queue, but the logical control id is not known until the JSON-RPC
+        response.  Rewrite only the proven native id and keep byte accounting
+        bounded; arbitrary queued controls and sibling turns are untouched.
+        """
+        if native_turn_id == control_turn_id:
+            return True
+
+        def rewrite(item: object, old_size: int) -> tuple[object, int]:
+            if (
+                not isinstance(item, dict)
+                or _notification_turn_id(item) != native_turn_id
+            ):
+                return item, old_size
+            raw_params = item.get("params")
+            if not isinstance(raw_params, dict):
+                return item, old_size
+            mapped = dict(item)
+            params = dict(raw_params)
+            params["turnId"] = control_turn_id
+            raw_turn = raw_params.get("turn")
+            if (
+                isinstance(raw_turn, dict)
+                and raw_turn.get("id") == native_turn_id
+            ):
+                params["turn"] = {**raw_turn, "id": control_turn_id}
+            mapped["params"] = params
+            try:
+                size = len(json.dumps(
+                    mapped,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8", errors="surrogatepass"))
+            except Exception:
+                return item, old_size
+            return mapped, size
+
+        items = deque(rewrite(item, size) for item, size in self._items)
+        end = (
+            rewrite(*self._end)
+            if self._end is not None else None
+        )
+        live_bytes = sum(size for _item, size in items)
+        end_bytes = end[1] if end is not None else 0
+        if (
+            live_bytes > self._live_max_bytes
+            or end_bytes > self.max_end_bytes
+            or live_bytes + end_bytes > self.max_bytes
+        ):
+            return False
+        self._items = items
+        self._end = end
+        self._bytes = live_bytes + end_bytes
+        return True
+
     def _can_put_live(self, size: int) -> bool:
         return not (
             self._end is not None
@@ -456,13 +963,17 @@ class _SpontaneousNotificationQueue:
 
     def begin_gap(self, marker: object) -> None:
         """Drop one stale live tail and open a bounded loss epoch."""
-        # Control-plane ordering boundaries are not lossy live detail. Preserve
-        # them even when later output overflows before the consumer reaches the
-        # barrier.
+        # Control-plane ordering and identity boundaries are not lossy live
+        # detail. Preserve them even when later output overflows before the
+        # consumer reaches the barrier.
         controls = [
             entry for entry in self._items
             if isinstance(
-                entry[0], (CodexSteerFence, CodexNoActiveTurnFence)
+                entry[0], (
+                    CodexSteerFence,
+                    CodexSteerUserIdentityProof,
+                    CodexNoActiveTurnFence,
+                )
             )
         ]
         self._items.clear()
@@ -640,7 +1151,7 @@ _MODEL_TURN_METHODS = frozenset({
     "model/verification",
 })
 _TURN_QUEUE_METHODS = frozenset({
-    "error", "thread/compacted", *_MODEL_TURN_METHODS,
+    "error", "thread/compacted", "thread/tokenUsage/updated", *_MODEL_TURN_METHODS,
 })
 
 
@@ -704,7 +1215,7 @@ def _codex_version(path: str) -> tuple[int, ...]:
 
 
 def _newer_private_core_for_oversized_resume(
-    managed_bin: str, resume_id: Optional[str],
+    managed_bin: str, resume_id: Optional[str], codex_home: Optional[str] = None,
 ) -> Optional[str]:
     """Select a newer official desktop app-server for one oversized thread.
 
@@ -721,7 +1232,11 @@ def _newer_private_core_for_oversized_resume(
     if (not resume_id or os.environ.get("CODEX_BIN")
             or managed_bin in _CODEX_DESKTOP_BIN_CANDIDATES):
         return None
-    rollout_path = codex_rollout_path(resume_id)
+    rollout_path = (
+        codex_rollout_path(resume_id)
+        if codex_home is None
+        else codex_rollout_path(resume_id, codex_home=codex_home)
+    )
     if not rollout_path:
         return None
     try:
@@ -754,7 +1269,7 @@ def _newer_private_core_for_oversized_resume(
 
 
 def _oversized_desktop_openai_resume_requires_http(
-    resume_id: Optional[str],
+    resume_id: Optional[str], codex_home: Optional[str] = None,
 ) -> bool:
     """Use Codex's official Responses HTTP path for one pathological resume.
 
@@ -772,7 +1287,11 @@ def _oversized_desktop_openai_resume_requires_http(
     """
     if not resume_id:
         return False
-    rollout_path = codex_rollout_path(resume_id)
+    rollout_path = (
+        codex_rollout_path(resume_id)
+        if codex_home is None
+        else codex_rollout_path(resume_id, codex_home=codex_home)
+    )
     if not rollout_path:
         return False
     try:
@@ -813,6 +1332,39 @@ def _append_openai_http_resume_provider(argv: list[str]) -> None:
     ])
 
 
+def _openai_http_resume_thread_config() -> dict[str, Any]:
+    """Register the HTTP compatibility alias in one thread configuration.
+
+    ``thread/resume.config`` is evaluated by the app-server which owns the
+    thread.  Supplying the alias there lets a shared daemon select official
+    Responses HTTP without writing the user's config.toml or starting a second
+    independently writable app-server.
+    """
+    return {
+        "model_providers": {
+            _OPENAI_HTTP_RESUME_PROVIDER_ID: {
+                "name": "cc-remote OpenAI HTTP",
+                "base_url": _OPENAI_HTTP_RESUME_BASE_URL,
+                "wire_api": "responses",
+                "requires_openai_auth": True,
+                "supports_websockets": False,
+            },
+        },
+    }
+
+
+def _code_thread_config(
+    *, http_only_resume: bool, web_search: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Compose independent Code-time overrides without losing either one."""
+    config: dict[str, Any] = {}
+    if http_only_resume:
+        config.update(_openai_http_resume_thread_config())
+    if web_search:
+        config["web_search"] = web_search
+    return config or None
+
+
 def _semantic_version(value: Optional[str]) -> tuple[int, ...]:
     """Return the numeric release prefix used for app-server feature gates."""
     if not isinstance(value, str):
@@ -831,21 +1383,45 @@ def _resolve_codex_bin() -> str:
     return _runtime_resolve_codex_bin()
 
 
-def _codex_env(bin_path: str) -> dict[str, str]:
+def _codex_env(
+    bin_path: str, codex_home: Optional[str] = None,
+) -> dict[str, str]:
     """Compatibility seam for wrapper-owned Codex child environments."""
-    return _runtime_codex_env(bin_path)
+    if codex_home is None:
+        return _runtime_codex_env(bin_path)
+    return _runtime_codex_env(bin_path, codex_home)
 
 
-def _codex_runtime_tmp() -> str:
+def _profile_codex_env(
+    bin_path: str, codex_home: Optional[str],
+) -> dict[str, str]:
+    return (_codex_env(bin_path) if codex_home is None
+            else _codex_env(bin_path, codex_home))
+
+
+def _profile_rollout_path(
+    session_id: str, codex_home: Optional[str],
+) -> Optional[str]:
+    return (
+        codex_rollout_path(session_id)
+        if codex_home is None
+        else codex_rollout_path(session_id, codex_home=codex_home)
+    )
+
+
+def _codex_runtime_tmp(codex_home: Optional[str] = None) -> str:
     """Return the private runtime directory Codex uses for sandbox launchers.
 
     Work leaves unspecified paths ungranted and opens only its own workspace.
     Codex stages ``codex-linux-sandbox`` below ``$CODEX_HOME/tmp`` before every
     tool call, so that narrow runtime path must remain readable as well.
     """
-    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    codex_home = os.path.abspath(os.path.expanduser(codex_home))
-    return os.path.join(codex_home, "tmp")
+    selected_home = (
+        codex_home or os.environ.get("CODEX_HOME")
+        or os.path.expanduser("~/.codex")
+    )
+    selected_home = os.path.abspath(os.path.expanduser(selected_home))
+    return os.path.join(selected_home, "tmp")
 
 
 def _initialize_params() -> dict[str, Any]:
@@ -939,12 +1515,25 @@ class CodexHandle:
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
+                 thread_started_callback: Optional[ThreadStartedCallback] = None,
                  runtime_event_callback: Optional[RuntimeEventCallback] = None,
                  daemon_mode: Optional[str] = None,
-                 daemon_manager: Optional[CodexDaemonManager] = None):
+                 daemon_manager: Optional[CodexDaemonManager] = None,
+                 codex_home: Optional[str] = None):
         self.cfg = cfg
+        self.codex_home = (
+            os.path.realpath(os.path.expanduser(codex_home))
+            if codex_home else None
+        )
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
+        # Separate native fork lifetime from this disposable transport. A proxy
+        # reconnect can preserve an ephemeral thread; replacing its server cannot.
+        self._ephemeral_thread_id: Optional[str] = None
+        self._ephemeral_server_identity: Optional[CodexServerIdentity] = None
+        self._ephemeral_private_generation: Optional[int] = None
+        self._ephemeral_thread_gone = False
+        self.btw_completions: CodexBtwCompletions | None = None
         # A shared daemon can publish every subscribed thread immediately after
         # initialize, before thread/resume returns and assigns ``thread_id``.
         # Freeze the requested resume id across that bind window so only the
@@ -953,12 +1542,19 @@ class CodexHandle:
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
+        # A control/API turn can be streamed and persisted beneath another
+        # native task after a cross-client steer. Keep turn_id logical; exact
+        # native-item proofs may add only a bounded set of active aliases.
+        self._active_stream_turn_ids: set[str] = set()
         # App-server 0.147 can emit thread/compacted followed by an
         # ``interrupted`` turn/completed for the same native turn, then keep
         # appending items to that turn. The compact notification is the only
         # authoritative evidence that this otherwise-terminal boundary is a
         # continuation fence rather than a real user interrupt.
         self._compaction_continuation_turn_id: Optional[str] = None
+        self._managed_compaction_continuation: Optional[
+            _CodexCompactionContinuation
+        ] = None
         # Inline Review has two different app-server turn ids.  The response and
         # visible lifecycle use the outer id, while a nested reviewer turn is the
         # thread's actual interrupt target.  Keep them separate: collapsing both
@@ -983,14 +1579,17 @@ class CodexHandle:
         self.daemon_manager = (
             daemon_manager
             if daemon_manager is not None
-            else default_codex_daemon_manager(self.daemon_mode)
+            else default_codex_daemon_manager(
+                self.daemon_mode, codex_home=self.codex_home)
         )
         self._using_daemon_proxy = False
+        self._control_only_connection = False
         # Once a Code session has joined the official shared app-server, a
         # transport interruption must not silently turn it into a private stdio
         # session.  Keep this affinity across proxy reconnects so Machine can
         # preserve bidirectional ownership while the short-lived proxy is down.
         self._daemon_proxy_established = False
+        self._daemon_process_identity: Optional[CodexServerIdentity] = None
         self._proxy_read_buffer = bytearray()
         self._proxy_close_sent = False
         self._send_lock = asyncio.Lock()
@@ -998,13 +1597,26 @@ class CodexHandle:
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._pending_response_boundaries: dict[
-            int, _CodexSteerResponseBoundary
+            int, _CodexSteerResponseBoundary | _CodexTurnStartResponseBoundary
         ] = {}
+        self._pending_steer_user_identities: OrderedDict[
+            str, _PendingSteerUserIdentity
+        ] = OrderedDict()
         self._turn_q: Optional[Any] = None
         self._managed_overflow = False
         self._reader: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._thread_settings_updated = asyncio.Event()
+        self._thread_settings_lock = asyncio.Lock()
+        self._thread_delete_target: Optional[str] = None
+        self._thread_deleted_ids: Optional[list[str]] = None
+        self.thread_delete_notifications_overflowed = False
+        self._thread_delete_done = asyncio.Event()
+        self._thread_archive_target: Optional[str] = None
+        self._thread_archived_ids: Optional[list[str]] = None
+        self.thread_archive_notifications_overflowed = False
+        self._thread_archive_done = asyncio.Event()
+        self._thread_settings_revision = 0
         # Human approval can take minutes.  It must not block the sole stdout
         # reader, which still has to consume turn/interrupt and other RPC replies.
         # Keep detached request handlers generation-owned and cancel them on
@@ -1021,6 +1633,7 @@ class CodexHandle:
         self.interaction_callback = interaction_callback
         self.goal_callback = goal_callback
         self.turn_lifecycle_callback = turn_lifecycle_callback
+        self.thread_started_callback = thread_started_callback
         # App-server can emit initialize/config warnings before thread/start has
         # returned.  Machine binds this callback immediately but activates it only
         # after the SessionContext has a non-null routing key.  Until then, keep a
@@ -1040,7 +1653,10 @@ class CodexHandle:
         self._http_provider_repair_tasks: set[asyncio.Task] = set()
         self._http_provider_repair_stop = asyncio.Event()
         self.last_token_usage: Optional[dict] = None
+        self._turn_usage = CodexUsageTracker()
+        self._context_usage_turn_id: Optional[str] = None
         self.context_window: Optional[int] = None
+        self._rollout_context_recovery_attempted = False
         self.app_server_version: Optional[str] = None
         self.last_thread_status: Optional[dict] = None
         self.last_rate_limits: Optional[dict] = None
@@ -1048,6 +1664,24 @@ class CodexHandle:
         self.last_goal: Optional[dict[str, Any]] = None
         self.goal_revision = 0
         self.last_goal_turn_id: Optional[str] = None
+        # A newly-created or actually-modified Goal objective is a visible user
+        # boundary even though app-server starts its turn without turn/start.
+        # Keep the objective separate from mutable Goal status/usage updates and
+        # consume it exactly once when the correlated native turn is projected.
+        self._goal_objective_baseline: Optional[str] = None
+        self._goal_status_baseline: Optional[str] = None
+        self._goal_baseline_loaded = False
+        self._goal_prompt_pending: OrderedDict[str, str] = OrderedDict()
+        self._goal_prompt_candidate: Optional[_GoalPromptCandidate] = None
+        self._manual_compact_request: asyncio.Future[bool] | None = None
+        self._manual_compact_candidate: str | None = None
+        self._manual_compact_generation = -1
+        self._explicit_interrupt_turn: tuple[int, str] | None = None
+        # Prompt correlation ends as soon as turn/started claims its candidate.
+        # Keep retired objectives independently across response -> notification
+        # gaps. Authoritative external replacements extend the same fence so
+        # delayed old-turn updates cannot regress state after rapid edits either.
+        self._goal_replacement_fence: Optional[_GoalReplacementFence] = None
         # A goal/automatic continuation can start without query(), hence without
         # a response queue owned by Machine._run_turn.  Track that one turn
         # separately so the machine can lock the session, expose interrupt, and
@@ -1061,14 +1695,51 @@ class CodexHandle:
         # turn. Config.toml is read-only here and supplies fresh-thread defaults.
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
-        self.model: Optional[str] = codex_model()
-        self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
+        configured_model = (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
+        self.model: Optional[str] = configured_model or None
+        configured_effort = (
+            codex_effort() if self.codex_home is None
+            else codex_effort(codex_home=self.codex_home)
+        )
+        self.effort: Optional[str] = configured_effort or None
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
+        # UI projection may be ``model-default`` when app-server reports a null
+        # thread override and its effective config has no explicit fallback.
+        # Query must continue to use only ``effort``; never send that display
+        # sentinel to turn/start.
+        self.display_effort: Optional[str] = self.effort
+        self.display_effort_model: Optional[str] = (
+            self.model if self.display_effort else None
+        )
+        self.display_effort_cwd: Optional[str] = (
+            os.path.realpath(self._cwd)
+            if self.display_effort and isinstance(self._cwd, str) and self._cwd
+            else None
+        )
+        self.display_effort_generation: Optional[int] = (
+            self._generation if self.display_effort else None
+        )
+        self._display_effort_retry_at: Optional[float] = None
+        # A null thread override falls through to app-server's effective config
+        # before the selected model's catalog default. Cache that read per cwd
+        # and app-server generation; it is presentation state only and must not
+        # become a turn/start override.
+        self._configured_default_effort: Optional[str] = None
+        self._configured_default_effort_cwd: Optional[str] = None
+        self._configured_default_effort_generation: Optional[int] = None
+        self._configured_default_effort_read_at: Optional[float] = None
+        self._configured_default_effort_known = False
         # Work is governed by its per-process named permission profile. It must
         # never fall back to interactive escalation outside that profile, even
         # when a resumed native thread persisted a Code-time approval policy.
         self.approval: str = (
-            "never" if self.work_mode else codex_approval())  # UI/callback projection
+            "never" if self.work_mode else (
+                codex_approval() if self.codex_home is None
+                else codex_approval(codex_home=self.codex_home)
+            ))  # UI/callback projection
         # Official named profile id (for example ``:workspace`` or
         # ``:danger-full-access``).  It is independent from approvalPolicy:
         # the profile says what the sandbox may access; approvalPolicy says
@@ -1080,12 +1751,17 @@ class CodexHandle:
         # applied through config.web_search on start/resume/fork and retained
         # locally so controlled reconnects preserve it.
         self.web_search_override: Optional[str] = None
+        self.context_settings = NativeContextSettings()
         self.web_search: str = (
-            "cached" if self.work_mode else codex_web_search()
+            "cached" if self.work_mode else (
+                codex_web_search() if self.codex_home is None
+                else codex_web_search(codex_home=self.codex_home)
+            )
         )
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = (
-            "fast" if codex_fast_enabled() else None
+            codex_service_tier() if self.codex_home is None
+            else codex_service_tier(codex_home=self.codex_home)
         )                                                    # thread-scoped; None = standard
 
     async def activate_runtime_events(self) -> None:
@@ -1123,6 +1799,43 @@ class CodexHandle:
                 )
 
     @property
+    def ephemeral_thread_destroyed(self) -> bool:
+        if not self._ephemeral_thread_id or self.thread_id != self._ephemeral_thread_id:
+            return False
+        if self._ephemeral_thread_gone:
+            return True
+        if self._ephemeral_private_generation is not None:
+            return bool(
+                self._generation != self._ephemeral_private_generation
+                or self.proc is None or self.proc.returncode is not None
+            )
+        expected = self._ephemeral_server_identity
+        observe = getattr(self.daemon_manager, "current_process_identity", None)
+        observed = observe() if expected is not None and callable(observe) else None
+        # A temporarily unreadable PID/socket, or a change in identity source,
+        # is not proof of destruction. Do not permanently lock recoverable chats.
+        return bool(expected is not None and observed is not None
+                    and type(expected) is type(observed) and expected != observed)
+
+    async def _require_loaded_ephemeral_thread(self, thread_id: str) -> None:
+        if thread_id != self._ephemeral_thread_id:
+            return
+        if self.ephemeral_thread_destroyed:
+            raise CodexEphemeralThreadGone(thread_id)
+        try:
+            await self._request("thread/read", {
+                "threadId": thread_id, "includeTurns": False,
+            })
+        except CodexAppServerError as exc:
+            # Only the official exact-identity miss is final. Transport, auth,
+            # malformed replies and generic JSON-RPC errors remain retryable.
+            if (exc.code == -32600 and isinstance(exc.error, dict)
+                    and exc.error.get("message") == f"thread not loaded: {thread_id}"):
+                self._ephemeral_thread_gone = True
+                raise CodexEphemeralThreadGone(thread_id) from exc
+            raise
+
+    @property
     def using_daemon_proxy(self) -> bool:
         """Whether this live handle is attached to the shared Codex daemon."""
         return bool(
@@ -1131,6 +1844,33 @@ class CodexHandle:
             and not self._dead
             and getattr(self.proc, "returncode", None) is None
         )
+
+    @property
+    def daemon_process_generation_current(self) -> bool:
+        """Whether this proxy still targets the server generation it joined.
+
+        Managers without the official identity surface retain normal WebSocket
+        liveness. Once that surface exists, an unavailable or different server
+        is a stale generation even when the proxy subprocess has not observed
+        EOF yet.
+        """
+        if not self.using_daemon_proxy:
+            return False
+        expected = self._daemon_process_identity
+        observe = getattr(
+            self.daemon_manager, "current_process_identity", None,
+        )
+        if not callable(observe):
+            # Third-party/test managers without the official PID observation
+            # surface use WebSocket liveness only.
+            return True
+        current = observe()
+        if expected is None:
+            # A manager which implements identity observation but cannot return
+            # the generation is temporarily unavailable, not "unsupported".
+            # Fail closed so a later preflight reconnects and binds it.
+            return False
+        return current == expected
 
     @property
     def shared_daemon_affinity(self) -> bool:
@@ -1150,11 +1890,12 @@ class CodexHandle:
     async def _publish_runtime_event(self, event: RuntimeEvent) -> None:
         key = _runtime_event_key(event)
         async with self._runtime_event_lock:
-            if isinstance(event, RateLimitUpdate):
+            if isinstance(event, (RateLimitUpdate, Fast)):
                 # Rate values can legitimately cycle (99 -> 100 -> 99). Dedup
                 # only a consecutive identical snapshot for the same public
                 # limit, not every value observed in the global LRU window.
-                identity = event.limit_id or "__default__"
+                identity = ("speed" if isinstance(event, Fast)
+                            else "rate:" + (event.limit_id or "__default__"))
                 previous = self._runtime_rate_keys.get(identity)
                 if previous == key and key in self._runtime_event_seen:
                     self._runtime_event_seen.move_to_end(key)
@@ -1162,6 +1903,8 @@ class CodexHandle:
                     return
                 if previous is not None:
                     self._runtime_event_seen.pop(previous, None)
+                    if isinstance(event, Fast):
+                        self._runtime_event_pending.pop(previous, None)
                 self._runtime_rate_keys[identity] = key
                 self._runtime_rate_keys.move_to_end(identity)
                 while len(self._runtime_rate_keys) > _STATUS_RATE_LIMIT_MAX:
@@ -1264,13 +2007,24 @@ class CodexHandle:
     async def _open_process(
         self, argv: list[str], codex_bin: str, *, daemon_proxy: bool,
     ) -> None:
+        process_argv = argv
+        if os.name == "posix" and not daemon_proxy:
+            # A private stdio app-server owns archive recursion itself.  Raise
+            # only that child so resident Work sessions and daemon-off Code
+            # sessions cannot inherit the wrapper's commonly-low FD ceiling.
+            process_argv = [
+                sys.executable,
+                _RLIMIT_EXEC,
+                str(_APP_SERVER_NOFILE_SOFT_LIMIT),
+                *argv,
+            ]
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            *process_argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
-            env=_codex_env(codex_bin),
+            env=_profile_codex_env(codex_bin, self.codex_home),
             # JSONL and reassembled WebSocket messages share this hard ceiling.
             limit=_PROXY_MESSAGE_MAX,
             start_new_session=(os.name == "posix"),
@@ -1280,6 +2034,7 @@ class CodexHandle:
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
         self._process_group = proc.pid if os.name == "posix" else None
+        self._clear_steer_user_identities()
         self._generation += 1
         generation = self._generation
         self._dead = False
@@ -1292,10 +2047,40 @@ class CodexHandle:
         self.last_goal = None
         self.goal_revision = 0
         self.last_goal_turn_id = None
+        self._goal_objective_baseline = None
+        self._goal_status_baseline = None
+        self._goal_baseline_loaded = False
+        self._goal_prompt_pending.clear()
+        self._goal_prompt_candidate = None
+        self._goal_replacement_fence = None
         self._spontaneous_turn_id = None
+        self._active_stream_turn_ids.clear()
         self._compaction_continuation_turn_id = None
+        self._discard_managed_compaction_continuation()
         self.last_token_usage = None
+        self._turn_usage = CodexUsageTracker()
+        self._context_usage_turn_id = None
         self.context_window = None
+        self._rollout_context_recovery_attempted = False
+        self._configured_default_effort = None
+        self._configured_default_effort_cwd = None
+        self._configured_default_effort_generation = None
+        self._configured_default_effort_read_at = None
+        self._configured_default_effort_known = False
+        if self.effort:
+            self.display_effort = self.effort
+            self.display_effort_model = self.model
+            self.display_effort_cwd = (
+                os.path.realpath(self._cwd)
+                if isinstance(self._cwd, str) and self._cwd else None
+            )
+            self.display_effort_generation = self._generation
+        else:
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+        self._display_effort_retry_at = None
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(proc, generation))
         try:
@@ -1316,32 +2101,53 @@ class CodexHandle:
         fork: bool = False,
         preserve_controls: bool = False,
         preserve_permission_profile: bool = True,
+        control_only: bool = False,
+        _bind_generation_attempt: int = 0,
     ) -> None:
+        if control_only and (resume_id is not None or fork or self.work_mode):
+            raise ValueError(
+                "control-only Codex connections cannot bind a thread"
+            )
         if self.proc is not None:
             await self.disconnect()
+        # Arm this before the reader starts. A shared daemon can publish a
+        # sibling thread/started during initialize, and a control connection
+        # must never adopt that unrelated thread while it is still unbound.
+        self._control_only_connection = control_only
         self._shared_resume_binding_thread_id = None
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
         private_core = None
         http_only_resume = False
-        if not self.work_mode and not self._daemon_proxy_established:
+        if not self.work_mode:
             http_only_resume = await asyncio.to_thread(
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id,
+            ) if self.codex_home is None else await asyncio.to_thread(
+                _oversized_desktop_openai_resume_requires_http,
+                resume_id, self.codex_home,
             )
+        if not self.work_mode and not self._daemon_proxy_established:
             private_core = await asyncio.to_thread(
                 _newer_private_core_for_oversized_resume,
                 codex_bin,
                 resume_id,
+            ) if self.codex_home is None else await asyncio.to_thread(
+                _newer_private_core_for_oversized_resume,
+                codex_bin,
+                resume_id, self.codex_home,
             )
-            if private_core is not None:
-                codex_bin = private_core
+        # The managed binary owns the shared daemon.  A newer desktop core is
+        # only a private-stdio fallback if no shared control plane is available;
+        # choosing it before probing the daemon would split terminal and Web
+        # into two independently writable app-servers for every large thread.
+        stdio_codex_bin = private_core or codex_bin
         self._http_provider_root_id = resume_id if http_only_resume else None
         if http_only_resume:
             self._http_provider_repair_stop.clear()
-        child_env = _codex_env(codex_bin)
-        stdio_argv = [codex_bin, "app-server", "--stdio"]
+        child_env = _profile_codex_env(codex_bin, self.codex_home)
+        stdio_argv = [stdio_codex_bin, "app-server", "--stdio"]
         if http_only_resume:
             _append_openai_http_resume_provider(stdio_argv)
             log.info(
@@ -1357,7 +2163,7 @@ class CodexHandle:
             # bwrap and every tool fails with ENOENT before its command starts.
             filesystem_entries = [
                 '":minimal" = "read"',
-                f'{json.dumps(_codex_runtime_tmp())} = "read"',
+                f'{json.dumps(_codex_runtime_tmp() if self.codex_home is None else _codex_runtime_tmp(self.codex_home))} = "read"',
                 f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
                 f'{json.dumps(self._cwd)} = "write"',
             ]
@@ -1368,13 +2174,18 @@ class CodexHandle:
                 "-c", "permissions.cc_remote_work.network.enabled=false",
             ])
         proxy_argv: Optional[list[str]] = None
-        strict_shared = False
-        if (private_core is None and not http_only_resume and not self.work_mode
-                and self.daemon_mode == "auto"):
+        strict_shared = bool(
+            getattr(
+                self.daemon_manager,
+                "strict_shared_affinity",
+                False,
+            )
+        )
+        if not self.work_mode and self.daemon_mode == "auto":
             try:
                 proxy_argv = await self.daemon_manager.proxy_args(
                     codex_bin, child_env)
-                strict_shared = bool(
+                strict_shared = strict_shared or bool(
                     getattr(
                         self.daemon_manager,
                         "strict_shared_affinity",
@@ -1386,16 +2197,27 @@ class CodexHandle:
                 # silently severing the terminal CLI <-> Remote live channel.
                 raise
             except Exception as exc:
+                strict_shared = strict_shared or bool(
+                    getattr(
+                        self.daemon_manager,
+                        "strict_shared_affinity",
+                        False,
+                    )
+                )
+                if strict_shared:
+                    raise
                 log.warning(
                     "Codex daemon preparation failed; using stdio",
                     error_type=type(exc).__name__,
                 )
         attempts = (
-            [(proxy_argv, True), (stdio_argv, False)]
-            if proxy_argv is not None else [(stdio_argv, False)]
+            [(proxy_argv, True, codex_bin),
+             (stdio_argv, False, stdio_codex_bin)]
+            if proxy_argv is not None
+            else [(stdio_argv, False, stdio_codex_bin)]
         )
         if strict_shared and proxy_argv is not None:
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         if self._daemon_proxy_established:
             if proxy_argv is None:
                 raise RuntimeError(
@@ -1403,45 +2225,118 @@ class CodexHandle:
             # A previously shared thread must never reconnect through private
             # stdio.  Leave the handle disconnected and let Machine retry the
             # shared proxy instead of manufacturing a false external-CLI lock.
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
+        if control_only:
+            if proxy_argv is None:
+                raise RuntimeError(
+                    "shared Codex app-server proxy is unavailable"
+                )
+            attempts = [(proxy_argv, True, codex_bin)]
         initialized: Any = None
-        for argv, daemon_proxy in attempts:
-            self._shared_resume_binding_thread_id = (
-                resume_id
-                if daemon_proxy and resume_id and not fork
-                else None
-            )
-            try:
-                await self._open_process(
-                    argv, codex_bin, daemon_proxy=daemon_proxy)
-                initialized = await self._request(
-                    "initialize", _initialize_params())
-                self.app_server_version = _app_server_version(initialized)
-                await self._notify("initialized")
-                if daemon_proxy:
-                    self._daemon_proxy_established = True
-                break
-            except asyncio.CancelledError:
-                await self.disconnect()
-                raise
-            except Exception as exc:
-                await self.disconnect()
-                if not daemon_proxy:
+        connected = False
+        for candidate_argv, daemon_proxy, attempt_codex_bin in attempts:
+            argv = candidate_argv
+            generation_attempt = 0
+            while True:
+                self._shared_resume_binding_thread_id = (
+                    resume_id
+                    if daemon_proxy and resume_id and not fork
+                    else None
+                )
+                observe = getattr(
+                    self.daemon_manager,
+                    "current_process_identity",
+                    None,
+                )
+                try:
+                    generation_before = (
+                        observe()
+                        if daemon_proxy and callable(observe) else None
+                    )
+                    await self._open_process(
+                        argv, attempt_codex_bin, daemon_proxy=daemon_proxy)
+                    initialized = await self._request(
+                        "initialize", _initialize_params())
+                    self.app_server_version = _app_server_version(initialized)
+                    await self._notify("initialized")
+                    if daemon_proxy:
+                        generation_after = (
+                            observe() if callable(observe) else None
+                        )
+                        if callable(observe) and (
+                            generation_before is None or generation_after is None
+                        ):
+                            raise _CodexDaemonGenerationChanged(
+                                "Cannot verify Codex app-server identity during "
+                                "proxy initialize"
+                            )
+                        if callable(observe) and (
+                            generation_before != generation_after
+                        ):
+                            raise _CodexDaemonGenerationChanged(
+                                "Codex app-server changed during proxy initialize"
+                            )
+                        self._daemon_proxy_established = True
+                        self._daemon_process_identity = generation_after
+                    connected = True
+                    break
+                except asyncio.CancelledError:
+                    await self.disconnect()
                     raise
-                self.daemon_manager.invalidate()
-                if strict_shared or self._daemon_proxy_established:
+                except Exception as exc:
+                    await self.disconnect()
+                    if not daemon_proxy:
+                        raise
+                    self.daemon_manager.invalidate()
+                    if isinstance(exc, _CodexDaemonGenerationChanged):
+                        generation_attempt += 1
+                        if (
+                            generation_attempt
+                            >= _DAEMON_GENERATION_CONNECT_ATTEMPTS
+                        ):
+                            log.warning(
+                                "Codex app-server identity verification failed",
+                                attempts=generation_attempt,
+                                reason=str(exc),
+                            )
+                            raise
+                        refreshed = await self.daemon_manager.proxy_args(
+                            codex_bin, child_env)
+                        if refreshed is None:
+                            raise RuntimeError(
+                                "shared Codex app-server proxy is unavailable"
+                            ) from exc
+                        argv = refreshed
+                        log.info(
+                            "retrying Codex proxy after app-server identity failure",
+                            attempt=generation_attempt + 1,
+                        )
+                        continue
+                    if (
+                        strict_shared
+                        or self._daemon_proxy_established
+                        or control_only
+                    ):
+                        log.warning(
+                            "Codex shared daemon proxy unavailable; reconnect required",
+                            error_type=type(exc).__name__,
+                        )
+                        raise
                     log.warning(
-                        "Codex shared daemon proxy unavailable; reconnect required",
+                        "Codex daemon proxy unavailable; using stdio",
                         error_type=type(exc).__name__,
                     )
-                    raise
-                log.warning(
-                    "Codex daemon proxy unavailable; using stdio",
-                    error_type=type(exc).__name__,
-                )
-        else:  # pragma: no cover - the attempt list is never empty
+                    break
+            if connected:
+                break
+        if not connected:  # pragma: no cover - the attempt list is never empty
             raise RuntimeError("unable to start Codex app-server transport")
+        bound_thread_id: Optional[str] = None
+        context_config = await self.context_settings.validated_config(self) if not self.work_mode else {}
         try:
+            if control_only:
+                log.info("codex control connection established", cwd=self._cwd)
+                return
             if self.work_mode:
                 # Inspect the effective native runtime rather than guessing at
                 # user-configured skill and MCP names.  Failure is fatal: silently
@@ -1461,6 +2356,7 @@ class CodexHandle:
                 )
                 self._work_config = _work_thread_config(
                     skills_response, config_response)
+                self._remember_configured_default_effort(config_response)
 
             if fork and resume_id:
                 # ephemeral /btw fork: inherits resume_id's context into a throwaway
@@ -1473,10 +2369,14 @@ class CodexHandle:
                 }
                 if self.permission_profile:
                     fork_params["permissions"] = self.permission_profile
-                if not self.work_mode and self.web_search_override:
-                    fork_params["config"] = {
-                        "web_search": self.web_search_override,
-                    }
+                code_config = _code_thread_config(
+                    http_only_resume=http_only_resume,
+                    web_search=(
+                        None if self.work_mode else self.web_search_override
+                    ),
+                )
+                if code_config is not None:
+                    fork_params["config"] = code_config
                 if http_only_resume:
                     fork_params["modelProvider"] = (
                         _OPENAI_HTTP_RESUME_PROVIDER_ID)
@@ -1495,7 +2395,19 @@ class CodexHandle:
                     fork_params["excludeTurns"] = True
                 res = await self._request("thread/fork", fork_params)
                 self.thread_id = _thread_id_of(res)
+                bound_thread_id = self.thread_id
+                self._ephemeral_thread_id = self.thread_id
+                self.btw_completions = CodexBtwCompletions(
+                    min(getattr(self.cfg, "ring_max_bytes", 24 * 1024 * 1024), 24 * 1024 * 1024),
+                    min(getattr(self.cfg, "ring_max_events", 10000), 10000),
+                    self.cfg.tool_result_max,
+                )
+                self._ephemeral_server_identity = self._daemon_process_identity
+                self._ephemeral_private_generation = (
+                    None if daemon_proxy else self._generation)
+                self._ephemeral_thread_gone = False
             elif resume_id:
+                await self._require_loaded_ephemeral_thread(resume_id)
                 # A replacement daemon reconstructs approval/profile from
                 # config defaults rather than the last live thread settings.
                 # Controlled reconnects repeat the exact settings that the old
@@ -1512,6 +2424,9 @@ class CodexHandle:
                 )
                 if preserve_controls:
                     resume_params["approvalPolicy"] = preserved_approval
+                    if self.context_settings.pending and self.model:
+                        resume_params["model"] = self.model
+                        resume_params["serviceTier"] = self.service_tier
                     if preserve_permission_profile and preserved_profile:
                         resume_params["permissions"] = preserved_profile
                 if http_only_resume:
@@ -1525,10 +2440,19 @@ class CodexHandle:
                         "config": self._work_config,
                         "permissions": "cc_remote_work",
                     })
-                elif self.web_search_override:
-                    resume_params["config"] = {
-                        "web_search": self.web_search_override,
-                    }
+                else:
+                    code_config = _code_thread_config(
+                        http_only_resume=http_only_resume,
+                        web_search=self.web_search_override,
+                    )
+                    if code_config is not None:
+                        resume_params["config"] = code_config
+                    if context_config:
+                        resume_params.setdefault("config", {}).update(context_config)
+                    elif self.context_settings.pending and self.context_settings.max_tokens is None:
+                        # Some({}) deliberately requests a fresh native config.
+                        # Omitting config only rejoins and retains the old override.
+                        resume_params.setdefault("config", {})
                 if _supports_lightweight_resume(self.app_server_version):
                     # Since Codex 0.144.6, excludeTurns is the official way for
                     # clients with a paged history UI to resume a live thread.
@@ -1541,7 +2465,7 @@ class CodexHandle:
                     # transport ceiling; otherwise fail before the stdout reader
                     # is destroyed by an oversized thread/resume response.
                     rollout_path = await asyncio.to_thread(
-                        codex_rollout_path, resume_id)
+                        _profile_rollout_path, resume_id, self.codex_home)
                     try:
                         rollout_size = (
                             await asyncio.to_thread(os.path.getsize, rollout_path)
@@ -1560,6 +2484,7 @@ class CodexHandle:
                         )
                 res = await self._request("thread/resume", resume_params)
                 self.thread_id = _thread_id_of(res) or resume_id
+                bound_thread_id = self.thread_id
                 self._shared_resume_binding_thread_id = None
             else:
                 params: dict[str, Any] = {
@@ -1575,6 +2500,8 @@ class CodexHandle:
                     params["config"] = {
                         "web_search": self.web_search_override,
                     }
+                if context_config:
+                    params.setdefault("config", {}).update(context_config)
                 if self.work_mode:
                     params.update({
                         "baseInstructions": WORK_BASE_INSTRUCTIONS,
@@ -1584,6 +2511,7 @@ class CodexHandle:
                     })
                 res = await self._request("thread/start", params)
                 self.thread_id = _thread_id_of(res)
+                bound_thread_id = self.thread_id
             if not self.thread_id:
                 raise RuntimeError("codex app-server did not return a thread id")
             if http_only_resume:
@@ -1630,22 +2558,114 @@ class CodexHandle:
                     sticky["permissions"] = self.permission_profile
                 await self._update_thread_settings(
                     wait_for_notification=True, **sticky)
-        except BaseException:
+            if daemon_proxy and callable(observe):
+                generation_after_bind = observe()
+                if (
+                    self._daemon_process_identity is None
+                    or generation_after_bind is None
+                    or generation_after_bind != self._daemon_process_identity
+                ):
+                    raise _CodexDaemonGenerationChanged(
+                        "Codex app-server changed while binding its thread"
+                    )
+        except BaseException as exc:
+            # initialize is not the complete connection boundary: resume/start
+            # and sticky settings still target the same daemon child. If that
+            # child is replaced after initialize, rebind the already-known
+            # native thread on the replacement generation. No turn input has
+            # been submitted yet, so resuming that identity is idempotent. A
+            # lost brand-new thread/start response has no recoverable id and is
+            # deliberately not retried, avoiding duplicate blank sessions.
+            retry_thread_id = (
+                bound_thread_id
+                or (
+                    resume_id
+                    if isinstance(resume_id, str) and not fork
+                    else None
+                )
+            )
+            retryable_generation_failure = isinstance(
+                exc,
+                (
+                    _CodexDaemonGenerationChanged,
+                    CodexAppServerDisconnected,
+                    CodexDaemonProxyClosed,
+                    ConnectionError,
+                    EOFError,
+                    asyncio.TimeoutError,
+                ),
+            )
+            if (
+                daemon_proxy
+                and retryable_generation_failure
+                and isinstance(retry_thread_id, str)
+                and retry_thread_id
+                and _bind_generation_attempt
+                    < _DAEMON_GENERATION_CONNECT_ATTEMPTS - 1
+            ):
+                self.daemon_manager.invalidate()
+                await self.disconnect()
+                log.info(
+                    "retrying Codex thread bind after daemon generation change",
+                    thread_id=retry_thread_id,
+                    attempt=_bind_generation_attempt + 2,
+                )
+                await self.connect(
+                    resume_id=retry_thread_id,
+                    cwd=self._cwd,
+                    preserve_controls=True,
+                    preserve_permission_profile=preserve_permission_profile,
+                    _bind_generation_attempt=_bind_generation_attempt + 1,
+                )
+                return
             await self.disconnect()
             raise
+        # Shared resume can silently retain a cached configuration. Neither a
+        # loaded/list snapshot nor thread status notifications prove that THIS
+        # request applied its overrides: another client's same-thread reload can
+        # emit even a complete notLoaded -> idle cycle while our RPC is pending.
+        # The native resume response exposes no context configuration receipt,
+        # so shared resumes stay pending even after an apparent cold reload.
+        # Start and fresh private resume have no competing cache entry; fork
+        # does not submit context_config and cannot confirm it either.
+        if not (fork and resume_id) and self.context_settings.pending and (
+            self.context_settings.max_tokens is None or context_config
+        ):
+            if not resume_id or not daemon_proxy:
+                await self.context_settings.confirm_applied(self)
+                self.context_window = self.context_settings.applied_effective_window
+            else:
+                # This resume submitted the preference, including on a cold
+                # attach. Lack of a receipt must not trigger another reload at
+                # every idle/query boundary. A new explicit save can retry.
+                self.context_settings.mark_attempted()
+        if (self.context_settings.applied_model is not None
+                and self.context_settings.applied_model == self.model
+                and self.context_window is None):
+            self.context_window = self.context_settings.applied_effective_window
         log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
                  resume=bool(resume_id), fork=fork)
 
-    async def query(self, prompt, images=None) -> Optional[str]:
+    async def query(
+        self,
+        prompt,
+        images=None,
+        *,
+        client_user_message_id: Optional[str] = None,
+    ) -> Optional[str]:
         if self.thread_id and (
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
             await self.force_reconnect(self.thread_id, self._cwd, reason="app-server unavailable")
+        await self._release_managed_compaction_continuation()
         assert self.proc is not None and self.thread_id, "connect() first"
+        thread_id = self.thread_id
         self._open_managed_stream()
+        if self.btw_completions is not None:
+            self.btw_completions.initial_owner = client_user_message_id
         queue = self._turn_q
         params = {
-            "threadId": self.thread_id,
+            "threadId": thread_id,
             "input": _to_input(prompt, images),
             "approvalPolicy": self.approval_policy,
         }
@@ -1664,7 +2684,10 @@ class CodexHandle:
         # Codex Plan mode is a collaboration-mode override, not an approval
         # policy. The app-server schema requires settings.model. Code selects the
         # built-in mode instructions with null; Work repeats its isolated policy.
-        collaboration_model = self.model or codex_model()
+        collaboration_model = self.model or (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
         if collaboration_model:
             params["collaborationMode"] = self._collaboration_setting(
                 self.collaboration_mode)
@@ -1673,6 +2696,25 @@ class CodexHandle:
         # null is intentional: in app-server 0.144.1 it clears a persisted Fast
         # override, while omission would leave the previous tier unchanged.
         params["serviceTier"] = self.service_tier
+        registered_identity = self._register_query_user_identity(
+            client_user_message_id,
+            thread_id,
+        )
+        if registered_identity:
+            params["clientUserMessageId"] = client_user_message_id
+        response_boundary = (
+            _CodexTurnStartResponseBoundary(
+                thread_id,
+                client_user_message_id,
+            )
+            if registered_identity else None
+        )
+        pending_identity = (
+            self._pending_steer_user_identities.get(client_user_message_id)
+            if registered_identity
+            and isinstance(client_user_message_id, str)
+            else None
+        )
         # Mark the turn active before awaiting the RPC.  app-server may dispatch
         # turn/completed immediately after the response, before this coroutine is
         # scheduled again; setting this afterwards would resurrect a completed
@@ -1685,13 +2727,55 @@ class CodexHandle:
         self.turn_active = True
         self.turn_start_pending = True
         try:
-            res = await self._request("turn/start", params)
-        except BaseException:
+            if response_boundary is None:
+                res = await self._request("turn/start", params)
+            else:
+                res = await self._request(
+                    "turn/start",
+                    params,
+                    response_boundary=response_boundary,
+                )
+        except BaseException as exc:
+            proof = (
+                pending_identity.proof
+                if pending_identity is not None
+                and pending_identity.state != "ambiguous"
+                else None
+            )
+            self._discard_steer_user_identity(client_user_message_id)
             self.turn_active = False
             self.turn_id = None
             if self._turn_q is queue:
                 self._turn_q = None
             self._managed_overflow = False
+            if (
+                self.shared_daemon_affinity
+                and isinstance(exc, (
+                    CodexAppServerDisconnected,
+                    ConnectionError,
+                    EOFError,
+                    asyncio.TimeoutError,
+                ))
+            ):
+                raise CodexTurnStartDisconnected(
+                    getattr(
+                        exc,
+                        "app_server_version",
+                        self.app_server_version,
+                    ),
+                    getattr(exc, "generation", self._generation),
+                    accepted=proof is not None,
+                    client_message_id=(
+                        client_user_message_id
+                        if registered_identity else None
+                    ),
+                    native_turn_id=(
+                        proof.native_turn_id if proof is not None else None
+                    ),
+                    native_message_id=(
+                        proof.native_message_id if proof is not None else None
+                    ),
+                ) from exc
             raise
         finally:
             self.turn_start_pending = False
@@ -1715,6 +2799,7 @@ class CodexHandle:
         client_user_message_id: Optional[str] = None,
     ) -> str:
         """Append input to the exact active turn without changing lifecycle."""
+        await self._wait_managed_compaction_settled()
         if self.thread_id and (
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
@@ -1735,7 +2820,16 @@ class CodexHandle:
         }
         if client_user_message_id:
             params["clientUserMessageId"] = client_user_message_id
-        boundary = _CodexSteerResponseBoundary(thread_id, turn_id)
+        self._register_steer_user_identity(
+            client_user_message_id,
+            thread_id,
+            turn_id,
+        )
+        boundary = _CodexSteerResponseBoundary(
+            thread_id,
+            turn_id,
+            client_user_message_id,
+        )
         try:
             result = await self._request(
                 "turn/steer",
@@ -1743,6 +2837,7 @@ class CodexHandle:
                 response_boundary=boundary,
             )
         except CodexAppServerError:
+            self._discard_steer_user_identity(client_user_message_id)
             raise
         except Exception as exc:
             raise CodexSteerOutcomeUnknown(
@@ -1752,11 +2847,284 @@ class CodexHandle:
         )
         if returned_turn_id != turn_id:
             boundary.release()
+            self._discard_steer_user_identity(client_user_message_id)
             raise CodexAppServerError({
                 "code": -32600,
                 "message": "expected turn mismatch after turn/steer",
             })
+        self._accept_steer_user_identity(client_user_message_id)
         return CodexSteerAcceptance(turn_id, boundary.fence)
+
+    def _steer_user_identity_queue(self, turn_id: str) -> Any:
+        if isinstance(self._turn_q, _SpontaneousNotificationQueue):
+            return self._turn_q
+        if (
+            self._spontaneous_queue_turn_id == turn_id
+            and isinstance(self._spontaneous_q, _SpontaneousNotificationQueue)
+        ):
+            return self._spontaneous_q
+        return None
+
+    def _register_user_identity(
+        self,
+        client_message_id: Optional[str],
+        thread_id: str,
+        expected_turn_id: Optional[str],
+        *,
+        kind: str,
+        queue: Any,
+    ) -> bool:
+        """Register one content-free upstream client id for this generation."""
+        if (
+            kind not in {"query", "steer"}
+            or not isinstance(client_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(client_message_id)
+            or not _STATUS_WIRE_ID.fullmatch(thread_id)
+            or (
+                expected_turn_id is not None
+                and not _STATUS_WIRE_ID.fullmatch(expected_turn_id)
+            )
+        ):
+            return False
+        pending = _PendingSteerUserIdentity(
+            thread_id=thread_id,
+            expected_turn_id=expected_turn_id,
+            client_message_id=client_message_id,
+            generation=self._generation,
+            queue=queue,
+            kind=kind,
+        )
+        self._pending_steer_user_identities.pop(client_message_id, None)
+        self._pending_steer_user_identities[client_message_id] = pending
+        while (
+            len(self._pending_steer_user_identities)
+            > _PENDING_STEER_USER_IDENTITIES_MAX
+        ):
+            self._pending_steer_user_identities.popitem(last=False)
+        return True
+
+    def _register_query_user_identity(
+        self,
+        client_message_id: Optional[str],
+        thread_id: str,
+    ) -> bool:
+        return self._register_user_identity(
+            client_message_id,
+            thread_id,
+            None,
+            kind="query",
+            queue=self._turn_q,
+        )
+
+    def _register_steer_user_identity(
+        self,
+        client_message_id: Optional[str],
+        thread_id: str,
+        expected_turn_id: str,
+    ) -> bool:
+        """Register only a safe client id; never retain its prompt or content."""
+        return self._register_user_identity(
+            client_message_id,
+            thread_id,
+            expected_turn_id,
+            kind="steer",
+            queue=self._steer_user_identity_queue(expected_turn_id),
+        )
+
+    def _discard_steer_user_identity(
+        self, client_message_id: Optional[str],
+    ) -> None:
+        if isinstance(client_message_id, str):
+            self._pending_steer_user_identities.pop(client_message_id, None)
+
+    def _clear_steer_user_identities(self) -> None:
+        self._pending_steer_user_identities.clear()
+
+    def _deliver_steer_user_identity(
+        self, pending: _PendingSteerUserIdentity,
+    ) -> bool:
+        proof = pending.proof
+        queue = pending.queue
+        if (
+            proof is None
+            or not isinstance(proof.expected_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(proof.expected_turn_id)
+            or pending.generation != self._generation
+            or pending.thread_id != self.thread_id
+            or not isinstance(queue, _SpontaneousNotificationQueue)
+            or queue.end_delivered
+        ):
+            return False
+        if pending.delivered:
+            if (
+                pending.completed_seen
+                and self._pending_steer_user_identities.get(
+                    pending.client_message_id) is pending
+            ):
+                self._pending_steer_user_identities.pop(
+                    pending.client_message_id, None)
+            return True
+        self.bind_owned_turn_stream(
+            proof.expected_turn_id,
+            proof.native_turn_id,
+        )
+        if pending.kind == "query":
+            queue.put_control_first_nowait(proof)
+        else:
+            queue.put_control_nowait(proof)
+        pending.delivered = True
+        if (
+            pending.completed_seen
+            and self._pending_steer_user_identities.get(
+                pending.client_message_id) is pending
+        ):
+            self._pending_steer_user_identities.pop(
+                pending.client_message_id, None)
+        return True
+
+    def _accept_query_user_identity(
+        self,
+        client_message_id: Optional[str],
+        control_turn_id: str,
+    ) -> None:
+        if (
+            not isinstance(client_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(control_turn_id)
+        ):
+            return
+        pending = self._pending_steer_user_identities.get(client_message_id)
+        if pending is None or pending.kind != "query":
+            return
+        pending.expected_turn_id = control_turn_id
+        proof = pending.proof
+        if proof is not None:
+            proof.expected_turn_id = control_turn_id
+            queue = pending.queue
+            if isinstance(queue, _SpontaneousNotificationQueue):
+                if not queue.remap_turn_id(
+                    proof.native_turn_id,
+                    control_turn_id,
+                ):
+                    self._pending_steer_user_identities.pop(
+                        client_message_id, None)
+                    log.warning(
+                        "Codex query stream identity remap exceeded queue bounds",
+                        thread_id=pending.thread_id,
+                    )
+                    return
+        pending.state = "accepted"
+        self._deliver_steer_user_identity(pending)
+
+    def _accept_steer_user_identity(
+        self, client_message_id: Optional[str],
+    ) -> None:
+        if not isinstance(client_message_id, str):
+            return
+        pending = self._pending_steer_user_identities.get(client_message_id)
+        if pending is None:
+            return
+        pending.state = "accepted"
+        self._deliver_steer_user_identity(pending)
+
+    def mark_steer_outcome_unknown(
+        self, client_message_id: Optional[str],
+    ) -> None:
+        """Arm a timed-out steer after Machine publishes its uncertainty state."""
+        if not isinstance(client_message_id, str):
+            return
+        pending = self._pending_steer_user_identities.get(client_message_id)
+        if pending is None:
+            return
+        pending.state = "uncertain"
+        self._deliver_steer_user_identity(pending)
+
+    def _capture_steer_user_identity(self, message: dict) -> bool:
+        """Extract a registered identity before foreign-frame filtering.
+
+        This deliberately copies only bounded ids.  Prompt text, images,
+        tool output and every other foreign field remain inaccessible to the
+        managed/spontaneous consumers.
+        """
+        if message.get("method") not in {"item/started", "item/completed"}:
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return False
+        client_message_id = item.get("clientId")
+        pending = (
+            self._pending_steer_user_identities.get(client_message_id)
+            if isinstance(client_message_id, str) else None
+        )
+        if pending is None:
+            return False
+        thread_id = _notification_thread_id(message)
+        native_turn_id = _notification_turn_id(message)
+        native_message_id = item.get("id")
+        if (
+            pending.generation != self._generation
+            or thread_id != pending.thread_id
+            or not isinstance(native_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(native_turn_id)
+            or not isinstance(native_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(native_message_id)
+        ):
+            return False
+        proof = CodexSteerUserIdentityProof(
+            thread_id=thread_id,
+            expected_turn_id=pending.expected_turn_id,
+            native_turn_id=native_turn_id,
+            native_message_id=native_message_id,
+            client_message_id=pending.client_message_id,
+            generation=pending.generation,
+            kind=pending.kind,
+        )
+        previous = pending.proof
+        if previous is not None:
+            if (
+                previous.native_turn_id == proof.native_turn_id
+                and previous.native_message_id == proof.native_message_id
+            ):
+                if message.get("method") == "item/completed":
+                    pending.completed_seen = True
+                if pending.state in {"accepted", "uncertain"}:
+                    self._deliver_steer_user_identity(pending)
+                return True
+            # One client id proving two native items is ambiguous. Fail closed
+            # instead of letting arrival order choose a durable alias.
+            pending.state = "ambiguous"
+            self._pending_steer_user_identities.pop(
+                pending.client_message_id, None)
+            log.warning(
+                "conflicting Codex user identities dropped",
+                thread_id=thread_id,
+            )
+            return True
+        pending.proof = proof
+        pending.completed_seen = message.get("method") == "item/completed"
+        if pending.kind == "query" and pending.expected_turn_id is None:
+            # The exact upstream client id proves this native task belongs to
+            # the in-flight turn/start even if its JSON-RPC response has not yet
+            # reached the request coroutine. Admit only that bounded task so
+            # immediately following frames can be retained and remapped once
+            # the response supplies the logical control id.
+            if (
+                native_turn_id not in self._active_stream_turn_ids
+                and len(self._active_stream_turn_ids)
+                >= _ACTIVE_STREAM_TURN_IDS_MAX
+            ):
+                self._pending_steer_user_identities.pop(
+                    pending.client_message_id, None)
+                log.warning(
+                    "Codex query stream identity cap reached",
+                    thread_id=thread_id,
+                )
+                return True
+            self._active_stream_turn_ids.add(native_turn_id)
+            self.remember_owned_turn_id(native_turn_id)
+        if pending.state in {"accepted", "uncertain"}:
+            self._deliver_steer_user_identity(pending)
+        return True
 
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None
@@ -1764,9 +3132,59 @@ class CodexHandle:
         while len(self._owned_turn_ids) > _OWNED_TURN_IDS_MAX:
             self._owned_turn_ids.popitem(last=False)
 
+    def bind_owned_turn_stream(
+        self,
+        control_turn_id: str,
+        stream_turn_id: str,
+    ) -> bool:
+        """Admit one exactly proven native stream into the active control turn."""
+        if (
+            not isinstance(control_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(control_turn_id)
+            or not isinstance(stream_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(stream_turn_id)
+            or not self.turn_active
+            or self.turn_id != control_turn_id
+        ):
+            return False
+        if stream_turn_id == control_turn_id:
+            self.remember_owned_turn_id(stream_turn_id)
+            return True
+        if (
+            stream_turn_id not in self._active_stream_turn_ids
+            and len(self._active_stream_turn_ids) >= _ACTIVE_STREAM_TURN_IDS_MAX
+        ):
+            return False
+        self._active_stream_turn_ids.add(stream_turn_id)
+        self.remember_owned_turn_id(stream_turn_id)
+        return True
+
     @property
     def owned_turn_ids(self) -> frozenset[str]:
         return frozenset(self._owned_turn_ids)
+
+    @property
+    def compaction_continuation_turn_ids(self) -> frozenset[str]:
+        """Native/logical ids backed by an exact live continuation proof.
+
+        The wire field predates split control/stream ids and is also the
+        browser's guarded way to reopen a persisted compact-interrupt shell.
+        A source-proven active stream alias supplies the same narrow fact: these
+        ids are one still-running task, not a generic in-progress guess.
+        """
+        ids = set(self._active_stream_turn_ids)
+        if ids and self.turn_active and self.turn_id is not None:
+            ids.add(self.turn_id)
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or not fence.suppression_enabled
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return frozenset(ids)
+        ids.update({fence.logical_turn_id, fence.native_turn_id})
+        return frozenset(ids)
 
     @property
     def turn_attribution_pending(self) -> bool:
@@ -1810,6 +3228,10 @@ class CodexHandle:
                 if msg is None:      # sentinel pushed by the reader on turn/completed
                     break
                 yield msg
+                if isinstance(msg, CodexDaemonProxyClosed):
+                    # This is an incomplete transport boundary, never a native
+                    # turn terminal. Machine classifies it after reconnect.
+                    break
                 # The fail-fast managed bridge preserves terminal frames without
                 # spending a third queue slot on a sentinel. Legacy asyncio.Queue
                 # tests may still append one; it is harmlessly abandoned below.
@@ -1860,8 +3282,458 @@ class CodexHandle:
         )
         return item_cap, byte_cap
 
+    @staticmethod
+    def _notification_is_user_message(message: dict) -> bool:
+        if message.get("method") not in {"item/started", "item/completed"}:
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        return isinstance(item, dict) and item.get("type") == "userMessage"
+
+    @staticmethod
+    def _notification_is_context_compaction(message: dict) -> bool:
+        """Recognize the current authoritative app-server compact item."""
+        if message.get("method") != "item/completed":
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        return (
+            isinstance(item, dict)
+            and item.get("type") == "contextCompaction"
+        )
+
+    def _managed_compaction_fence_current(
+        self,
+        fence: Optional[_CodexCompactionContinuation] = None,
+        *,
+        check_deadline: bool = True,
+    ) -> bool:
+        fence = fence or self._managed_compaction_continuation
+        if fence is None or self._managed_compaction_continuation is not fence:
+            return False
+        if (
+            fence.generation != self._generation
+            or fence.thread_id != self.thread_id
+            or fence.queue is not self._turn_q
+            or self._spontaneous_turn_id is not None
+            or self._review_active
+            or not self.turn_active
+            or fence.native_turn_id != self.turn_id
+        ):
+            return False
+        if (
+            check_deadline
+            and fence.awaiting_replacement
+            and not fence.probing
+            and fence.deadline > 0
+            and asyncio.get_running_loop().time() > fence.deadline
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _cancel_compaction_expiry(
+        fence: _CodexCompactionContinuation,
+    ) -> None:
+        task = fence.expiry_task
+        fence.expiry_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _discard_managed_compaction_continuation(self) -> None:
+        fence = self._managed_compaction_continuation
+        self._managed_compaction_continuation = None
+        if fence is not None:
+            fence.settled.set()
+            self._cancel_compaction_expiry(fence)
+
+    async def _release_managed_compaction_continuation(self) -> bool:
+        """Release the old terminal and replay an unconfirmed replacement.
+
+        A replacement ``turn/started`` is not enough to merge two native turns:
+        it may be an independent prompt arriving beside the compact boundary.
+        When the fence expires or meets a user boundary, close the managed turn
+        first, then replay that withheld start through the ordinary spontaneous
+        path so neither lifecycle can disappear.
+        """
+        fence = self._managed_compaction_continuation
+        if fence is None:
+            return False
+        terminal = fence.suppressed_terminal
+        raw_size = fence.suppressed_size
+        candidate_started = fence.candidate_started
+        candidate_size = fence.candidate_size
+        deliver = bool(
+            terminal is not None
+            and self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        )
+        replay_candidate = bool(deliver and candidate_started is not None)
+        self._managed_compaction_continuation = None
+        fence.settled.set()
+        self._cancel_compaction_expiry(fence)
+        self._compaction_continuation_turn_id = None
+        if not deliver:
+            return False
+        await self._dispatch(terminal, raw_size=raw_size)
+        if replay_candidate:
+            await self._dispatch(candidate_started, raw_size=candidate_size)
+        return True
+
+    async def _wait_managed_compaction_settled(self) -> None:
+        """Wait for exact continuation attribution before issuing a steer."""
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or fence.settled.is_set()
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return
+        remaining = max(
+            0.0,
+            fence.deadline - asyncio.get_running_loop().time(),
+        )
+        try:
+            await asyncio.wait_for(
+                fence.settled.wait(),
+                timeout=(
+                    remaining
+                    + _COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS
+                    + 0.25
+                ),
+            )
+        except asyncio.TimeoutError:
+            if self._managed_compaction_continuation is fence:
+                await self._release_managed_compaction_continuation()
+
+    async def _expire_managed_compaction_continuation(
+        self, fence: _CodexCompactionContinuation,
+    ) -> None:
+        try:
+            delay = max(
+                0.0,
+                fence.deadline - asyncio.get_running_loop().time(),
+            )
+            await asyncio.sleep(delay)
+            if (
+                self._managed_compaction_continuation is not fence
+                or not fence.awaiting_replacement
+                or not self._managed_compaction_fence_current(
+                    fence, check_deadline=False)
+            ):
+                return
+            fence.probing = True
+            still_running = False
+            try:
+                still_running = await asyncio.wait_for(
+                    self._probe_managed_compaction_continuation(fence),
+                    timeout=(
+                        _COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS
+                    ),
+                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception as exc:
+                log.warning(
+                    "Codex compaction continuation probe failed",
+                    error_type=type(exc).__name__,
+                )
+            finally:
+                fence.probing = False
+
+            if self._managed_compaction_continuation is not fence:
+                return
+            if (
+                still_running
+                and fence.awaiting_replacement
+                and self._managed_compaction_fence_current(
+                    fence, check_deadline=False)
+            ):
+                # The official status endpoints prove that the exact native
+                # turn is still in progress. Drop only the compact-interrupt
+                # shell; the eventual real terminal remains authoritative.
+                fence.awaiting_replacement = False
+                fence.suppressed_terminal = None
+                fence.suppressed_size = None
+                fence.settled.set()
+                fence.expiry_task = None
+                self._compaction_continuation_turn_id = None
+                return
+            # ``_request`` replies are dispatched by the sole stdout reader.
+            # A continuation item may therefore have confirmed this fence
+            # while the final probe reply was being delivered. Never replay
+            # the previously suppressed terminal after that confirmation.
+            if (
+                fence.awaiting_replacement
+                and not fence.settled.is_set()
+            ):
+                await self._release_managed_compaction_continuation()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.warning(
+                "Codex compaction continuation expiry failed",
+                error_type=type(exc).__name__,
+            )
+
+    async def _probe_managed_compaction_continuation(
+        self, fence: _CodexCompactionContinuation,
+    ) -> bool:
+        """Prove once that a compact-interrupted native turn is still active.
+
+        This runs only in the detached expiry task. Never await these requests
+        from ``_dispatch``: their replies are consumed by the same stdout reader.
+        """
+        if not self._managed_compaction_fence_current(
+            fence, check_deadline=False,
+        ):
+            return False
+        response = await self._request("thread/read", {
+            "threadId": fence.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") != fence.thread_id
+            or not isinstance(status, dict)
+            or status.get("type") != "active"
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return False
+        page = await self._request("thread/turns/list", {
+            "threadId": fence.thread_id,
+            "cursor": None,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        latest = turns[0] if isinstance(turns, list) and len(turns) == 1 else None
+        return bool(
+            isinstance(latest, dict)
+            and latest.get("id") == fence.native_turn_id
+            and latest.get("status") == "inProgress"
+            and self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        )
+
+    def _arm_managed_compaction_continuation(
+        self, native_turn_id: str,
+    ) -> None:
+        queue = self._turn_q
+        thread_id = self.thread_id
+        if (
+            queue is None
+            or not thread_id
+            or self._spontaneous_turn_id is not None
+            or self._review_active
+        ):
+            return
+        previous = self._managed_compaction_continuation
+        logical_turn_id = native_turn_id
+        suppression_enabled = True
+        if (
+            previous is not None
+            and self._managed_compaction_fence_current(
+                previous, check_deadline=False)
+            and previous.native_turn_id == native_turn_id
+        ):
+            # A repeated compact notification is not proof that the suppressed
+            # terminal has gained a continuation. Keep the original deadline
+            # and terminal intact; replacing this fence would silently lose the
+            # only authoritative close if no further model item arrives.
+            if previous.awaiting_replacement:
+                return
+            logical_turn_id = previous.logical_turn_id
+            suppression_enabled = previous.suppression_enabled
+        self._discard_managed_compaction_continuation()
+        fence = _CodexCompactionContinuation(
+            thread_id=thread_id,
+            native_turn_id=native_turn_id,
+            logical_turn_id=logical_turn_id,
+            generation=self._generation,
+            queue=queue,
+        )
+        fence.suppression_enabled = suppression_enabled
+        self._managed_compaction_continuation = fence
+
+    def _confirm_same_id_compaction_continuation(
+        self, message: dict,
+    ) -> None:
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or not fence.awaiting_replacement
+            or not self._managed_compaction_fence_current(fence)
+            or _notification_turn_id(message) != fence.native_turn_id
+            or self._notification_is_context_compaction(message)
+            or message.get("method") in {
+                "turn/completed", "thread/compacted", "error",
+            }
+        ):
+            return
+        fence.awaiting_replacement = False
+        fence.suppressed_terminal = None
+        fence.suppressed_size = None
+        fence.settled.set()
+        self._cancel_compaction_expiry(fence)
+
+    def _can_stage_managed_compaction_replacement(
+        self,
+        message: dict,
+        target_thread_id: Optional[str],
+        target_turn_id: Optional[str],
+    ) -> bool:
+        fence = self._managed_compaction_continuation
+        if (
+            message.get("method") != "turn/started"
+            or fence is None
+            or not fence.awaiting_replacement
+            or not self._managed_compaction_fence_current(fence)
+            or target_thread_id != fence.thread_id
+            or target_turn_id is None
+            or target_turn_id == fence.native_turn_id
+            or (
+                fence.candidate_turn_id is not None
+                and fence.candidate_turn_id != target_turn_id
+            )
+        ):
+            return False
+        return True
+
+    def _stage_managed_compaction_replacement(
+        self,
+        message: dict,
+        raw_size: Optional[int],
+    ) -> bool:
+        target_thread_id = _notification_thread_id(message)
+        target_turn_id = _notification_turn_id(message)
+        if not self._can_stage_managed_compaction_replacement(
+            message, target_thread_id, target_turn_id,
+        ):
+            return False
+        fence = self._managed_compaction_continuation
+        assert fence is not None and target_turn_id is not None
+        if fence.candidate_turn_id is None:
+            fence.candidate_turn_id = target_turn_id
+            fence.candidate_started = message
+            fence.candidate_size = raw_size
+        return True
+
+    def _managed_compaction_candidate_matches(self, message: dict) -> bool:
+        fence = self._managed_compaction_continuation
+        return bool(
+            fence is not None
+            and fence.awaiting_replacement
+            and fence.candidate_turn_id is not None
+            and self._managed_compaction_fence_current(fence)
+            and _notification_turn_id(message) == fence.candidate_turn_id
+        )
+
+    async def _confirm_managed_compaction_replacement(
+        self, message: dict,
+    ) -> bool:
+        fence = self._managed_compaction_continuation
+        if (
+            fence is None
+            or not self._managed_compaction_candidate_matches(message)
+            or fence.candidate_turn_id is None
+            or fence.candidate_started is None
+        ):
+            return False
+        candidate_turn_id = fence.candidate_turn_id
+        candidate_started = fence.candidate_started
+        candidate_size = fence.candidate_size
+        fence.awaiting_replacement = False
+        fence.suppressed_terminal = None
+        fence.suppressed_size = None
+        fence.candidate_turn_id = None
+        fence.candidate_started = None
+        fence.candidate_size = None
+        fence.native_turn_id = candidate_turn_id
+        fence.interruption_consumed = False
+        fence.settled.set()
+        self._cancel_compaction_expiry(fence)
+        self.turn_id = candidate_turn_id
+        self.remember_owned_turn_id(candidate_turn_id)
+        logical_started = self._logicalize_managed_compaction_notification(
+            candidate_started)
+        logical_size = (
+            candidate_size
+            if logical_started is candidate_started
+            else self._notification_wire_size(logical_started)
+        )
+        queue = self._turn_q
+        if queue is not None and not self._queue_managed_notification(
+            logical_started, logical_size,
+        ):
+            await queue.put(logical_started)
+        return True
+
+    def _logicalize_managed_compaction_notification(
+        self, message: dict,
+    ) -> dict:
+        fence = self._managed_compaction_continuation
+        target_turn_id = _notification_turn_id(message)
+        if (
+            fence is None
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+            or target_turn_id != fence.native_turn_id
+            or fence.logical_turn_id == target_turn_id
+        ):
+            return message
+        logical = dict(message)
+        raw_params = message.get("params")
+        if not isinstance(raw_params, dict):
+            return message
+        params = dict(raw_params)
+        params["turnId"] = fence.logical_turn_id
+        raw_turn = raw_params.get("turn")
+        if isinstance(raw_turn, dict) and raw_turn.get("id") == target_turn_id:
+            params["turn"] = {
+                **raw_turn,
+                "id": fence.logical_turn_id,
+            }
+        logical["params"] = params
+        return logical
+
+    def _logicalize_active_stream_notification(
+        self, message: dict,
+    ) -> dict:
+        """Project a proven native stream task onto its control-turn id."""
+        target_turn_id = _notification_turn_id(message)
+        logical_turn_id = self.turn_id
+        if (
+            target_turn_id not in self._active_stream_turn_ids
+            or not isinstance(logical_turn_id, str)
+            or target_turn_id == logical_turn_id
+        ):
+            return message
+        raw_params = message.get("params")
+        if not isinstance(raw_params, dict):
+            return message
+        logical = dict(message)
+        params = dict(raw_params)
+        params["turnId"] = logical_turn_id
+        raw_turn = raw_params.get("turn")
+        if isinstance(raw_turn, dict) and raw_turn.get("id") == target_turn_id:
+            params["turn"] = {**raw_turn, "id": logical_turn_id}
+        logical["params"] = params
+        return logical
+
     def _open_managed_stream(self) -> None:
         """Create a bounded producer that can never block JSON-RPC stdout."""
+        self._discard_managed_compaction_continuation()
+        # A query/review has its own authoritative user boundary. It must never
+        # consume a delayed Goal objective which was waiting for an automatic
+        # continuation.
+        self._goal_prompt_candidate = None
+        self._active_stream_turn_ids.clear()
         item_cap, byte_cap = self._notification_queue_limits(managed=True)
         self._turn_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
         self._managed_overflow = False
@@ -1960,6 +3832,8 @@ class CodexHandle:
         turn_id = self._spontaneous_queue_turn_id
         if q is None or turn_id is None:
             return False
+        if self.btw_completions is not None:
+            self.btw_completions.observe(message)
         method = message.get("method")
         terminal = method == "turn/completed"
         size = (
@@ -2000,6 +3874,8 @@ class CodexHandle:
         q = self._turn_q
         if not isinstance(q, _SpontaneousNotificationQueue):
             return False
+        if self.btw_completions is not None:
+            self.btw_completions.observe(message)
         method = message.get("method")
         terminal = method == "turn/completed"
         size = (
@@ -2047,10 +3923,16 @@ class CodexHandle:
         self._spontaneous_queue_turn_id = None
         self._spontaneous_overflow = False
 
-    async def receive_spontaneous_response(self, turn_id: str):
-        """Yield exactly one spontaneous turn's raw frames and internal signals."""
+    def receive_spontaneous_response(self, turn_id: str):
+        """Bind this turn's queue now, before a successor can replace it."""
         q = self._spontaneous_q
         if q is None or self._spontaneous_queue_turn_id != turn_id:
+            q = None
+        return self._receive_spontaneous_queue(q)
+
+    async def _receive_spontaneous_queue(self, q):
+        """Yield exactly one captured turn, even if its consumer starts late."""
+        if q is None:
             return
         terminal_seen = False
         try:
@@ -2074,8 +3956,34 @@ class CodexHandle:
                 self._schedule_http_provider_descendant_repair()
 
     async def interrupt(self) -> None:
+        fence = self._managed_compaction_continuation
+        if fence is not None:
+            if (
+                fence.awaiting_replacement
+                and fence.candidate_started is not None
+            ):
+                # The withheld start is the newest exact native task. A user
+                # interrupt is itself sufficient attribution evidence: expose
+                # the logical continuation before targeting that native id.
+                await self._confirm_managed_compaction_replacement(
+                    fence.candidate_started)
+                fence = self._managed_compaction_continuation
+            elif fence.awaiting_replacement:
+                # The compact terminal already proved there is no steerable task
+                # yet. End the UI grace immediately instead of sending a stale
+                # interrupt RPC to the completed native id.
+                await self._release_managed_compaction_continuation()
+                return
+            # A user stop is authoritative. Keep only the native->logical id
+            # mapping so its eventual terminal still closes the original row;
+            # never suppress that terminal as another compact boundary.
+            if fence is not None:
+                fence.suppression_enabled = False
         if not (self.proc and self.thread_id and self.turn_id):
             raise RuntimeError("codex turn is not running")
+        # Spontaneous turns have no managed continuation fence. Stop still owns
+        # their real terminal, including a compaction item arriving after Stop.
+        self._explicit_interrupt_turn = (self._generation, self.turn_id)
         target_thread_id = self.thread_id
         target_turn_id = self._review_execution_turn_id or self.turn_id
         try:
@@ -2234,15 +4142,372 @@ class CodexHandle:
             self._spontaneous_turn_id = None
         return True
 
+    async def delete_thread(
+        self, expected_thread_id: Optional[str] = None,
+    ) -> tuple[str, ...]:
+        """Delete the loaded thread through its authoritative app-server."""
+        loaded_thread_id = self.thread_id
+        thread_id = expected_thread_id or loaded_thread_id
+        if not thread_id:
+            raise RuntimeError("connect() or an explicit thread id is required")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex deletion requires a live control connection"
+            )
+        if (
+            loaded_thread_id is not None
+            and expected_thread_id is not None
+            and expected_thread_id != loaded_thread_id
+        ):
+            raise ValueError("loaded Codex thread does not match delete target")
+        if self.turn_active or self.turn_start_pending:
+            raise RuntimeError("Codex turn is active")
+        if self._thread_delete_target is not None:
+            raise RuntimeError("Codex thread deletion is already active")
+        self._thread_delete_target = thread_id
+        self._thread_deleted_ids = []
+        self.thread_delete_notifications_overflowed = False
+        self._thread_delete_done.clear()
+        try:
+            await self._request(
+                "thread/delete",
+                {"threadId": thread_id},
+            )
+            if self._reader is not None and not self._reader.done():
+                loop = asyncio.get_running_loop()
+                notification_deadline = (
+                    loop.time() + _THREAD_DELETE_NOTIFY_TIMEOUT
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._thread_delete_done.wait(),
+                        timeout=_THREAD_DELETE_NOTIFY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Codex thread deletion notification timed out",
+                        thread_id=thread_id,
+                    )
+                else:
+                    # The current app-server emits the root last, but the wire
+                    # contract promises one notification per deleted thread,
+                    # not that the root is the final notification. Keep the
+                    # collector alive for the original bounded window so a
+                    # root-first batch cannot strand local descendants.
+                    remaining = notification_deadline - loop.time()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+            deleted_ids = list(self._thread_deleted_ids)
+        finally:
+            self._thread_delete_target = None
+            self._thread_deleted_ids = None
+            self._thread_delete_done.clear()
+        if thread_id not in deleted_ids:
+            deleted_ids.append(thread_id)
+        if self.thread_id == thread_id:
+            self.thread_id = None
+        self._shared_resume_binding_thread_id = None
+        return tuple(deleted_ids)
+
+    async def archive_thread(
+        self, expected_thread_id: Optional[str] = None,
+    ) -> tuple[str, ...]:
+        """Archive a thread through the app-server which owns its writer."""
+        loaded_thread_id = self.thread_id
+        thread_id = expected_thread_id or loaded_thread_id
+        if not thread_id:
+            raise RuntimeError("connect() or an explicit thread id is required")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex archive requires a live control connection"
+            )
+        if (
+            loaded_thread_id is not None
+            and expected_thread_id is not None
+            and expected_thread_id != loaded_thread_id
+        ):
+            raise ValueError("loaded Codex thread does not match archive target")
+        if not _STATUS_WIRE_ID.fullmatch(thread_id):
+            raise ValueError("invalid Codex thread id")
+        if self.turn_active or self.turn_start_pending:
+            raise RuntimeError("Codex turn is active")
+        if self._thread_archive_target is not None:
+            raise RuntimeError("Codex thread archive is already active")
+        self._thread_archive_target = thread_id
+        self._thread_archived_ids = []
+        self.thread_archive_notifications_overflowed = False
+        self._thread_archive_done.clear()
+        try:
+            try:
+                await self._request(
+                    "thread/archive",
+                    {"threadId": thread_id},
+                )
+            except CodexAppServerError:
+                # A JSON-RPC error is a terminal boundary. The caller may read
+                # the exact tree and safely compensate any partial mutation.
+                raise
+            except Exception as exc:
+                # From the request write onward, timeout/EOF cannot prove that
+                # the shared app-server stopped mutating the archive tree.
+                raise CodexArchiveOutcomeUnknown(
+                    "Codex archive outcome is unknown"
+                ) from exc
+            if self._reader is not None and not self._reader.done():
+                loop = asyncio.get_running_loop()
+                notification_deadline = (
+                    loop.time() + _THREAD_ARCHIVE_NOTIFY_TIMEOUT
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._thread_archive_done.wait(),
+                        timeout=_THREAD_ARCHIVE_NOTIFY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Codex thread archive notification timed out",
+                        thread_id=thread_id,
+                    )
+                else:
+                    # The wire contract does not order root and descendant
+                    # notifications. Keep the bounded collector open for the
+                    # same window even after the target has been observed.
+                    remaining = notification_deadline - loop.time()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+            archived_ids = list(self._thread_archived_ids)
+        finally:
+            self._thread_archive_target = None
+            self._thread_archived_ids = None
+            self._thread_archive_done.clear()
+        if thread_id not in archived_ids:
+            archived_ids.append(thread_id)
+        if self.thread_id == thread_id:
+            self.thread_id = None
+        self._shared_resume_binding_thread_id = None
+        return tuple(archived_ids)
+
+    async def unarchive_thread(self, thread_id: str) -> dict[str, Any]:
+        """Restore one archived thread without resuming its model context."""
+        loaded_thread_id = self.thread_id
+        if not isinstance(thread_id, str) or not _STATUS_WIRE_ID.fullmatch(
+            thread_id
+        ):
+            raise ValueError("invalid Codex thread id")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex unarchive requires a live control connection"
+            )
+        if loaded_thread_id is not None and loaded_thread_id != thread_id:
+            raise ValueError("loaded Codex thread does not match unarchive target")
+        response = await self._request(
+            "thread/unarchive",
+            {"threadId": thread_id},
+        )
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise RuntimeError("Codex thread/unarchive returned another thread")
+        return thread
+
+    async def set_thread_name(self, thread_id: str, name: str) -> None:
+        """Rename one thread through its authoritative app-server."""
+        loaded_thread_id = self.thread_id
+        if not isinstance(thread_id, str) or not _STATUS_WIRE_ID.fullmatch(
+            thread_id
+        ):
+            raise ValueError("invalid Codex thread id")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex rename requires a live control connection"
+            )
+        if loaded_thread_id is not None and loaded_thread_id != thread_id:
+            raise ValueError("loaded Codex thread does not match rename target")
+        await self._request(
+            "thread/name/set",
+            {"threadId": thread_id, "name": name},
+        )
+
+    async def read_thread_parent(self, thread_id: str) -> Optional[str]:
+        """Return one thread's authoritative native fork parent."""
+        if (
+            not isinstance(thread_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(thread_id)
+        ):
+            raise ValueError("invalid Codex thread id")
+        response = await self._request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": False},
+        )
+        thread = (
+            response.get("thread")
+            if isinstance(response, dict) else None
+        )
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise RuntimeError("Codex thread/read returned another thread")
+        parent = thread.get("forkedFromId")
+        if parent is None:
+            return None
+        if (
+            not isinstance(parent, str)
+            or not _STATUS_WIRE_ID.fullmatch(parent)
+        ):
+            raise RuntimeError("Codex thread/read returned an invalid parent")
+        return parent
+
+    async def list_thread_delete_candidates(
+        self,
+    ) -> tuple[tuple[str, bool], ...]:
+        """List every bounded native thread before a recursive delete."""
+        candidates: dict[str, bool] = {}
+        for archived in (False, True):
+            cursor: Optional[str] = None
+            seen_cursors: set[str] = set()
+            for _page in range(_THREAD_DELETE_LIST_MAX_PAGES):
+                params: dict[str, Any] = {
+                    "archived": archived,
+                    "limit": _THREAD_DELETE_LIST_PAGE_SIZE,
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                }
+                if cursor is not None:
+                    params["cursor"] = cursor
+                response = await self._request("thread/list", params)
+                rows = (
+                    response.get("data")
+                    if isinstance(response, dict)
+                    else None
+                )
+                if not isinstance(rows, list):
+                    raise RuntimeError(
+                        "Codex thread/list returned an invalid response"
+                    )
+                if len(rows) > _THREAD_DELETE_LIST_PAGE_SIZE:
+                    raise RuntimeError(
+                        "Codex thread/list exceeded its requested page size"
+                    )
+                for thread in rows:
+                    thread_id = (
+                        thread.get("id")
+                        if isinstance(thread, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(thread_id, str)
+                        or not _STATUS_WIRE_ID.fullmatch(thread_id)
+                    ):
+                        raise RuntimeError(
+                            "Codex thread/list returned an invalid thread"
+                        )
+                    status = thread.get("status")
+                    status_type = (
+                        status.get("type")
+                        if isinstance(status, dict)
+                        else status
+                    )
+                    candidates[thread_id] = bool(
+                        candidates.get(thread_id)
+                        or status_type == "active"
+                    )
+                    if len(candidates) > _THREAD_DELETE_LIST_MAX_IDS:
+                        raise RuntimeError(
+                            "Codex deletion catalog exceeds the safety limit"
+                        )
+                next_cursor = response.get("nextCursor")
+                if next_cursor in (None, ""):
+                    break
+                if (
+                    not isinstance(next_cursor, str)
+                    or next_cursor in seen_cursors
+                ):
+                    raise RuntimeError(
+                        "Codex thread/list returned an invalid cursor"
+                    )
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise RuntimeError(
+                    "Codex deletion catalog exceeds the page limit"
+                )
+        return tuple(candidates.items())
+
+    async def list_loaded_thread_ids(self) -> tuple[str, ...]:
+        """List the bounded set of threads cached by this app-server owner."""
+        loaded: list[str] = []
+        seen_ids: set[str] = set()
+        cursor: Optional[str] = None
+        seen_cursors: set[str] = set()
+        for _page in range(_THREAD_DELETE_LIST_MAX_PAGES):
+            params: dict[str, Any] = {
+                "limit": _THREAD_DELETE_LIST_PAGE_SIZE,
+            }
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = await self._request("thread/loaded/list", params)
+            rows = (
+                response.get("data")
+                if isinstance(response, dict)
+                else None
+            )
+            if not isinstance(rows, list):
+                raise RuntimeError(
+                    "Codex thread/loaded/list returned an invalid response"
+                )
+            if len(rows) > _THREAD_DELETE_LIST_PAGE_SIZE:
+                raise RuntimeError(
+                    "Codex thread/loaded/list exceeded its requested page size"
+                )
+            for thread_id in rows:
+                if (
+                    not isinstance(thread_id, str)
+                    or not _STATUS_WIRE_ID.fullmatch(thread_id)
+                ):
+                    raise RuntimeError(
+                        "Codex thread/loaded/list returned an invalid thread"
+                    )
+                if thread_id in seen_ids:
+                    continue
+                seen_ids.add(thread_id)
+                loaded.append(thread_id)
+                if len(loaded) > _THREAD_DELETE_LIST_MAX_IDS:
+                    raise RuntimeError(
+                        "Codex loaded-thread catalog exceeds the safety limit"
+                    )
+            next_cursor = response.get("nextCursor")
+            if next_cursor in (None, ""):
+                return tuple(loaded)
+            if (
+                not isinstance(next_cursor, str)
+                or next_cursor in seen_cursors
+            ):
+                raise RuntimeError(
+                    "Codex thread/loaded/list returned an invalid cursor"
+                )
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError("Codex loaded-thread catalog exceeds the page limit")
+
     async def disconnect(self) -> None:
         self._http_provider_repair_stop.set()
         proc = self.proc
         process_group = self._process_group
         daemon_proxy = self._using_daemon_proxy
+        disconnect_version = self.app_server_version
+        disconnect_generation = self._generation
         spontaneous_turn_id = self._spontaneous_turn_id
         self._close_spontaneous_stream(spontaneous_turn_id)
         self._spontaneous_turn_id = None
         self._compaction_continuation_turn_id = None
+        self._goal_prompt_candidate = None
+        self._goal_replacement_fence = None
+        self._discard_managed_compaction_continuation()
         self._clear_review_tracking()
         tasks = [t for t in (self._reader, self._stderr_task)
                  if t is not None and t is not asyncio.current_task()]
@@ -2256,6 +4521,7 @@ class CodexHandle:
         for boundary in self._pending_response_boundaries.values():
             boundary.release()
         self._pending_response_boundaries.clear()
+        self._clear_steer_user_identities()
         self.proc = None
         self._process_group = None
         self._reader = None
@@ -2272,7 +4538,14 @@ class CodexHandle:
                     if process_group is not None:
                         os.killpg(process_group, sig)
                     elif proc.returncode is None:
-                        (proc.kill() if force else proc.terminate())
+                        if os.name == "nt":
+                            # Windows: terminate the tree, not just the direct
+                            # child. The app-server's node helpers inherit the
+                            # thread-writer locks and would otherwise survive,
+                            # blocking the next resume of the same session.
+                            kill_process_tree(proc.pid)
+                        else:
+                            (proc.kill() if force else proc.terminate())
                 except ProcessLookupError:
                     pass
                 except Exception as exc:
@@ -2292,6 +4565,8 @@ class CodexHandle:
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
         self._using_daemon_proxy = False
+        self._daemon_process_identity = None
+        self._control_only_connection = False
         self._shared_resume_binding_thread_id = None
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
@@ -2301,11 +4576,15 @@ class CodexHandle:
         self._managed_overflow = False
         for fut in list(self._pending.values()):
             if not fut.done():
-                fut.set_exception(RuntimeError("codex app-server disconnected"))
+                fut.set_exception(CodexAppServerDisconnected(
+                    disconnect_version,
+                    disconnect_generation,
+                ))
         self._pending.clear()
         self.turn_id = None
         self.turn_start_pending = False
         self.turn_active = False
+        self._active_stream_turn_ids.clear()
         if spontaneous_turn_id is not None:
             await self._publish_turn_lifecycle(
                 "completed", spontaneous_turn_id)
@@ -2325,11 +4604,28 @@ class CodexHandle:
                               reason: str = "reconnect") -> None:
         log.warning("codex force-reconnect", reason=reason)
         target = resume_id or self.thread_id
+        if target == self._ephemeral_thread_id and self.ephemeral_thread_destroyed:
+            raise CodexEphemeralThreadGone(target)
+        previous_thread_id = self.thread_id
+        previous_model = self.model
+        previous_cwd = self._cwd
+        previous_effort = (
+            self.effort
+            if target is not None and target == previous_thread_id
+            else None
+        )
         await self.disconnect()
         await self.connect(
             resume_id=target,
             cwd=cwd or self._cwd,
             preserve_controls=True,
+        )
+        _restore_nullable_explicit_effort(
+            self,
+            previous_effort,
+            thread_id=previous_thread_id,
+            model=previous_model,
+            cwd=previous_cwd,
         )
 
     # --- live controls (persisted for this thread by app-server 0.144.1) ---
@@ -2353,6 +4649,19 @@ class CodexHandle:
         self.approval_policy: Any = value
 
     async def _update_thread_settings(
+        self, *, wait_for_notification: bool = False,
+        _expected_scope: Optional[tuple[object, ...]] = None, **settings: Any,
+    ) -> bool:
+        # All live controls share one notification event. A second request must
+        # not clear/consume the first request's authoritative snapshot.
+        async with self._thread_settings_lock:
+            if _expected_scope is not None and _expected_scope != (
+                    self.thread_id, self._cwd, self._generation):
+                raise RuntimeError("Codex permission scope changed before update")
+            return await self._update_thread_settings_serialized(
+                wait_for_notification=wait_for_notification, **settings)
+
+    async def _update_thread_settings_serialized(
         self, *, wait_for_notification: bool = False, **settings: Any,
     ) -> bool:
         if not self.thread_id:
@@ -2380,7 +4689,10 @@ class CodexHandle:
         return False
 
     def _collaboration_setting(self, mode: str) -> dict[str, Any]:
-        model = self.model or codex_model()
+        model = self.model or (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
         if not model:
             raise RuntimeError("Codex collaboration mode requires an active model")
         settings: dict[str, Any] = {
@@ -2400,6 +4712,7 @@ class CodexHandle:
         Granular approval objects are preserved in ``approval_policy`` while the
         current UI receives their lossless-compatible ``on-request`` projection.
         """
+        self._thread_settings_revision += 1
         cwd = settings.get("cwd")
         if (isinstance(cwd, str) and os.path.isabs(cwd)
                 and 0 < len(cwd) <= 4096):
@@ -2415,9 +4728,22 @@ class CodexHandle:
             if effort is None:
                 self.effort = None
                 self.applied_effort = None
+                self.display_effort = None
+                self.display_effort_model = None
+                self.display_effort_cwd = None
+                self.display_effort_generation = None
+                self._display_effort_retry_at = None
             elif isinstance(effort, str) and effort:
                 self.effort = effort[:64]
                 self.applied_effort = self.effort
+                self.display_effort = self.effort
+                self.display_effort_model = self.model
+                self.display_effort_cwd = (
+                    os.path.realpath(self._cwd)
+                    if isinstance(self._cwd, str) and self._cwd else None
+                )
+                self.display_effort_generation = self._generation
+                self._display_effort_retry_at = None
 
         approval = settings.get("approvalPolicy")
         if self.work_mode:
@@ -2466,13 +4792,88 @@ class CodexHandle:
         elif active_key in settings:
             self.permission_profile = None
 
+    def _remember_configured_default_effort(
+        self,
+        response: object,
+        *,
+        cwd: Optional[str] = None,
+        generation: Optional[int] = None,
+    ) -> Optional[str]:
+        if not isinstance(response, dict):
+            raise RuntimeError("codex config/read returned an invalid response")
+        config = response.get("config")
+        if not isinstance(config, dict):
+            raise RuntimeError("codex config/read returned an invalid response")
+        raw = config.get("model_reasoning_effort")
+        if raw is not None and (
+            not isinstance(raw, str) or not raw or len(raw) > 64
+        ):
+            raise RuntimeError(
+                "codex config/read returned an invalid reasoning effort")
+        resolved_cwd = os.path.realpath(cwd or self._cwd)
+        resolved_generation = (
+            self._generation if generation is None else generation)
+        # config/read is asynchronous. A cwd migration or reconnect may finish
+        # while the old request is in flight; never label that old response as
+        # belonging to the new scope. The caller separately revalidates before
+        # using the returned value as a display projection.
+        if (os.path.realpath(self._cwd) == resolved_cwd
+                and self._generation == resolved_generation):
+            self._configured_default_effort = raw
+            self._configured_default_effort_cwd = resolved_cwd
+            self._configured_default_effort_generation = resolved_generation
+            self._configured_default_effort_read_at = time.monotonic()
+            self._configured_default_effort_known = True
+        return raw
+
+    async def configured_default_effort(self) -> Optional[str]:
+        """Read the effective config fallback for a null thread override."""
+        cwd = os.path.realpath(self._cwd)
+        generation = self._generation
+        if (
+            self._configured_default_effort_known
+            and self._configured_default_effort_cwd == cwd
+            and self._configured_default_effort_generation == generation
+            and self._configured_default_effort_read_at is not None
+            and time.monotonic() - self._configured_default_effort_read_at
+                < _CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS
+        ):
+            return self._configured_default_effort
+        response = await self._request("config/read", {
+            "cwd": cwd,
+            "includeLayers": False,
+        })
+        return self._remember_configured_default_effort(
+            response, cwd=cwd, generation=generation)
+
     async def set_model(self, model: str) -> None:
         if not isinstance(model, str) or not model:
             raise ValueError("Codex model must be non-empty")
-        authoritative = await self._update_thread_settings(
-            model=model, wait_for_notification=True)
-        if not authoritative:
-            self.model = model
+        configured_window = max(self.context_settings.window or 0,
+                                self.context_settings.applied_window or 0)
+        if configured_window:
+            bounds = await asyncio.to_thread(model_context_bounds, model, self.codex_home)
+            if bounds is None or configured_window > bounds.max_window:
+                raise ValueError("当前会话的上下文配置超过目标模型上限；请先恢复默认上下文设置")
+        # Validate and mutate in the same lane as speed changes. A stale model
+        # check must never apply a paid tier to a different model.
+        async with self._thread_settings_lock:
+            settings: dict[str, Any] = {"model": model}
+            if normalize_service_tier(self.service_tier) != "default":
+                catalog = await codex_catalog(codex_home=self.codex_home)
+                try:
+                    tier = resolve_service_tier(model, self.service_tier, catalog)
+                except ValueError:
+                    # Never carry a model-specific paid tier onto an unsupported
+                    # model or silently upgrade it to a different paid speed.
+                    tier = None
+                settings["serviceTier"] = tier
+            authoritative = await self._update_thread_settings_serialized(
+                wait_for_notification=True, **settings)
+            if not authoritative:
+                self.model = model
+                if "serviceTier" in settings:
+                    self.service_tier = settings["serviceTier"]
         log.info("codex thread model set", requested=model, applied=self.model)
 
     async def set_cwd(
@@ -2507,7 +4908,7 @@ class CodexHandle:
         )
         return effective
 
-    async def set_effort(self, effort: str) -> None:
+    async def set_effort(self, effort: str) -> bool:
         if not isinstance(effort, str) or not effort:
             raise ValueError("Codex effort must be non-empty")
         authoritative = await self._update_thread_settings(
@@ -2515,17 +4916,30 @@ class CodexHandle:
         if not authoritative:
             self.effort = effort
             self.applied_effort = effort
+            self.display_effort = effort
+            self.display_effort_model = self.model
+            self.display_effort_cwd = (
+                os.path.realpath(self._cwd)
+                if isinstance(self._cwd, str) and self._cwd else None
+            )
+            self.display_effort_generation = self._generation
+            self._display_effort_retry_at = None
         log.info("codex thread effort set", requested=effort,
                  applied=self.effort)
+        return authoritative
 
     async def set_service_tier(self, tier: Optional[str]) -> None:
-        normalized = tier if tier and tier != "default" else None
-        if normalized not in {None, "fast"}:
-            raise ValueError(f"unsupported Codex service tier: {tier}")
-        authoritative = await self._update_thread_settings(
-            serviceTier=normalized, wait_for_notification=True)
-        if not authoritative:
-            self.service_tier = normalized
+        async with self._thread_settings_lock:
+            scope = (self.model, self.thread_id, self._generation)
+            catalog = (await codex_catalog(codex_home=self.codex_home)
+                       if normalize_service_tier(tier) != "default" else [])
+            if scope != (self.model, self.thread_id, self._generation):
+                raise ValueError("模型或会话已变化，请重新选择速度。")
+            normalized = resolve_service_tier(self.model, tier, catalog)
+            authoritative = await self._update_thread_settings_serialized(
+                serviceTier=normalized, wait_for_notification=True)
+            if not authoritative:
+                self.service_tier = normalized
         log.info("codex thread service tier set", requested=normalized,
                  applied=self.service_tier)
 
@@ -2558,15 +4972,24 @@ class CodexHandle:
         if self.work_mode:
             raise ValueError(
                 "Codex Work permission profile is fixed to cc_remote_work")
+        scope = (self.thread_id, self._cwd, self._generation)
         catalog = await self.list_permission_profiles()
+        if scope != (self.thread_id, self._cwd, self._generation):
+            raise RuntimeError("Codex permission scope changed during catalog read")
         selected = next(
             (item for item in catalog if item["id"] == profile), None)
         if selected is None or not selected["allowed"]:
             raise ValueError(
                 "Codex permission profile is unavailable for this cwd")
+        had_reader = self._reader is not None
         authoritative = await self._update_thread_settings(
-            permissions=profile, wait_for_notification=True)
+            permissions=profile, wait_for_notification=True,
+            _expected_scope=scope)
+        if scope != (self.thread_id, self._cwd, self._generation):
+            raise RuntimeError("Codex permission scope changed during update")
         if not authoritative:
+            if had_reader:
+                raise RuntimeError("Codex did not confirm the permission profile")
             self.permission_profile = profile
         log.info(
             "codex permission profile set",
@@ -2646,14 +5069,259 @@ class CodexHandle:
         goal = (result or {}).get("goal")
         if goal is None:
             self.last_goal = None
+            self._goal_objective_baseline = None
+            self._goal_status_baseline = None
+            self._goal_baseline_loaded = True
+            self._goal_replacement_fence = None
             return None
-        self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        candidate = _sanitize_thread_goal(goal, self.thread_id)
+        previous_objective = self._goal_objective_baseline
+        previous_goal_turn_id = self.last_goal_turn_id
+        self.last_goal = candidate
+        self._goal_objective_baseline = self.last_goal.get("objective")
+        self._goal_status_baseline = self.last_goal.get("status")
+        self._goal_baseline_loaded = True
+        # Unlike a streamed snapshot, thread/goal/get reads the app-server's
+        # current persisted Goal. It is the escape hatch for an external client
+        # intentionally restoring the objective fenced below.
+        self._observe_goal_objective(
+            self.last_goal.get("objective"),
+            previous_objective=previous_objective,
+            previous_turn_ids=(
+                {previous_goal_turn_id}
+                if previous_goal_turn_id is not None else set()
+            ),
+            authoritative=True,
+        )
+        if self._goal_objective_baseline != previous_objective:
+            # A persisted snapshot has no turn attribution. Do not let the last
+            # extension turn from the replaced objective become the new
+            # objective's owner.
+            self.last_goal_turn_id = None
         return self.last_goal
+
+    def _current_goal_replacement_fence(
+        self,
+    ) -> Optional[_GoalReplacementFence]:
+        fence = self._goal_replacement_fence
+        if fence is None:
+            return None
+        if fence.generation != self._generation:
+            self._goal_replacement_fence = None
+            return None
+        return fence
+
+    def _observe_goal_objective(
+        self,
+        objective: Any,
+        *,
+        previous_objective: Any = None,
+        turn_id: Optional[str] = None,
+        previous_turn_ids: Optional[set[str]] = None,
+        authoritative: bool = False,
+    ) -> None:
+        """Advance one authoritative response/notification fence."""
+        fence = self._current_goal_replacement_fence()
+        if not isinstance(objective, str):
+            return
+        if fence is None and (authoritative or turn_id is not None):
+            observed_turn_ids = {turn_id} if turn_id is not None else set()
+            if objective == previous_objective:
+                observed_turn_ids.update(previous_turn_ids or set())
+            self._rotate_goal_replacement_fence(
+                objective,
+                previous_objective=previous_objective,
+                current_turn_ids=observed_turn_ids,
+                previous_turn_ids=previous_turn_ids,
+                authoritative=True,
+            )
+            return
+        if fence is not None and objective == fence.objective:
+            if (
+                isinstance(previous_objective, str)
+                and previous_objective
+                and previous_objective != objective
+            ):
+                known_previous_turn_ids = {
+                    item for item in (previous_turn_ids or set())
+                    if isinstance(item, str) and item
+                }
+                if known_previous_turn_ids:
+                    fence.retired_turn_ids.setdefault(
+                        previous_objective, set()
+                    ).update(known_previous_turn_ids)
+            fence.authoritative = True
+            if isinstance(turn_id, str) and turn_id:
+                fence.current_turn_ids.add(turn_id)
+            return
+        if not authoritative:
+            return
+        self._rotate_goal_replacement_fence(
+            objective,
+            previous_objective=previous_objective,
+            current_turn_ids={turn_id} if turn_id else set(),
+            previous_turn_ids=previous_turn_ids,
+            authoritative=True,
+        )
+
+    def _rotate_goal_replacement_fence(
+        self,
+        objective: str,
+        *,
+        previous_objective: Any,
+        current_turn_ids: Optional[set[str]] = None,
+        previous_turn_ids: Optional[set[str]] = None,
+        authoritative: bool,
+    ) -> None:
+        current = self._current_goal_replacement_fence()
+        retired_turn_ids = {
+            retired_objective: set(turn_ids)
+            for retired_objective, turn_ids in (
+                current.retired_turn_ids.items() if current is not None else ()
+            )
+        }
+        if (
+            current is not None
+            and current.authoritative
+            and current.objective != objective
+        ):
+            if current.current_turn_ids:
+                retired_turn_ids.setdefault(
+                    current.objective, set()
+                ).update(current.current_turn_ids)
+        if (
+            isinstance(previous_objective, str)
+            and previous_objective
+            and previous_objective != objective
+        ):
+            known_previous_turn_ids = {
+                item for item in (previous_turn_ids or set())
+                if isinstance(item, str) and item
+            }
+            if known_previous_turn_ids:
+                retired_turn_ids.setdefault(
+                    previous_objective, set()
+                ).update(known_previous_turn_ids)
+        replacement = _GoalReplacementFence(
+            objective,
+            {
+                item for item in (current_turn_ids or set())
+                if isinstance(item, str) and item
+            },
+            retired_turn_ids,
+            self._generation,
+        )
+        replacement.authoritative = authoritative
+        self._goal_replacement_fence = replacement
+
+    def _is_superseded_goal_update(
+        self,
+        candidate: dict[str, Any],
+        turn_id: Optional[str],
+    ) -> bool:
+        """Reject only old turns fenced by a Goal replacement.
+
+        The public Goal contract has no generation id. A permanent
+        different-objective filter would therefore drop legitimate replacements
+        made by another shared-daemon client. Retain objectives retired by
+        authoritative set responses, persisted reads, or accepted replacement
+        notifications. Quarantine observed old turn ids until their individual
+        drain boundary, clear, or reconnect. Without an old turn id, public
+        objective text cannot distinguish a delayed update from a legitimate
+        same-objective restore, so turn-owned updates remain authoritative.
+        Explicit set notifications use turnId=null and remain authoritative
+        even when another client restores that exact objective.
+        """
+        fence = self._current_goal_replacement_fence()
+        if (
+            fence is None
+            or not fence.authoritative
+            or not isinstance(turn_id, str)
+            or not turn_id
+        ):
+            return False
+        incoming_objective = candidate.get("objective")
+        if not isinstance(incoming_objective, str):
+            return False
+        retired_turn_ids = fence.retired_turn_ids.get(
+            incoming_objective, set()
+        )
+        if (
+            incoming_objective == fence.objective
+            and turn_id in fence.current_turn_ids
+        ):
+            return False
+        # A restored objective can have the same public text but a new automatic
+        # turn. The app-server does not expose its internal Goal generation id,
+        # so reject only turn ids observed on a retired generation.
+        superseded = turn_id in retired_turn_ids
+        if superseded and candidate.get("status") == "complete":
+            # Listener FIFO makes this the retired turn's drain boundary. Drop
+            # only that turn because multiple generations may reuse one public
+            # objective string.
+            if turn_id in retired_turn_ids:
+                retired_turn_ids.discard(turn_id)
+                if not retired_turn_ids:
+                    fence.retired_turn_ids.pop(incoming_objective, None)
+        return superseded
+
+    def take_goal_prompt(self, turn_id: str) -> Optional[str]:
+        """Consume the one visible objective owned by ``turn_id``."""
+        return self._goal_prompt_pending.pop(turn_id, None)
+
+    def _seed_goal_prompt_candidate(self, objective: str) -> None:
+        self._goal_prompt_candidate = _GoalPromptCandidate(
+            objective=objective,
+            generation=self._generation,
+            revision=self.goal_revision,
+            deadline=time.monotonic() + _GOAL_PROMPT_CANDIDATE_TTL_SECONDS,
+        )
+
+    def _refresh_goal_prompt_candidate(self, objective: Any) -> None:
+        candidate = self._goal_prompt_candidate
+        if candidate is None:
+            return
+        if (
+            candidate.generation != self._generation
+            or candidate.deadline < time.monotonic()
+            or candidate.objective != objective
+        ):
+            self._goal_prompt_candidate = None
+            return
+        candidate.revision = self.goal_revision
+
+    def _claim_goal_prompt_candidate(self) -> Optional[str]:
+        candidate = self._goal_prompt_candidate
+        self._goal_prompt_candidate = None
+        if candidate is None:
+            return None
+        if (
+            candidate.generation != self._generation
+            or candidate.revision != self.goal_revision
+            or candidate.deadline < time.monotonic()
+        ):
+            return None
+        return candidate.objective
 
     async def set_goal(self, *, objective: Optional[str] = None,
                        status: Optional[str] = None,
                        token_budget: Optional[int] = None) -> dict:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
+        if (
+            (objective is not None or status == "active")
+            and not self._goal_baseline_loaded
+        ):
+            try:
+                await self.get_goal()
+            except Exception as exc:
+                # The explicit mutation can still succeed. Keep the command's
+                # objective as correlation evidence instead of turning a
+                # read-only baseline failure into a false set failure.
+                log.warning(
+                    "codex goal baseline unavailable before mutation",
+                    error_type=type(exc).__name__,
+                )
         params = {"threadId": self.thread_id}
         if objective is not None:
             params["objective"] = objective
@@ -2661,19 +5329,97 @@ class CodexHandle:
             params["status"] = status
         if token_budget is not None:
             params["tokenBudget"] = token_budget
-        result = await self._request("thread/goal/set", params)
+        candidate_objective: Optional[str] = None
+        if (
+            isinstance(objective, str)
+            and objective
+            and objective != self._goal_objective_baseline
+            and status in (None, "active")
+        ):
+            candidate_objective = objective
+        elif (
+            status == "active"
+            and self._goal_status_baseline == "paused"
+            and isinstance(objective or self._goal_objective_baseline, str)
+            and bool(objective or self._goal_objective_baseline)
+        ):
+            candidate_objective = objective or self._goal_objective_baseline
+        if candidate_objective is not None:
+            # thread/goal/set may synchronously emit turn/started before its RPC
+            # response. Record the replacement and seed the prompt candidate
+            # before sending so both early notification orders stay correlated.
+            previous_objective = self._goal_objective_baseline
+            previous_turn_ids = {
+                turn_id for turn_id in (
+                    self.last_goal_turn_id,
+                    self.turn_id if self.turn_active else None,
+                )
+                if isinstance(turn_id, str) and turn_id
+            }
+            current_fence = self._current_goal_replacement_fence()
+            if (
+                current_fence is None
+                or current_fence.objective != candidate_objective
+            ):
+                self._rotate_goal_replacement_fence(
+                    candidate_objective,
+                    previous_objective=previous_objective,
+                    previous_turn_ids=previous_turn_ids,
+                    authoritative=False,
+                )
+            self._seed_goal_prompt_candidate(candidate_objective)
+        try:
+            result = await self._request("thread/goal/set", params)
+        except BaseException:
+            self._goal_prompt_candidate = None
+            raise
         goal = (result or {}).get("goal")
         if not isinstance(goal, dict):
+            self._goal_prompt_candidate = None
             raise RuntimeError("codex app-server did not return a goal")
+        response_previous_objective = self._goal_objective_baseline
+        response_previous_turn_id = self.last_goal_turn_id
         self.last_goal = _sanitize_thread_goal(goal, self.thread_id)
+        self._goal_objective_baseline = self.last_goal.get("objective")
+        self._goal_status_baseline = self.last_goal.get("status")
+        self._goal_baseline_loaded = True
+        self._observe_goal_objective(
+            self.last_goal.get("objective"),
+            previous_objective=response_previous_objective,
+            previous_turn_ids=(
+                {response_previous_turn_id}
+                if response_previous_turn_id is not None else set()
+            ),
+            authoritative=True,
+        )
+        if self._goal_objective_baseline != response_previous_objective:
+            # The RPC response itself is not tied to an automatic turn. An
+            # earlier matching notification already changed the baseline and
+            # therefore keeps its turn id; response-first ordering clears the
+            # previous objective's attribution until a notification arrives.
+            self.last_goal_turn_id = None
+        if (
+            self.last_goal.get("status") != "active"
+        ):
+            self._goal_prompt_candidate = None
+        elif self._goal_prompt_candidate is not None:
+            self._refresh_goal_prompt_candidate(
+                self.last_goal.get("objective"))
         return self.last_goal
 
     async def clear_goal(self) -> bool:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         result = await self._request("thread/goal/clear", {"threadId": self.thread_id})
         cleared = bool((result or {}).get("cleared"))
         if cleared:
             self.last_goal = None
+            self._goal_objective_baseline = None
+            self._goal_status_baseline = None
+            self._goal_baseline_loaded = True
+            self._goal_prompt_pending.clear()
+            self._goal_prompt_candidate = None
+            self._goal_replacement_fence = None
         return cleared
 
     async def start_review(self, target: dict[str, Any]) -> dict[str, str]:
@@ -2684,6 +5430,7 @@ class CodexHandle:
         reader as ordinary turns instead of disappearing in a one-shot RPC.
         """
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if self.turn_active:
             raise RuntimeError("codex thread is busy")
         self._open_managed_stream()
@@ -2749,13 +5496,43 @@ class CodexHandle:
 
     async def compact_thread(self) -> None:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if self.turn_active:
             raise RuntimeError("codex thread is busy")
-        await self._request(
-            "thread/compact/start", {"threadId": self.thread_id})
+        accepted = asyncio.get_running_loop().create_future()
+        self._manual_compact_request = accepted
+        self._manual_compact_candidate = None
+        self._manual_compact_generation = self._generation
+        try:
+            await self._request("thread/compact/start", {"threadId": self.thread_id})
+        except BaseException:
+            accepted.set_result(False)
+            if self._manual_compact_request is accepted:
+                self._manual_compact_request = None
+            raise
+        else:
+            accepted.set_result(True)
+
+    async def manual_compact_for_turn(self, turn_id: str) -> bool:
+        """Called by the consumer only after native compaction output proves it.
+
+        The stdout reader must never await the RPC response it itself delivers.
+        Keep early notifications queued until the control request is accepted.
+        """
+        request = self._manual_compact_request
+        if (request is None or self._manual_compact_candidate != turn_id
+                or self._manual_compact_generation != self._generation):
+            return False
+        accepted = await asyncio.shield(request)
+        if (self._manual_compact_request is not request
+                or self._manual_compact_generation != self._generation):
+            return False
+        self._manual_compact_request = None
+        return accepted
 
     async def rollback_thread(self, num_turns: int) -> dict[str, Any]:
         assert self.thread_id, "connect() first"
+        await self._release_managed_compaction_continuation()
         if self.turn_active:
             raise RuntimeError("codex thread is busy")
         if not isinstance(num_turns, int) or isinstance(num_turns, bool) \
@@ -2800,41 +5577,363 @@ class CodexHandle:
                 error_type=type(exc).__name__,
             )
 
+    def _publish_thread_started_hint(self, thread_id: str) -> None:
+        """Schedule-only catalog hint; never await relay work on stdout reader."""
+        callback = self.thread_started_callback
+        if callback is None:
+            return
+        try:
+            callback(thread_id)
+        except Exception as exc:
+            log.warning(
+                "codex thread catalog callback failed",
+                error_type=type(exc).__name__,
+            )
+
     async def get_context_usage(self) -> dict:
+        configured_capacity = (
+            self.context_settings.applied_model is not None
+            and self.context_settings.applied_model == self.model)
         # Real shape (verified, gpt-5.5): tokenUsage = {last:{totalTokens,…},
         # total:{totalTokens,…}, modelContextWindow}. `last.totalTokens` is the most
-        # recent turn's full token count ≈ current context depth (what the codex TUI
-        # gauges); `total` is the cumulative session sum (over-counts context). Use
-        # `last` for the "context full?" reading, falling back to `total`.
+        # recent model response's usage, not the native compaction estimator.
+        # Read the native estimate separately, matched to this sample. Never
+        # substitute the cumulative session sum in `total` for context depth.
+        if (self.thread_id and self.last_token_usage is None
+                and not self._rollout_context_recovery_attempted):
+            recovery_thread_id = self.thread_id
+            recovery_generation = self._generation
+            self._rollout_context_recovery_attempted = True
+            recovered = await asyncio.to_thread(
+                recover_codex_context_usage,
+                recovery_thread_id,
+                codex_home=self.codex_home,
+            )
+            # The stdout reader may have installed a live notification while
+            # the bounded file read was in flight. A reconnect/resume can also
+            # replace the handle's thread; never install that old file sample
+            # into a new app-server generation or native session.
+            if (self.last_token_usage is None
+                    and self.thread_id == recovery_thread_id
+                    and self._generation == recovery_generation
+                    and isinstance(recovered, dict)):
+                self.last_token_usage = recovered
+                window = recovered.get("modelContextWindow")
+                if (isinstance(window, int) and not isinstance(window, bool)
+                        and self.context_window is None
+                        and not configured_capacity):
+                    self.context_window = window
+            elif (self.last_token_usage is None
+                    and self.thread_id == recovery_thread_id
+                    and self._generation == recovery_generation):
+                # Missing/replaced/truncated rollouts are transient while Codex
+                # is flushing or rotating the file. Let a later explicit
+                # context read retry; a successful recovery or live
+                # tokenUsage notification still permanently ends cold reads
+                # for this process generation.
+                self._rollout_context_recovery_attempted = False
         u = self.last_token_usage if isinstance(self.last_token_usage, dict) else {}
         last = u.get("last") if isinstance(u.get("last"), dict) else {}
-        total = u.get("total") if isinstance(u.get("total"), dict) else {}
-        used = last.get("totalTokens")
-        if used is None:
-            used = total.get("totalTokens")
+        used = _nonnegative_int(last.get("totalTokens"))
         # server value (captured in _dispatch) wins; else the config-declared window.
-        win = self.context_window or u.get("modelContextWindow") or codex_context_window()
-        return {"used_tokens": used, "context_window": win, "raw": u}
+        win = _nonnegative_int(self.context_window)
+        if not win and not configured_capacity:
+            win = _nonnegative_int(u.get("modelContextWindow"))
+        win = win or (0 if configured_capacity else (
+            codex_context_window() if self.codex_home is None
+            else codex_context_window(codex_home=self.codex_home)
+        ))
+        source = "recent_turn"
+        threshold = None
+        if self.thread_id and used is not None and win:
+            identity = (self._generation, self.thread_id, self.model, self.context_window)
+            estimate = await asyncio.to_thread(
+                read_codex_context_estimate, self.thread_id,
+                codex_home=self.codex_home, last=last, window=win,
+                turn_id=self._context_usage_turn_id,
+            )
+            if (identity != (self._generation, self.thread_id, self.model, self.context_window)
+                    or self.last_token_usage is not u):
+                # A newer sample, compaction or reconnect won the read. Do not
+                # publish either old counter into that new context generation.
+                return {"used_tokens": None, "context_window": self.context_window or 0,
+                        "raw": {}, "source": "recent_turn"}
+            if estimate is not None:
+                used, threshold = estimate.used_tokens, estimate.threshold_tokens
+                source = "native_estimate"
+        return {"used_tokens": used, "context_window": win, "raw": u,
+                "source": source, "auto_compact_threshold_tokens": threshold}
 
-    async def recover_owned_turn(self, turn_id: str) -> bool:
+    async def reconcile_turn_start(
+        self,
+        client_message_id: str,
+        *,
+        native_turn_id: Optional[str] = None,
+        native_message_id: Optional[str] = None,
+    ) -> CodexTurnStartReconciliation:
+        """Resolve a lost ``turn/start`` response without replaying its input.
+
+        The replacement shared connection supplies two independent facts: the
+        thread's current liveness and a bounded newest-turn page.  Only exact
+        native user identity can attribute a turn to the interrupted request;
+        a merely active thread remains unowned and must stay write-blocked.
+        """
+        if (
+            not isinstance(client_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(client_message_id)
+            or not isinstance(self.thread_id, str)
+        ):
+            raise ValueError("invalid Codex turn/start reconciliation identity")
+        for value in (native_turn_id, native_message_id):
+            if value is not None and (
+                not isinstance(value, str)
+                or not _STATUS_WIRE_ID.fullmatch(value)
+            ):
+                raise ValueError(
+                    "invalid Codex turn/start reconciliation identity"
+                )
+
+        response = await self._request("thread/read", {
+            "threadId": self.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        raw_status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") not in {None, self.thread_id}
+            or not isinstance(raw_status, dict)
+            or raw_status.get("type") not in _THREAD_STATUSES
+        ):
+            raise RuntimeError(
+                "codex thread/read returned an invalid reconciliation state"
+            )
+        read_reports_active = raw_status.get("type") == "active"
+
+        page = await self._request("thread/turns/list", {
+            "threadId": self.thread_id,
+            "cursor": None,
+            "limit": _TURN_START_RECONCILE_PAGE_SIZE,
+            "sortDirection": "desc",
+            "itemsView": "summary",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        if not isinstance(turns, list):
+            raise RuntimeError(
+                "codex latest-turn read returned an invalid reconciliation page"
+            )
+
+        active_turn_id: Optional[str] = None
+        latest_turn_id: Optional[str] = None
+        if turns:
+            latest = turns[0]
+            latest_id = latest.get("id") if isinstance(latest, dict) else None
+            if (
+                isinstance(latest_id, str)
+                and _STATUS_WIRE_ID.fullmatch(latest_id)
+            ):
+                latest_turn_id = latest_id
+                # thread/turns/list is issued after thread/read. A turn may
+                # start between those requests, so its newer inProgress row is
+                # authoritative active evidence even when the older read said
+                # idle. The opposite disagreement stays conservatively active
+                # until a later ordered probe agrees it is idle.
+                if latest.get("status") == "inProgress":
+                    active_turn_id = latest_id
+        thread_active = bool(read_reports_active or active_turn_id is not None)
+
+        matches: set[str] = set()
+        match_indexes: dict[str, int] = {}
+        for index, turn in enumerate(
+            turns[:_TURN_START_RECONCILE_PAGE_SIZE]
+        ):
+            if not isinstance(turn, dict):
+                continue
+            turn_id = turn.get("id")
+            if (
+                not isinstance(turn_id, str)
+                or not _STATUS_WIRE_ID.fullmatch(turn_id)
+            ):
+                continue
+            # An exact notification proof can expose the same task id as the
+            # control turn even when this app-server's summary omits items.
+            if (
+                native_message_id is not None
+                and native_turn_id is not None
+                and turn_id == native_turn_id
+            ):
+                matches.add(turn_id)
+                match_indexes.setdefault(turn_id, index)
+            items = turn.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or item.get("type") != "userMessage":
+                    continue
+                item_id = item.get("id")
+                item_client_id = item.get("clientId")
+                client_match = item_client_id == client_message_id
+                native_match = (
+                    native_message_id is not None
+                    and item_id == native_message_id
+                )
+                if not (client_match or native_match):
+                    continue
+                if (
+                    client_match
+                    and native_message_id is not None
+                    and item_id != native_message_id
+                ) or (
+                    native_match
+                    and isinstance(item_client_id, str)
+                    and item_client_id != client_message_id
+                ):
+                    raise RuntimeError(
+                        "conflicting Codex turn/start reconciliation identity"
+                    )
+                matches.add(turn_id)
+                match_indexes.setdefault(turn_id, index)
+
+        if len(matches) > 1:
+            raise RuntimeError(
+                "ambiguous Codex turn/start reconciliation identity"
+            )
+        matched_turn_id = next(iter(matches), None)
+        matched_index = (
+            match_indexes.get(matched_turn_id)
+            if matched_turn_id is not None else None
+        )
+        next_cursor = page.get("nextCursor") if isinstance(page, dict) else None
+        if next_cursor not in (None, "") and not isinstance(next_cursor, str):
+            raise RuntimeError(
+                "codex latest-turn read returned an invalid cursor"
+            )
+        return CodexTurnStartReconciliation(
+            thread_active=thread_active,
+            active_turn_id=active_turn_id,
+            matched_turn_id=matched_turn_id,
+            matched_turn_active=bool(
+                matched_turn_id is not None
+                and matched_turn_id == active_turn_id
+            ),
+            latest_turn_id=latest_turn_id,
+            matched_turn_is_latest=matched_index == 0,
+            newer_turns_present=bool(
+                matched_index is not None and matched_index > 0
+            ),
+            page_truncated=bool(next_cursor),
+        )
+
+    async def probe_owned_turn(
+        self, turn_id: str,
+    ) -> Optional[CodexOwnedTurnProbe]:
+        """Read an active control turn without claiming or changing lifecycle."""
+        if (
+            not isinstance(turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(turn_id)
+            or not isinstance(self.thread_id, str)
+        ):
+            return None
+        response = await self._request("thread/read", {
+            "threadId": self.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        raw_status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(raw_status, dict)
+            or raw_status.get("type") != "active"
+        ):
+            return None
+        page = await self._request("thread/turns/list", {
+            "threadId": self.thread_id,
+            "cursor": None,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "summary",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        if not isinstance(turns, list) or len(turns) != 1:
+            return None
+        latest = turns[0]
+        if (
+            not isinstance(latest, dict)
+            or latest.get("id") != turn_id
+            or latest.get("status") != "inProgress"
+        ):
+            return None
+        items = latest.get("items")
+        native_user_message_ids: list[str] = []
+        if isinstance(items, list):
+            for item in reversed(
+                items[-_PENDING_STEER_USER_IDENTITIES_MAX:]
+            ):
+                if not isinstance(item, dict) or item.get("type") != "userMessage":
+                    continue
+                native_message_id = item.get("id")
+                if (
+                    isinstance(native_message_id, str)
+                    and _STATUS_WIRE_ID.fullmatch(native_message_id)
+                    and native_message_id not in native_user_message_ids
+                ):
+                    native_user_message_ids.append(native_message_id)
+                    if len(native_user_message_ids) >= 64:
+                        break
+        return CodexOwnedTurnProbe(
+            turn_id=turn_id,
+            native_user_message_ids=tuple(native_user_message_ids),
+        )
+
+    async def recover_owned_turn(
+        self,
+        turn_id: str,
+        *,
+        stream_turn_ids: tuple[str, ...] = (),
+    ) -> bool:
         """Reattach one durably attributed turn after a wrapper restart.
 
         Arm the bounded stream before the status reads so a terminal notification
         racing either RPC is captured rather than leaving a false running state.
-        Machine has already matched this id against its private lease and rollout
-        tail; the bounded latest-turn page supplies the missing native-id proof.
+        Machine has matched this id against a private lease or an explicitly
+        rooted Goal continuation, plus an exact source-bound rollout witness;
+        the bounded latest-turn page
+        revalidates that the official control turn is still active.
         """
         if not isinstance(turn_id, str) or not turn_id:
             raise ValueError("invalid Codex turn id")
+        if not isinstance(stream_turn_ids, tuple):
+            raise ValueError("invalid Codex stream turn ids")
+        stream_ids: set[str] = set()
+        for value in stream_turn_ids:
+            if (
+                not isinstance(value, str)
+                or not _STATUS_WIRE_ID.fullmatch(value)
+            ):
+                raise ValueError("invalid Codex stream turn ids")
+            if value != turn_id:
+                stream_ids.add(value)
+        if len(stream_ids) > _ACTIVE_STREAM_TURN_IDS_MAX:
+            raise ValueError("invalid Codex stream turn ids")
         if self.turn_active or self._spontaneous_turn_id is not None:
-            return (
+            recovered = (
                 self.turn_id == turn_id
                 and self._spontaneous_turn_id == turn_id
             )
+            if recovered:
+                for stream_turn_id in stream_ids:
+                    self.bind_owned_turn_stream(turn_id, stream_turn_id)
+            return recovered
 
         self.turn_id = turn_id
         self.turn_active = True
+        self._active_stream_turn_ids.clear()
         self.remember_owned_turn_id(turn_id)
+        for stream_turn_id in stream_ids:
+            if not self.bind_owned_turn_stream(turn_id, stream_turn_id):
+                self.turn_id = None
+                self.turn_active = False
+                self._active_stream_turn_ids.clear()
+                return False
         self._spontaneous_turn_id = turn_id
         self._open_spontaneous_stream(turn_id)
         try:
@@ -2883,6 +5982,7 @@ class CodexHandle:
             if self.turn_id == turn_id:
                 self.turn_id = None
             self.turn_active = False
+            self._active_stream_turn_ids.clear()
             raise
 
         # turn/completed may have been dispatched while the read response was
@@ -2904,6 +6004,7 @@ class CodexHandle:
         if self.turn_id == turn_id:
             self.turn_id = None
         self.turn_active = False
+        self._active_stream_turn_ids.clear()
         return False
 
     async def get_status(self) -> dict:
@@ -3052,6 +6153,21 @@ class CodexHandle:
                 "rateLimits": self.last_rate_limits,
                 "rateLimitsByLimitId": self.last_rate_limits_by_id,
             })
+        reset_credits = None
+        if (
+            not skip_chatgpt_stats
+            and rate_response is not None
+            and "rateLimitResetCredits" in rate_response
+        ):
+            raw_reset_credits = rate_response.get("rateLimitResetCredits")
+            reset_credits = _sanitize_rate_limit_reset_credits(
+                raw_reset_credits)
+            if raw_reset_credits is not None and reset_credits is None:
+                _append_status_error(
+                    errors,
+                    "reset_credits",
+                    "app-server returned an invalid response",
+                )
 
         usage = None
         usage_response = responses.get("usage")
@@ -3077,9 +6193,32 @@ class CodexHandle:
             "context": context,
             "account": account,
             "rate_limits": rate_limits,
+            "reset_credits": reset_credits,
             "usage": usage,
             "component_errors": errors[:5],
         }
+
+    async def consume_rate_limit_reset_credit(
+        self,
+        *,
+        credit_id: Optional[str],
+        idempotency_key: str,
+    ) -> str:
+        """Redeem one native Codex reset credit with caller-owned idempotency."""
+        params = {"idempotencyKey": idempotency_key}
+        if credit_id is not None:
+            params["creditId"] = credit_id
+        response = await self._request(
+            "account/rateLimitResetCredit/consume", params)
+        outcome = response.get("outcome") if isinstance(response, dict) else None
+        if not isinstance(outcome, str) or not outcome:
+            raise RuntimeError(
+                "codex reset-credit consume returned an invalid response")
+        if outcome not in {
+            "reset", "nothingToReset", "noCredit", "alreadyRedeemed",
+        }:
+            return "unknown"
+        return outcome
 
     def _remember_rate_limits(self, response: dict) -> None:
         single = response.get("rateLimits")
@@ -3099,7 +6238,9 @@ class CodexHandle:
         method: str,
         params: Optional[dict] = None,
         *,
-        response_boundary: Optional[_CodexSteerResponseBoundary] = None,
+        response_boundary: Optional[
+            _CodexSteerResponseBoundary | _CodexTurnStartResponseBoundary
+        ] = None,
     ):
         self._id += 1
         rid = self._id
@@ -3140,15 +6281,28 @@ class CodexHandle:
         roots = {root_id} if include_descendants else set()
         async with self._http_provider_repair_lock:
             try:
+                repair_kwargs: dict[str, Any] = {}
+                restored_kwargs: dict[str, Any] = {}
+                if self.codex_home is not None:
+                    repair_kwargs = {
+                        "codex_home": self.codex_home,
+                        "journal_dir": str(
+                            Path(self.codex_home)
+                            / ".cc-remote-provider-repair-journal"
+                        ),
+                    }
+                    restored_kwargs = {"codex_home": self.codex_home}
                 report = await asyncio.to_thread(
                     repair_http_provider_records,
                     apply=True,
                     roots=roots,
                     include_thread_ids=include_ids,
+                    **repair_kwargs,
                 )
                 restored = await asyncio.to_thread(
                     canonical_thread_provider_is_restored,
                     root_id,
+                    **restored_kwargs,
                 )
                 if strict and not restored:
                     raise RuntimeError(
@@ -3280,7 +6434,12 @@ class CodexHandle:
         if not isinstance(method, str):
             await self._respond_error(rid, -32600, "invalid server request")
             return
-        if method not in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS | _INTERACTION_METHODS:
+        supported_methods = (
+            _NEW_APPROVAL_METHODS
+            | _LEGACY_APPROVAL_METHODS
+            | _INTERACTION_METHODS
+        )
+        if method not in supported_methods:
             log.warning("unsupported codex server request; rejecting", method=method)
             await self._respond_error(rid, -32601, f"unsupported server request: {method}")
             return
@@ -3398,8 +6557,16 @@ class CodexHandle:
         frame = _websocket_client_frame(payload, opcode=opcode)
         async with self._send_lock:
             proc = self.proc
-            if proc is None or proc.stdin is None:
-                raise RuntimeError("codex daemon proxy disconnected")
+            if (
+                proc is None
+                or proc.stdin is None
+                or self._dead
+                or proc.returncode is not None
+            ):
+                raise CodexAppServerDisconnected(
+                    self.app_server_version,
+                    self._generation,
+                )
             proc.stdin.write(frame)
             await proc.stdin.drain()
 
@@ -3482,11 +6649,17 @@ class CodexHandle:
                          generation: int) -> None:
         assert proc.stdout
         daemon_proxy = self._using_daemon_proxy
+        proxy_close: Optional[CodexDaemonProxyClosed] = None
         try:
             while True:
                 if daemon_proxy:
                     line = await self._proxy_read_message(proc)
                     if line is None:
+                        proxy_close = CodexDaemonProxyClosed(
+                            self.app_server_version,
+                            generation,
+                            close_kind="eof",
+                        )
                         break
                 else:
                     line = await proc.stdout.readline()
@@ -3522,6 +6695,16 @@ class CodexHandle:
         except Exception as e:
             log.warning("codex read loop ended", error=str(e))
             if daemon_proxy and generation == self._generation:
+                proxy_close = CodexDaemonProxyClosed(
+                    self.app_server_version,
+                    generation,
+                    close_kind=(
+                        "eof" if isinstance(e, EOFError) else "protocol"
+                    ),
+                )
+                if self._turn_q is not None:
+                    self._force_turn_sentinel(
+                        self._turn_q, proxy_close)
                 self.daemon_manager.invalidate()
                 await self.disconnect()
         finally:
@@ -3535,6 +6718,10 @@ class CodexHandle:
                     self.daemon_manager.invalidate()
                     self._using_daemon_proxy = False
                     self._proxy_read_buffer.clear()
+                self._compaction_continuation_turn_id = None
+                self._goal_prompt_candidate = None
+                self._goal_replacement_fence = None
+                self._discard_managed_compaction_continuation()
                 self._clear_review_tracking()
                 spontaneous_turn_id = self._spontaneous_turn_id
                 self._spontaneous_turn_id = None
@@ -3546,11 +6733,22 @@ class CodexHandle:
                     task.cancel()
                 # unblock any waiting turn/request
                 if self._turn_q is not None:
-                    self._force_turn_sentinel(self._turn_q)
+                    self._force_turn_sentinel(
+                        self._turn_q,
+                        proxy_close if daemon_proxy else None,
+                    )
                 self._managed_overflow = False
                 for fut in self._pending.values():
                     if not fut.done():
-                        fut.set_exception(RuntimeError("codex app-server closed"))
+                        fut.set_exception(
+                            CodexAppServerDisconnected(
+                                self.app_server_version,
+                                generation,
+                            )
+                            if daemon_proxy else
+                            RuntimeError("codex app-server closed")
+                        )
+                self._clear_steer_user_identities()
                 if spontaneous_turn_id is not None:
                     await self._publish_turn_lifecycle(
                         "completed", spontaneous_turn_id)
@@ -3570,8 +6768,24 @@ class CodexHandle:
             if self._using_daemon_proxy else None
         )
         current_thread_id = binding_thread_id or self.thread_id
+        target_turn_id = _notification_turn_id(message)
+        exact_unattributed_managed_turn = bool(
+            self._using_daemon_proxy
+            and target_thread_id is None
+            and target_turn_id is not None
+            and (
+                target_turn_id == self.turn_id
+                or target_turn_id in self._active_stream_turn_ids
+            )
+            and self.turn_active
+            and self._turn_q is not None
+            and self._spontaneous_turn_id is None
+            and not self._review_active
+        )
         if (method in _MODEL_TURN_METHODS
-                and (target_thread_id is None or current_thread_id is None)):
+                and (current_thread_id is None
+                     or (target_thread_id is None
+                         and not exact_unattributed_managed_turn))):
             # These 0.144.1 notifications require both threadId and turnId.
             # Unlike legacy error/hook frames, there is no valid thread-scoped
             # form, so a partial payload must never be guessed into this session.
@@ -3581,7 +6795,8 @@ class CodexHandle:
         if (self._using_daemon_proxy
                 and (_is_turn_notification(method)
                      or method == "thread/compacted")
-                and target_thread_id is None):
+                and target_thread_id is None
+                and not exact_unattributed_managed_turn):
             # Private one-session app-servers historically omit threadId on
             # legitimate spontaneous turns. A shared daemon has no such safe
             # inference at any point in its connection lifetime: after resume
@@ -3596,7 +6811,6 @@ class CodexHandle:
                 and target_thread_id != current_thread_id):
             log.warning("foreign codex thread notification dropped", method=method)
             return False
-        target_turn_id = _notification_turn_id(message)
         if (not _is_turn_notification(method)
                 and method not in {"error", "thread/compacted"}):
             return True
@@ -3627,11 +6841,32 @@ class CodexHandle:
             }:
                 return True
 
+        if (
+            self.turn_active
+            and target_turn_id is not None
+            and target_turn_id in self._active_stream_turn_ids
+        ):
+            if self._notification_is_user_message(message):
+                # The one Remote user item which established this alias was
+                # consumed by _capture_steer_user_identity above. A different
+                # user boundary on the same native task is not ours merely
+                # because later assistant frames share its task id.
+                log.warning(
+                    "unproven Codex stream user notification dropped",
+                    method=method,
+                )
+                return False
+            return True
+
         if method == "turn/started":
             if target_turn_id is None:
                 log.warning("unattributed codex turn notification dropped",
                             method=method)
                 return False
+            if self._can_stage_managed_compaction_replacement(
+                message, target_thread_id, target_turn_id,
+            ):
+                return True
             if (self.turn_active and self.turn_id is not None
                     and self.turn_id != target_turn_id):
                 log.warning("foreign codex turn notification dropped",
@@ -3642,6 +6877,8 @@ class CodexHandle:
             return True
 
         if target_turn_id is not None:
+            if self._managed_compaction_candidate_matches(message):
+                return True
             if self.turn_id is None:
                 if not (self.turn_active or self.turn_start_pending):
                     log.warning("orphan codex turn notification dropped",
@@ -3715,9 +6952,89 @@ class CodexHandle:
         )
         if queue is None or queue.end_delivered:
             return
+        pending = self._pending_steer_user_identities.get(
+            boundary.client_message_id)
+        if pending is not None:
+            pending.queue = queue
         fence = CodexSteerFence()
         queue.put_control_nowait(fence)
         boundary.fence = fence
+        self._accept_steer_user_identity(boundary.client_message_id)
+
+    def _install_turn_start_response_boundary(
+        self,
+        boundary: _CodexTurnStartResponseBoundary,
+        response: dict,
+    ) -> None:
+        """Attach an exact client id before post-response frames are routed."""
+        if "error" in response or self.thread_id != boundary.thread_id:
+            return
+        result = response.get("result")
+        turn = result.get("turn") if isinstance(result, dict) else None
+        control_turn_id = turn.get("id") if isinstance(turn, dict) else None
+        if (
+            not isinstance(control_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(control_turn_id)
+        ):
+            return
+        pending = self._pending_steer_user_identities.get(
+            boundary.client_message_id)
+        if (
+            pending is None
+            or pending.kind != "query"
+            or pending.thread_id != boundary.thread_id
+            or pending.generation != self._generation
+        ):
+            return
+        self.remember_owned_turn_id(control_turn_id)
+        if self.turn_active:
+            self.turn_id = control_turn_id
+        self._accept_query_user_identity(
+            boundary.client_message_id,
+            control_turn_id,
+        )
+
+    def _capture_thread_deleted_notification(self, message: dict) -> bool:
+        """Collect the target and its descendants until the target arrives."""
+        if message.get("method") != "thread/deleted":
+            return False
+        thread_id = _notification_thread_id(message)
+        deleted_ids = self._thread_deleted_ids
+        if deleted_ids is None or self._thread_delete_target is None:
+            return False
+        if (
+            isinstance(thread_id, str)
+            and _STATUS_WIRE_ID.fullmatch(thread_id)
+        ):
+            if thread_id not in deleted_ids:
+                if len(deleted_ids) < _THREAD_DELETE_NOTIFY_MAX:
+                    deleted_ids.append(thread_id)
+                else:
+                    self.thread_delete_notifications_overflowed = True
+            if thread_id == self._thread_delete_target:
+                self._thread_delete_done.set()
+        return True
+
+    def _capture_thread_archived_notification(self, message: dict) -> bool:
+        """Collect actually archived roots/descendants until the target arrives."""
+        if message.get("method") != "thread/archived":
+            return False
+        thread_id = _notification_thread_id(message)
+        archived_ids = self._thread_archived_ids
+        if archived_ids is None or self._thread_archive_target is None:
+            return False
+        if (
+            isinstance(thread_id, str)
+            and _STATUS_WIRE_ID.fullmatch(thread_id)
+        ):
+            if thread_id not in archived_ids:
+                if len(archived_ids) < _THREAD_ARCHIVE_NOTIFY_MAX:
+                    archived_ids.append(thread_id)
+                else:
+                    self.thread_archive_notifications_overflowed = True
+            if thread_id == self._thread_archive_target:
+                self._thread_archive_done.set()
+        return True
 
     async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
@@ -3726,8 +7043,10 @@ class CodexHandle:
             fut = self._pending.get(m["id"])
             if fut and not fut.done():
                 boundary = self._pending_response_boundaries.get(m["id"])
-                if boundary is not None:
+                if isinstance(boundary, _CodexSteerResponseBoundary):
                     self._install_steer_response_boundary(boundary, m)
+                elif isinstance(boundary, _CodexTurnStartResponseBoundary):
+                    self._install_turn_start_response_boundary(boundary, m)
                 if "error" in m:
                     fut.set_exception(CodexAppServerError(m["error"]))
                 else:
@@ -3735,6 +7054,15 @@ class CodexHandle:
             return
         if has_id and has_method:                            # server -> client request
             method = m.get("method")
+            if self._control_only_connection:
+                # This proxy has no thread or interaction owner. A shared
+                # daemon can broadcast a sibling's approval request here;
+                # silence leaves it available to that thread's real client.
+                log.warning(
+                    "Codex control connection left server request pending",
+                    method=method,
+                )
+                return
             request_id = _server_request_key(m.get("id"))
             missing_callback = isinstance(method, str) and ((
                 method in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS
@@ -3791,6 +7119,35 @@ class CodexHandle:
             return
         # notification
         method = m.get("method")
+        if (
+            self._capture_thread_deleted_notification(m)
+            or self._capture_thread_archived_notification(m)
+        ):
+            return
+        if self._control_only_connection:
+            # Responses are handled above and lifecycle collectors are the only
+            # notifications used by this connection. In particular, never let
+            # shared-daemon sibling lifecycle bind or mutate this handle.
+            return
+        if method == "thread/started" and self._using_daemon_proxy:
+            target_thread_id = _notification_thread_id(m)
+            params = m.get("params")
+            thread = params.get("thread") if isinstance(params, dict) else None
+            source = thread.get("source") if isinstance(thread, dict) else None
+            current_thread_id = (
+                self._shared_resume_binding_thread_id or self.thread_id
+            )
+            if (
+                isinstance(target_thread_id, str)
+                and _STATUS_WIRE_ID.fullmatch(target_thread_id)
+                and source in _EXTERNAL_THREAD_STARTED_SOURCES
+                and isinstance(current_thread_id, str)
+                and target_thread_id != current_thread_id
+            ):
+                # A shared daemon publishes sibling thread creation to every
+                # subscribed handle. Preserve the strict foreign-frame drop below;
+                # expose only this content-free catalog hint to Machine.
+                self._publish_thread_started_hint(target_thread_id)
         if method == "serverRequest/resolved":
             params = m.get("params")
             request_id = _server_request_key(
@@ -3800,8 +7157,43 @@ class CodexHandle:
                 task = self._server_request_tasks_by_id.pop(request_id, None)
                 if task is not None and not task.done():
                     task.cancel()
+        # Preserve the strict ownership filter below. The only pre-filter
+        # exception is a content-free identity proof for a client id registered
+        # by this exact handle generation.
+        if self._capture_steer_user_identity(m):
+            return
         if not self._notification_is_current(m):
             return
+        logical_stream_message = self._logicalize_active_stream_notification(m)
+        if logical_stream_message is not m:
+            m = logical_stream_message
+            raw_size = self._notification_wire_size(m)
+        if self._stage_managed_compaction_replacement(m, raw_size):
+            # ``turn/started`` alone is ambiguous: app-server may be announcing
+            # the compact replacement or an independent user/Goal turn. Hold it
+            # until the first attributable item settles that distinction.
+            return
+        candidate_frame = self._managed_compaction_candidate_matches(m)
+        candidate_user_boundary = candidate_frame and (
+            self._notification_is_user_message(m)
+            or method in {"thread/goal/updated", "thread/goal/cleared"}
+        )
+        candidate_terminal = candidate_frame and method in {
+            "turn/completed", "error",
+        }
+        if (
+            self._managed_compaction_continuation is not None
+            and (candidate_user_boundary or candidate_terminal)
+        ):
+            # Ownership has already been checked above. Close the old managed
+            # turn, replay a provisional replacement as spontaneous, then
+            # revalidate this frame against the resulting state.
+            await self._release_managed_compaction_continuation()
+            if not self._notification_is_current(m):
+                return
+        elif candidate_frame:
+            await self._confirm_managed_compaction_replacement(m)
+        self._confirm_same_id_compaction_continuation(m)
         if method == "error":
             diagnostic = _provider_error_diagnostic(m.get("params"))
             logger_method = log.info if diagnostic["will_retry"] else log.warning
@@ -3813,13 +7205,37 @@ class CodexHandle:
             and target_turn_id == self._review_execution_turn_id
             and target_turn_id != self._review_outer_turn_id
         )
+        managed_queue_message = self._logicalize_managed_compaction_notification(
+            m)
+        usage = self._turn_usage.feed(managed_queue_message)
+        if usage is not None:
+            # Keep accounting on the same logical owner across a native
+            # compaction continuation, just like the narrative stream.
+            fields = {"_cc_remote_usage": usage.usage.model_dump()}
+            m = {**m, **fields}
+            managed_queue_message = {**managed_queue_message, **fields}
+            raw_size = self._notification_wire_size(m)
+        managed_queue_raw_size = (
+            raw_size
+            if managed_queue_message is m
+            else self._notification_wire_size(managed_queue_message)
+        )
         # Some app-server revisions may report a nested terminal before the
         # outer Review finishes its exitedReviewMode/agentMessage lifecycle.  It
         # is not the managed turn's terminal and must not close the queue.
         if method == "turn/completed" and review_execution_frame:
             self._review_execution_turn_id = None
             return
-        if method == "thread/compacted":
+        if (
+            method == "thread/compacted"
+            or self._notification_is_context_compaction(m)
+        ):
+            self.last_token_usage = None
+            self._context_usage_turn_id = None
+            # Wait for a post-compaction notification. The rollout can still
+            # be flushing, and recovering its old tail would revive the high
+            # pre-compaction gauge immediately after the context was reset.
+            self._rollout_context_recovery_attempted = True
             # This notification has already passed exact thread/turn routing.
             # Freeze its native owner now; a later different turn cannot inherit
             # the continuation right.
@@ -3830,6 +7246,8 @@ class CodexHandle:
                 and compacted_turn_id == self.turn_id
             ):
                 self._compaction_continuation_turn_id = compacted_turn_id
+                self._arm_managed_compaction_continuation(
+                    compacted_turn_id)
         compact_continuation_boundary = False
         if method == "turn/completed":
             params = m.get("params")
@@ -3843,13 +7261,40 @@ class CodexHandle:
                 and target_turn_id == self._compaction_continuation_turn_id
                 and target_turn_id == self.turn_id
                 and self.turn_active
+                and self._explicit_interrupt_turn != (self._generation, target_turn_id)
             )
             if compact_continuation_boundary:
-                # Do not deliver a false terminal to either managed or
-                # spontaneous consumers. Consume the one-shot proof so a later
-                # genuine interrupt of this turn still closes normally.
                 self._compaction_continuation_turn_id = None
-                return
+                fence = self._managed_compaction_continuation
+                if (
+                    fence is not None
+                    and fence.suppression_enabled
+                    and not fence.interruption_consumed
+                    and self._managed_compaction_fence_current(
+                        fence, check_deadline=False)
+                    and target_turn_id == fence.native_turn_id
+                ):
+                    # Delay this otherwise-authoritative terminal briefly. A
+                    # same-id item or exact replacement turn confirms compact
+                    # continuation; silence releases the real interrupt instead
+                    # of leaving the UI permanently running.
+                    fence.interruption_consumed = True
+                    fence.awaiting_replacement = True
+                    fence.deadline = (
+                        asyncio.get_running_loop().time()
+                        + _COMPACTION_CONTINUATION_GRACE_SECONDS
+                    )
+                    fence.suppressed_terminal = m
+                    fence.suppressed_size = raw_size
+                    fence.settled.clear()
+                    fence.expiry_task = asyncio.create_task(
+                        self._expire_managed_compaction_continuation(fence)
+                    )
+                    return
+                # Existing private/spontaneous behavior: compact is the only
+                # proof that one interrupted boundary is non-terminal.
+                if fence is None:
+                    return
         completed_spontaneous_turn_id: Optional[str] = None
         if method == "thread/started" and not self.thread_id:
             self.thread_id = _thread_id_of_notif(m)
@@ -3865,6 +7310,11 @@ class CodexHandle:
             was_active = self.turn_active
             turn = (m.get("params") or {}).get("turn") or {}
             turn_id = turn.get("id")
+            if (not was_active and not review_execution_frame
+                    and isinstance(turn_id, str) and turn_id
+                    and self._manual_compact_request is not None
+                    and self._manual_compact_candidate is None):
+                self._manual_compact_candidate = turn_id
             if (isinstance(turn_id, str) and turn_id
                     and not review_execution_frame):
                 if self._compaction_continuation_turn_id not in {
@@ -3873,6 +7323,25 @@ class CodexHandle:
                     self._compaction_continuation_turn_id = None
                 self.turn_id = turn_id
                 self.remember_owned_turn_id(turn_id)
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and self._goal_prompt_candidate is not None
+            ):
+                if not was_active and not review_execution_frame:
+                    objective = self._claim_goal_prompt_candidate()
+                    if objective is not None:
+                        self._goal_prompt_pending[turn_id] = objective
+                        self._goal_prompt_pending.move_to_end(turn_id)
+                        while len(self._goal_prompt_pending) > 8:
+                            self._goal_prompt_pending.popitem(last=False)
+                        self._observe_goal_objective(
+                            objective,
+                            turn_id=turn_id,
+                        )
+                # Managed query/review turns have their own authoritative user
+                # boundary. Never let a stale Goal candidate steal one.
+                self._goal_prompt_candidate = None
             self.turn_active = True
             if (not was_active and isinstance(turn_id, str) and turn_id
                     and not review_execution_frame):
@@ -3891,6 +7360,7 @@ class CodexHandle:
             tu = (m.get("params") or {}).get("tokenUsage")
             if isinstance(tu, dict):
                 self.last_token_usage = tu
+                self._context_usage_turn_id = _notification_turn_id(m)
                 # modelContextWindow is the SERVER-authoritative window (e.g. 258400);
                 # keep the last non-null value so get_context_usage always has it.
                 mcw = tu.get("modelContextWindow")
@@ -3903,6 +7373,10 @@ class CodexHandle:
                     and isinstance(settings, dict)):
                 self._apply_thread_settings(settings)
                 self._thread_settings_updated.set()
+                if "serviceTier" in settings:
+                    tier = normalize_service_tier(self.service_tier)
+                    await self._publish_runtime_event(Fast(
+                        on=tier != "default", tier=tier))
         elif method == "thread/status/changed":
             params = m.get("params") or {}
             status = params.get("status")
@@ -3944,17 +7418,97 @@ class CodexHandle:
                         error_type=type(exc).__name__,
                     )
                 else:
-                    self.last_goal = goal
-                    self.goal_revision += 1
-                    turn_id = params.get("turnId")
-                    self.last_goal_turn_id = (
-                        turn_id if isinstance(turn_id, str) and turn_id else None
+                    raw_turn_id = params.get("turnId")
+                    explicit_goal_update = (
+                        "turnId" in params and raw_turn_id is None
                     )
+                    turn_id = (
+                        raw_turn_id
+                        if isinstance(raw_turn_id, str) and raw_turn_id
+                        else None
+                    )
+                    if self._is_superseded_goal_update(goal, turn_id):
+                        log.warning(
+                            "superseded codex goal notification ignored",
+                            thread_id=self.thread_id,
+                            incoming_status=goal.get("status"),
+                        )
+                        return
+                    previous_objective = self._goal_objective_baseline
+                    previous_goal_turn_id = self.last_goal_turn_id
+                    objective = goal.get("objective")
+                    created_at = goal.get("createdAt")
+                    updated_at = goal.get("updatedAt")
+                    objective_changed = bool(
+                        isinstance(objective, str)
+                        and objective
+                        and objective != previous_objective
+                        and (
+                            self._goal_baseline_loaded
+                            or (
+                                isinstance(created_at, (int, float))
+                                and not isinstance(created_at, bool)
+                                and created_at == updated_at
+                            )
+                        )
+                    )
+                    self.last_goal = goal
+                    if isinstance(objective, str) and objective:
+                        self._goal_objective_baseline = objective
+                        self._goal_baseline_loaded = True
+                    self.goal_revision += 1
+                    self._goal_status_baseline = goal.get("status")
+                    self.last_goal_turn_id = turn_id
+                    self._observe_goal_objective(
+                        objective,
+                        previous_objective=previous_objective,
+                        turn_id=turn_id,
+                        previous_turn_ids=(
+                            {previous_goal_turn_id}
+                            if previous_goal_turn_id is not None else set()
+                        ),
+                        authoritative=(
+                            explicit_goal_update
+                            or (
+                                isinstance(previous_objective, str)
+                                and isinstance(objective, str)
+                                and previous_objective != objective
+                            )
+                        ),
+                    )
+                    if goal.get("status") != "active":
+                        self._goal_prompt_candidate = None
+                    else:
+                        self._refresh_goal_prompt_candidate(objective)
+                    if objective_changed and goal.get("status") == "active":
+                        if self.last_goal_turn_id is not None:
+                            self._goal_prompt_pending[
+                                self.last_goal_turn_id
+                            ] = objective
+                            self._goal_prompt_pending.move_to_end(
+                                self.last_goal_turn_id
+                            )
+                            while len(self._goal_prompt_pending) > 8:
+                                self._goal_prompt_pending.popitem(last=False)
+                            self._goal_prompt_candidate = None
+                        else:
+                            candidate = self._goal_prompt_candidate
+                            if (
+                                candidate is None
+                                or candidate.objective != objective
+                            ):
+                                self._seed_goal_prompt_candidate(objective)
                     await self._publish_goal(goal)
         elif method == "thread/goal/cleared":
             params = m.get("params") or {}
             if params.get("threadId") == self.thread_id:
                 self.last_goal = None
+                self._goal_objective_baseline = None
+                self._goal_status_baseline = None
+                self._goal_baseline_loaded = True
+                self._goal_prompt_pending.clear()
+                self._goal_prompt_candidate = None
+                self._goal_replacement_fence = None
                 self.goal_revision += 1
                 self.last_goal_turn_id = None
                 await self._publish_goal(None)
@@ -3963,6 +7517,8 @@ class CodexHandle:
             self.turn_active = False
             turn = (m.get("params") or {}).get("turn") or {}
             completed_turn_id = turn.get("id")
+            if isinstance(completed_turn_id, str):
+                self._goal_prompt_pending.pop(completed_turn_id, None)
             spontaneous_turn_id = self._spontaneous_turn_id
             if (
                 spontaneous_turn_id is not None
@@ -3974,10 +7530,12 @@ class CodexHandle:
             await self._restore_http_provider_state()
         if self._turn_q is not None and _is_turn_queue_notification(method):
             queue = self._turn_q
-            if not self._queue_managed_notification(m, raw_size):
+            if not self._queue_managed_notification(
+                managed_queue_message, managed_queue_raw_size,
+            ):
                 # Compatibility for narrow unit tests which inject an
                 # asyncio.Queue directly instead of opening the live bridge.
-                await queue.put(m)
+                await queue.put(managed_queue_message)
                 if method == "turn/completed":
                     await queue.put(None)
         elif (_is_turn_queue_notification(method)
@@ -3991,12 +7549,15 @@ class CodexHandle:
             completed_turn_id = _notification_turn_id(m)
             if completed_turn_id == self.turn_id:
                 self.turn_id = None
+            self._discard_managed_compaction_continuation()
             if (self._review_active
                     and completed_turn_id == self._review_outer_turn_id):
                 self._clear_review_tracking()
+            if completed_turn_id is not None:
+                self._active_stream_turn_ids.clear()
 
     @staticmethod
-    def _force_turn_sentinel(queue: Any) -> None:
+    def _force_turn_sentinel(queue: Any, item: object = None) -> None:
         """Wake a consumer during disconnect even when the bounded queue is full."""
         if isinstance(queue, _SpontaneousNotificationQueue):
             # The reserved end slot never competes with live frames. An existing
@@ -4004,22 +7565,22 @@ class CodexHandle:
             # the consumer after its retained live tail drains.
             if queue.has_turn_completed():
                 return
-            queue.put_end_nowait(None)
+            queue.put_end_nowait(item)
             return
         try:
-            offered = queue.put_nowait(None)
+            offered = queue.put_nowait(item)
             if offered is False:
                 clear = getattr(queue, "clear", None)
                 if clear is not None:
                     clear()
-                    queue.put_nowait(None)
+                    queue.put_nowait(item)
         except asyncio.QueueFull:
             try:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
             try:
-                queue.put_nowait(None)
+                queue.put_nowait(item)
             except asyncio.QueueFull:
                 pass
 
@@ -4282,7 +7843,8 @@ def _runtime_event_key(event: RuntimeEvent) -> str:
 
 
 def _nonnegative_int(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (isinstance(value, bool) or not isinstance(value, int) or value < 0
+            or value > MAX_SAFE_WIRE_INTEGER):
         return None
     return value
 
@@ -4563,3 +8125,62 @@ def _sanitize_rate_limits(response: dict) -> list[dict]:
             "secondary": _sanitize_rate_window(snapshot.get("secondary")),
         })
     return out
+
+
+def _sanitize_rate_limit_reset_credits(value: Any) -> Optional[dict]:
+    """Copy only the bounded earned-reset-credit account surface.
+
+    Paid credit balances and spend controls live beside this payload upstream
+    and are deliberately not inspected here. Opaque ids are never truncated:
+    an oversized id drops its detail row so it cannot redeem a different item.
+    """
+    if not isinstance(value, dict):
+        return None
+    available_count = _nonnegative_int(value.get("availableCount"))
+    if available_count is None:
+        return None
+    raw_credits = value.get("credits")
+    if raw_credits is not None and not isinstance(raw_credits, list):
+        return None
+    credits = None
+    if isinstance(raw_credits, list):
+        credits = []
+        for raw in raw_credits[:MAX_STATUS_RESET_CREDITS]:
+            if not isinstance(raw, dict):
+                continue
+            credit_id = raw.get("id")
+            granted_at = _nonnegative_int(raw.get("grantedAt"))
+            if (
+                not isinstance(credit_id, str)
+                or not 1 <= len(credit_id) <= 512
+                or granted_at is None
+                or granted_at > MAX_SAFE_WIRE_TIMESTAMP_SECONDS
+            ):
+                continue
+            expires_at = raw.get("expiresAt")
+            if expires_at is not None:
+                expires_at = _nonnegative_int(expires_at)
+                if (
+                    expires_at is None
+                    or expires_at > MAX_SAFE_WIRE_TIMESTAMP_SECONDS
+                ):
+                    continue
+            reset_type = raw.get("resetType")
+            if reset_type not in {"codexRateLimits", "unknown"}:
+                reset_type = "unknown"
+            status = raw.get("status")
+            if status not in {
+                "available", "redeeming", "redeemed", "unknown",
+            }:
+                status = "unknown"
+            credits.append({
+                "id": credit_id,
+                "granted_at": granted_at,
+                "expires_at": expires_at,
+                "reset_type": reset_type,
+                "status": status,
+                "title": _bounded_string(raw.get("title"), 256),
+                "description": _bounded_string(
+                    raw.get("description"), 2048),
+            })
+    return {"available_count": available_count, "credits": credits}

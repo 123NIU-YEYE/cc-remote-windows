@@ -17,9 +17,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-if sys.platform != "win32":
+# The Claude PTY broker is Unix-only (Unix sockets). Import its default socket
+# path opportunistically so configuration keeps loading on Windows, where the
+# broker is unavailable and its setting is never used.
+try:  # pragma: no cover - exercised on Unix
     from cc_remote.claude_broker.paths import default_socket_path
-
+except ImportError:  # pragma: no cover - Windows
+    def default_socket_path() -> str:  # type: ignore[misc]
+        """No broker socket exists on this platform."""
+        return ""
+from cc_remote.claude_profiles import ClaudeProfileRegistry
+from cc_remote.codex_profiles import CodexProfileRegistry
 
 try:
     from dotenv import load_dotenv
@@ -89,6 +97,90 @@ def _wrapper_value(env_key: str, file_key: str, default: str) -> str:
     if explicit is not None and explicit.strip():
         return explicit
     return _load_device_config().get(file_key, default)
+
+
+def _codex_profiles_json() -> str:
+    inline = _env("CC_REMOTE_CODEX_PROFILES_JSON", "").strip()
+    if inline:
+        return inline
+    configured = _env("CC_REMOTE_CODEX_PROFILES_FILE", "").strip()
+    if not configured:
+        return ""
+    path = Path(configured).expanduser()
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise ValueError("profile file is not a bounded regular file")
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        raise ValueError(f"invalid Codex profile file: {path}") from exc
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise ValueError(f"invalid Codex profile file: {path}")
+    return payload.strip()
+
+
+def _claude_profiles_json() -> str:
+    inline = _env("CC_REMOTE_CLAUDE_PROFILES_JSON", "").strip()
+    if inline:
+        return inline
+    configured = _env("CC_REMOTE_CLAUDE_PROFILES_FILE", "").strip()
+    # Older installed macOS LaunchAgents predate the explicit profile-file key.
+    # launchd injects the exact XPC service name, so keep only those permanent
+    # managed jobs forward compatible without making an ordinary source/test
+    # process implicitly read a real user's registry on macOS.
+    if (not configured
+            and sys.platform == "darwin"
+            and _env("XPC_SERVICE_NAME", "").strip() in {
+                "com.muggle.cc-remote.wrapper",
+                "com.mugglepro.cc-remote-wrapper",
+            }):
+        configured = str(
+            Path.home() / ".cc-remote" / "claude-profiles.json")
+    if not configured:
+        return ""
+    path = Path(configured).expanduser()
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise ValueError("profile file is not a bounded regular file")
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        raise ValueError(f"invalid Claude profile file: {path}") from exc
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise ValueError(f"invalid Claude profile file: {path}")
+    return payload.strip()
+
+
+def _claude_service_socket(key: str = "socket") -> str:
+    env_key = ("CC_REMOTE_CLAUDE_SERVICE_SOCKET" if key == "socket"
+               else "CC_REMOTE_CLAUDE_SERVICE_DRAIN_SOCKET")
+    explicit = os.environ.get(env_key)
+    if explicit is not None:
+        return explicit.strip()
+    # A system-managed Wrapper can use its user's private registration without
+    # granting that user permission to rewrite root-owned service credentials.
+    directory = Path(_env("CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote"))).expanduser()
+    path = directory / "claude-service.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(fd, "r") as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_size > 4096):
+            raise ValueError("Claude service registration must be a private user-owned file")
+        payload = json.loads(source.read(4097))
+    if not isinstance(payload, dict) or not isinstance(payload.get("socket"), str):
+        raise ValueError("invalid Claude service registration")
+    value = payload.get(key, "")
+    if not isinstance(value, str):
+        raise ValueError("invalid Claude service registration")
+    return value
 
 
 def _default_device_db_path() -> str:
@@ -168,16 +260,32 @@ class RelayConfig:
     )
     push_db_path: str = field(default_factory=lambda: _env(
         "PUSH_DB_PATH", str(Path.home() / ".cc-remote" / "relay-push.sqlite3")))
+    # Optional HarmonyOS channel. The private Huawei service-account JSON stays
+    # outside releases; Web Push keeps its independent VAPID configuration.
+    harmony_push_service_account: str = field(default_factory=lambda: _env(
+        "HARMONY_PUSH_SERVICE_ACCOUNT", "").strip())
+    harmony_push_category: str = field(default_factory=lambda: _env(
+        "HARMONY_PUSH_CATEGORY", "MARKETING").strip())
+    harmony_push_test_message: bool = field(default_factory=lambda: _bool(
+        "HARMONY_PUSH_TEST_MESSAGE"))
     # Persistent enrollment metadata and hashed per-device credentials. This
     # database never contains conversations, artifacts, or plaintext tokens.
     device_db_path: str = field(default_factory=lambda: _env(
         "DEVICE_DB_PATH", _default_device_db_path()))
     device_pairing_ttl_seconds: int = field(
         default_factory=lambda: _int("DEVICE_PAIRING_TTL_SECONDS", 600))
+    # Empty mode preserves an explicitly configured legacy isolated host;
+    # otherwise the default bridge needs no extra DNS, port or certificate.
+    viewer_mode: str = field(default_factory=lambda: _env("VIEWER_MODE", "").strip())
+    viewer_origin_template: str = field(default_factory=lambda: _env(
+        "VIEWER_ORIGIN_TEMPLATE", "").strip())
 
 
 @dataclass
 class WrapperConfig:
+    # Local agent messaging is opt-in and never changes account MCP settings.
+    session_messages_enabled: bool = field(default_factory=lambda: _bool(
+        "CC_REMOTE_SESSION_MESSAGES", False))
     relay_url: str = field(default_factory=lambda: _wrapper_value(
         "RELAY_URL", "relay_url", "ws://127.0.0.1:8765/ws"))
     # Token the wrapper presents to the relay at WS upgrade (must match the
@@ -197,20 +305,36 @@ class WrapperConfig:
     # shell. An explicit absolute CLAUDE_BIN may override this standard path,
     # but an empty value must never silently select the SDK-bundled executable.
     claude_bin: str = field(default_factory=_claude_bin)
+    # Optional account registry. Each entry owns one complete
+    # CLAUDE_CONFIG_DIR. Empty preserves the historical single-account path.
+    claude_profiles_json: str = field(
+        default_factory=_claude_profiles_json)
+    # Optional local DSH control credential, created by dsh_pair.
+    dsh_connection_file: str = field(default_factory=lambda: _env(
+        "CC_REMOTE_DSH_CONNECTION_FILE", "").strip())
     # Optional proxy inherited only by Codex subprocesses launched by this
     # wrapper.  It deliberately does not mutate the wrapper process or the
     # user's shell/CLI environment.
     codex_proxy: str = field(
         default_factory=lambda: _env("CC_REMOTE_CODEX_PROXY", "").strip())
+    # Optional account registry. Each entry owns a complete CODEX_HOME and an
+    # independent app-server daemon. Empty preserves the historical single-home
+    # behavior using CODEX_HOME (or ~/.codex).
+    codex_profiles_json: str = field(
+        default_factory=_codex_profiles_json)
     # Optional local PTY broker used only by the explicit `claude-remote`
     # experiment. It is intentionally disabled in the supported product path:
     # direct native Claude owners are mirrored read-only and explicitly taken
     # over by the SDK instead of sharing a PTY input state machine.
-    claude_broker_socket: str = field(
-        default_factory=(
-            default_socket_path if sys.platform != "win32" else lambda: ""
-        )
-    )
+    claude_broker_socket: str = field(default_factory=default_socket_path)
+    # Installed separately from the Wrapper's service/cgroup. An empty value
+    # retains the in-process SDK for unmanaged development installations.
+    claude_service_socket: str = field(
+        default_factory=lambda: _env("CC_REMOTE_CLAUDE_SERVICE_SOCKET", ""))
+    # During an SDK-service upgrade, existing native work may finish on the
+    # previous service while newly opened sessions use the primary socket.
+    claude_service_drain_socket: str = field(
+        default_factory=lambda: _env("CC_REMOTE_CLAUDE_SERVICE_DRAIN_SOCKET", ""))
     experimental_claude_broker: bool = field(
         default_factory=lambda: _bool(
             "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER", False))
@@ -248,12 +372,6 @@ class WrapperConfig:
     # Seconds to wait for the terminal ResultMessage after interrupt() before
     # forcing an SDK reconnect (drain safety net).
     drain_timeout: float = field(default_factory=lambda: _float("DRAIN_TIMEOUT", 15.0))
-    # A Codex turn may legitimately run for a long time, so this is a warning,
-    # not an automatic interrupt. Any raw app-server event resets the idle clock.
-    # Set 0 to disable.
-    codex_turn_idle_warn_seconds: float = field(
-        default_factory=lambda: _float("CODEX_TURN_IDLE_WARN_SECONDS", 90.0)
-    )
     # Code sessions prefer Codex's official shared app-server daemon so the
     # native TUI and Remote can attach to the same thread/control plane. Work
     # intentionally keeps its private stdio app-server for isolation.
@@ -435,6 +553,13 @@ def validate_relay_config(cfg: RelayConfig) -> None:
     if not (60 <= cfg.device_pairing_ttl_seconds <= 3600):
         errors.append("DEVICE_PAIRING_TTL_SECONDS must be between 60 and 3600")
 
+    if cfg.harmony_push_category not in {"MARKETING", "WORK"}:
+        errors.append("HARMONY_PUSH_CATEGORY must be MARKETING or WORK")
+    if cfg.harmony_push_service_account and (
+            not Path(cfg.harmony_push_service_account).expanduser().is_absolute()
+            or "\x00" in cfg.harmony_push_service_account):
+        errors.append("HARMONY_PUSH_SERVICE_ACCOUNT must be an absolute path")
+
     origin = cfg.public_origin.strip()
     try:
         parsed = urlsplit(origin)
@@ -480,17 +605,50 @@ def validate_relay_config(cfg: RelayConfig) -> None:
             ):
                 errors.append("PUBLIC_ORIGIN must use https except on loopback")
 
+    from cc_remote.relay.viewer import effective_viewer_mode, validate_origin_template
+    try:
+        mode = effective_viewer_mode(cfg)
+        if mode not in {"off", "bridge", "isolated"}:
+            raise ValueError("VIEWER_MODE must be off, bridge or isolated")
+        if mode == "isolated":
+            if not cfg.viewer_origin_template:
+                raise ValueError("isolated Viewer mode needs VIEWER_ORIGIN_TEMPLATE")
+            validate_origin_template(cfg.viewer_origin_template, cfg.public_origin)
+    except ValueError as exc:
+        errors.append(str(exc))
+
     if errors:
         raise ValueError("invalid relay configuration: " + "; ".join(errors))
 
 
 def wrapper_config() -> WrapperConfig:
-    return WrapperConfig()
+    # Read the opt-in installation registration only at actual Wrapper startup;
+    # constructing test/development config objects must not attach live workers.
+    return WrapperConfig(claude_service_socket=_claude_service_socket(),
+                         claude_service_drain_socket=_claude_service_socket("drain_socket"))
 
 
 def validate_wrapper_config(cfg: WrapperConfig) -> None:
     """Reject credentials or relay URLs that could expose wrapper authority."""
     errors: list[str] = []
+    try:
+        claude_profiles = ClaudeProfileRegistry.from_json(
+            cfg.claude_profiles_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+        claude_profiles = None
+    try:
+        CodexProfileRegistry.from_json(cfg.codex_profiles_json)
+    except ValueError as exc:
+        errors.append(str(exc))
+    if (
+        claude_profiles is not None
+        and claude_profiles.is_multi_profile
+        and cfg.experimental_claude_broker
+    ):
+        errors.append(
+            "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER is not supported with "
+            "multiple Claude profiles")
     if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
     if not valid_machine_id(cfg.machine_id):
@@ -558,6 +716,19 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
         elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
             errors.append(
                 "CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
+    if cfg.claude_service_socket:
+        service_socket = os.path.expanduser(cfg.claude_service_socket)
+        if (not os.path.isabs(service_socket) or "\x00" in service_socket
+                or len(os.fsencode(service_socket)) > 103):
+            errors.append("CC_REMOTE_CLAUDE_SERVICE_SOCKET must be an absolute Unix socket path of at most 103 bytes")
+        if cfg.experimental_claude_broker:
+            errors.append("Claude SDK service and experimental PTY broker cannot be enabled together")
+    if cfg.claude_service_drain_socket:
+        drain_socket = os.path.expanduser(cfg.claude_service_drain_socket)
+        if (not cfg.claude_service_socket or not os.path.isabs(drain_socket)
+                or "\x00" in drain_socket or len(os.fsencode(drain_socket)) > 103
+                or drain_socket == os.path.expanduser(cfg.claude_service_socket)):
+            errors.append("CC_REMOTE_CLAUDE_SERVICE_DRAIN_SOCKET requires a distinct absolute Unix socket path")
 
     if not (12 * 1024 * 1024 <= cfg.ws_max_size_bytes <= 64 * 1024 * 1024):
         errors.append("WS_MAX_SIZE_BYTES must be between 12582912 and 67108864")
@@ -593,12 +764,7 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
             "CODEX_HISTORY_WINDOW_MAX_BYTES must be between 1048576 and 268435456")
     if not (0 < cfg.drain_timeout <= 300):
         errors.append("DRAIN_TIMEOUT must be greater than 0 and at most 300")
-    if (cfg.codex_turn_idle_warn_seconds != 0
-            and not (5 <= cfg.codex_turn_idle_warn_seconds <= 3600)):
-        errors.append(
-            "CODEX_TURN_IDLE_WARN_SECONDS must be 0 or between 5 and 3600")
     if cfg.codex_daemon_mode not in {"auto", "off"}:
         errors.append("CC_REMOTE_CODEX_DAEMON must be auto or off")
-
     if errors:
         raise ValueError("invalid wrapper configuration: " + "; ".join(errors))

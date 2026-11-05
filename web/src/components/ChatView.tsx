@@ -1,31 +1,50 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
+  type Ref,
   type PointerEvent,
   type TouchEvent,
   type WheelEvent,
 } from "react";
 import {
   defaultRangeExtractor,
+  elementScroll,
   useVirtualizer,
 } from "@tanstack/react-virtual";
-import type { Turn } from "../domain/conversation";
+import type {
+  ProcessBlock, TextBlock, Turn,
+} from "../domain/conversation";
 import type { Space } from "../protocol";
+import type { LoadTurnFilePage } from "../turn-file-pages";
+import { usageForTurn, type TurnUsageReadings } from "../turn-usage";
 import { MessageBlock } from "./MessageBlock";
-import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
+import { assistantContinuations, type AssistantContinuation } from "../assistant-continuations";
+import { returnRunId, returnedAgents } from "../agent-returns";
+import { TimedMessageTag } from "./TimedMessageTag";
+import { Icon, ClaudeMark, EngineWorking, EngineDone } from "../icons";
 import { canForkTurn } from "../session-worktree";
-import { ProcessTimeline } from "./ProcessTimeline";
+import { sidebarDragIntent } from "../responsive-layout";
+import {
+  GeneratedImagePreview,
+  ProcessTimeline,
+} from "./ProcessTimeline";
 import {
   finalTextBlocks,
+  generatedImageIdentity,
+  generatedOutputImages,
+  modelFallbackNotices,
   hasActiveProcess,
-  processBlocks,
+  presentableProcessBlocks,
 } from "../process-blocks";
-import { isMarkdownPath } from "../preview-path";
-import { collectTurnFileChanges } from "../file-changes";
+import { TurnChangesPanel } from "./TurnChangesPanel";
 import type { InlineImageAsset } from "../inline-image-assets";
 import type { PreviewAuthorizationState } from "../reducer";
 import {
@@ -34,7 +53,7 @@ import {
   type HistoryImageVariant,
 } from "../history-image-assets";
 import { ImageLightbox } from "./ImageLightbox";
-import { presentHistoricalTurnProblem } from "../problem-presentation";
+import TurnProblem from "./TurnProblem";
 import { queryImageDimensions } from "../img";
 import {
   updateTurnKeySnapshot,
@@ -43,8 +62,10 @@ import {
 import { TurnImagePreviewCache } from "../turn-image-previews";
 import type { TextSelectionGuard } from "../history-selection-guard";
 import { HistoryUserImage } from "./HistoryUserImage";
+import { UserImageButton } from "./UserImageButton";
 import {
   HistoryAnchorController,
+  HistoryPageActivityController,
   historyPageStatus,
   isAtHistoryEdge,
   isAtLatestEdge,
@@ -54,6 +75,7 @@ import {
   shouldAutoLoadNewerHistory,
   ScrollFollowController,
   type HistoryAnchorPoint,
+  type HistoryPageActivity,
   type HistoryPageDirection,
   type ScrollFollowSnapshot,
   type ScrollMetrics,
@@ -67,6 +89,15 @@ import {
   HISTORY_REQUEST_TIMEOUT_MS,
 } from "../history-requests";
 import { mergeDetailWithLiveTail } from "../history-merge";
+import { presentAsyncQuestionReplies } from "../async-question-presentation";
+import type { QueryAcceptanceResult } from "../outbox";
+
+const SessionMessageLinks = lazy(() => import("./SessionMessageLinks"));
+const TurnUsageIndicator = lazy(() => import("./TurnUsageIndicator").then(m => ({ default: m.TurnUsageIndicator })));
+const DshProducedFiles = lazy(() => import("./DshProducedFiles"));
+const AsyncQuestionCard = lazy(() => import("./AsyncQuestionCard"));
+const AsyncQuestionHost = lazy(() => import("./AsyncQuestionDialog"));
+const PagePreviewLinks = lazy(() => import("./PagePreviewLinks").then((module) => ({ default: module.PagePreviewLinks })));
 
 const WHEEL_GESTURE_IDLE_MS = 180;
 const HISTORY_VIRTUAL_ESTIMATE_PX = 280;
@@ -78,6 +109,10 @@ const THREAD_CONTENT_BOTTOM_PX = 8;
 const WORK_THREAD_CONTENT_TOP_PX = 26;
 const WORK_THREAD_CONTENT_BOTTOM_PX = 20;
 const USER_SCROLL_INTENT_IDLE_MS = 260;
+// Overlay scrollbars do not subtract their painted width from clientWidth.
+// Keep a small right-edge hit region for the native thumb while still
+// requiring the event target to be the scroll container itself.
+const SCROLLBAR_POINTER_GUTTER_PX = 14;
 // HistoryRequestCoordinator allows replacement after 15 seconds. Release the
 // local anchor just after that boundary so an unanswered command cannot lock
 // pagination forever.
@@ -111,6 +146,7 @@ interface RetainedMeasurementBoundary {
 }
 
 interface HistoryViewportPresentation {
+  sid: string | null;
   scope: string;
   authorityScope: string;
   generation: string | null;
@@ -122,13 +158,29 @@ interface HistoryViewportPresentation {
   windowEpoch: number;
 }
 
+interface HistoryPageRequestTransaction {
+  sid: string | null;
+  revision: string | null;
+  authorityScope: string;
+  viewId: string | null;
+  direction: HistoryPageDirection;
+  before: string | null;
+  windowEpoch: number;
+  activityKey: number;
+}
+
+interface HistoryViewportScopeTransition {
+  source: HistoryViewportPresentation;
+  request: HistoryPageRequestTransaction;
+  presentation: HistoryViewportPresentation;
+}
+
 function sameHistoryViewportPresentation(
   left: HistoryViewportPresentation,
   right: HistoryViewportPresentation,
 ): boolean {
   return left.scope === right.scope
     && left.authorityScope === right.authorityScope
-    && left.generation === right.generation
     && left.turns === right.turns
     && left.hasMore === right.hasMore
     && left.cursor === right.cursor
@@ -137,11 +189,29 @@ function sameHistoryViewportPresentation(
     && left.windowEpoch === right.windowEpoch;
 }
 
+function acceptedHistoryViewportTransition(
+  leaseActive: boolean,
+  transition: HistoryViewportScopeTransition | null,
+  request: HistoryPageRequestTransaction | null,
+  presented: HistoryViewportPresentation,
+  incoming: HistoryViewportPresentation,
+): HistoryViewportPresentation | null {
+  if (!leaseActive || !transition || !request) return null;
+  if (request !== transition.request
+      || presented.scope !== transition.source.scope
+      || presented.authorityScope !== transition.source.authorityScope
+      || incoming.scope !== transition.presentation.scope
+      || incoming.authorityScope !== transition.presentation.authorityScope
+      || incoming.generation !== transition.presentation.generation
+      || !incoming.browseMode) return null;
+  return transition.presentation;
+}
+
 interface TextSelectionRetention {
   scope: string;
   anchorTurnId: string;
   focusTurnId: string;
-  pointerId: number;
+  pointerId: number | null;
   interactionToken: number | null;
   dragging: boolean;
   releaseAnchorTurnId: string | null;
@@ -151,6 +221,13 @@ interface TextSelectionRetention {
 interface TextSelectionCandidate {
   scope: string;
   pointerId: number;
+}
+
+function nativeSelectionBoundary(selection: Selection) {
+  return {
+    anchor: selection.anchorNode, anchorOffset: selection.anchorOffset,
+    focus: selection.focusNode, focusOffset: selection.focusOffset,
+  };
 }
 
 const TEXT_SELECTION_EXCLUDED_SELECTOR = [
@@ -172,6 +249,7 @@ function selectionTurnId(
 ): string | null {
   if (!root || !node || !root.contains(node)) return null;
   const element = node instanceof Element ? node : node.parentElement;
+  if (element?.closest("input, textarea, select, [contenteditable='true']")) return null;
   return element?.closest<HTMLElement>("[data-turn-id]")?.dataset.turnId ?? null;
 }
 
@@ -200,6 +278,9 @@ interface HistoryPageLoadAcceptance {
   accepted: true;
   /** The first runtime page creates its browse view synchronously in App. */
   viewId?: string;
+  /** The first runtime page also freezes its new cache authority scope. */
+  scopeKey?: string;
+  generation?: string | null;
 }
 
 type HistoryPageLoadResult = boolean | HistoryPageLoadAcceptance;
@@ -234,7 +315,11 @@ function detailTurnFingerprint(turn: Turn): string {
   ].join("\u0000");
 }
 
-export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading,
+export interface ChatViewHandle {
+  prepareLayoutChange: () => void;
+}
+
+export function ChatView({ ref, sid, turnUsage, turns: incomingTurns, engine = "claude", loading,
   hasMore: incomingHasMore,
   historyPagingReady = true,
   historyRevision = null, historyViewRevision = historyRevision,
@@ -244,16 +329,25 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyCursor: incomingHistoryCursor = null,
   browseMode: incomingBrowseMode = false, hasNewer: incomingHasNewer = false,
   onLoadMore, onLoadNewer, onReturnLatest,
-  onLoadDetail, onEdit, onOpenTurnDiff, onPreviewMarkdown, onOpenFile,
+  onLoadDetail, onEdit, onReplyAsyncQuestion, asyncReplyMode, pendingReplyId, onOpenTurnDiff, onOpenArchivedDiff, onLoadFilePage, onPreviewMarkdown, onOpenFile,
   onOpenArtifacts, onFork, forkingPointId, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
+  externalPlanProgress,
+  onOpenAgent,
+  sessionLink, onOpenSession,
+  activeTurnId = null,
+  ambiguousActiveTurnIds = [],
   surface = "code" }: {
+  ref?: Ref<ChatViewHandle>;
+  sessionLink?: (nativeId: string) => { title: string; available: boolean };
+  onOpenSession?: (nativeId: string) => void;
+  turnUsage?: TurnUsageReadings;
   sid: string | null;
   turns: Turn[];
   surface?: Space;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
   loading?: boolean;
   hasMore?: boolean;
   historyPagingReady?: boolean;
@@ -278,8 +372,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     autoLoad?: boolean,
   ) => boolean;
   onEdit?: (prompt: string) => void;
+  onReplyAsyncQuestion?: (prompt: string) => Promise<QueryAcceptanceResult> | null;
+  asyncReplyMode?: "query" | "steer";
+  pendingReplyId?: string | null;
   onGetDiff?: (file: string) => void;
   onOpenTurnDiff?: (files: string[], diff: string) => void;
+  onOpenArchivedDiff?: (turnId: string, revision: string, path: string) => void;
+  onLoadFilePage?: LoadTurnFilePage;
   onPreviewMarkdown?: (file: string) => void;
   onOpenFile?: (file: string, line?: number) => void;
   onOpenArtifacts?: () => void;
@@ -296,12 +395,24 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string, imageId: string, variant: HistoryImageVariant,
   ) => boolean;
   onTextSelectionGuardChange?: (guard: TextSelectionGuard | null) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
+  externalPlanProgress?: {
+    turnId: string;
+    itemId: string;
+  } | null;
+  /** Exact displayed row owned by the still-running native task. Runtime-only:
+   * never infer this from array position, final text, or historical activity. */
+  activeTurnId?: string | null;
+  /** More than one displayed row exactly aliases the active native owner.
+   * Empty for idle/browse/missing-owner states, which must stay fail-closed. */
+  ambiguousActiveTurnIds?: readonly string[];
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
   const controllerRef = useRef<ScrollFollowController | null>(null);
   if (!controllerRef.current) controllerRef.current = new ScrollFollowController();
   const scrollCoordinatorRef = useRef(new ScrollCoordinator());
+  const applyingScrollCommandRef = useRef(false);
   const [scrollPolicyEpoch, setScrollPolicyEpoch] = useState(0);
   const [scrollState, setScrollState] = useState<ScrollFollowSnapshot>(() =>
     controllerRef.current!.snapshot());
@@ -311,17 +422,28 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     | null
   >(null);
   const historyAnchorRef = useRef(new HistoryAnchorController());
-  const historyRequestRef = useRef<{
-    sid: string | null;
-    revision: string | null;
-    viewId: string | null;
-    direction: HistoryPageDirection;
-    before: string | null;
-    windowEpoch: number;
-  } | null>(null);
+  const historyPageActivityRef = useRef(new HistoryPageActivityController());
+  const [historyPageActivity, setHistoryPageActivity] =
+    useState<HistoryPageActivity | null>(null);
+  const beginHistoryPageActivity = useCallback((
+    input: Omit<HistoryPageActivity, "key">,
+  ): HistoryPageActivity => {
+    const activity = historyPageActivityRef.current.begin(input);
+    setHistoryPageActivity(activity);
+    return activity;
+  }, []);
+  const completeHistoryPageActivity = useCallback((key?: number): boolean => {
+    if (!historyPageActivityRef.current.complete(key)) return false;
+    setHistoryPageActivity(null);
+    return true;
+  }, []);
+  const historyRequestRef = useRef<HistoryPageRequestTransaction | null>(null);
   const turnNodeRefs = useRef(new Map<string, HTMLDivElement>());
   const textSelectionCandidateRef = useRef<TextSelectionCandidate | null>(null);
   const textSelectionRef = useRef<TextSelectionRetention | null>(null);
+  const nativeSelectionBoundaryRef = useRef<ReturnType<typeof nativeSelectionBoundary> | null>(null);
+  const textSelectionReleaseFrameRef = useRef<number | null>(null);
+  const selectionScrollIntentFnRef = useRef<(() => void) | null>(null);
   const [textSelection, setTextSelection] =
     useState<TextSelectionRetention | null>(null);
   const detailAnchorRef = useRef<DetailAnchorTransaction | null>(null);
@@ -331,6 +453,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const historyReleaseFrameRef = useRef<number | null>(null);
   const historyRequestTimeoutRef = useRef<{
     generation: number | null;
+    activityKey: number;
     timer: number;
   } | null>(null);
   const historyLoadGateRef = useRef(new OlderHistoryLoadGate());
@@ -341,6 +464,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const lastScrollTopRef = useRef(0);
   const renderedScrollScopeRef = useRef<string | null>(null);
   const touchYRef = useRef<number | null>(null);
+  const touchOriginRef = useRef<{ x: number; y: number; vertical: boolean } | null>(null);
   const touchMomentumActiveRef = useRef(false);
   const touchEventClockOffsetRef = useRef<number | null>(null);
   const touchTransactionBoundaryRef =
@@ -349,17 +473,26 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const userScrollIntentRef = useRef(false);
   const userScrollDirectionRef = useRef<UserScrollDirection | null>(null);
   const userScrollIntentTimerRef = useRef<number | null>(null);
+  const scrollbarDragIntentRef = useRef<{
+    scope: string;
+    pointerId: number;
+  } | null>(null);
+  // A real downward gesture may finish while the final cached-newer page is
+  // still installing. Remember only that exact viewport scope so the settled
+  // page can hand back to the live runtime without requiring a second scroll.
+  const manualLatestIntentRef = useRef<string | null>(null);
   const turnKeySnapshotRef = useRef<TurnKeySnapshot | null>(null);
   const turnImagePreviewCacheRef = useRef(new TurnImagePreviewCache());
   // `historyViewRevision` is kept as a compatibility scope for the
   // non-destructive recovery path. Deep-history browsing supplies an explicit
   // stable view id: revision/view changes reset, window paging does not.
   const resolvedHistoryViewId = historyViewId ?? historyViewRevision ?? "";
-  const scrollScope = historyViewId == null
+  const incomingScrollScope = historyViewId == null
     ? `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${resolvedHistoryViewId}`
-    : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
+    : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${historyViewRevision ?? historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
   const incomingHistoryPresentation: HistoryViewportPresentation = {
-    scope: scrollScope,
+    sid,
+    scope: incomingScrollScope,
     authorityScope: [
       historyScopeKey ?? "", sid ?? "", historyRevision ?? "",
       historyGeneration ?? "",
@@ -378,10 +511,34 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const pendingHistoryPresentationRef =
     useRef<HistoryViewportPresentation | null>(null);
   const historyViewportLeaseRef = useRef(false);
+  const historyViewportTransitionRef =
+    useRef<HistoryViewportScopeTransition | null>(null);
   const [presentedHistory, setPresentedHistory] =
     useState<HistoryViewportPresentation>(incomingHistoryPresentation);
-  const scopedPresentedHistory = presentedHistory.scope === scrollScope
-    ? presentedHistory : incomingHistoryPresentation;
+  const transitionPresentation = acceptedHistoryViewportTransition(
+    historyViewportLeaseRef.current,
+    historyViewportTransitionRef.current,
+    historyRequestRef.current,
+    presentedHistory,
+    incomingHistoryPresentation,
+  );
+  // A revision/generation handoff can briefly expose an empty replacement.
+  // Keep the same session's complete old scope mounted until its rows arrive;
+  // same-authority rollback invalidation deliberately does not qualify.
+  const retainPendingHistory = loading && sid
+    && presentedHistory.sid === sid && presentedHistory.turns.length
+    && !incomingTurns.length
+    && presentedHistory.authorityScope
+      !== incomingHistoryPresentation.authorityScope;
+  const scopedPresentedHistory = retainPendingHistory
+    ? presentedHistory
+    : (presentedHistory.scope === incomingScrollScope
+      ? presentedHistory
+      : transitionPresentation ?? incomingHistoryPresentation);
+  // Every scroll/virtualization transaction must use the presentation's own
+  // scope. During a pending empty handoff that is intentionally the old scope,
+  // never the incoming revision's scope.
+  const scrollScope = scopedPresentedHistory.scope;
   const {
     turns,
     hasMore,
@@ -390,22 +547,40 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     hasNewer,
     windowEpoch: historyWindowEpoch,
   } = scopedPresentedHistory;
+  const supplemental = useMemo(() => presentAsyncQuestionReplies(turns, pendingReplyId), [turns, pendingReplyId]);
+  const asyncQuestionScope = JSON.stringify([historyScopeKey ?? "", sid]);
+  const [openAsyncQuestion, setOpenAsyncQuestion] = useState<{
+    scope: string; messageId: string | null;
+  } | null>(null);
+  useLayoutEffect(() => { setOpenAsyncQuestion(null); }, [asyncQuestionScope]);
   turnImagePreviewCacheRef.current.update(sid, turns);
 
   useLayoutEffect(() => {
     const incoming = latestHistoryPresentationRef.current;
+    if (retainPendingHistory) {
+      pendingHistoryPresentationRef.current = incoming;
+      return;
+    }
     if (presentedHistory.scope !== incoming.scope) {
-      if (historyViewportLeaseRef.current
-          && presentedHistory.authorityScope === incoming.authorityScope) {
-        // Entering the first deep-history browse view changes only its local
-        // view id before the network page arrives. Re-scope the unchanged base
-        // window without releasing the physical gesture; the later page for
-        // this new view will still be staged until touch/wheel idle.
-        pendingHistoryPresentationRef.current = null;
-        setPresentedHistory(incoming);
+      const retained = acceptedHistoryViewportTransition(
+        historyViewportLeaseRef.current,
+        historyViewportTransitionRef.current,
+        historyRequestRef.current,
+        presentedHistory,
+        incoming,
+      );
+      if (retained) {
+        // The first runtime page creates a cache-backed browse scope. Keep the
+        // exact pre-request rows mounted under that accepted target scope until
+        // the physical gesture ends; even a zero-latency response is staged.
+        pendingHistoryPresentationRef.current =
+          sameHistoryViewportPresentation(retained, incoming) ? null : incoming;
+        historyViewportTransitionRef.current = null;
+        setPresentedHistory(retained);
         return;
       }
       historyViewportLeaseRef.current = false;
+      historyViewportTransitionRef.current = null;
       pendingHistoryPresentationRef.current = null;
       setPresentedHistory(incoming);
       return;
@@ -419,7 +594,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [
     incomingBrowseMode, incomingHasMore, incomingHasNewer,
     incomingHistoryCursor, incomingHistoryWindowEpoch, incomingTurns,
-    presentedHistory, scrollScope,
+    incomingHistoryPresentation.authorityScope,
+    incomingScrollScope, presentedHistory, retainPendingHistory,
   ]);
 
   const beginHistoryViewportLease = useCallback(() => {
@@ -427,6 +603,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, []);
   const flushHistoryViewportLease = useCallback(() => {
     historyViewportLeaseRef.current = false;
+    historyViewportTransitionRef.current = null;
     const pending = pendingHistoryPresentationRef.current
       ?? latestHistoryPresentationRef.current;
     pendingHistoryPresentationRef.current = null;
@@ -567,6 +744,18 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const virtualAnchorTo = keyedPrependActive
       && activeHistoryAnchor?.direction === "newer"
     ? "end" : "start";
+  const canFollowLiveTail = useCallback(() =>
+    activeScrollScopeRef.current === scrollScope
+      && renderedScrollScopeRef.current === scrollScope
+      && !browseMode
+      && !!controllerRef.current?.isFollowing()
+      && !userScrollIntentRef.current
+      && touchYRef.current === null
+      && !wheelGestureActiveRef.current
+      && textSelectionRef.current === null
+      && historyAnchorRef.current.current() === null
+      && !scrollCoordinatorRef.current.isInteractionLocked(),
+  [browseMode, scrollScope]);
   const virtualizer = useVirtualizer({
     count: turns.length,
     getScrollElement: () => scrollRef.current,
@@ -578,6 +767,16 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     // remains owned by ChatView's measured-tail observer below.
     anchorTo: virtualAnchorTo,
     followOnAppend: virtualScrollPolicy.followOnAppend,
+    scrollToFn: (offset, options, instance) => {
+      // scrollToEnd keeps reconciling its target as streamed rows or the IME
+      // resize. Changing followOnAppend does not cancel that pending operation.
+      // Check ownership at the actual DOM write, including delayed corrections;
+      // otherwise they can fight the reader's anchor or impersonate momentum.
+      // Explicit history/detail offsets and scope resets own their synchronous
+      // write even when output following is paused.
+      if (!applyingScrollCommandRef.current && !canFollowLiveTail()) return;
+      elementScroll(offset, options, instance);
+    },
     scrollEndThreshold: 80,
     overscan: HISTORY_VIRTUAL_OVERSCAN,
     rangeExtractor: (range) => {
@@ -716,7 +915,6 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, []);
 
   const cancelHistoryAnchor = useCallback((generation?: number): boolean => {
-    clearHistoryRequestTimeout(generation);
     const activeGeneration =
       historyAnchorRef.current.current()?.generation ?? null;
     const cancelled = historyAnchorRef.current.cancel(generation);
@@ -731,7 +929,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
     setActiveHistoryGeneration(null);
     return cancelled;
-  }, [clearHistoryRequestTimeout]);
+  }, []);
 
   const syncScrollState = useCallback((next: ScrollFollowSnapshot) => {
     setScrollState((previous) =>
@@ -745,10 +943,15 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const el = scrollRef.current;
     const controller = controllerRef.current;
     if (!el || !controller) return;
-    if (command.kind === "bottom") {
-      virtualizer.scrollToEnd({ behavior: command.behavior });
-    } else {
-      virtualizer.scrollToOffset(command.offset, { behavior: "auto" });
+    applyingScrollCommandRef.current = true;
+    try {
+      if (command.kind === "bottom") {
+        virtualizer.scrollToEnd({ behavior: command.behavior });
+      } else {
+        virtualizer.scrollToOffset(command.offset, { behavior: "auto" });
+      }
+    } finally {
+      applyingScrollCommandRef.current = false;
     }
     lastScrollTopRef.current = el.scrollTop;
     syncScrollState(controller.recordProgrammaticScroll(readScrollMetrics(el)));
@@ -756,23 +959,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   const maintainFollowedLiveTail = useCallback(() => {
     const el = scrollRef.current;
-    const controller = controllerRef.current;
-    if (!el || !controller
-        || activeScrollScopeRef.current !== scrollScope
-        || renderedScrollScopeRef.current !== scrollScope
-        || browseMode
-        || !controller.isFollowing()
-        || userScrollIntentRef.current
-        || touchYRef.current !== null
-        || wheelGestureActiveRef.current
-        || textSelectionRef.current !== null
-        || historyAnchorRef.current.current() !== null
-        || scrollCoordinatorRef.current.isInteractionLocked()) return;
+    if (!el || !canFollowLiveTail()) return;
     if (measureBottom(readScrollMetrics(el)).distance <= 0.5) return;
     applyScrollCommand(
       scrollCoordinatorRef.current.requestBottom("auto"),
     );
-  }, [applyScrollCommand, browseMode, scrollScope]);
+  }, [applyScrollCommand, canFollowLiveTail]);
 
   useLayoutEffect(() => {
     const el = scrollRef.current;
@@ -876,21 +1068,34 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const active = textSelectionRef.current;
     if (!active || !active.dragging
         || (pointerId != null && active.pointerId !== pointerId)) return;
-    const releaseBoundary = captureHistoryBoundary();
-    if (active.interactionToken !== null) {
-      // Finishing a text drag must never replay a bottom command queued while
-      // the browser owned native selection auto-scroll.
-      scrollCoordinatorRef.current.endInteraction(
-        active.interactionToken, false,
-      );
-      setScrollPolicyEpoch((value) => value + 1);
-    }
-    commitTextSelection({
-      ...active,
-      dragging: false,
-      interactionToken: null,
-      releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
-      releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+    if (textSelectionReleaseFrameRef.current !== null) return;
+    // Mouseup's native default action can finish one last auto-scroll / range
+    // update. Keep ownership until that action has settled, then snapshot both
+    // the selection and viewport together; its queued selectionchange is not
+    // a new gesture and must not disable stationary resize protection.
+    textSelectionReleaseFrameRef.current = window.requestAnimationFrame(() => {
+      textSelectionReleaseFrameRef.current = null;
+      const current = textSelectionRef.current;
+      if (!current || current.interactionToken !== active.interactionToken) return;
+      const releaseBoundary = captureHistoryBoundary();
+      const native = window.getSelection();
+      const valid = !!native && !native.isCollapsed && native.rangeCount > 0;
+      nativeSelectionBoundaryRef.current = valid ? nativeSelectionBoundary(native) : null;
+      if (current.interactionToken !== null) {
+        // Finishing a text drag must never replay a bottom command queued while
+        // the browser owned native selection auto-scroll.
+        scrollCoordinatorRef.current.endInteraction(
+          current.interactionToken, false,
+        );
+        setScrollPolicyEpoch((value) => value + 1);
+      }
+      commitTextSelection(valid ? {
+        ...current,
+        dragging: false,
+        interactionToken: null,
+        releaseAnchorTurnId: releaseBoundary?.anchorTurnId ?? null,
+        releaseAnchorOffset: releaseBoundary?.anchorOffset ?? null,
+      } : null);
     });
   }, [captureHistoryBoundary, commitTextSelection]);
 
@@ -910,7 +1115,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [commitTextSelection]);
 
   const clearTextSelection = useCallback(() => {
+    if (textSelectionReleaseFrameRef.current !== null) {
+      window.cancelAnimationFrame(textSelectionReleaseFrameRef.current);
+      textSelectionReleaseFrameRef.current = null;
+    }
     textSelectionCandidateRef.current = null;
+    nativeSelectionBoundaryRef.current = null;
     const active = textSelectionRef.current;
     if (active?.interactionToken != null) {
       scrollCoordinatorRef.current.endInteraction(
@@ -926,6 +1136,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, [commitTextSelection, publishTextSelection]);
 
   const disposeTextSelection = useCallback(() => {
+    if (textSelectionReleaseFrameRef.current !== null) {
+      window.cancelAnimationFrame(textSelectionReleaseFrameRef.current);
+      textSelectionReleaseFrameRef.current = null;
+    }
     const selection = textSelectionRef.current;
     if (selection?.interactionToken != null) {
       scrollCoordinatorRef.current.endInteraction(
@@ -934,6 +1148,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
     textSelectionRef.current = null;
     textSelectionCandidateRef.current = null;
+    nativeSelectionBoundaryRef.current = null;
     onTextSelectionGuardChange?.(null);
   }, [onTextSelectionGuardChange]);
 
@@ -943,11 +1158,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const active = textSelectionRef.current;
     if (!nativeSelection || nativeSelection.isCollapsed
         || nativeSelection.rangeCount === 0) {
-      if (active) clearTextSelection();
+      // Native edge selection can transiently expose an empty range while
+      // the mouse remains held. Release on the real pointer boundary instead.
+      if (active && !active.dragging) clearTextSelection();
       return;
     }
-    if (!candidate && !active) return;
-    const expectedScope = active?.scope ?? candidate?.scope;
+    const expectedScope = active?.scope ?? candidate?.scope ?? scrollScope;
     if (expectedScope !== scrollScope) {
       clearTextSelection();
       return;
@@ -962,29 +1178,42 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       if (!active || !active.dragging) clearTextSelection();
       return;
     }
+    const previous = nativeSelectionBoundaryRef.current;
+    const boundary = nativeSelectionBoundary(nativeSelection);
+    nativeSelectionBoundaryRef.current = boundary;
     if (active) {
-      if (active.anchorTurnId === anchorTurnId
-          && active.focusTurnId === focusTurnId) return;
+      if (previous && previous.anchor === boundary.anchor
+          && previous.anchorOffset === boundary.anchorOffset
+          && previous.focus === boundary.focus
+          && previous.focusOffset === boundary.focusOffset) return;
+      // Native selection handles and keyboard extension can move without a
+      // pointerdown/wheel reaching this element, including within ONE turn.
+      // Yield the old stationary viewport anchor before native auto-scroll.
+      if (!active.dragging) selectionScrollIntentFnRef.current?.();
+      if (active.anchorTurnId === anchorTurnId && active.focusTurnId === focusTurnId) return;
       commitTextSelection({
-        ...active,
+        ...textSelectionRef.current!,
         anchorTurnId,
         focusTurnId,
       });
       return;
     }
-    if (!candidate || !sid) return;
+    if (!sid) return;
     cancelDetailAnchorFnRef.current?.();
     setMeasurementBoundary(null);
     pauseOutputFollow();
-    const interactionToken =
-      scrollCoordinatorRef.current.beginInteraction(false);
+    // Touch handles / a selectionchange delivered after mouseup have no
+    // pressed mouse candidate. Retain their DOM without a never-ending lock.
+    const interactionToken = candidate
+      ? scrollCoordinatorRef.current.beginInteraction(false) : null;
+    if (!candidate) selectionScrollIntentFnRef.current?.();
     const selection: TextSelectionRetention = {
       scope: scrollScope,
       anchorTurnId,
       focusTurnId,
-      pointerId: candidate.pointerId,
+      pointerId: candidate?.pointerId ?? null,
       interactionToken,
-      dragging: true,
+      dragging: !!candidate,
       releaseAnchorTurnId: null,
       releaseAnchorOffset: null,
     };
@@ -997,6 +1226,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   useEffect(() => {
     const handlePointerEnd = (event: globalThis.PointerEvent) => {
+      if (scrollbarDragIntentRef.current?.pointerId === event.pointerId) {
+        scrollbarDragIntentRef.current = null;
+      }
       const candidate = textSelectionCandidateRef.current;
       if (candidate?.pointerId === event.pointerId) {
         textSelectionCandidateRef.current = null;
@@ -1071,39 +1303,88 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   // Cached-newer paging may append at the tail and evict rows at the head, so
   // it deliberately uses the same keyed measurement transaction as prepend.
   const doLoadPage = (direction: HistoryPageDirection): boolean => {
-    if (historyAnchorRef.current.current()) return false;
+    if (historyAnchorRef.current.current() || historyRequestRef.current) {
+      return false;
+    }
     const el = scrollRef.current;
     const point = el ? captureHistoryBoundary() : null;
+    const sourcePresentation = scopedPresentedHistory;
     if (el) pauseOutputFollow();
     const loadResult = direction === "older"
       ? onLoadMore?.(point?.anchorTurnId)
       : onLoadNewer?.(point?.anchorTurnId);
     const accepted = loadResult === true
       || (typeof loadResult === "object" && loadResult.accepted);
-    const requestViewId = typeof loadResult === "object"
-      ? loadResult.viewId ?? resolvedHistoryViewId
+    const acceptance = typeof loadResult === "object" ? loadResult : null;
+    const requestViewId = acceptance
+      ? acceptance.viewId ?? resolvedHistoryViewId
       : resolvedHistoryViewId;
     if (!accepted) {
       clearHistoryRequestTimeout();
       completeHistoryLoadGates();
       return false;
     }
-    historyRequestRef.current = {
+    const requestGeneration = acceptance
+        && Object.prototype.hasOwnProperty.call(acceptance, "generation")
+      ? acceptance.generation ?? null
+      : historyGeneration;
+    const requestScopeKey = acceptance?.scopeKey ?? historyScopeKey ?? "";
+    const requestAuthorityScope = [
+      requestScopeKey,
+      sid ?? "",
+      historyRevision ?? "",
+      requestGeneration ?? "",
+    ].join("\u0000");
+    const requestScrollScope = acceptance?.viewId != null
+      ? [
+          requestScopeKey,
+          sid ?? "",
+          historyViewRevision ?? historyRevision ?? "",
+          requestViewId,
+        ].join("\u0000")
+      : scrollScope;
+    const activity = beginHistoryPageActivity({
+      direction,
+    });
+    const request: HistoryPageRequestTransaction = {
       sid,
       revision: historyRevision,
+      authorityScope: requestAuthorityScope,
       viewId: requestViewId,
       direction,
       before: direction === "older" ? historyCursor : null,
       windowEpoch: historyWindowEpoch,
+      activityKey: activity.key,
     };
+    historyRequestRef.current = request;
+    if (historyViewportLeaseRef.current
+        && direction === "older"
+        && acceptance?.viewId != null
+        && requestScrollScope !== scrollScope
+        && sourcePresentation.scope === scrollScope
+        && sourcePresentation.authorityScope
+          === incomingHistoryPresentation.authorityScope
+        && sourcePresentation.cursor === historyCursor
+        && sourcePresentation.windowEpoch === historyWindowEpoch) {
+      historyViewportTransitionRef.current = {
+        source: sourcePresentation,
+        request,
+        presentation: {
+          ...sourcePresentation,
+          scope: requestScrollScope,
+          authorityScope: requestAuthorityScope,
+          generation: requestGeneration,
+          browseMode: true,
+          hasNewer: false,
+        },
+      };
+    } else {
+      historyViewportTransitionRef.current = null;
+    }
     let generation: number | null = null;
     if (point) {
-      cancelHistoryAnchor();
       setMeasurementBoundary({
-        scope: requestViewId === resolvedHistoryViewId
-          ? scrollScope
-          : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000`
-            + `${historyRevision ?? ""}\u0000${requestViewId}`,
+        scope: requestScrollScope,
         sid,
         revision: historyRevision,
         viewId: requestViewId,
@@ -1141,14 +1422,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const timeoutGeneration = generation;
     const timer = window.setTimeout(() => {
       const pending = historyRequestTimeoutRef.current;
-      if (!pending || pending.timer !== timer) return;
+      if (!pending || pending.timer !== timer
+          || pending.activityKey !== activity.key) return;
       historyRequestTimeoutRef.current = null;
       historyRequestRef.current = null;
       if (timeoutGeneration != null) cancelHistoryAnchor(timeoutGeneration);
+      completeHistoryPageActivity(activity.key);
       completeHistoryLoadGates();
     }, HISTORY_PAGE_REQUEST_TIMEOUT_MS);
     historyRequestTimeoutRef.current = {
       generation: timeoutGeneration,
+      activityKey: activity.key,
       timer,
     };
     return true;
@@ -1240,7 +1524,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       readScrollMetrics(el), true, canLoadOlder,
     )) return;
     const boundary = [
-      "older", sid ?? "", resolvedHistoryViewId, turns[0]?.id ?? "",
+      "older", incomingHistoryPresentation.authorityScope,
+      sid ?? "", resolvedHistoryViewId, turns[0]?.id ?? "",
       turns.length, historyRevision ?? "", historyCursor ?? "", hasMore ? 1 : 0,
     ].join("\u0000");
     if (source === "other" && autoLoadedBoundaryRef.current === boundary) return;
@@ -1264,7 +1549,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       readScrollMetrics(el), movingTowardLatest, canLoadNewer,
     )) return;
     const boundary = [
-      "newer", sid ?? "", resolvedHistoryViewId,
+      "newer", incomingHistoryPresentation.authorityScope,
+      sid ?? "", resolvedHistoryViewId,
       turns.at(-1)?.id ?? "", turns.length,
       historyRevision ?? "", historyWindowEpoch, hasNewer ? 1 : 0,
     ].join("\u0000");
@@ -1294,6 +1580,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const requestScopeChanged = request && (
       request.sid !== sid
       || request.revision !== historyRevision
+      || request.authorityScope
+        !== incomingHistoryPresentation.authorityScope
       || request.viewId !== resolvedHistoryViewId
     );
     const requestCompleted = request && (
@@ -1304,10 +1592,20 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     if (requestScopeChanged || requestCompleted) {
       historyRequestRef.current = null;
       clearHistoryRequestTimeout();
+      completeHistoryPageActivity(request?.activityKey);
     }
     const anchor = historyAnchorRef.current.current();
     if (!anchor) {
       if (requestScopeChanged || requestCompleted) completeHistoryLoadGates();
+      return;
+    }
+    if (requestScopeChanged) {
+      // Authority/generation are not fields on the physical row anchor. Once
+      // the accepted request loses that authority, its timeout and activity
+      // are already gone above, so retaining the anchor would block every
+      // subsequent page forever with no self-healing path.
+      cancelHistoryAnchor(anchor.generation);
+      completeHistoryLoadGates();
       return;
     }
     if (anchor.sid !== sid || anchor.revision !== historyRevision
@@ -1328,6 +1626,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     });
     if (pageStatus === "pending") return;
     if (pageStatus === "stale") {
+      const activityKey = historyRequestRef.current?.activityKey;
+      historyRequestRef.current = null;
+      clearHistoryRequestTimeout();
+      completeHistoryPageActivity(activityKey);
       cancelHistoryAnchor(anchor.generation);
       completeHistoryLoadGates();
       return;
@@ -1336,6 +1638,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     if (!turns.some((turn) => turn.id === anchor.anchorTurnId)) {
       // The bounded projection no longer contains the reading row. Never
       // manufacture a viewport movement from cursor metadata alone.
+      const activityKey = historyRequestRef.current?.activityKey;
+      historyRequestRef.current = null;
+      clearHistoryRequestTimeout();
+      completeHistoryPageActivity(activityKey);
       cancelHistoryAnchor(anchor.generation);
       completeHistoryLoadGates();
       return;
@@ -1360,8 +1666,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
   }, [
     cancelHistoryAnchor, canLoadNewer, clearHistoryRequestTimeout,
-    completeHistoryLoadGates, hasMore,
-    historyCursor, historyRevision, historyWindowEpoch, resolvedHistoryViewId,
+    completeHistoryLoadGates, completeHistoryPageActivity, hasMore,
+    historyCursor, historyRevision, historyWindowEpoch,
+    incomingHistoryPresentation.authorityScope, resolvedHistoryViewId,
     scheduleHistoryAnchorRelease, sid, turns,
   ]);
 
@@ -1379,6 +1686,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       textSelectionCandidateRef.current = null;
       if (textSelectionRef.current) clearTextSelection();
       const request = historyRequestRef.current;
+      const requestActivityKey = request?.activityKey;
       const anchor = historyAnchorRef.current.current();
       const enteringBrowse = browseMode
         && request?.direction === "older"
@@ -1396,10 +1704,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       cancelHistoryAnchor();
       clearHistoryRequestTimeout();
       touchYRef.current = null;
+      touchOriginRef.current = null;
       touchTransactionBoundaryRef.current = null;
       touchEventClockOffsetRef.current = null;
       userScrollIntentRef.current = false;
       userScrollDirectionRef.current = null;
+      scrollbarDragIntentRef.current = null;
+      manualLatestIntentRef.current = null;
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
         userScrollIntentTimerRef.current = null;
@@ -1410,6 +1721,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       }
       wheelGestureActiveRef.current = false;
       historyRequestRef.current = null;
+      completeHistoryPageActivity(requestActivityKey);
       autoLoadedBoundaryRef.current = null;
       historyLoadGateRef.current.complete();
       historyLoadGateRef.current.endGesture();
@@ -1433,7 +1745,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
   }, [
     activeHistoryGeneration, applyScrollCommand, browseMode, cancelHistoryAnchor,
-    clearHistoryRequestTimeout, clearTextSelection, historyRevision,
+    clearHistoryRequestTimeout, clearTextSelection,
+    completeHistoryPageActivity, historyRevision,
     resolvedHistoryViewId,
     scrollScope, sid, syncScrollState, turns,
   ]);
@@ -1467,7 +1780,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   useEffect(() => setZoom(null), [sid]);
 
   const settleUserScrollIntent = () => {
-    if (touchYRef.current !== null || wheelGestureActiveRef.current) {
+    if (touchYRef.current !== null || wheelGestureActiveRef.current
+        || scrollbarDragIntentRef.current?.scope === scrollScope) {
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
       }
@@ -1482,6 +1796,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       window.clearTimeout(userScrollIntentTimerRef.current);
       userScrollIntentTimerRef.current = null;
     }
+    const reachedLatestIntentionally = userScrollIntentRef.current
+      && userScrollDirectionRef.current === "latest";
     userScrollIntentRef.current = false;
     userScrollDirectionRef.current = null;
     flushHistoryViewportLease();
@@ -1497,6 +1813,21 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       return;
     }
     const controller = controllerRef.current;
+    const el = scrollRef.current;
+    // At the physical edge, a final downward gesture may produce no scroll
+    // event (clamping, coalescing, or short content). Settle that explicit
+    // intent here; layout alone must never resume a paused history reader.
+    if (reachedLatestIntentionally && !browseMode && !historyRequestRef.current
+        && !scrollCoordinatorRef.current.isInteractionLocked()
+        && !textSelectionRef.current?.dragging && el && controller
+        && measureBottom(readScrollMetrics(el)).atBottom) {
+      syncScrollState(controller.resume(readScrollMetrics(el)));
+      setMeasurementBoundary(null);
+    }
+    // A tap or a pull beyond the latest edge can leave follow enabled while
+    // suppressing a queued resize correction. Catch up only after the native
+    // gesture has settled; a history reader keeps their paused state.
+    if (controller?.isFollowing()) maintainFollowedLiveTail();
     const point = captureHistoryBoundary();
     const request = historyRequestRef.current;
     if (point && (!controller?.isFollowing()
@@ -1513,6 +1844,24 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       });
     }
   };
+
+  useImperativeHandle(ref, () => ({
+    prepareLayoutChange: () => {
+      // An explicit dock/expand action ends a completed wheel gesture. Capture
+      // the reading row before its width changes; otherwise the gesture's idle
+      // timer can capture the reflowed DOM and replace the original anchor.
+      // Active touch/selection/scrollbar interactions still own their viewport.
+      if (touchYRef.current !== null || scrollbarDragIntentRef.current
+          || scrollCoordinatorRef.current.isInteractionLocked()) return;
+      if (wheelGestureTimerRef.current !== null) {
+        window.clearTimeout(wheelGestureTimerRef.current);
+        wheelGestureTimerRef.current = null;
+      }
+      wheelGestureActiveRef.current = false;
+      wheelHistoryLoadGateRef.current.endGesture();
+      settleUserScrollIntent();
+    },
+  }));
 
   const markUserScrollIntent = (direction: UserScrollDirection) => {
     // A real wheel/touch/key/pointer action transfers ownership back to the
@@ -1533,11 +1882,50 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       USER_SCROLL_INTENT_IDLE_MS,
     );
   };
+  selectionScrollIntentFnRef.current = () => markUserScrollIntent("unknown");
+
+  const leaveHistoryBrowse = useCallback((): boolean => {
+    if (!browseMode || !onReturnLatest) return false;
+    const requestActivityKey = historyRequestRef.current?.activityKey;
+    scrollbarDragIntentRef.current = null;
+    manualLatestIntentRef.current = null;
+    cancelDetailAnchorFnRef.current?.();
+    cancelHistoryAnchor();
+    historyRequestRef.current = null;
+    clearHistoryRequestTimeout();
+    completeHistoryPageActivity(requestActivityKey);
+    completeHistoryLoadGates();
+    setMeasurementBoundary(null);
+    onReturnLatest();
+    return true;
+  }, [
+    browseMode, cancelHistoryAnchor, clearHistoryRequestTimeout,
+    completeHistoryLoadGates, completeHistoryPageActivity, onReturnLatest,
+  ]);
 
   const onThreadPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     markUserScrollIntent("unknown");
+    scrollbarDragIntentRef.current = null;
     if (event.pointerType !== "mouse" || event.button !== 0
         || !event.isPrimary) {
+      textSelectionCandidateRef.current = null;
+      return;
+    }
+    const thread = event.currentTarget;
+    const rect = thread.getBoundingClientRect();
+    const paintedScrollbarWidth = Math.max(
+      thread.offsetWidth - thread.clientWidth,
+      SCROLLBAR_POINTER_GUTTER_PX,
+    );
+    const ownsVerticalScrollbar = event.target === thread
+      && thread.scrollHeight > thread.clientHeight + 0.5
+      && event.clientX >= rect.right - paintedScrollbarWidth
+      && event.clientX <= rect.right;
+    if (ownsVerticalScrollbar) {
+      scrollbarDragIntentRef.current = {
+        scope: scrollScope,
+        pointerId: event.pointerId,
+      };
       textSelectionCandidateRef.current = null;
       return;
     }
@@ -1644,6 +2032,35 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
         }
       }
     }
+    if (userDrivenScroll && movingTowardHistory) {
+      manualLatestIntentRef.current = null;
+    }
+    const scrollbarReachedBrowseTail = browseMode
+      && !!onReturnLatest
+      && scrollbarDragIntentRef.current?.scope === scrollScope
+      && movingTowardLatest
+      && isAtLatestEdge(metrics);
+    if (scrollbarReachedBrowseTail) {
+      lastScrollTopRef.current = metrics.scrollTop;
+      leaveHistoryBrowse();
+      return;
+    }
+    const reachedBrowseTail = browseMode
+      && !!onReturnLatest
+      && movingTowardLatest
+      && !textSelectionDragging
+      && isAtLatestEdge(metrics)
+      && userDrivenScroll;
+    if (reachedBrowseTail) {
+      if (userDrivenScroll) manualLatestIntentRef.current = scrollScope;
+      if (!hasNewer
+          && !historyRequestRef.current
+          && !historyAnchorRef.current.current()) {
+        lastScrollTopRef.current = metrics.scrollTop;
+        leaveHistoryBrowse();
+        return;
+      }
+    }
     lastScrollTopRef.current = metrics.scrollTop;
     const nextScrollState = userDrivenScroll
       ? controller.observeScroll(
@@ -1668,6 +2085,26 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       );
     }
   };
+
+  useEffect(() => {
+    const intentScope = manualLatestIntentRef.current;
+    if (!browseMode || intentScope !== scrollScope) {
+      manualLatestIntentRef.current = null;
+      return;
+    }
+    // The final cached-newer response clears its keyed request/anchor in the
+    // preceding layout effects. If the user's gesture already left the DOM at
+    // the real bottom, complete the same action as the explicit button.
+    if (hasNewer || historyRequestRef.current
+        || historyAnchorRef.current.current()) return;
+    const el = scrollRef.current;
+    if (!el || !isAtLatestEdge(readScrollMetrics(el))
+        || textSelectionRef.current?.dragging) return;
+    leaveHistoryBrowse();
+  }, [
+    activeHistoryGeneration, browseMode, hasNewer, historyWindowEpoch,
+    leaveHistoryBrowse, scrollScope, turns,
+  ]);
 
   const onWheel = (event: WheelEvent<HTMLDivElement>) => {
     if (Math.abs(event.deltaY) <= 0.5) return;
@@ -1716,6 +2153,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // Native keyboard scrolling can update scrollTop before React receives the
+    // preceding scroll event (and browsers may coalesce that event with the
+    // next key's movement). Use the physical position at this input boundary
+    // as the baseline so End -> Home still registers as historyward movement.
+    const el = scrollRef.current;
+    if (el) lastScrollTopRef.current = el.scrollTop;
     if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
       markUserScrollIntent("history");
     } else if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) {
@@ -1732,9 +2175,26 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     touchEventClockOffsetRef.current =
       window.performance.now() - event.timeStamp;
     touchYRef.current = event.touches[0]?.clientY ?? null;
+    const touch = event.touches[0];
+    touchOriginRef.current = touch
+      ? { x: touch.clientX, y: touch.clientY, vertical: false } : null;
   };
 
   const onTouchMove = (event: TouchEvent<HTMLDivElement>) => {
+    // The shell's native listener claims sidebar navigation before React's
+    // delegated listener runs. Do not read layout after it writes transforms,
+    // cancel history transactions, or pause output for a horizontal swipe.
+    if (event.defaultPrevented || event.touches.length !== 1) return;
+    const touch = event.touches[0];
+    const origin = touchOriginRef.current;
+    if (origin && !origin.vertical) {
+      // Even before the sidebar reaches its claim threshold, small vertical
+      // finger noise must not be mistaken for reading older messages. Once a
+      // vertical pan wins, keep its history semantics through later reversals.
+      if (sidebarDragIntent(touch.clientX - origin.x, touch.clientY - origin.y)
+          !== "vertical") return;
+      origin.vertical = true;
+    }
     const currentY = event.touches[0]?.clientY;
     const previousY = touchYRef.current;
     if (currentY == null || previousY == null) return;
@@ -1807,7 +2267,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     });
   };
 
-  const clearTouch = () => {
+  const clearTouch = (event: TouchEvent<HTMLDivElement>) => {
+    const origin = touchOriginRef.current;
+    const touch = event.changedTouches[0];
+    // Chrome may make touchend non-cancelable after a pending first movement,
+    // even for a CSS-reserved horizontal gesture. It still must not rebuild
+    // history on the first release-animation frame.
+    const navigationTouch = origin && !origin.vertical && (event.defaultPrevented
+      || (touch && sidebarDragIntent(touch.clientX - origin.x, touch.clientY - origin.y) === "horizontal"));
     // Mobile WebKit may defer React's scroll event until touchend. Capture the
     // DOM's already-moved reading row before clearing the touch lock, otherwise
     // the residual prepend correction can restore the pre-gesture row first.
@@ -1817,6 +2284,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     touchTransactionBoundaryRef.current = null;
     touchEventClockOffsetRef.current = null;
     touchYRef.current = null;
+    touchOriginRef.current = null;
     historyLoadGateRef.current.endGesture();
     // touchend only releases the finger. Mobile WebKit can keep scrolling for
     // several native frames afterwards, so restart the complete idle window
@@ -1827,7 +2295,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     // A page can finish while the finger is still down. Re-render after the
     // native touch ends so the retained history transaction can correct and
     // release its exact reading boundary without fighting the gesture.
-    setScrollPolicyEpoch((value) => value + 1);
+    // A horizontal navigation gesture did not move the reading boundary. Its
+    // normal idle lease still flushes pending history, but rebuilding the chat
+    // here would block the sidebar's first automatic-animation frame.
+    if (!navigationTouch) setScrollPolicyEpoch((value) => value + 1);
     const anchor = historyAnchorRef.current.current();
     if (anchor?.phase === "applied") {
       scheduleHistoryAnchorRelease(anchor.generation);
@@ -1838,27 +2309,23 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     const el = scrollRef.current;
     const controller = controllerRef.current;
     if (!el || !controller) return;
+    const requestActivityKey = historyRequestRef.current?.activityKey;
     cancelDetailAnchorFnRef.current?.();
     cancelHistoryAnchor();
     historyRequestRef.current = null;
+    clearHistoryRequestTimeout();
+    completeHistoryPageActivity(requestActivityKey);
+    completeHistoryLoadGates();
     setMeasurementBoundary(null);
     syncScrollState(controller.resume(readScrollMetrics(el)));
     applyScrollCommand(
-      scrollCoordinatorRef.current.requestBottom("smooth"),
+      scrollCoordinatorRef.current.requestBottom("auto"),
     );
   };
 
   const returnToLatest = () => {
-    if (!browseMode || !onReturnLatest) {
-      scrollToBottom();
-      return;
-    }
-    cancelDetailAnchorFnRef.current?.();
-    cancelHistoryAnchor();
-    historyRequestRef.current = null;
-    setMeasurementBoundary(null);
-    completeHistoryLoadGates();
-    onReturnLatest();
+    if (leaveHistoryBrowse()) return;
+    scrollToBottom();
   };
 
   const beginProcessInteraction = useCallback((): number => {
@@ -1871,16 +2338,21 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     return token;
   }, []);
 
-  const endProcessInteraction = useCallback((token: number): void => {
+  const endProcessInteraction = useCallback((
+    token: number,
+    followOutput?: boolean,
+  ): void => {
     const command = scrollCoordinatorRef.current.endInteraction(
       token,
-      controllerRef.current?.isFollowing() ?? false,
+      followOutput ?? (controllerRef.current?.isFollowing() ?? false),
     );
     setScrollPolicyEpoch((value) => value + 1);
     if (command) {
-      window.requestAnimationFrame(() => applyScrollCommand(command));
+      window.requestAnimationFrame(() => {
+        if (canFollowLiveTail()) applyScrollCommand(command);
+      });
     }
-  }, [applyScrollCommand]);
+  }, [applyScrollCommand, canFollowLiveTail]);
 
   const disposeDetailResources = useCallback((
     transaction: DetailAnchorTransaction,
@@ -2106,58 +2578,16 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
   const aiText = (t: Turn) => finalTextBlocks(t.blocks).map((block) => block.text).join("\n\n");
 
-  // Collect engine-neutral file mutations. The helper also understands old
-  // Claude file_path and Codex changes payloads already stored in browser cache.
-  const fileChips = (t: Turn) => {
-    const changes = collectTurnFileChanges([
-      ...t.blocks,
-      ...(t.liveSpillBlocks ?? []),
-      ...(t.detailProjection?.blocks ?? []),
-    ]);
-    if (!changes.paths.length) return null;
-    const arr = changes.paths;
-    const canOpenSummary = surface !== "work"
-      ? !!changes.diff && !!onOpenTurnDiff
-      : (arr.length === 1 && !!onOpenFile) || !!onOpenArtifacts;
-    const openSummary = () => {
-      if (surface !== "work") {
-        if (changes.diff && onOpenTurnDiff) onOpenTurnDiff(arr, changes.diff);
-        return;
-      }
-      if (arr.length === 1 && onOpenFile) {
-        onOpenFile(arr[0]);
-        return;
-      }
-      onOpenArtifacts?.();
-    };
-    return (
-      <div className="turn-files">
-        <button className="turn-files-summary" onClick={openSummary}
-          disabled={!canOpenSummary}
-          title={surface === "work" ? "预览 Artifacts" : "查看本轮改动"}>
-          <Icon name={surface === "work" ? "folder" : "edit"} size={13} />{
-            surface === "work" ? `Artifacts · ${arr.length} 个文件` : `改动 ${arr.length} 个文件`
-          }
-        </button>
-        <div className="turn-files-list">
-          {arr.map((f) => {
-            const markdown = surface !== "work" && isMarkdownPath(f) && !!onPreviewMarkdown;
-            const canOpenFile = markdown || (!!changes.diff && !!onOpenTurnDiff);
-            return <button key={f} className={"turn-file-chip" + (markdown ? " markdown" : "")}
-              disabled={!canOpenFile}
-              onClick={() => markdown
-                ? onPreviewMarkdown(f)
-                : onOpenTurnDiff?.(arr, changes.diff)}
-              title={markdown ? `预览 ${f}`
-                : changes.diff ? "查看本轮原生 diff" : "本轮没有可用的原生 diff"}>
-              <Icon name={markdown ? "read" : "edit"} size={12} />
-              {f.split("/").pop()}
-              {markdown && <span className="turn-file-action">预览</span>}
-            </button>;
-          })}
-        </div>
-      </div>
-    );
+  const renderTurnChanges = (t: Turn) => {
+    const key = `${scrollScope}\u0000changes:${t.clientMsgId ?? t.id}`;
+    return <TurnChangesPanel key={key} turn={t} open={processDisclosureOpen[key] ?? false}
+      onToggle={() => {
+        pauseOutputFollow();
+        rememberProcessDisclosure(key, !(processDisclosureOpen[key] ?? false));
+      }} onOpenDiff={onOpenArchivedDiff} onOpenLegacyDiff={onOpenTurnDiff}
+      onLoadFilePage={onLoadFilePage} onBeforeLoad={pauseOutputFollow}
+      onPreviewMarkdown={onPreviewMarkdown} work={surface === "work"}
+      onOpenFile={onOpenFile} onOpenArtifacts={onOpenArtifacts} />;
   };
 
   const measuredVirtualItems = virtualizer.getVirtualItems();
@@ -2178,30 +2608,83 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
           + index * (HISTORY_VIRTUAL_ESTIMATE_PX + HISTORY_TURN_GAP_PX),
       };
     });
+  // A shared native Codex task can make two steer segments match the same
+  // history alias. App passes those exact active candidates separately so an
+  // idle, browsed, missing, or stale owner can never revive an arbitrary row.
+  const ambiguousActiveTurnIdSet = new Set(ambiguousActiveTurnIds);
+  const activeTurnIndex = activeTurnId == null ? -1
+    : turns.findIndex((turn) => turn.id === activeTurnId);
+  const fallbackWorkingTurnId = activeTurnId == null
+      && ambiguousActiveTurnIdSet.size > 1
+    ? [...turns].reverse().find((turn) => {
+        if (!ambiguousActiveTurnIdSet.has(turn.id)) return false;
+        if (turn.done && (turn.interrupted || turn.error)) return false;
+        const archived = mergeDetailWithLiveTail(
+          turn.detailProjection?.blocks ?? [],
+          turn.liveSpillBlocks ?? [],
+          turn.done && !turn.detailRestorePending
+            && !turn.detailRestoreIncomplete,
+        );
+        const timeline = mergeDetailWithLiveTail(
+          archived,
+          turn.blocks,
+          turn.done && !turn.detailRestorePending
+            && !turn.detailRestoreIncomplete,
+        );
+        const processItems = presentableProcessBlocks(timeline, engine);
+        const foreground = turn.done
+          ? processItems.filter((block) => !(
+              block.kind === "process" && block.background === true
+            ))
+          : processItems;
+        return !turn.done || hasActiveProcess(foreground)
+          || foreground.some((block) => !block.done);
+      })?.id ?? null
+    : null;
+  const activityRequest = historyRequestRef.current;
+  const visibleHistoryPageActivity = historyPageActivity && (
+    activityRequest?.activityKey === historyPageActivity.key
+      && activityRequest.sid === sid)
+    ? historyPageActivity : null;
 
   if (turns.length === 0) {
     if (loading) {
       return (
-        <div className="empty">
-          <div className="spinner" aria-label="加载中" />
-          <p className="loading-tx">加载会话历史…</p>
+        <div className={surface === "work"
+          ? "thread-shell work-thread-shell" : "thread-shell"}>
+          <div className="empty">
+            <div className="spinner" aria-label="加载中" />
+            <p className="loading-tx">加载会话历史…</p>
+          </div>
         </div>
       );
     }
     return (
-      <div className="empty">
-        <div className="glyph"><ClaudeMark size={30} /></div>
-        <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
-        <p>{surface === "work"
-          ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
-          : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
+      <div className={surface === "work"
+        ? "thread-shell work-thread-shell" : "thread-shell"}>
+        <div className="empty">
+          <div className="glyph"><ClaudeMark size={30} /></div>
+          <h2>{surface === "work" ? "工作区已就绪" : "已连接"}</h2>
+          <p>{surface === "work"
+            ? "添加资料并描述成果，我会把生成的文档和文件留在这项工作的私有目录。"
+            : <>发一条消息开始，或用 <code>/</code> 唤起命令面板（Plan mode、review、技能…）。</>}</p>
+        </div>
       </div>
     );
   }
 
   return (
     <div className={surface === "work" ? "thread-shell work-thread-shell" : "thread-shell"}>
-      <div className="thread" ref={scrollRef}
+      {visibleHistoryPageActivity && (
+        <div className="history-page-activity"
+          data-testid="history-page-activity" role="status" aria-live="polite">
+          <span className="history-page-activity-spinner" aria-hidden="true" />
+          <span>{visibleHistoryPageActivity.direction === "older"
+            ? "正在加载更早历史…" : "正在加载更新历史…"}</span>
+        </div>
+      )}
+      <div className="thread-frame">
+        <div className="thread" ref={scrollRef}
         data-detail-anchor-active={activeDetailAnchor ? "true" : "false"}
         data-text-selection-dragging={
           activeTextSelection?.dragging ? "true" : "false"
@@ -2221,7 +2704,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             height: `${virtualLeadingPad}px`,
             overflowAnchor: "none",
           }} />
-          {showOlderHistory && (
+          {showOlderHistory
+              && visibleHistoryPageActivity?.direction !== "older" && (
             <div className="load-more-wrap virtual-history-loader">
               {olderHistoryAvailability === "ready"
                 ? (
@@ -2237,7 +2721,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                   )}
             </div>
           )}
-          {canLoadNewer && (
+          {canLoadNewer
+              && visibleHistoryPageActivity?.direction !== "newer" && (
             <div className="load-more-wrap virtual-history-loader"
               style={{ top: "auto", bottom: 0 }}>
               <button className="load-more-btn" onClick={doLoadNewer}>
@@ -2261,27 +2746,106 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
               t.done && !t.detailRestorePending
                 && !t.detailRestoreIncomplete,
             );
-            const activeProcess = hasActiveProcess(timelineBlocks);
-            const processItems = processBlocks(timelineBlocks);
+            const processItems = presentableProcessBlocks(
+              timelineBlocks, engine);
+            const foregroundProcessItems = t.done
+              ? processItems.filter((block) => !(
+                  block.background === true
+                    && (engine === "claude" || block.kind === "process")
+                ))
+              : processItems;
+            const activeProcess = hasActiveProcess(foregroundProcessItems);
             const activeTimeline = activeProcess
-              || processItems.some((block) => !block.done);
-            const finalBlocks = finalTextBlocks(t.blocks);
-            const working = !t.done || activeTimeline;
+              || foregroundProcessItems.some((block) => !block.done);
+            const finalBlocks = finalTextBlocks(t.blocks).filter(block =>
+              block.delivery !== "async" || !block.questions?.length
+                || supplemental.questionOwners.get(block.message_id) === t.id);
+            const generatedImages = generatedOutputImages(timelineBlocks);
+            const modelNotices = modelFallbackNotices(timelineBlocks);
+            const narrative = assistantContinuations(timelineBlocks, finalBlocks, engine);
+            const renderAgentReturn = (receipt: ProcessBlock) => {
+              const runId = returnRunId(receipt);
+              return runId && onOpenAgent ? <button key={receipt.item_id} type="button" className="agent-return-link"
+                onClick={() => onOpenAgent(runId, receipt.summary || receipt.title)}>
+                <span>代理返回 · {receipt.summary || receipt.title}</span><Icon name="chev" size={13} />
+              </button> : null;
+            };
+            const lastContinuation = narrative.continuations.at(-1);
+            const originalProcessItems = presentableProcessBlocks(
+              narrative.original, engine);
+            const enclosingTaskActive = activeTurnId === t.id;
+            const processDetailState = processItems.length > 0
+              ? "present"
+              : t.processDetailState
+                ?? ((t.detailEventCount ?? 0) > 0 ? "unknown" : "none");
+            const hasDeferredContent = t.detailReasons?.some(
+              (reason) => reason !== "process") ?? false;
+            // A failed/interrupted enclosing terminal is authoritative. A
+            // successful answer may still own genuine background agent work,
+            // but a stale child flag must never animate beside "已打断".
+            const terminalProblem = t.done && (!!t.interrupted || !!t.error);
+            const working = !terminalProblem && (
+              enclosingTaskActive || !t.done || activeTimeline);
+            // A source can positively report process presence while an
+            // incomplete detail response contains only the final answer. Do
+            // not turn that contradiction into an endless loading row: keep
+            // the disclosure and expose a retryable error instead.
+            const missingLoadedProcess = t.done && !!t.detailLoaded
+              && !t.detailLoading
+              && !t.detailHasMore && !t.detailHasNewer
+              && processItems.length === 0
+              && processDetailState === "present";
+            const processDetailError = t.detailError
+              ?? (missingLoadedProcess
+                ? "详细过程未完整返回，请重试" : undefined);
             const hasProcessTimeline = processItems.length > 0
-              || (!!t.detailEventCount && !t.detailLoaded)
-              || !!t.detailError;
+              || processDetailState === "present";
             const activePhase = !working
               ? "complete"
-              : hasProcessTimeline
-                  && (activeTimeline || finalBlocks.length === 0)
+              : lastContinuation
+                ? lastContinuation.answers.length > 0 ? "answering" : "process"
+                : hasProcessTimeline
+                  && (activeTimeline
+                    || (enclosingTaskActive
+                      && (finalBlocks.length === 0 || t.done)))
                 ? "process"
                 : finalBlocks.length > 0 ? "answering" : "waiting";
-            const showProcessTimeline = hasProcessTimeline;
+            const showProcessTimeline = originalProcessItems.length > 0
+              || processDetailState === "present";
+            // Unknown native summaries don't prove that there is anything to
+            // expand. Keep that uncertainty in the projection, not as a button
+            // which disappears after an empty read. Real deferred content,
+            // unread detail pages and explicit failures retain their controls.
+            const canReadOlderDetail = !!t.detailHasMore && !!t.detailOldestCursor;
+            const canReadNewerDetail = !!t.detailHasNewer && !!t.detailNewerCursor;
+            const hasUnreadDetailPages = canReadOlderDetail || canReadNewerDetail;
+            // The process disclosure already owns its paging controls. A second
+            // entry below the answer would load invisible, collapsed process
+            // rows. Keep a separate entry only for genuinely deferred content
+            // or pages which don't yet have a process disclosure.
+            const showStandaloneDetail = t.done && !t.detailLoaded
+              && (hasDeferredContent || (!showProcessTimeline && hasUnreadDetailPages));
+            const standaloneDetailLabel = hasDeferredContent
+              ? "查看完整内容" : hasUnreadDetailPages ? "查看更多内容" : "重试加载详情";
             // Keep the live affordance at the physical tail of the turn. The
             // process disclosure can be far above the viewport once a long
             // tool stream grows, so it must not be the only place which tells
             // the reader that the turn is still active.
-            const showWorking = working;
+            // A steered Codex task can span several visible narrative rows.
+            // Once the runtime has an exact owner, only that row may render
+            // the session-level working affordance. Older rows can still keep
+            // their own background/process lifecycle inside the disclosure,
+            // but a delayed child update must not create a second top-level
+            // spark beside the current steer row.
+            const showWorking = working && (
+              enclosingTaskActive
+              || (ambiguousActiveTurnIdSet.has(t.id)
+                && fallbackWorkingTurnId === t.id)
+            );
+            // Compact can close a display segment before the enclosing native
+            // task reaches its terminal boundary. Completion time, copy and
+            // fork belong to that real boundary, never to the segment bit.
+            const showCompletionFooter = t.done && !working;
             const workingLabel = t.progress
               ?? (activePhase === "answering"
                 ? "回答中"
@@ -2291,8 +2855,128 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const processOpenKey =
               `${scrollScope}\u0000turn:${processDisclosureId}`;
             const historyTurnId = t.historyTurnId ?? t.id;
+            const externalPlanItemId = externalPlanProgress
+              && externalPlanProgress.itemId
+              && [t.id, historyTurnId, t.clientMsgId].includes(
+                externalPlanProgress.turnId)
+                ? externalPlanProgress.itemId : null;
             const detailRetryBefore = t.detailRetryBefore;
             const detailRetryDirection = t.detailRetryDirection;
+            const standaloneDetailPage = detailRetryDirection
+              ? [detailRetryBefore, detailRetryDirection] as const
+              : !hasDeferredContent && canReadOlderDetail
+                ? [t.detailOldestCursor, "older"] as const
+                : !hasDeferredContent && canReadNewerDetail
+                  ? [t.detailNewerCursor, "newer"] as const
+                  : [undefined, "initial"] as const;
+            const deferredProcessCount = (!t.detailLoaded || !!t.detailLoading)
+                && processDetailState === "present"
+              ? processItems.length === 0
+                ? Math.max(1, t.detailEventCount ?? 0)
+                : t.detailEventCount ?? 0
+              : 0;
+            const renderProcess = (segment?: AssistantContinuation) => {
+              if (!segment && engine === "codex" && lastContinuation
+                  && originalProcessItems.length === 0) return null;
+              // Deferred counts describe the whole native turn. A continuation
+              // containing only an answer has no process disclosure of its own;
+              // borrowing the parent's count creates an empty "1 item" row.
+              if (segment && presentableProcessBlocks(segment.blocks, engine).length === 0) {
+                return null;
+              }
+              const continuing = !!segment && segment === lastContinuation
+                && enclosingTaskActive && !terminalProblem;
+              const disclosureKey = segment
+                ? `${processOpenKey}\u0000continuation:${segment.id}` : processOpenKey;
+              return (
+              <ProcessTimeline blocks={segment?.blocks ?? narrative.original}
+                done={segment ? !continuing : t.done || !!lastContinuation}
+                active={activePhase === "process" && (segment ? continuing : !lastContinuation)} engine={engine}
+                outcome={t.error ? "failed" : t.interrupted ? "interrupted" : undefined}
+                problem={t.error}
+                durationMs={segment || engine === "codex" || (lastContinuation
+                  && t.doneTs != null && lastContinuation.startedTs != null
+                  && t.doneTs > lastContinuation.startedTs) ? undefined : t.durationMs}
+                startTs={segment?.startedTs ?? (engine === "codex" ? t.processStartedTs : t.ts)}
+                doneTs={segment ? segment.doneTs : engine === "codex" ? t.processDoneTs
+                  : lastContinuation && t.doneTs != null
+                    && lastContinuation.startedTs != null
+                    && t.doneTs > lastContinuation.startedTs ? undefined : t.doneTs}
+                deferredCount={segment ? 0 : deferredProcessCount}
+                detailPending={!!segment && engine === "codex" && deferredProcessCount > 0}
+                detailLoading={t.detailLoading}
+                detailError={processDetailError}
+                externalPlanItemId={externalPlanItemId}
+                onLoadDetail={onLoadDetail
+                  ? (automatic) => automatic
+                    ? onLoadDetail(t.id)
+                    : requestProcessDetail(t.id, undefined, "initial", false)
+                  : undefined}
+                onRetryDetail={onLoadDetail && detailRetryDirection
+                  ? () => requestProcessDetail(
+                      t.id,
+                      detailRetryBefore,
+                      detailRetryDirection,
+                      false)
+                  : undefined}
+                canLoadEarlier={(!segment || engine === "codex") && canReadOlderDetail}
+                canLoadNewer={(!segment || engine === "codex") && canReadNewerDetail}
+                onLoadEarlier={onLoadDetail && canReadOlderDetail
+                  ? () => requestProcessDetail(
+                      t.id, t.detailOldestCursor, "older")
+                  : undefined}
+                onLoadNewer={onLoadDetail && canReadNewerDetail
+                  ? () => requestProcessDetail(
+                      t.id, t.detailNewerCursor, "newer")
+                  : undefined}
+                onOpenFile={onOpenFile} imageAssets={imageAssets}
+                onLoadImage={onLoadImage}
+                onAuthorizeImage={onAuthorizeImage}
+                historyTurnId={historyTurnId}
+                historyImageAssets={historyImageAssets}
+                onLoadHistoryImage={onLoadHistoryImage}
+                onPreviewHistoryImage={(turnId, imageId) => setZoom({
+                  kind: "history",
+                  turnId,
+                  imageId,
+                  alt: "查看过的图片",
+                })}
+                onOpenAgent={onOpenAgent}
+                onInteractionStart={beginProcessInteraction}
+                onInteractionEnd={endProcessInteraction}
+                openOverride={
+                  processDisclosureOpen[`${disclosureKey}\u0000outer`]
+                  ?? (!segment && t.detailRestoreOpen ? true : undefined)
+                }
+                onOpenChange={(open) => rememberProcessDisclosure(
+                  `${disclosureKey}\u0000outer`, open,
+                )}
+                itemOpen={(key) =>
+                  processDisclosureOpen[`${disclosureKey}\u0000${key}`]}
+                onItemOpenChange={(key, open) => rememberProcessDisclosure(
+                  `${disclosureKey}\u0000${key}`, open,
+                )}
+                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
+              );
+            };
+            const renderAnswer = (block: TextBlock) => (
+              <div key={block.message_id} className="assistant-answer-segment">
+                {block.delivery === "async" && block.questions?.length
+                  ? <Suspense fallback={<span className="async-question-hint">助手询问…</span>}>
+                      <AsyncQuestionCard questions={block.questions}
+                        answered={supplemental.answered.has(block.message_id)}
+                        onOpen={() => {
+                          pauseOutputFollow();
+                          setOpenAsyncQuestion({ scope: asyncQuestionScope, messageId: block.message_id });
+                        }} />
+                    </Suspense>
+                  : <MessageBlock text={block.text}
+                    done={block.done} onOpenFile={onOpenFile}
+                    imageAssets={imageAssets} onLoadImage={onLoadImage}
+                    onAuthorizeImage={onAuthorizeImage}
+                    onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />}
+              </div>
+            );
             const historyImagesReady = !!t.imageRefs?.length
               && t.imageRefs.every((image) => (
                 historyImageAssets?.[historyImageAssetKey(
@@ -2302,6 +2986,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             if (historyImagesReady) {
               turnImagePreviewCacheRef.current.release(t.id);
             }
+            const imageSizes = t.images?.length
+              ? t.images.map((img) => queryImageDimensions(img) ?? [180, 180])
+              : t.imageRefs?.map((img) => [img.width, img.height]) ?? [];
+            const imageHeight = Math.max(96, Math.min(180,
+              ...imageSizes.map(([width, height]) =>
+                width > 0 && height > 0 ? 240 * height / width : 180)));
             return (
             <div className="turn" key={virtualItem.key}
               data-index={virtualItem.index} data-turn-id={t.id}
@@ -2317,22 +3007,40 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                   turnNodeRefs.current.delete(t.id);
                 }
               }}>
+            {t.continuation && !t.prompt && (
+              <div className="turn-continuation">
+                {returnedAgents(timelineBlocks).map(renderAgentReturn)}
+                <span>收到子代理结果，继续处理</span>
+              </div>
+            )}
             {(t.prompt || (t.images && t.images.length) || (t.imageRefs && t.imageRefs.length) || (t.files && t.files.length)) && (
               <div className="ubub-wrap">
-                {t.prompt && <div className="ubub">{t.prompt}</div>}
+                {t.prompt && <div className="ubub">
+                  {t.sourceThreadId && <Suspense fallback={null}>
+                    <SessionMessageLinks turn={t} source resolve={sessionLink}
+                      onOpen={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined} />
+                  </Suspense>}
+                  {t.timedTask && <TimedMessageTag task={t.timedTask} />}
+                  {supplemental.replies.has(t.id)
+                  ? <div className="supplemental-answer">
+                      <details className="supplemental-answer-context">
+                        <summary><Icon name="message" size={13} />查看问题<Icon name="chev" size={12} /></summary>
+                        <div>{supplemental.replies.get(t.id)!.map((answer, index) =>
+                          <p key={index}>{answer.question}</p>)}</div>
+                      </details>
+                      {supplemental.replies.get(t.id)!.map((answer, index) =>
+                        <p key={index}>{answer.answer}</p>)}
+                    </div>
+                  : t.prompt}</div>}
                 {t.images && t.images.length > 0 && (
                   <div className="ubub-imgs">
                     {t.images.map((img, i) => {
                       const src = `data:${img.media_type};base64,${img.data}`;
                       const [width, height] = queryImageDimensions(img)
                         ?? [180, 180];
-                      return <button key={i} type="button" className="ubub-image-trigger"
-                        style={{ aspectRatio: `${width} / ${height}` }}
-                        aria-label="预览用户发送的图片"
-                        onClick={() => setZoom({ kind: "data", src, alt: "用户发送的图片" })}>
-                        <img src={src} className="ubub-img" width={width}
-                          height={height} alt="用户发送的图片" />
-                      </button>;
+                      return <UserImageButton key={i} width={width} height={height}
+                        src={src} maxHeight={imageHeight}
+                        onClick={() => setZoom({ kind: "data", src, alt: "用户发送的图片" })} />;
                     })}
                   </div>
                 )}
@@ -2349,6 +3057,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                       return <HistoryUserImage key={image.image_id}
                         turnId={historyTurnId} imageId={image.image_id}
                         width={image.width} height={image.height}
+                        maxHeight={imageHeight}
                         asset={thumbnail} fallback={fallback}
                         onLoad={onLoadHistoryImage}
                         onPreview={() => {
@@ -2380,116 +3089,113 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 <div className="ubub-meta">
                   {t.ts && <span className="ubub-time">{formatTime(t.ts)}</span>}
                   {t.prompt && onEdit && <button className="ubub-act" onClick={() => onEdit(t.prompt!)} aria-label="编辑"><Icon name="edit" size={13} /></button>}
-                  {t.prompt && <button className={"ubub-act" + (copiedId === t.id ? " copied" : "")} onClick={() => copyText(t.id, t.prompt!)} aria-label="复制"><Icon name="check" size={13} /></button>}
+                  {t.prompt && <button className={"ubub-act" + (copiedId === t.id ? " copied" : "")} onClick={() => copyText(t.id, t.prompt!)} aria-label="复制"><Icon name="copy" size={13} /></button>}
                 </div>
               </div>
             )}
-            {showProcessTimeline && (
-              <ProcessTimeline blocks={timelineBlocks} done={t.done}
-                active={activePhase === "process"} engine={engine}
-                durationMs={t.durationMs} startTs={t.ts} doneTs={t.doneTs}
-                deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
-                detailLoading={t.detailLoading}
-                detailError={t.detailError}
-                onLoadDetail={onLoadDetail
-                  ? () => requestProcessDetail(
-                      t.id, undefined, "initial", true)
-                  : undefined}
-                onRetryDetail={onLoadDetail && detailRetryDirection
-                  ? () => requestProcessDetail(
-                      t.id,
-                      detailRetryBefore,
-                      detailRetryDirection,
-                      detailRetryDirection === "initial")
-                  : undefined}
-                canLoadEarlier={
-                  !!t.detailHasMore && !!t.detailOldestCursor
-                }
-                canLoadNewer={
-                  !!t.detailHasNewer && !!t.detailNewerCursor
-                }
-                onLoadEarlier={onLoadDetail && t.detailOldestCursor
-                  ? () => requestProcessDetail(
-                      t.id, t.detailOldestCursor, "older")
-                  : undefined}
-                onLoadNewer={onLoadDetail && t.detailNewerCursor
-                  ? () => requestProcessDetail(
-                      t.id, t.detailNewerCursor, "newer")
-                  : undefined}
-                onOpenFile={onOpenFile} imageAssets={imageAssets}
-                onLoadImage={onLoadImage}
+            {showProcessTimeline && renderProcess()}
+            {(!!t.sessionMessages?.length || t.blocks.some((b) =>
+              b.kind === "tool" && (b.tool.endsWith("send_message_to_thread")
+                || b.tool.endsWith("send_message")))) && <Suspense fallback={null}>
+              <SessionMessageLinks turn={t} resolve={sessionLink}
+                onOpen={onOpenSession ? (id) => { pauseOutputFollow(); onOpenSession(id); } : undefined} />
+            </Suspense>}
+            {modelNotices.map((notice) => <div className="turn-model-notice" key={notice.item_id} role="note">
+              <Icon name="notify" size={15} />
+              <span>{notice.summary}</span>
+            </div>)}
+            {generatedImages.length > 0 && <div className="generated-image-gallery">
+              {generatedImages.map((block) => <GeneratedImagePreview key={generatedImageIdentity(block)}
+                block={block} imageAssets={imageAssets} onLoadImage={onLoadImage}
                 onAuthorizeImage={onAuthorizeImage}
-                historyTurnId={historyTurnId}
-                historyImageAssets={historyImageAssets}
+                historyTurnId={historyTurnId} historyImageAssets={historyImageAssets}
                 onLoadHistoryImage={onLoadHistoryImage}
+                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })}
                 onPreviewHistoryImage={(turnId, imageId) => setZoom({
-                  kind: "history",
-                  turnId,
-                  imageId,
-                  alt: "查看过的图片",
-                })}
-                onInteractionStart={beginProcessInteraction}
-                onInteractionEnd={endProcessInteraction}
-                openOverride={
-                  processDisclosureOpen[`${processOpenKey}\u0000outer`]
-                  ?? (t.detailRestoreOpen ? true : undefined)
-                }
-                onOpenChange={(open) => rememberProcessDisclosure(
-                  `${processOpenKey}\u0000outer`, open,
-                )}
-                itemOpen={(key) =>
-                  processDisclosureOpen[`${processOpenKey}\u0000${key}`]}
-                onItemOpenChange={(key, open) => rememberProcessDisclosure(
-                  `${processOpenKey}\u0000${key}`, open,
-                )}
-                onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
-            )}
-            {t.blocks.length > 0 && (
+                  kind: "history", turnId, imageId, alt: "生成的图片",
+                })} />)}
+            </div>}
+            {(t.blocks.length > 0 || t.error) && (
               <>
-                {finalBlocks.map((block) => (
-                  <MessageBlock key={block.message_id} text={block.text}
-                    done={block.done} onOpenFile={onOpenFile}
-                    imageAssets={imageAssets} onLoadImage={onLoadImage}
-                    onAuthorizeImage={onAuthorizeImage}
-                    onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
-                ))}
-                {t.done && (
-                  <>
-                    <div className="ubub-meta ai-meta">
-                      {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
-                      {finalBlocks.length > 0 && <button
-                        className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
-                        onClick={() => copyText(t.id + "-ai", aiText(t))}
-                        aria-label="复制">
-                        <Icon name="check" size={13} />
-                      </button>}
-                      {onFork && canForkTurn(engine, t) && (
-                        <button className="ubub-act" aria-label="派生"
-                          data-tooltip="从此回复派生新会话"
-                          aria-busy={forkingPointId === t.forkPointId}
-                          disabled={!!forkingPointId}
-                          onClick={() => onFork(t.forkPointId)}>
-                          <Icon name="branch" size={13} />
-                        </button>
-                      )}
+                {narrative.answers.map(renderAnswer)}
+                {narrative.continuations.map((segment) => (
+                  <div key={segment.id} className="background-followup">
+                    <div className="background-followup-boundary">
+                      {segment.returns.map(renderAgentReturn)}
+                      <span>{engine === "codex" ? "Codex 收到后台消息，继续处理" : engine === "dsh" ? "DSH 继续处理" : "Claude 继续处理"}</span>
+                      {segment.startedTs != null && <time>{formatTime(segment.startedTs)}</time>}
                     </div>
-                    {ti === turns.length - 1 && !working
-                      && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
-                  </>
-                )}
+                    {renderProcess(segment)}
+                    {segment.answers.map(renderAnswer)}
+                  </div>
+                ))}
+                {engine === "dsh" && onOpenFile && <Suspense fallback={null}><DshProducedFiles turn={t} onOpen={onOpenFile} /></Suspense>}
+                {t.error && <TurnProblem message={t.error} continuing={activeTurnIndex > ti} />}
+                {/* Final metadata already has a stable row. While running,
+                    page discovery shares the existing working indicator below
+                    instead of reserving an empty 22px metadata row. */}
+                {showCompletionFooter && <div className="ubub-meta ai-meta">
+                  {showCompletionFooter && t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
+                  {showCompletionFooter && finalBlocks.length > 0 && <button
+                    className={"ubub-act" + (copiedId === t.id + "-ai" ? " copied" : "")}
+                    onClick={() => copyText(t.id + "-ai", aiText(t))}
+                    aria-label="复制">
+                    <Icon name="copy" size={13} />
+                  </button>}
+                  {showCompletionFooter && onFork && canForkTurn(engine, t) && (
+                    <button className="ubub-act" aria-label="派生"
+                      data-tooltip="从此回复派生新会话"
+                      aria-busy={forkingPointId === t.forkPointId}
+                      disabled={!!forkingPointId}
+                      onClick={() => onFork(t.forkPointId)}>
+                      <Icon name="branch" size={13} />
+                    </button>
+                  )}
+                  <Suspense fallback={null}><PagePreviewLinks turn={t} sid={sid} /></Suspense>
+                </div>}
+                {showCompletionFooter && !terminalProblem && ti === turns.length - 1
+                      && <div className="turn-done-mark"><EngineDone engine={engine} size={22} /></div>}
               </>
             )}
-              {showWorking && (
-                <div className="turn-working" role="status" aria-live="polite">
-                  <ClaudeWorking size={24} />
-                  <span className="turn-working-tx">{workingLabel}</span>
+              {(showStandaloneDetail
+                  || (!!t.detailError && !showProcessTimeline)) && (
+                <div className="turn-detail-entry">
+                  <button type="button" className="turn-detail-entry-btn"
+                    disabled={!onLoadDetail || !!t.detailLoading}
+                    aria-busy={!!t.detailLoading}
+                    onClick={() => requestProcessDetail(
+                      t.id,
+                      ...standaloneDetailPage,
+                      false,
+                    )}>
+                    {t.detailLoading
+                      ? <span className="process-spin" aria-hidden="true" />
+                      : <Icon name="chev" size={14} />}
+                    <span>{t.detailLoading
+                      ? "正在加载详情…" : standaloneDetailLabel}</span>
+                  </button>
+                  {t.detailError && (
+                    <span className="turn-detail-entry-error">
+                      {t.detailError}
+                    </span>
+                  )}
                 </div>
               )}
-              {fileChips(t)}
-              {t.interrupted && <div className="note interrupted">— 已打断 —</div>}
-              {t.error && <div className="note interrupted">{
-                presentHistoricalTurnProblem(t.error)
-              }</div>}
+              {showWorking && (
+                <div className="turn-working" role="status" aria-live="polite">
+                  <EngineWorking engine={engine} size={24} />
+                  <span className="turn-working-tx">{workingLabel}</span>
+                  {usageForTurn(t, turnUsage) && <Suspense fallback={null}>
+                    <TurnUsageIndicator key={`${sid}:${t.id}`} usage={usageForTurn(t, turnUsage)} />
+                  </Suspense>}
+                  {!showCompletionFooter && <Suspense fallback={null}>
+                    <PagePreviewLinks turn={t} sid={sid} />
+                  </Suspense>}
+                </div>
+              )}
+              {renderTurnChanges(t)}
+              {t.done && t.interrupted && !t.error
+                && <div className="note interrupted">— 已打断 —</div>}
             </div>
             );
           })}
@@ -2498,21 +3204,24 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             overflowAnchor: "none",
           }} />
         </div>
-      </div>
-      {(!scrollState.followOutput || !scrollState.nearBottom) && (
-        <div className="scroll-bottom-wrap">
-          <button className="scroll-bottom-btn" onClick={returnToLatest}
-            style={browseMode ? {
-              width: "auto", padding: "0 12px",
-              gridAutoFlow: "column", gap: 5,
-            } : undefined}
-            aria-label={browseMode ? "回到最新" : "滚动到底部"}
-            data-tooltip={browseMode ? "回到最新" : undefined}>
-            <Icon name="chev" size={20} />
-            {browseMode && <span style={{ fontSize: 12 }}>回到最新</span>}
-          </button>
         </div>
-      )}
+        {(!scrollState.followOutput || !scrollState.nearBottom) && (
+          <div className="scroll-bottom-wrap">
+            <button className="scroll-bottom-btn" onClick={returnToLatest}
+              aria-label={browseMode ? "回到最新" : "滚动到底部"}
+              data-tooltip={browseMode ? "回到最新" : undefined}>
+              <Icon name="chev" size={20} />
+            </button>
+          </div>
+        )}
+      </div>
+      {openAsyncQuestion?.scope === asyncQuestionScope && <Suspense fallback={null}>
+        <AsyncQuestionHost key={asyncQuestionScope}
+          messageId={openAsyncQuestion.messageId}
+          turns={turns} answeredMessageIds={supplemental.answered}
+          replyMode={asyncReplyMode} onReply={onReplyAsyncQuestion}
+          onClose={() => setOpenAsyncQuestion(q => q ? { ...q, messageId: null } : null)} />
+      </Suspense>}
       {zoom && (() => {
         const asset = zoom.kind === "history" ? historyImageAssets?.[
           historyImageAssetKey(zoom.turnId, zoom.imageId, "full")

@@ -1,14 +1,26 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Icon } from "../icons";
-import type { QueryFile, WorkDashboard } from "../protocol";
+import type { ClaudeProfileInfo, CodexProfileInfo, QueryFile, WorkDashboard } from "../protocol";
 import { MAX_FILENAME_BYTES, MAX_SINGLE_ATTACHMENT_BYTES } from "../img";
 import { DateTimePicker } from "./DateTimePicker";
+import {
+  resolveWorkScheduleProfile, workProfileDisplayName,
+} from "../work-profile-selection";
 
 type Tab = "projects" | "library" | "schedules" | "plugins";
+const EMPTY_CODEX_PROFILES: CodexProfileInfo[] = [];
+const EMPTY_CLAUDE_PROFILES: ClaudeProfileInfo[] = [];
 
 interface Props {
   open: boolean;
+  scopeKey: string;
   dashboard: WorkDashboard | null;
+  claudeProfiles?: ClaudeProfileInfo[];
+  defaultClaudeProfileId?: string | null;
+  claudeProfileId?: string | null;
+  codexProfiles?: CodexProfileInfo[];
+  defaultCodexProfileId?: string | null;
+  codexProfileId?: string | null;
   selectedProjectId: string | null;
   onSelectProject: (projectId: string | null) => void;
   onClose: () => void;
@@ -18,7 +30,8 @@ interface Props {
     title: string, uri?: string, file?: QueryFile) => boolean;
   onDeleteSource: (sourceId: string) => boolean;
   onCreateSchedule: (title: string, prompt: string, nextRunAt: number,
-    repeatSeconds?: number, projectId?: string) => boolean;
+    repeatSeconds?: number, projectId?: string,
+    codexProfileId?: string) => boolean;
   onDeleteSchedule: (scheduleId: string) => boolean;
   onCreatePlugin: (name: string, instructions: string, projectId?: string) => boolean;
   onDeletePlugin: (pluginId: string) => boolean;
@@ -53,15 +66,56 @@ export function WorkDashboardSheet(props: Props) {
   const [schedulePrompt, setSchedulePrompt] = useState("");
   const [scheduleAt, setScheduleAt] = useState("");
   const [repeat, setRepeat] = useState("");
+  const [scheduleProfileId, setScheduleProfileId] = useState<string | null>(null);
   const [pluginName, setPluginName] = useState("");
   const [pluginInstructions, setPluginInstructions] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  const codexProfiles = props.codexProfiles ?? EMPTY_CODEX_PROFILES;
+  const claudeProfiles = props.claudeProfiles ?? EMPTY_CLAUDE_PROFILES;
+  const accountProfiles = dashboard?.engine === "codex"
+    ? codexProfiles : claudeProfiles;
+  const defaultAccountProfileId = dashboard?.engine === "codex"
+    ? props.defaultCodexProfileId : props.defaultClaudeProfileId;
+  const preferredProfileId = (dashboard?.engine === "codex"
+    ? props.codexProfileId : props.claudeProfileId)
+    ?? defaultAccountProfileId
+    ?? accountProfiles[0]?.id
+    ?? null;
+  const scheduleProfile = resolveWorkScheduleProfile(
+    accountProfiles, scheduleProfileId, preferredProfileId);
+  const effectiveScheduleProfileId = scheduleProfile.profileId;
+  const scheduleProfileMissing = !!dashboard && scheduleProfile.missing;
+
+  useEffect(() => {
+    if (!open) setScheduleProfileId(null);
+  }, [open]);
+
+  useEffect(() => {
+    // Drafts and account choices may outlive a close/reopen on one machine,
+    // but they must never cross a device or engine ownership boundary.
+    setTab("projects");
+    setName("");
+    setDetail("");
+    setSourceTitle("");
+    setSourceBody("");
+    setScheduleTitle("");
+    setSchedulePrompt("");
+    setScheduleAt("");
+    setRepeat("");
+    setScheduleProfileId(null);
+    setPluginName("");
+    setPluginInstructions("");
+    setError(null);
+  }, [props.scopeKey]);
 
   if (!open) return null;
   const projects = dashboard?.projects ?? [];
   const libraryProjectId = selectedProjectId ?? projects[0]?.project_id ?? null;
   const projectName = (id?: string | null) =>
     projects.find((project) => project.project_id === id)?.name ?? "未归类";
+  const profileName = (id?: string | null) => workProfileDisplayName(
+    accountProfiles, defaultAccountProfileId, id);
 
   const remove = (label: string, action: () => boolean) => {
     if (window.confirm(`确定删除${label}吗？`)) action();
@@ -141,6 +195,31 @@ export function WorkDashboardSheet(props: Props) {
             <section className="work-form">
               <h3>新建定时任务</h3>
               <ProjectPicker projects={projects} value={selectedProjectId} onChange={onSelectProject} allowNone />
+              {(accountProfiles.length > 1 || scheduleProfileMissing) && (
+                <label className="work-schedule-profile">
+                  <span>执行账号</span>
+                  <select value={effectiveScheduleProfileId ?? ""}
+                    onChange={(event) => setScheduleProfileId(event.target.value)}>
+                    {scheduleProfileMissing && effectiveScheduleProfileId && (
+                      <option value={effectiveScheduleProfileId} disabled>
+                        已移除账号
+                      </option>
+                    )}
+                    {accountProfiles.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profileName(profile.id)}
+                        {profile.error ? " · 目录暂不可用" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              {scheduleProfileMissing && (
+                <p className="work-form-error">
+                  所选 {dashboard.engine === "codex" ? "Codex" : "Claude"}
+                  账号已移除，请重新选择执行账号。
+                </p>
+              )}
               <input value={scheduleTitle} onChange={(e) => setScheduleTitle(e.target.value)} placeholder="任务名称" />
               <textarea value={schedulePrompt} onChange={(e) => setSchedulePrompt(e.target.value)} placeholder="到时间后让 Agent 完成什么？" />
               <div className="work-form-actions">
@@ -149,18 +228,20 @@ export function WorkDashboardSheet(props: Props) {
                   <option value="">仅一次</option><option value="86400">每天</option><option value="604800">每周</option>
                 </select>
               </div>
-              <button className="primary" disabled={!scheduleTitle.trim() || !schedulePrompt.trim() || !scheduleAt} onClick={() => {
+              <button className="primary" disabled={!scheduleTitle.trim() || !schedulePrompt.trim() || !scheduleAt
+                || !effectiveScheduleProfileId || scheduleProfileMissing} onClick={() => {
                 const when = new Date(scheduleAt).getTime() / 1000;
                 if (!Number.isFinite(when) || when < Date.now() / 1000 - 60) { setError("请选择未来的执行时间"); return; }
                 if (props.onCreateSchedule(scheduleTitle.trim(), schedulePrompt.trim(), when,
-                  repeat ? Number(repeat) : undefined, selectedProjectId ?? undefined)) {
+                  repeat ? Number(repeat) : undefined, selectedProjectId ?? undefined,
+                  effectiveScheduleProfileId ?? undefined)) {
                   setScheduleTitle(""); setSchedulePrompt(""); setScheduleAt("");
                 }
               }}>创建任务</button>
             </section>
             <section className="work-items">
               {dashboard.schedules.map((item) => <article key={item.schedule_id}>
-                <div><b>{item.title}</b><p>{projectName(item.project_id)} · {item.enabled ? new Date(item.next_run_at * 1000).toLocaleString() : "已执行"}{item.last_error ? ` · ${item.last_error}` : ""}</p></div>
+                <div><b>{item.title}</b><p>{projectName(item.project_id)} · {profileName(dashboard.engine === "codex" ? item.codex_profile_id : item.claude_profile_id)} · {item.enabled ? new Date(item.next_run_at * 1000).toLocaleString() : "已执行"}{item.last_error ? ` · ${item.last_error}` : ""}</p></div>
                 <button className="danger" onClick={() => remove(`任务「${item.title}」`, () => props.onDeleteSchedule(item.schedule_id))}><Icon name="trash" size={15} /></button>
               </article>)}
             </section>

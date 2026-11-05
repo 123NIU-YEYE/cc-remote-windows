@@ -9,12 +9,14 @@ from types import SimpleNamespace
 import pytest
 
 from cc_remote.wrapper.history_store import (
+    _sqlite_int,
+    _source_identity,
     HistoryIndexStore,
     HistorySourceFingerprint,
     MaterializedHistoryPage,
-    _sqlite_int,
-    _source_identity,
+    MaterializedTurnDetail,
     history_source_extends,
+    history_turn_snapshot_hash,
     materialize_history_turns,
 )
 
@@ -28,6 +30,151 @@ def _page(label: str, *, more: bool = False) -> MaterializedHistoryPage:
         newest_id=label,
         turns=materialize_history_turns(events),
     )
+
+
+def _compact_visible(row):
+    return row.get("type") == "user"
+
+
+@pytest.mark.parametrize("kind,run_id", [("agent", "child"), ("task", None)])
+def test_compact_return_receipts_keep_source_order_and_exact_child_without_output(kind, run_id):
+    from cc_remote.protocol import ProcessEvent
+    from cc_remote.wrapper.agent_returns import return_receipt
+
+    original = ProcessEvent(item_id="task-id", kind=kind, phase="end", status="succeeded",
+                            title="Review", detail="private child output", parent_id="agent-tool")
+    event = return_receipt(original, "native-notice", run_id).model_dump(exclude_none=True)
+    assert event["item_id"] == return_receipt(original, "native-notice", run_id).item_id
+    assert "detail" not in event
+    def text(identifier):
+        return [{"type": "assistant_msg_start", "message_id": identifier, "channel": "final"},
+                {"type": "delta", "message_id": identifier, "channel": "final", "text": identifier},
+                {"type": "assistant_msg_end", "message_id": identifier, "channel": "final"}]
+    turn = materialize_history_turns([
+        {"type": "user_msg", "msg_id": "human", "prompt": "review"},
+        *text("before"), event, *text("after"),
+    ])[0]
+    blocks = turn["blocks"]
+    assert [block["kind"] for block in blocks] == ["text", "process", "text"]
+    assert blocks[1]["input"] == {"agent_run_id": run_id}
+    assert blocks[1]["tool"] == f"{kind}_return"
+    assert "private child output" not in json.dumps(blocks)
+    assert turn["processDetailState"] == "none"
+    assert turn["detailEventCount"] == 0
+
+
+def _compact_row(uid):
+    return json.dumps({"type": "user", "uuid": uid, "isSidechain": False}) + "\n"
+
+
+def _compact_index(store, path, **kwargs):
+    return store.get_claude_compact_index(
+        str(path), snapshot_size=kwargs.pop("snapshot_size", None),
+        max_record_bytes=1024, max_entries=kwargs.pop("max_entries", 10),
+        visible_user=_compact_visible, **kwargs,
+    )
+
+
+def test_compact_graph_reuse_does_not_share_mutable_rows(tmp_path, monkeypatch):
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(_compact_row("first"))
+    store = HistoryIndexStore(tmp_path / "state")
+    first = _compact_index(store, path)
+    expected = dict(first.rows)
+    first.rows.clear()
+
+    def no_sqlite_read(*args, **kwargs):
+        raise AssertionError("unchanged metadata must not be reloaded from SQLite")
+
+    monkeypatch.setattr(store, "_read_claude_compact_index", no_sqlite_read)
+    second = _compact_index(store, path)
+    assert second.rows == expected
+    second.rows.clear()
+    assert _compact_index(store, path).rows == expected
+
+
+@pytest.mark.parametrize("change", ["append", "truncate", "rewrite", "replace"])
+def test_compact_graph_reuse_validates_source(tmp_path, change):
+    path = tmp_path / "transcript.jsonl"
+    original = _compact_row("first") + _compact_row("later")
+    path.write_text(original)
+    store = HistoryIndexStore(tmp_path / "state")
+    assert _compact_index(store, path).leaf == "later"
+    if change == "append":
+        with path.open("a") as stream:
+            stream.write(_compact_row("newer"))
+        expected = {"first", "later", "newer"}
+    elif change == "truncate":
+        path.write_text(_compact_row("first"))
+        expected = {"first"}
+    elif change == "rewrite":
+        stat = path.stat()
+        path.write_text(original.replace("later", "other"))
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        expected = {"first", "other"}
+    else:
+        replacement = tmp_path / "replacement"
+        replacement.write_text(_compact_row("other"))
+        os.replace(replacement, path)
+        expected = {"other"}
+    assert set(_compact_index(store, path).rows) == expected
+
+
+def test_compact_graph_cache_respects_snapshots_limits_and_partial_rows(tmp_path):
+    path = tmp_path / "transcript.jsonl"
+    first = _compact_row("first")
+    path.write_text(first + _compact_row("second"), newline="\n")
+    store = HistoryIndexStore(tmp_path / "state")
+    assert len(_compact_index(store, path).rows) == 2
+    assert set(_compact_index(store, path, snapshot_size=len(first)).rows) == {"first"}
+    assert _compact_index(store, path, max_entries=1) is None
+    with path.open("a") as stream:
+        stream.write('{"type":"user","uuid":')
+    assert _compact_index(store, path) is None
+    with path.open("a") as stream:
+        stream.write('"third"}\n')
+    assert _compact_index(store, path).leaf == "third"
+
+
+def test_compact_graph_memory_is_bounded_and_rebuildable(tmp_path, monkeypatch):
+    import cc_remote.wrapper.history_store as history_store
+
+    monkeypatch.setattr(history_store, "_COMPACT_MEMORY_ENTRIES", 1)
+    store = HistoryIndexStore(tmp_path / "state")
+    for i in range(2):
+        path = tmp_path / f"transcript-{i}.jsonl"
+        path.write_text(_compact_row(f"user-{i}"))
+        assert _compact_index(store, path).leaf == f"user-{i}"
+        assert len(store._compact_memory) == 1
+    store.invalidate_session("unrelated")
+    assert not store._compact_memory
+    assert store._compact_memory_bytes == 0
+    monkeypatch.setattr(history_store, "_COMPACT_MEMORY_BYTES", 1)
+    assert _compact_index(store, path).leaf == "user-1"
+    assert not store._compact_memory
+
+
+@pytest.mark.parametrize("old_version", [44, 45, 46, 47, 48, 49])
+def test_return_receipt_migration_rebuilds_chat_projections_preserving_images(tmp_path, old_version):
+    path = tmp_path / "source.jsonl"
+    path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(path)
+    store = HistoryIndexStore(tmp_path / "state")
+    for engine in ("codex", "claude", "dsh"):
+        store.put_page(engine, engine, source, before=None, limit=4, page=_page(engine))
+        store.put_image_asset(engine, engine, source, engine, "image",
+                              "thumbnail", "image/png", 1, 1, engine.encode())
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+    migrated = HistoryIndexStore(tmp_path / "state")
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert sorted(connection.execute(f"SELECT engine FROM {table}").fetchall()) == []
+        assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 3
+    migrated.put_page("codex", "codex", source, before=None, limit=4, page=_page("new"))
+    reopened = HistoryIndexStore(tmp_path / "state")
+    assert reopened.get_page("codex", "codex", source, before=None, limit=4) == _page("new")
 
 
 def test_history_index_roundtrip_is_bound_to_exact_source_snapshot(tmp_path):
@@ -156,6 +303,75 @@ def test_turn_detail_survives_append_but_not_destructive_invalidation(tmp_path):
         "session-1", "codex", changed, "message-1") is None
 
 
+def test_turn_detail_snapshot_lookup_is_immutable_and_scope_bound(tmp_path):
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_text('{"type":"first"}\n')
+    original = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    original_events = (
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "process", "item_id": "old-step", "phase": "end"},
+        {"type": "turn_end", "turn_id": "native-1", "result": {
+            "subtype": "success", "duration_ms": 1, "is_error": False,
+        }},
+    )
+    store.put_turn_details(
+        "session-1", "codex", original, original_events)
+
+    first = store.get_turn_detail_snapshot(
+        "session-1", "codex", original, "message-1")
+    assert first == MaterializedTurnDetail(
+        events=original_events,
+        turn_id="message-1",
+        source_token=original.token,
+    )
+
+    with source_path.open("a") as stream:
+        stream.write('{"type":"second"}\n')
+    appended = HistorySourceFingerprint.capture(source_path)
+    appended_events = (
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "process", "item_id": "new-step", "phase": "end"},
+        {"type": "turn_end", "turn_id": "native-1", "result": {
+            "subtype": "success", "duration_ms": 2, "is_error": False,
+        }},
+    )
+    store.put_turn_details(
+        "session-1", "codex", appended, appended_events)
+
+    turn_hash = history_turn_snapshot_hash("message-1")
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", original.token, turn_hash,
+    ) == first
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", appended.token, turn_hash,
+    ) == MaterializedTurnDetail(
+        events=appended_events,
+        turn_id="message-1",
+        source_token=appended.token,
+    )
+    assert store.get_turn_detail_by_snapshot(
+        "session-2", "codex", original.token, turn_hash,
+    ) is None
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "claude", original.token, turn_hash,
+    ) is None
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", original.token,
+        history_turn_snapshot_hash("message-2"),
+    ) is None
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "DELETE FROM history_turn_details "
+            "WHERE session_id=? AND engine=? AND source_token=?",
+            ("session-1", "codex", original.token),
+        )
+    assert store.get_turn_detail_by_snapshot(
+        "session-1", "codex", original.token, turn_hash,
+    ) is None
+
+
 def test_turn_detail_recovers_from_retained_page_after_detail_lru_eviction(
     tmp_path,
 ):
@@ -194,6 +410,121 @@ def test_turn_detail_recovers_from_retained_page_after_detail_lru_eviction(
         "session-1", "codex", source, before=None, limit=4) == page
     assert store.get_turn_detail(
         "session-1", "codex", source, "message-1") == events
+
+
+def test_summary_cache_read_skips_full_events_without_losing_detail(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text('{"type":"first"}\n')
+    source = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    events = (
+        {"type": "model", "model": "claude-test"},
+        {"type": "user_msg", "msg_id": "message-1", "prompt": "inspect"},
+        {"type": "tool_use", "tool_use_id": "tool-1", "tool": "Read",
+         "input": {"file_path": "/tmp/example"}},
+        {"type": "tool_result", "tool_use_id": "tool-1", "content": "ok",
+         "is_error": False},
+        {"type": "turn_end", "turn_id": "turn-1",
+         "result": {"subtype": "success", "duration_ms": 1,
+                    "is_error": False}},
+    )
+    page = MaterializedHistoryPage(
+        events=events,
+        has_more=False,
+        oldest_id="message-1",
+        newest_id="message-1",
+        turns=materialize_history_turns(events),
+    )
+    assert store.put_page(
+        "session-1", "claude", source,
+        before=None, limit=4, page=page,
+    )
+
+    summary = store.get_page(
+        "session-1", "claude", source,
+        before=None, limit=4, summary_only=True,
+    )
+    assert summary is not None
+    assert summary.events == ({"type": "model", "model": "claude-test"},)
+    assert summary.turns == page.turns
+
+    # The source-complete page remains available to compatibility full-history
+    # callers and to TurnDetail's retained-page fallback.
+    assert store.get_page(
+        "session-1", "claude", source,
+        before=None, limit=4,
+    ) == page
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "DELETE FROM history_turn_details WHERE session_id=?",
+            ("session-1",),
+        )
+    assert store.get_turn_detail(
+        "session-1", "claude", source, "message-1",
+    ) == events[1:]
+
+
+@pytest.mark.parametrize("summary_only", [False, True])
+def test_page_read_does_not_retry_unrelated_sqlite_failures(summary_only):
+    class BrokenConnection:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, _sql, _parameters):
+            self.calls += 1
+            raise sqlite3.OperationalError("database is locked")
+
+    store = object.__new__(HistoryIndexStore)
+    store._summary_json_sql_available = None
+    connection = BrokenConnection()
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        store._select_page_row(
+            connection,
+            summary_only=summary_only,
+            projected_sql="SELECT projected",
+            raw_sql="SELECT raw",
+            parameters=(),
+        )
+
+    assert connection.calls == 1
+
+
+def test_missing_sqlite_json_projection_falls_back_only_once():
+    class Cursor:
+        def __init__(self, value):
+            self.value = value
+
+        def fetchone(self):
+            return self.value
+
+    class JsonlessConnection:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, sql, _parameters):
+            self.calls.append(sql)
+            if sql == "SELECT projected":
+                raise sqlite3.OperationalError(
+                    "no such function: json_set")
+            return Cursor("raw-row")
+
+    store = object.__new__(HistoryIndexStore)
+    store._summary_json_sql_available = None
+    connection = JsonlessConnection()
+    kwargs = {
+        "summary_only": True,
+        "projected_sql": "SELECT projected",
+        "raw_sql": "SELECT raw",
+        "parameters": (),
+    }
+
+    assert store._select_page_row(connection, **kwargs) == "raw-row"
+    assert store._summary_json_sql_available is False
+    assert store._select_page_row(connection, **kwargs) == "raw-row"
+    assert connection.calls == [
+        "SELECT projected", "SELECT raw", "SELECT raw",
+    ]
 
 
 def test_history_index_separates_cursor_limit_engine_and_session(tmp_path):
@@ -245,6 +576,497 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
         assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
 
 
+def test_agent_detail_cache_is_source_bound_and_invalidatable(tmp_path):
+    source_path = tmp_path / "agent.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    events = ({"type": "delta", "text": "agent output"},)
+
+    store.put_agent_detail("session-1", source, "agent-run", events)
+    assert store.get_agent_detail(
+        "session-1", source, "agent-run") == events
+
+    source_path.write_text("{}\n{}\n")
+    changed = HistorySourceFingerprint.capture(source_path)
+    assert store.get_agent_detail(
+        "session-1", changed, "agent-run") is None
+
+    store.invalidate_session("session-1")
+    assert store.get_agent_detail(
+        "session-1", source, "agent-run") is None
+
+
+@pytest.mark.parametrize("old_version", [32, 33])
+def test_paged_file_migration_rebuilds_summaries_once_without_removing_assets(tmp_path, old_version):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    store = HistoryIndexStore(tmp_path / "state")
+    for engine in ("claude", "codex"):
+        store.put_page(engine, engine, source, before=None, limit=4, page=_page(engine))
+        store.put_image_asset(engine, engine, source, engine, "image",
+                              "thumbnail", "image/png", 1, 1, engine.encode())
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+    migrated = HistoryIndexStore(tmp_path / "state")
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 2
+    assert migrated.get_page("claude", "claude", source, before=None, limit=4) is None
+    assert migrated.put_page("codex", "codex", source, before=None, limit=4, page=_page("codex"))
+    reopened = HistoryIndexStore(tmp_path / "state")
+    assert reopened.get_page("codex", "codex", source, before=None, limit=4) is not None
+
+
+@pytest.mark.parametrize("old_version", [41, 42])
+def test_compact_migration_rebuilds_claude_details_and_preserves_assets(tmp_path, old_version):
+    path = tmp_path / "source.jsonl"
+    path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(path)
+    store = HistoryIndexStore(tmp_path / "state")
+    for engine in ("claude", "codex"):
+        store.put_page(engine, engine, source, before=None, limit=4, page=_page(engine))
+        store.put_image_asset(engine, engine, source, engine, "image",
+                              "thumbnail", "image/png", 1, 1, engine.encode())
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+    migrated = HistoryIndexStore(tmp_path / "state")
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        assert connection.execute(
+            "SELECT engine FROM history_pages").fetchall() == []
+        assert connection.execute(
+            "SELECT engine FROM history_turn_details").fetchall() == []
+        assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 2
+    assert migrated.put_page("codex", "codex", source, before=None, limit=4, page=_page("rebuilt"))
+    reopened = HistoryIndexStore(tmp_path / "state")
+    assert reopened.get_page("codex", "codex", source, before=None, limit=4) == _page("rebuilt")
+
+
+@pytest.mark.parametrize("old_version", [34, 35, 36, 37])
+def test_narrative_migration_preserves_assets(tmp_path, old_version):
+    path = tmp_path / "rollout.jsonl"
+    path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(path)
+    store = HistoryIndexStore(tmp_path / "state")
+    for engine in ("claude", "codex"):
+        store.put_page(engine, engine, source, before=None, limit=4, page=_page(engine))
+        store.put_image_asset(engine, engine, source, engine, "image", "thumbnail", "image/png", 1, 1, b"image")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+    migrated = HistoryIndexStore(tmp_path / "state")
+    assert migrated.get_page("codex", "codex", source, before=None, limit=4) is None
+    assert migrated.get_page("claude", "claude", source, before=None, limit=4) is None
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM history_turn_details WHERE engine='codex'").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM history_turn_details WHERE engine='claude'").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 2
+    migrated.put_page("codex", "codex", source, before=None, limit=4, page=_page("rebuilt"))
+    reopened = HistoryIndexStore(tmp_path / "state")
+    assert reopened.get_page("codex", "codex", source, before=None, limit=4) == _page("rebuilt")
+
+
+@pytest.mark.parametrize("old_version", [38, 39])
+def test_background_and_summary_migrations_preserve_source_assets(tmp_path, old_version):
+    path = tmp_path / "source.jsonl"
+    path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(path)
+    store = HistoryIndexStore(tmp_path / "state")
+    for engine in ("claude", "codex", "dsh"):
+        store.put_page(engine, engine, source, before=None, limit=4, page=_page(engine))
+        store.put_image_asset(engine, engine, source, engine, "image", "thumbnail", "image/png", 1, 1, b"image")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+    migrated = HistoryIndexStore(tmp_path / "state")
+    assert migrated.get_page("claude", "claude", source, before=None, limit=4) is None
+    assert migrated.get_page("codex", "codex", source, before=None, limit=4) is None
+    assert migrated.get_page("dsh", "dsh", source, before=None, limit=4) is None
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM history_image_assets").fetchone()[0] == 3
+    migrated.put_page("claude", "claude", source, before=None, limit=4, page=_page("rebuilt"))
+    assert HistoryIndexStore(tmp_path / "state").get_page(
+        "claude", "claude", source, before=None, limit=4) == _page("rebuilt")
+
+
+def test_v19_migration_rebuilds_history_and_adds_agent_details(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+    assert store.put_page(
+        "session-1", "claude", source, before=None, limit=4,
+        page=_page("session-1"),
+    )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("DROP TABLE history_agent_details")
+        connection.execute("PRAGMA user_version=19")
+
+    migrated = HistoryIndexStore(state_dir)
+    assert migrated.get_page(
+        "session-1", "claude", source, before=None, limit=4) is None
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_agent_details").fetchone()[0] == 0
+
+
+def test_v20_migration_rebuilds_codex_and_claude_identity_projections(tmp_path):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=20")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_image_asset(
+        "codex-session", "codex", source,
+        "codex-session", "codex-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"codex")
+
+
+def test_v21_migration_rebuilds_claude_alias_and_codex_process_projections(
+    tmp_path,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id,
+            engine,
+            source,
+            before=None,
+            limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+            "image/png",
+            1,
+            1,
+            engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=21")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+
+
+def test_v22_migration_applies_codex_and_claude_projection_repairs(
+    tmp_path,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id,
+            engine,
+            source,
+            before=None,
+            limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+            "image/png",
+            1,
+            1,
+            engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=22")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+
+
+@pytest.mark.parametrize("old_version", [23, 24])
+def test_recent_migration_applies_codex_and_claude_projection_repairs(
+    tmp_path,
+    old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id,
+            engine,
+            source,
+            before=None,
+            limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+            "image/png",
+            1,
+            1,
+            engine.encode(),
+        )
+    agent_events = ({"type": "delta", "text": "agent output"},)
+    store.put_agent_detail(
+        "claude-session", source, "agent-run", agent_events)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_agent_details"
+        ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_image_asset(
+        "codex-session", "codex", source,
+        "codex-session", "codex-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"codex")
+    assert migrated.get_agent_detail(
+        "claude-session", source, "agent-run",
+    ) == agent_events
+
+
+@pytest.mark.parametrize("old_version", [25, 26, 27, 28, 29, 30, 31])
+def test_async_question_migration_preserves_assets(
+    tmp_path, old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id,
+            engine,
+            source,
+            before=None,
+            limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+            "image/png",
+            1,
+            1,
+            engine.encode(),
+        )
+    agent_events = ({"type": "delta", "text": "agent output"},)
+    store.put_agent_detail(
+        "claude-session", source, "agent-run", agent_events)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_agent_details"
+        ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_image_asset(
+        "claude-session", "claude", source,
+        "claude-session", "claude-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"claude")
+    assert migrated.get_agent_detail(
+        "claude-session", source, "agent-run",
+    ) == agent_events
+
+
+def test_async_summary_migration_rebuilds_once_without_source_changes(tmp_path):
+    source_path = tmp_path / "rollout.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+    events = (
+        {"type": "user_msg", "msg_id": "user", "prompt": "test"},
+        {"type": "delta", "message_id": "question", "channel": "commentary",
+         "text": "Question?"},
+        {"type": "assistant_msg_end", "message_id": "question",
+         "delivery": "async", "questions": [{"title": "Question?"}]},
+        {"type": "delta", "message_id": "answer", "channel": "unknown",
+         "text": "Finished."},
+        {"type": "turn_end", "reason": "success"},
+    )
+    repaired = materialize_history_turns(events)
+    stale = dict(repaired[0], blocks=[repaired[0]["blocks"][0]])
+    page = MaterializedHistoryPage(
+        events=events, turns=(stale,), has_more=False,
+        oldest_id="user", newest_id="user",
+    )
+    assert store.put_page("session", "codex", source, before=None, limit=4, page=page)
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA user_version=28")
+
+    migrated = HistoryIndexStore(state_dir)
+    assert HistorySourceFingerprint.capture(source_path).token == source.token
+    assert migrated.get_page("session", "codex", source, before=None, limit=4) is None
+    detail = migrated.get_turn_detail("session", "codex", source, "user")
+    assert detail is None  # v30 also rebuilds generated-image references.
+    rebuilt = MaterializedHistoryPage(
+        events=events, turns=repaired, has_more=False,
+        oldest_id="user", newest_id="user",
+    )
+    assert migrated.put_page(
+        "session", "codex", source, before=None, limit=4, page=rebuilt)
+    reopened = HistoryIndexStore(state_dir)
+    restored = reopened.get_page("session", "codex", source, before=None, limit=4)
+    assert restored == rebuilt
+    assert [b["text"] for b in restored.turns[0]["blocks"]] == ["Question?", "Finished."]
+
+
 @pytest.mark.parametrize("old_version", [6, 7, 8, 9])
 def test_legacy_migration_rebuilds_all_derived_history_rows(
         tmp_path, old_version):
@@ -281,7 +1103,7 @@ def test_legacy_migration_rebuilds_all_derived_history_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
         for table in (
             "history_pages",
             "history_turn_details",
@@ -305,7 +1127,7 @@ def test_legacy_migration_rebuilds_all_derived_history_rows(
         ) is None
 
 
-def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
+def test_v10_migration_invalidates_changed_projection_rows(tmp_path):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")
     source = HistorySourceFingerprint.capture(source_path)
@@ -328,7 +1150,7 @@ def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
         for table in (
             "history_pages", "history_turn_details", "history_image_assets",
         ):
@@ -337,17 +1159,24 @@ def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
             ).fetchone()[0] == 0
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == (
+                1 if table == "history_image_assets" else 0)
 
     assert migrated.get_page(
         "claude-session", "claude", source, before=None, limit=4,
     ) is None
     assert migrated.get_page(
         "codex-session", "codex", source, before=None, limit=4,
-    ) == _page("codex-session")
+    ) is None
+    assert migrated.get_image_asset(
+        "codex-session", "codex", source,
+        "codex-session", "codex-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"codex")
 
 
-def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
+def test_v11_migration_invalidates_claude_pages_and_adds_compact_index(
+    tmp_path,
+):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")
     source = HistorySourceFingerprint.capture(source_path)
@@ -370,9 +1199,9 @@ def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
     migrated = HistoryIndexStore(state_dir)
     assert migrated.get_page(
         "claude-session", "claude", source, before=None, limit=4,
-    ) == _page("claude-session")
+    ) is None
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
         tables = {
             row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -383,6 +1212,177 @@ def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
         "claude_compact_records",
         "claude_compact_queue",
     } <= tables
+
+
+@pytest.mark.parametrize("old_version", [12, 13, 14])
+def test_recent_migration_invalidates_changed_projection_rows(
+    tmp_path, old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT INTO claude_compact_sources ("
+            "source_path, source_device, source_inode, indexed_size, "
+            "source_head_sha256, source_tail_sha256, record_count, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(source_path), 1, 2, 3, "head", "tail", 1, 1.0),
+        )
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in (
+            "history_pages", "history_turn_details", "history_image_assets",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == (
+                1 if table == "history_image_assets" else 0)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM claude_compact_sources"
+        ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("old_version", [15, 16])
+def test_owner_and_interrupt_alias_migration_invalidates_both_projections(
+    tmp_path, old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        for engine in ("claude", "codex"):
+            assert connection.execute(
+                "SELECT COUNT(*) FROM history_image_assets WHERE engine=?",
+                (engine,),
+            ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_image_asset(
+        "codex-session", "codex", source,
+        "codex-session", "codex-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"codex")
+
+
+@pytest.mark.parametrize("old_version", [17, 18])
+def test_recent_summary_migration_rebuilds_pages_but_preserves_source_assets(
+    tmp_path, old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id,
+            engine,
+            source,
+            before=None,
+            limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+            "image/png",
+            1,
+            1,
+            engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 50
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_pages"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_turn_details WHERE engine='claude'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_turn_details WHERE engine='codex'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM history_image_assets"
+        ).fetchone()[0] == 2
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert migrated.get_page(
+            session_id, engine, source, before=None, limit=4,
+        ) is None
+        assert migrated.get_turn_detail(
+            session_id, engine, source, session_id,
+        ) is None
+        assert migrated.get_image_asset(
+            session_id,
+            engine,
+            source,
+            session_id,
+            f"{engine}-image",
+            "thumbnail",
+        ) == ("image/png", 1, 1, engine.encode())
 
 
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):
@@ -438,6 +1438,8 @@ def test_materialized_turn_keeps_final_answer_and_defers_process_detail():
             "done": True, "channel": "final",
         }],
         "done": True,
+        "processDetailState": "present",
+        "detailReasons": ["process"],
         "detailEventCount": 2,
         "detailLoaded": False,
         "forkPointId": "turn-1",
@@ -445,6 +1447,119 @@ def test_materialized_turn_keeps_final_answer_and_defers_process_detail():
         "doneTs": 12_000,
         "durationMs": 2000,
     },)
+
+
+def test_materialized_turn_separates_visible_process_from_private_detail():
+    direct = materialize_history_turns([
+        {"type": "user_msg", "msg_id": "direct-user", "prompt": "hello",
+         "ts": 10.0},
+        {"type": "process", "item_id": "reasoning-private",
+         "kind": "reasoning", "phase": "end", "status": "succeeded",
+         "ts": 11.0},
+        {"type": "process", "item_id": "hook-success",
+         "kind": "hook", "phase": "end", "status": "succeeded",
+         "ts": 12.0},
+        {"type": "assistant_msg_start", "message_id": "legacy-unknown",
+         "channel": "unknown", "ts": 12.5},
+        {"type": "delta", "message_id": "legacy-unknown",
+         "channel": "unknown", "text": "compatibility envelope",
+         "ts": 12.5},
+        {"type": "assistant_msg_start", "message_id": "direct-final",
+         "channel": "final", "ts": 13.0},
+        {"type": "delta", "message_id": "direct-final",
+         "channel": "final", "text": "hi", "ts": 13.0},
+        {"type": "turn_end", "turn_id": "direct-turn", "ts": 14.0,
+         "result": {"subtype": "success", "duration_ms": 4000,
+                    "is_error": False}},
+    ])[0]
+
+    assert direct["detailEventCount"] == 3
+    assert direct["processDetailState"] == "none"
+    assert direct["detailReasons"] == []
+    assert "processStartedTs" not in direct
+    assert "processDoneTs" not in direct
+
+    processed = materialize_history_turns([
+        {"type": "user_msg", "msg_id": "process-user", "prompt": "work",
+         "ts": 10.0},
+        {"type": "assistant_msg_start", "message_id": "commentary",
+         "channel": "commentary", "ts": 20.0},
+        {"type": "delta", "message_id": "commentary",
+         "channel": "commentary", "text": "checking", "ts": 21.0},
+        {"type": "assistant_msg_end", "message_id": "commentary",
+         "channel": "commentary", "ts": 22.0},
+        {"type": "tool_use", "message_id": "tool-message",
+         "tool_use_id": "tool-visible", "tool": "exec_command", "ts": 23.0},
+        {"type": "tool_result", "tool_use_id": "tool-visible",
+         "content": "ok", "is_error": False, "ts": 24.0},
+        {"type": "assistant_msg_start", "message_id": "process-final",
+         "channel": "final", "ts": 29.0},
+        {"type": "delta", "message_id": "process-final",
+         "channel": "final", "text": "done", "ts": 29.0},
+        {"type": "turn_end", "turn_id": "process-turn", "ts": 30.0,
+         "result": {"subtype": "success", "duration_ms": 20_000,
+                    "is_error": False}},
+    ])[0]
+
+    assert processed["processDetailState"] == "present"
+    assert processed["detailReasons"] == ["process"]
+    assert processed["processStartedTs"] == 20_000
+    assert processed["processDoneTs"] == 24_000
+
+    commentary_only = materialize_history_turns([
+        {"type": "user_msg", "msg_id": "commentary-user",
+         "prompt": "explain", "ts": 10.0},
+        {"type": "assistant_msg_start", "message_id": "commentary-only",
+         "channel": "commentary", "ts": 20.0},
+        {"type": "delta", "message_id": "commentary-only",
+         "channel": "commentary", "text": "checking", "ts": 21.0},
+        {"type": "assistant_msg_end", "message_id": "commentary-only",
+         "channel": "commentary", "ts": 22.0},
+        {"type": "assistant_msg_start", "message_id": "commentary-final",
+         "channel": "final", "ts": 29.0},
+        {"type": "delta", "message_id": "commentary-final",
+         "channel": "final", "text": "done", "ts": 29.0},
+        {"type": "turn_end", "turn_id": "commentary-turn", "ts": 30.0,
+         "result": {"subtype": "success", "duration_ms": 20_000,
+                    "is_error": False}},
+    ])[0]
+
+    assert commentary_only["processStartedTs"] == 20_000
+    assert commentary_only["processDoneTs"] == 22_000
+
+    failed_hook = materialize_history_turns([
+        {"type": "user_msg", "msg_id": "hook-user", "prompt": "work",
+         "ts": 10.0},
+        {"type": "process", "item_id": "hook-actionable",
+         "kind": "hook", "phase": "start", "status": "running",
+         "ts": 11.0},
+        {"type": "process", "item_id": "hook-actionable",
+         "kind": "hook", "phase": "end", "status": "failed",
+         "ts": 15.0},
+        {"type": "turn_end", "turn_id": "hook-turn", "ts": 16.0,
+         "result": {"subtype": "error", "duration_ms": 6000,
+                    "is_error": True}},
+    ])[0]
+
+    assert failed_hook["processDetailState"] == "present"
+    assert failed_hook["processStartedTs"] == 15_000
+    assert failed_hook["processDoneTs"] == 15_000
+
+    missing_tool_terminal_stamp = materialize_history_turns([
+        {"type": "user_msg", "msg_id": "tool-user", "prompt": "work",
+         "ts": 10.0},
+        {"type": "tool_use", "message_id": "tool-envelope",
+         "tool_use_id": "tool-no-terminal-ts", "tool": "exec_command",
+         "input": {}, "ts": 20.0},
+        {"type": "tool_result", "tool_use_id": "tool-no-terminal-ts",
+         "content": "ok", "is_error": False},
+        {"type": "turn_end", "turn_id": "tool-turn", "ts": 30.0,
+         "result": {"subtype": "success", "duration_ms": 20_000,
+                    "is_error": False}},
+    ])[0]
+
+    assert missing_tool_terminal_stamp["processStartedTs"] == 20_000
+    assert missing_tool_terminal_stamp["processDoneTs"] == 30_000
 
 
 def test_materialized_live_projection_keeps_commentary_tools_and_compaction():
@@ -601,6 +1716,61 @@ def test_materialized_turn_bounds_initial_final_text_and_advertises_detail():
     assert len(turns[0]["blocks"][0]["text"]) <= 256 * 1024
     assert "完整内容请展开" in turns[0]["blocks"][0]["text"]
     assert turns[0]["detailEventCount"] == 1
+    assert turns[0]["processDetailState"] == "none"
+    assert turns[0]["detailReasons"] == ["answer_truncated"]
+
+
+@pytest.mark.parametrize("channel,include_live_detail", [
+    ("final", False), ("final", True), ("commentary", True),
+])
+def test_recovered_text_replaces_partial_prefix_before_live_tail(
+    channel, include_live_detail,
+):
+    from cc_remote.protocol import Delta, deserialize, serialize
+
+    recovered = deserialize(serialize(Delta(
+        sid="session", message_id="reply", channel=channel,
+        text="first recovered", replace=True,
+    ))).model_dump(mode="json")
+    events = [
+        {"type": "user_msg", "msg_id": "prompt", "prompt": "continue"},
+        {"type": "assistant_msg_start", "message_id": "reply", "channel": channel},
+        {"type": "delta", "message_id": "reply", "channel": channel, "text": "first "},
+        recovered,
+        recovered,  # A second reconnect must remain idempotent.
+        {"type": "delta", "message_id": "reply", "channel": channel, "text": " tail"},
+        {"type": "assistant_msg_end", "message_id": "reply", "channel": channel},
+        {"type": "turn_end", "result": {
+            "subtype": "success", "duration_ms": 1, "is_error": False,
+        }},
+    ]
+    turn = materialize_history_turns(events, include_live_detail=include_live_detail)[0]
+    assert [(block["text"], block["done"]) for block in turn["blocks"]] == [
+        ("first recovered tail", True),
+    ]
+
+
+@pytest.mark.parametrize("channel", ["unknown", "final"])
+@pytest.mark.parametrize("include_live_detail", [False, True])
+def test_many_short_answers_cannot_exceed_summary_wire_block_budget(channel, include_live_detail):
+    from cc_remote.protocol import History, deserialize, serialize
+
+    events = [{"type": "user_msg", "msg_id": "prompt", "prompt": "many replies"}]
+    for index in range(70):
+        events.extend([
+            {"type": "assistant_msg_start", "message_id": f"reply-{index}", "channel": channel},
+            {"type": "delta", "message_id": f"reply-{index}", "channel": channel, "text": f"answer {index}"},
+            {"type": "assistant_msg_end", "message_id": f"reply-{index}", "channel": channel},
+        ])
+    turns = materialize_history_turns(events, include_live_detail=include_live_detail)
+    assert len(turns[0]["blocks"]) == 32
+    assert turns[0]["blocks"][-1]["text"] == "answer 69"
+    assert "answer_truncated" in turns[0]["detailReasons"]
+    assert turns[0]["detailEventCount"] >= 1
+    summary = History(session_id="session", revision="revision", detail="summary", turns=turns)
+    assert deserialize(serialize(summary)) == summary
+    # Materialization is a projection: the full source detail remains intact.
+    assert sum(event["type"] == "delta" for event in events) == 70
 
 
 def test_materialized_turn_defers_images_and_bounds_large_prompt():
@@ -617,23 +1787,16 @@ def test_materialized_turn_defers_images_and_bounds_large_prompt():
     assert "完整问题请展开" in turns[0]["prompt"]
     assert "images" not in turns[0]
     assert turns[0]["detailEventCount"] == 2
-
-
-# --- Windows device/inode identity ----------------------------------------
-# Windows reports st_dev as an UNSIGNED 64-bit volume serial number, which
-# exceeds SQLite's signed INTEGER maximum. Persisting it unmodified raised
-# `OverflowError: Python int too large to convert to SQLite INTEGER` and made
-# every history page and compact-index row unwritable on Windows.
-_SQLITE_MAX = 2**63 - 1
-_SQLITE_MIN = -(2**63)
-# Observed on a real Windows volume; deliberately above the signed maximum.
-_WINDOWS_DEVICE = 10565073836593449224
+    assert turns[0]["processDetailState"] == "none"
+    assert turns[0]["detailReasons"] == [
+        "prompt_truncated", "image_deferred"]
 
 
 def test_unsigned_windows_device_fits_sqlite_integer_range():
     assert _WINDOWS_DEVICE > _SQLITE_MAX, "fixture must exceed the signed range"
     mapped = _sqlite_int(_WINDOWS_DEVICE)
     assert _SQLITE_MIN <= mapped <= _SQLITE_MAX
+
 
 
 def test_device_normalization_is_idempotent_and_lossless():
@@ -645,10 +1808,12 @@ def test_device_normalization_is_idempotent_and_lossless():
         assert (once & 0xFFFFFFFFFFFFFFFF) == (value & 0xFFFFFFFFFFFFFFFF)
 
 
+
 def test_device_normalization_does_not_collide_distinct_devices():
     values = [0, 1, _SQLITE_MAX, _SQLITE_MAX + 1, 2**64 - 1, _WINDOWS_DEVICE]
     mapped = [_sqlite_int(value) for value in values]
     assert len(set(mapped)) == len(values)
+
 
 
 def test_source_identity_normalizes_both_stat_fields():
@@ -659,6 +1824,7 @@ def test_source_identity_normalizes_both_stat_fields():
     device, inode = _source_identity(_Stat())
     for value in (device, inode):
         assert _SQLITE_MIN <= value <= _SQLITE_MAX
+
 
 
 def test_history_page_roundtrip_survives_an_out_of_range_device(tmp_path, monkeypatch):
@@ -699,3 +1865,8 @@ def test_history_page_roundtrip_survives_an_out_of_range_device(tmp_path, monkey
     assert store.get_page(
         "session-1", "codex", source, before=None, limit=4,
     ) == _page("first", more=True)
+
+
+_SQLITE_MAX = (1 << 63) - 1
+_SQLITE_MIN = -(1 << 63)
+_WINDOWS_DEVICE = 10565073836593449224

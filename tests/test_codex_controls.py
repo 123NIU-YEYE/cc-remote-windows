@@ -15,7 +15,8 @@ from pydantic import ValidationError
 from cc_remote import __version__
 from cc_remote.protocol import (
     ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
-    CollaborationMode, CommandAck, Delta, Error, GoalState, Interrupt, Model,
+    AnswerQuestion, CollaborationMode, CommandAck, Delta, Effort, Error,
+    GoalState, Interrupt, Model,
     NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
     TurnSteered, UserMsg, PermissionProfile, PermissionProfiles,
     SetPermissionProfile, SetWebSearch, WebSearch,
@@ -31,18 +32,335 @@ from cc_remote.wrapper.codex_handle import (
     CodexManagedOverflow,
     _provider_error_diagnostic,
 )
+from cc_remote.wrapper.claude_runtime import UnsupportedClaudeCliVersion
 from cc_remote.wrapper.sdk import SdkHandle
 from cc_remote.wrapper.session_ctx import CodexGoalMutation
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
 )
+from cc_remote.workspaces import WorkStores
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
 class _Cfg:
     cc_cwd = "/tmp"
     tool_result_max = 8000
+
+
+def test_codex_work_btw_uses_private_profile_bound_runtime(
+    monkeypatch, tmp_path,
+):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.thread_id = None
+            self.model = "gpt-work"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self._approval = "on-request"
+            self.approval_policy = "on-request"
+            self.permission_profile = ":workspace"
+            self.web_search_override = "live"
+            self.web_search = "live"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.connect_call = None
+            self.disconnected = False
+            created.append(self)
+
+        @property
+        def approval(self):
+            return self._approval
+
+        @approval.setter
+        def approval(self, value):
+            self._approval = value
+            self.approval_policy = value
+
+        async def connect(self, **kwargs):
+            self.connect_call = kwargs
+            self.thread_id = "forked-work"
+            # Model the app-server echoing controls from the parent rollout.
+            self.approval = "on-request"
+            self.approval_policy = "on-request"
+            self.permission_profile = ":workspace"
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        profiles = {
+            "primary": {
+                "label": "Primary",
+                "home": str(tmp_path / "primary-home"),
+                "default": True,
+            },
+            "secondary": {
+                "label": "Secondary",
+                "home": str(tmp_path / "secondary-home"),
+            },
+        }
+        machine, _ = _mk_machine()
+        machine.cfg.codex_profiles_json = json.dumps(profiles)
+        machine.cfg.state_dir = tmp_path / "state"
+        machine.cfg.codex_work_root = tmp_path / "work" / "codex"
+        machine.cfg.claude_work_root = tmp_path / "work" / "claude"
+        # Rebuild so profile daemons and Work roots match the explicit config.
+        machine = machine_module.WrapperMachine(machine.cfg, machine.transport)
+        machine._work = WorkStores(
+            machine.cfg.claude_work_root, machine.cfg.codex_work_root)
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+
+        async def keep_effort(_model, effort, **_kwargs):
+            return effort
+
+        monkeypatch.setattr(machine_module, "clamp_effort", keep_effort)
+
+        store = machine._work.for_engine("codex")
+        record = store.create_session(codex_profile_id="secondary")
+        store.bind_session(
+            record.work_id, "parent-work", codex_profile_id="secondary")
+        parent = _mk_ctx("secondary@parent-work", "parent-work")
+        parent.engine = "codex"
+        parent.cwd = record.cwd
+        parent.space = "work"
+        parent.work_id = record.work_id
+        parent.codex_profile_id = "secondary"
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        handle = created[-1]
+        assert handle.init["cwd"] == record.cwd
+        assert handle.init["daemon_mode"] == "off"
+        assert handle.init["work_mode"] is True
+        assert handle.init["codex_home"] == str(tmp_path / "secondary-home")
+        assert handle.connect_call == {
+            "resume_id": "parent-work", "cwd": record.cwd, "fork": True,
+        }
+        assert fork.space == "work"
+        assert fork.work_id == record.work_id
+        assert fork.codex_profile_id == "secondary"
+        assert handle.approval == handle.approval_policy == "never"
+        assert handle.permission_profile == "cc_remote_work"
+        assert handle.web_search_override is None
+        assert handle.web_search == "cached"
+        assert handle.effort == handle.applied_effort == "xhigh"
+        assert handle.display_effort == "xhigh"
+
+    asyncio.run(run())
+
+
+def test_codex_code_btw_keeps_parent_controls_and_shared_mode(monkeypatch):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.thread_id = None
+            self.model = "gpt-code"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self.approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search_override = None
+            self.web_search = "cached"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            created.append(self)
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "forked-code"
+            self.thread_started_callback(self.thread_id)
+
+        async def disconnect(self):
+            return None
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, _ = _mk_machine()
+        parent = _mk_ctx("parent-code", "parent-code")
+        parent.engine = "codex"
+        parent.space = "code"
+        parent.sdk = SimpleNamespace(
+            approval="on-request",
+            approval_policy="on-request",
+            permission_profile=":read-only",
+            web_search_override="live",
+            web_search="live",
+        )
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        handle = created[-1]
+        assert handle.init["daemon_mode"] == machine.cfg.codex_daemon_mode
+        assert "work_mode" not in handle.init
+        assert "codex_home" not in handle.init
+        assert fork.space == "code" and fork.work_id is None
+        assert fork.btw_real_id == "forked-code"
+        assert ("primary", "forked-code") in (
+            machine._private_codex_btw_threads)
+        assert ("primary", "forked-code") not in (
+            machine._codex_thread_started_hints)
+        assert handle.approval == handle.approval_policy == "on-request"
+        assert handle.permission_profile == ":read-only"
+        assert handle.web_search_override == handle.web_search == "live"
+
+    asyncio.run(run())
+
+
+def test_btw_post_connect_failure_disconnects_partial_handle(monkeypatch):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.thread_id = None
+            self.model = "gpt-code"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self.approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search_override = None
+            self.web_search = "cached"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.disconnected = False
+            created.append(self)
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "partial-fork"
+            self.thread_started_callback(self.thread_id)
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, _ = _mk_machine()
+        parent = _mk_ctx("parent-code", "parent-code")
+        parent.engine = "codex"
+        parent.sdk = SimpleNamespace(
+            approval="never", approval_policy="never",
+            permission_profile=None, web_search_override=None,
+            web_search="cached",
+        )
+        machine.sessions[parent.key] = parent
+
+        async def fail_effort(*_args, **_kwargs):
+            raise RuntimeError("effort probe failed")
+
+        machine._resolve_codex_session_effort = fail_effort
+        with pytest.raises(
+            machine_module._BtwSpawnFailure,
+            match="临时侧边会话暂时无法打开",
+        ):
+            await machine._spawn_btw(parent, owner_client_id="client-1")
+
+        assert created[-1].disconnected is True
+        assert list(machine.sessions) == ["parent-code"]
+        assert ("primary", "partial-fork") in (
+            machine._private_codex_btw_threads)
+        assert ("primary", "partial-fork") not in (
+            machine._codex_thread_started_hints)
+
+    asyncio.run(run())
+
+
+def test_spawn_post_connect_failure_disconnects_partial_handle(
+        monkeypatch, tmp_path,
+):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.thread_id = None
+            self.model = "gpt-code"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self.approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search_override = None
+            self.web_search = "cached"
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.disconnected = False
+            created.append(self)
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "partial-session"
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, transport = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+
+        async def fail_effort(*_args, **_kwargs):
+            raise RuntimeError("effort probe failed")
+
+        machine._resolve_codex_session_effort = fail_effort
+        ctx = await machine._spawn(
+            resume_id=None,
+            cwd=str(tmp_path),
+            engine="codex",
+            space="code",
+        )
+
+        assert ctx is None
+        assert created[-1].disconnected is True
+        assert machine.sessions == {}
+        assert any(message.type == "error" for message in transport.sent)
+
+    asyncio.run(run())
 
 
 def test_provider_error_diagnostic_keeps_only_safe_classification():
@@ -87,6 +405,513 @@ def test_codex_json_rpc_error_preserves_typed_no_active_turn_signal():
             await handle._request("turn/interrupt", {})
         assert caught.value.code == -32600
         assert caught.value.no_active_turn is True
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_uses_loaded_app_server_connection():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            return {}
+
+        handle._request = request
+
+        deleted = await handle.delete_thread("thread-1")
+
+        assert requests == [(
+            "thread/delete",
+            {"threadId": "thread-1"},
+        )]
+        assert deleted == ("thread-1",)
+        assert handle.thread_id is None
+
+    asyncio.run(run())
+
+
+def test_codex_archive_thread_uses_loaded_owner_and_collects_descendants():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            await handle._dispatch({
+                "method": "thread/archived",
+                "params": {"threadId": "child-1"},
+            })
+            await handle._dispatch({
+                "method": "thread/archived",
+                "params": {"threadId": "thread-1"},
+            })
+            return {}
+
+        handle._request = request
+
+        archived = await handle.archive_thread("thread-1")
+
+        assert requests == [(
+            "thread/archive",
+            {"threadId": "thread-1"},
+        )]
+        assert archived == ("child-1", "thread-1")
+        assert handle.thread_id is None
+        assert handle._capture_thread_archived_notification({
+            "method": "thread/archived",
+            "params": {"threadId": "unrelated"},
+        }) is False
+
+    asyncio.run(run())
+
+
+def test_codex_archive_thread_rejects_wrong_or_active_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid archive must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(ValueError, match="does not match"):
+            await handle.archive_thread("thread-2")
+
+        handle.turn_active = True
+        with pytest.raises(RuntimeError, match="turn is active"):
+            await handle.archive_thread("thread-1")
+
+    asyncio.run(run())
+
+
+def test_codex_control_connection_unarchives_and_renames_without_resume():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle._control_only_connection = True
+        handle._using_daemon_proxy = True
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._dead = False
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            if method == "thread/unarchive":
+                return {"thread": {"id": params["threadId"], "name": "old"}}
+            return {}
+
+        handle._request = request
+
+        await handle.set_thread_name("thread-1", "new")
+        restored = await handle.unarchive_thread("thread-1")
+
+        assert restored == {"id": "thread-1", "name": "old"}
+        assert requests == [
+            (
+                "thread/name/set",
+                {"threadId": "thread-1", "name": "new"},
+            ),
+            (
+                "thread/unarchive",
+                {"threadId": "thread-1"},
+            ),
+        ]
+        assert handle.thread_id is None
+
+    asyncio.run(run())
+
+
+def test_codex_read_thread_parent_uses_exact_loaded_thread_metadata():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            thread_id = params["threadId"]
+            return {"thread": {
+                "id": thread_id,
+                "forkedFromId": (
+                    "thread-1" if thread_id == "thread-2" else None
+                ),
+            }}
+
+        handle._request = request
+
+        assert await handle.read_thread_parent("thread-2") == "thread-1"
+        assert await handle.read_thread_parent("thread-1") is None
+        assert requests == [
+            (
+                "thread/read",
+                {"threadId": "thread-2", "includeTurns": False},
+            ),
+            (
+                "thread/read",
+                {"threadId": "thread-1", "includeTurns": False},
+            ),
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_delete_catalog_pages_active_and_archived_threads():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            key = (params["archived"], params.get("cursor"))
+            pages = {
+                (False, None): {
+                    "data": [{
+                        "id": "thread-root",
+                        "status": {"type": "idle"},
+                    }],
+                    "nextCursor": "active-next",
+                },
+                (False, "active-next"): {
+                    "data": [{
+                        "id": "thread-child",
+                        "status": {"type": "active"},
+                    }],
+                    "nextCursor": None,
+                },
+                (True, None): {
+                    "data": [{
+                        "id": "thread-archived",
+                        "status": {"type": "notLoaded"},
+                    }],
+                    "nextCursor": None,
+                },
+            }
+            assert method == "thread/list"
+            return pages[key]
+
+        handle._request = request
+
+        assert await handle.list_thread_delete_candidates() == (
+            ("thread-root", False),
+            ("thread-child", True),
+            ("thread-archived", False),
+        )
+        assert [params for _method, params in requests] == [
+            {
+                "archived": False,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+            {
+                "archived": False,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "cursor": "active-next",
+            },
+            {
+                "archived": True,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_loaded_thread_catalog_is_bounded_and_paginated():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            if params.get("cursor") == "next":
+                return {"data": ["thread-2"], "nextCursor": None}
+            return {"data": ["thread-1"], "nextCursor": "next"}
+
+        handle._request = request
+
+        assert await handle.list_loaded_thread_ids() == (
+            "thread-1",
+            "thread-2",
+        )
+        assert requests == [
+            ("thread/loaded/list", {"limit": 100}),
+            ("thread/loaded/list", {"limit": 100, "cursor": "next"}),
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_unloaded_delete_requires_control_connection():
+    async def run():
+        handle = CodexHandle(_Cfg())
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid delete must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(RuntimeError, match="live control connection"):
+            await handle.delete_thread("thread-1")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("work_mode", "connect_kwargs"),
+    [
+        (False, {"resume_id": "thread-1"}),
+        (False, {"fork": True}),
+        (True, {}),
+    ],
+)
+def test_codex_control_connection_rejects_thread_binding(
+    work_mode,
+    connect_kwargs,
+):
+    async def run():
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
+
+        with pytest.raises(ValueError, match="cannot bind a thread"):
+            await handle.connect(control_only=True, **connect_kwargs)
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_rejects_wrong_or_active_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid delete must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(ValueError, match="does not match"):
+            await handle.delete_thread("thread-2")
+
+        handle.turn_active = True
+        with pytest.raises(RuntimeError, match="turn is active"):
+            await handle.delete_thread("thread-1")
+
+    asyncio.run(run())
+
+
+def test_codex_control_only_connect_skips_thread_binding(monkeypatch):
+    class Manager:
+        mode = "auto"
+        strict_shared_affinity = True
+
+        async def proxy_args(self, _bin, _env):
+            return ["/usr/bin/codex", "app-server", "proxy"]
+
+        def invalidate(self):
+            pass
+
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_resolve_codex_bin",
+            lambda: "/usr/bin/codex",
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: None,
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: False,
+        )
+        handle = CodexHandle(
+            _Cfg(),
+            daemon_mode="auto",
+            daemon_manager=Manager(),
+        )
+        requests = []
+        server_requests = []
+
+        async def handle_server_request(message):
+            server_requests.append(message)
+
+        handle._handle_server_request = handle_server_request
+
+        async def open_process(_argv, _bin, *, daemon_proxy):
+            assert daemon_proxy is True
+            handle.proc = SimpleNamespace(returncode=None)
+            handle._using_daemon_proxy = True
+            handle._dead = False
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "initialize":
+                await handle._dispatch({
+                    "method": "thread/started",
+                    "params": {"thread": {
+                        "id": "initializing-sibling-thread",
+                        "source": "cli",
+                    }},
+                })
+                await handle._dispatch({
+                    "id": "initializing-approval",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "initializing-sibling-thread"},
+                })
+                return {"userAgent": "codex_cli_rs/0.147.0 (test)"}
+            assert method == "thread/delete"
+            return {}
+
+        handle._open_process = open_process
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+        await handle.connect(cwd="/tmp", control_only=True)
+
+        assert requests == [(
+            "initialize",
+            codex_handle_module._initialize_params(),
+        )]
+        await handle._dispatch({
+            "method": "thread/started",
+            "params": {"thread": {
+                "id": "sibling-thread",
+                "source": "cli",
+            }},
+        })
+        await handle._dispatch({
+            "id": "approval",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "sibling-thread"},
+        })
+        await asyncio.sleep(0)
+        assert handle.thread_id is None
+        assert server_requests == []
+        assert handle._pending_server_request_ids == set()
+        assert handle.using_daemon_proxy is True
+        assert await handle.delete_thread("thread-1") == ("thread-1",)
+        assert requests[-1] == (
+            "thread/delete",
+            {"threadId": "thread-1"},
+        )
+        handle.proc = None
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_collects_descendant_notifications():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def request(method, params):
+            assert method == "thread/delete"
+            assert params == {"threadId": "thread-1"}
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "child-1"},
+            })
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "thread-1"},
+            })
+            return {}
+
+        handle._request = request
+
+        deleted = await handle.delete_thread("thread-1")
+
+        assert deleted == ("child-1", "thread-1")
+        assert handle._capture_thread_deleted_notification({
+            "method": "thread/deleted",
+            "params": {"threadId": "unrelated"},
+        }) is False
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_marks_notification_overflow(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_THREAD_DELETE_NOTIFY_MAX",
+            2,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def request(_method, _params):
+            for thread_id in ("child-1", "child-2", "child-3", "thread-1"):
+                await handle._dispatch({
+                    "method": "thread/deleted",
+                    "params": {"threadId": thread_id},
+                })
+            return {}
+
+        handle._request = request
+
+        deleted = await handle.delete_thread("thread-1")
+
+        assert deleted == ("child-1", "child-2", "thread-1")
+        assert handle.thread_delete_notifications_overflowed is True
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_collects_notifications_after_root(
+    monkeypatch,
+):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_THREAD_DELETE_NOTIFY_TIMEOUT",
+            0.05,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        reader_release = asyncio.Event()
+        handle._reader = asyncio.create_task(reader_release.wait())
+        notification_task = None
+
+        async def notify_after_response():
+            await asyncio.sleep(0)
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "thread-1"},
+            })
+            await asyncio.sleep(0.01)
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "child-1"},
+            })
+
+        async def request(method, params):
+            nonlocal notification_task
+            assert method == "thread/delete"
+            assert params == {"threadId": "thread-1"}
+            notification_task = asyncio.create_task(
+                notify_after_response()
+            )
+            return {}
+
+        handle._request = request
+        try:
+            deleted = await handle.delete_thread("thread-1")
+            assert notification_task is not None
+            await notification_task
+        finally:
+            reader_release.set()
+            await handle._reader
+
+        assert deleted == ("thread-1", "child-1")
 
     asyncio.run(run())
 
@@ -243,11 +1068,11 @@ def test_stale_codex_session_list_paints_before_refresh_finishes(monkeypatch):
 
 
 @pytest.mark.parametrize("model", ["gpt-5.6-terra", "gpt-5.6-luna"])
-def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model):
+def test_codex_model_id_is_exact_through_wrapper_and_turn_start(model, tmp_path):
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("codex-model", "codex-model")
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), codex_home=str(tmp_path))
         handle.proc = SimpleNamespace(returncode=None)
         handle.thread_id = "codex-model"
         ctx.sdk = handle
@@ -1219,6 +2044,134 @@ def test_codex_recover_owned_turn_arms_stream_before_status_read():
     asyncio.run(run())
 
 
+def test_codex_owned_turn_probe_exposes_only_native_user_item_ids():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            assert params["itemsView"] == "summary"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [
+                        {
+                            "id": "native-user-item",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "secret"}],
+                        },
+                        {
+                            "id": "assistant-item",
+                            "type": "agentMessage",
+                            "text": "private answer",
+                        },
+                    ],
+                }],
+            }
+
+        handle._request = request
+        proof = await handle.probe_owned_turn("control-turn")
+        assert proof is not None
+        assert proof.turn_id == "control-turn"
+        assert proof.native_user_message_ids == ("native-user-item",)
+        assert handle.turn_id is None
+        assert handle.turn_active is False
+
+    asyncio.run(run())
+
+
+def test_codex_recovered_control_turn_accepts_only_bound_stream_task():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(
+            _Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                }],
+            }
+
+        handle._request = request
+        assert await handle.recover_owned_turn(
+            "control-turn", stream_turn_ids=("rollout-task",),
+        ) is True
+        assert handle.owned_turn_ids.issuperset({
+            "control-turn", "rollout-task",
+        })
+        assert handle.compaction_continuation_turn_ids == {
+            "control-turn", "rollout-task",
+        }
+
+        await handle._dispatch({
+            "method": "item/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turnId": "rollout-task",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "answer",
+                    "text": "still running",
+                },
+            },
+        })
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turn": {
+                    "id": "rollout-task",
+                    "status": "completed",
+                },
+            },
+        })
+        frames = [
+            frame async for frame in
+            handle.receive_spontaneous_response("control-turn")
+        ]
+        assert [frame["method"] for frame in frames] == [
+            "item/completed", "turn/completed",
+        ]
+        assert [
+            frame["params"].get("turnId")
+            or frame["params"].get("turn", {}).get("id")
+            for frame in frames
+        ] == ["control-turn", "control-turn"]
+        assert lifecycle == [
+            ("started", "control-turn"),
+            ("completed", "control-turn"),
+        ]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert handle.compaction_continuation_turn_ids == set()
+
+    asyncio.run(run())
+
+
 def test_codex_recover_owned_turn_rejects_a_different_active_turn():
     async def run():
         lifecycle = []
@@ -1559,7 +2512,9 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-turn"
 
             async def receive_response(self):
@@ -1624,7 +2579,6 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
 def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
     async def run():
         machine, transport = _mk_machine()
-        machine.cfg.codex_turn_idle_warn_seconds = 0.02
         ctx = _mk_ctx("managed-overflow-wait", "managed-overflow-wait")
         ctx.engine = "codex"
         ctx.state = "running"
@@ -1639,7 +2593,9 @@ def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-wait-turn"
 
             async def receive_response(self):
@@ -1712,7 +2668,9 @@ def test_managed_codex_overflow_keeps_authoritative_failure_terminal():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-failed-turn"
 
             async def receive_response(self):
@@ -2036,6 +2994,652 @@ def test_codex_catalog_normalization_is_structurally_bounded(monkeypatch):
     assert normalized[0]["efforts"] == ["low", "high"]
 
 
+def test_machine_resolves_nullable_codex_effort_without_loading_forever(
+        monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-session", "effort-session")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-default",
+            effort=None,
+            applied_effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            _cwd="/tmp/effort-one",
+            _generation=1,
+        )
+
+        async def configured_default():
+            return "medium"
+
+        async def unexpected_model_default(*_args, **_kwargs):
+            raise AssertionError("configured default must win")
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unexpected_model_default)
+        ctx.sdk.configured_default_effort = configured_default
+        assert await machine._resolve_codex_session_effort(ctx) == "medium"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.applied_effort is None
+        assert ctx.sdk.display_effort == "medium"
+        assert ctx.sdk.display_effort_model == "gpt-default"
+
+        ctx.sdk.effort = None
+        ctx.sdk.applied_effort = None
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        async def unavailable_default():
+            return None
+
+        ctx.sdk.configured_default_effort = unavailable_default
+
+        async def model_default(model, *, codex_home=None):
+            assert model == "gpt-default"
+            assert codex_home is None
+            return "low"
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", model_default)
+        assert await machine._resolve_codex_session_effort(ctx) == "low"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == "low"
+
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        unknown_default_calls = 0
+
+        async def unknown_model_default(_model, *, codex_home=None):
+            nonlocal unknown_default_calls
+            unknown_default_calls += 1
+            return None
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unknown_model_default)
+        assert await machine._resolve_codex_session_effort(ctx) == (
+            machine_module.MODEL_DEFAULT_EFFORT)
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == machine_module.MODEL_DEFAULT_EFFORT
+        assert ctx.sdk.display_effort_model == "gpt-default"
+        assert unknown_default_calls == 1
+        assert await machine._resolve_codex_session_effort(ctx) == (
+            machine_module.MODEL_DEFAULT_EFFORT)
+        assert unknown_default_calls == 1
+
+        # A temporary catalog miss is throttled, not cached forever. The next
+        # eligible control refresh can replace the truthful sentinel with the
+        # concrete suggested default without pinning turn/start.
+        ctx.sdk._display_effort_retry_at = 0
+
+        async def recovered_model_default(_model, *, codex_home=None):
+            return "high"
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", recovered_model_default)
+        assert await machine._resolve_codex_session_effort(ctx) == "high"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == "high"
+
+        # A failed effective-config read must still leave time for the catalog
+        # fallback instead of immediately degrading to the sentinel.
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        async def failed_configured_default():
+            raise RuntimeError("config temporarily unavailable")
+
+        ctx.sdk.configured_default_effort = failed_configured_default
+        assert await machine._resolve_codex_session_effort(ctx) == "high"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == "high"
+        assert ctx.sdk._display_effort_retry_at is not None
+
+        # A concrete catalog fallback is provisional when config/read failed.
+        # Once the retry window opens, the recovered effective config replaces
+        # it instead of leaving the UI pinned to the wrong model default.
+        configured_recovery_calls = 0
+
+        async def recovered_configured_default():
+            nonlocal configured_recovery_calls
+            configured_recovery_calls += 1
+            return "medium"
+
+        ctx.sdk.configured_default_effort = recovered_configured_default
+        assert await machine._resolve_codex_session_effort(ctx) == "high"
+        assert configured_recovery_calls == 0
+        ctx.sdk._display_effort_retry_at = 0
+        assert await machine._resolve_codex_session_effort(ctx) == "medium"
+        assert configured_recovery_calls == 1
+        assert ctx.sdk._display_effort_retry_at is not None
+
+        # A concrete display cache is authoritative only for the cwd and
+        # app-server generation that produced it.
+        scoped_config_calls = 0
+
+        async def scoped_configured_default():
+            nonlocal scoped_config_calls
+            scoped_config_calls += 1
+            return "xhigh" if ctx.sdk._generation == 1 else "low"
+
+        ctx.sdk.configured_default_effort = scoped_configured_default
+        ctx.sdk._cwd = "/tmp/effort-two"
+        assert await machine._resolve_codex_session_effort(ctx) == "xhigh"
+        ctx.sdk._generation = 2
+        assert await machine._resolve_codex_session_effort(ctx) == "low"
+        assert scoped_config_calls == 2
+
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        async def clamp(_model, effort, *, codex_home=None):
+            assert effort == "xhigh"
+            return effort
+
+        monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+        assert await machine._resolve_codex_session_effort(
+            ctx, preferred="xhigh") == "xhigh"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "xhigh"
+        assert ctx.sdk.display_effort == "xhigh"
+        assert ctx.sdk.display_effort_model == "gpt-default"
+
+        # thread/fork may echo the parent's explicit setting. BTW's wrapper-
+        # owned xhigh choice must still win before its first query.
+        ctx.sdk.effort = "high"
+        ctx.sdk.applied_effort = "high"
+        assert await machine._resolve_codex_session_effort(
+            ctx, preferred="xhigh") == "xhigh"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "xhigh"
+
+    asyncio.run(run())
+
+
+def test_machine_effort_resolution_discards_stale_async_authority(monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-race", "effort-race")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-before",
+            effort=None,
+            applied_effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            display_effort_cwd=None,
+            display_effort_generation=None,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-before",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_configured_default():
+            started.set()
+            await release.wait()
+            return "xhigh"
+
+        async def unexpected_catalog_default(*_args, **_kwargs):
+            raise AssertionError("stale config result must not fall through")
+
+        ctx.sdk.configured_default_effort = delayed_configured_default
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unexpected_catalog_default)
+        resolving = asyncio.create_task(
+            machine._resolve_codex_session_effort(ctx))
+        await started.wait()
+
+        # Simulate the authoritative thread/settings/updated snapshot which can
+        # arrive while config/read is in flight. Its concrete clamp must win.
+        ctx.sdk.model = "gpt-after"
+        ctx.sdk.effort = "medium"
+        ctx.sdk.applied_effort = "medium"
+        ctx.sdk.display_effort = "medium"
+        ctx.sdk.display_effort_model = "gpt-after"
+        ctx.sdk.display_effort_cwd = os.path.realpath("/tmp/effort-after")
+        ctx.sdk.display_effort_generation = 2
+        ctx.sdk._cwd = "/tmp/effort-after"
+        ctx.sdk._generation = 2
+        ctx.sdk._thread_settings_revision = 1
+        release.set()
+
+        assert await resolving == "medium"
+        assert ctx.sdk.effort == "medium"
+        assert ctx.sdk.display_effort == "medium"
+        assert ctx.sdk.display_effort_model == "gpt-after"
+        assert ctx.sdk.display_effort_generation == 2
+
+    asyncio.run(run())
+
+
+def test_machine_model_effort_publish_never_mixes_async_authorities(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("effort-publish-race", "effort-publish-race")
+        ctx.engine = "codex"
+        ctx.announced_model = "gpt-ui-before"
+        ctx.announced_effort = "high"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-before",
+            effort=None,
+            applied_effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            display_effort_cwd=None,
+            display_effort_generation=None,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-publish-before",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_configured_default():
+            started.set()
+            await release.wait()
+            return "xhigh"
+
+        async def unexpected_catalog_default(*_args, **_kwargs):
+            raise AssertionError("stale config result must not fall through")
+
+        ctx.sdk.configured_default_effort = delayed_configured_default
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unexpected_catalog_default)
+        publishing = asyncio.create_task(
+            machine._publish_codex_model_effort(ctx))
+        await started.wait()
+
+        # No half-snapshot may escape while the nullable effort probe is still
+        # tied to the old model. The authoritative notification replaces the
+        # complete pair before the probe completes.
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ]
+        ctx.sdk.model = "gpt-after"
+        ctx.sdk.effort = "medium"
+        ctx.sdk.applied_effort = "medium"
+        ctx.sdk.display_effort = "medium"
+        ctx.sdk.display_effort_model = "gpt-after"
+        ctx.sdk.display_effort_cwd = os.path.realpath(
+            "/tmp/effort-publish-after")
+        ctx.sdk.display_effort_generation = 2
+        ctx.sdk._cwd = "/tmp/effort-publish-after"
+        ctx.sdk._generation = 2
+        ctx.sdk._thread_settings_revision = 1
+        release.set()
+
+        assert await publishing is True
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ] == [
+            ("model", "gpt-after", None),
+            ("effort", None, "medium"),
+        ]
+        assert ctx.announced_model == "gpt-after"
+        assert ctx.announced_effort == "medium"
+
+    asyncio.run(run())
+
+
+def test_machine_model_effort_publish_completes_old_pair_before_replacement():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("effort-send-race", "effort-send-race")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-before",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-before",
+            display_effort_cwd=os.path.realpath("/tmp/effort-send-before"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-send-before",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        original_send = transport.send
+        replaced = False
+
+        async def send(event):
+            nonlocal replaced
+            await original_send(event)
+            if isinstance(event, Model) and not replaced:
+                replaced = True
+                # A native settings notification lands while sending the first
+                # frame. The old effort must still follow the old model before
+                # a complete new pair replaces it.
+                ctx.sdk.model = "gpt-after"
+                ctx.sdk.effort = "medium"
+                ctx.sdk.applied_effort = "medium"
+                ctx.sdk.display_effort = "medium"
+                ctx.sdk.display_effort_model = "gpt-after"
+                ctx.sdk.display_effort_cwd = os.path.realpath(
+                    "/tmp/effort-send-after")
+                ctx.sdk.display_effort_generation = 2
+                ctx.sdk._cwd = "/tmp/effort-send-after"
+                ctx.sdk._generation = 2
+                ctx.sdk._thread_settings_revision = 1
+
+        transport.send = send
+        published: list[object] = []
+        assert await machine._publish_codex_model_effort(
+            ctx, force=True, published=published,
+        ) is True
+
+        expected = [
+            ("model", "gpt-before", None),
+            ("effort", None, "high"),
+            ("model", "gpt-after", None),
+            ("effort", None, "medium"),
+        ]
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+        ] == expected
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in published
+        ] == expected
+        assert ctx.announced_model == "gpt-after"
+        assert ctx.announced_effort == "medium"
+
+    asyncio.run(run())
+
+
+def test_machine_forced_model_effort_publish_falls_back_after_probe_churn():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("effort-probe-churn", "effort-probe-churn")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-0",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-0",
+            display_effort_cwd=os.path.realpath("/tmp/effort-probe-churn"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-probe-churn",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        probes = 0
+
+        async def churning_effort(_ctx):
+            nonlocal probes
+            probes += 1
+            ctx.sdk.model = f"gpt-{probes}"
+            ctx.sdk.display_effort_model = ctx.sdk.model
+            ctx.sdk._thread_settings_revision = probes
+            return "high"
+
+        machine._resolve_codex_session_effort = churning_effort
+        published: list[object] = []
+        assert await machine._publish_codex_model_effort(
+            ctx, force=True, published=published,
+        ) is True
+
+        assert probes == 3
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+        ] == [
+            ("model", "gpt-3", None),
+            ("effort", None, "high"),
+        ]
+        assert published == transport.sent
+        assert ctx.announced_model == "gpt-3"
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "rollout_model,native_model,explicit_model,expected_model,expected_updates",
+    [
+        ("retired-model", "retired-model", None, "current-model", ["current-model"]),
+        (None, "selected-model", None, "selected-model", []),
+        ("retired-model", "selected-model", None, "selected-model", []),
+        ("current-model", "selected-model", None, "selected-model", []),
+        (None, "retired-model", None, "current-model", ["current-model"]),
+        (None, "selected-model", "current-model", "current-model", ["current-model"]),
+    ],
+)
+def test_codex_resume_preserves_native_model_and_restores_nullable_effort(
+        monkeypatch, tmp_path, rollout_model, native_model, explicit_model,
+        expected_model, expected_updates):
+    class FakeCodexHandle:
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
+            self.cwd = cwd
+            self._cwd = cwd
+            self._generation = 1
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
+            self.thread_id = None
+            self.proc = SimpleNamespace(returncode=None)
+            self.model = "gpt-test"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search = "cached"
+            self.web_search_override = None
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.preconnect_effort = None
+            self.preconnect_model = None
+            self.set_model_calls = []
+
+        @property
+        def approval(self):
+            return self._approval
+
+        @approval.setter
+        def approval(self, value):
+            self._approval = value
+            self.approval_policy = value
+
+        async def connect(self, **kwargs):
+            self.thread_id = kwargs["resume_id"]
+            self.preconnect_effort = self.effort
+            self.preconnect_model = self.model
+            # The native selection can be newer than a stale or unreadable
+            # rollout tail; availability must be decided after this receipt.
+            self.model = native_model
+            # Some app-server versions omit the effective override on resume.
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+
+        async def set_model(self, model):
+            self.set_model_calls.append(model)
+            self.model = model
+
+        async def configured_default_effort(self):
+            return "medium"
+
+        async def disconnect(self):
+            self.proc = None
+
+    async def run():
+        thread_id = "nullable-effort-resume"
+        machine, _transport = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        monkeypatch.setattr(
+            machine_module,
+            "codex_session_cwd",
+            lambda _thread_id: str(tmp_path),
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_session_settings",
+            lambda *_args, **_kwargs: {
+                "model": rollout_model,
+                "effort": "high",
+            },
+        )
+
+        async def catalog(*, codex_home=None):
+            return [{
+                "id": "current-model",
+                "efforts": ["high"],
+                "default_effort": "high",
+                "is_default": True,
+            }, {
+                "id": "selected-model",
+                "efforts": ["high"],
+                "default_effort": "high",
+            }]
+
+        monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+        monkeypatch.setattr(
+            machine_module, "codex_current_provider", lambda **_kwargs: "")
+
+        async def unchanged_effort(_model, effort, **_kwargs):
+            return effort
+
+        monkeypatch.setattr(machine_module, "clamp_effort", unchanged_effort)
+        machine._watch_session = lambda _sid: None
+        machine._prime_codex_ownership = (
+            lambda _sid: asyncio.sleep(0, result=False))
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            resume_id=thread_id,
+            engine="codex",
+            space="code",
+            model=explicit_model,
+        )
+
+        assert ctx is not None
+        assert ctx.sdk.preconnect_model == "current-model"
+        assert ctx.sdk.set_model_calls == expected_updates
+        assert ctx.sdk.model == expected_model
+        assert ctx.sdk.preconnect_effort == "high"
+        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.applied_effort == "high"
+        assert ctx.sdk.display_effort == "high"
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(run())
+
+
+def test_machine_effort_apply_preserves_authoritative_app_server_clamp(
+        monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-clamp", "effort-clamp")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-clamped",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-clamped",
+            display_effort_cwd=os.path.realpath("/tmp"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp",
+            _generation=1,
+        )
+
+        async def set_effort(_requested):
+            # The authoritative notification adjusted the requested high level.
+            ctx.sdk.effort = "medium"
+            ctx.sdk.applied_effort = "medium"
+            ctx.sdk.display_effort = "medium"
+            return True
+
+        ctx.sdk.set_effort = set_effort
+
+        async def clamp(_model, effort, *, codex_home=None):
+            assert effort == "high"
+            return "high"
+
+        monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+        assert await machine._apply_codex_effort(ctx, "high") == "medium"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "medium"
+        assert ctx.sdk.display_effort == "medium"
+
+    asyncio.run(run())
+
+
+def test_machine_effort_apply_keeps_authoritative_null(monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-null", "effort-null")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-null",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-null",
+            display_effort_cwd=os.path.realpath("/tmp"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp",
+            _generation=1,
+        )
+
+        async def set_effort(_requested):
+            # An authoritative notification can reject/clear the override.
+            ctx.sdk.effort = None
+            ctx.sdk.applied_effort = None
+            ctx.sdk.display_effort = None
+            ctx.sdk.display_effort_model = None
+            ctx.sdk.display_effort_cwd = None
+            ctx.sdk.display_effort_generation = None
+            return True
+
+        async def configured_default():
+            return None
+
+        async def model_default(_model, *, codex_home=None):
+            return "low"
+
+        async def clamp(_model, effort, *, codex_home=None):
+            return effort
+
+        ctx.sdk.set_effort = set_effort
+        ctx.sdk.configured_default_effort = configured_default
+        monkeypatch.setattr(machine_module, "default_effort_for", model_default)
+        monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+
+        assert await machine._apply_codex_effort(ctx, "high") == "low"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.applied_effort is None
+        assert ctx.sdk.display_effort == "low"
+
+    asyncio.run(run())
+
+
 def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         monkeypatch):
     monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE", None)
@@ -2201,9 +3805,25 @@ def test_codex_config_defaults_use_only_top_level_toml_keys(
     assert codex_sessions_module.codex_web_search() == "live"
 
 
-def test_codex_thread_settings_update_uses_official_01441_shapes():
+def test_codex_handle_has_no_retired_model_or_effort_fallback(tmp_path):
+    handle = CodexHandle(_Cfg(), codex_home=str(tmp_path))
+
+    assert codex_sessions_module.codex_model(
+        codex_home=str(tmp_path)) == ""
+    assert codex_sessions_module.codex_effort(
+        codex_home=str(tmp_path)) == ""
+    assert handle.model is None
+    assert handle.effort is None
+    assert handle.applied_effort is None
+
+
+def test_codex_thread_settings_update_uses_official_01441_shapes(monkeypatch, tmp_path):
+    async def catalog(**_kwargs):
+        return [{"id": "gpt-after", "service_tiers": [{"id": "priority"}]}]
+
+    monkeypatch.setattr(codex_handle_module, "codex_catalog", catalog)
     async def run():
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), codex_home=str(tmp_path))
         handle.thread_id = "thread-settings"
         handle.model = "gpt-before"
         handle.effort = "high"
@@ -2257,7 +3877,7 @@ def test_codex_thread_settings_update_uses_official_01441_shapes():
                 },
             }),
             ("thread/settings/update", {
-                "threadId": "thread-settings", "serviceTier": "fast",
+                "threadId": "thread-settings", "serviceTier": "priority",
             }),
             ("thread/settings/update", {
                 "threadId": "thread-settings", "serviceTier": None,
@@ -2317,6 +3937,42 @@ def test_codex_authoritative_thread_settings_restore_after_resume_or_notificatio
                 handle.collaboration_mode) == (
             "notification-model", "ultra", "untrusted",
             ":danger-full-access", None, "plan")
+
+    asyncio.run(run())
+
+
+def test_codex_configured_default_effort_is_bounded_and_scoped_per_cwd(
+        monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/one")
+        calls = []
+        now = 0.0
+        one = os.path.realpath("/tmp/one")
+        two = os.path.realpath("/tmp/two")
+
+        monkeypatch.setattr(
+            codex_handle_module.time, "monotonic", lambda: now)
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            effort = "xhigh" if params["cwd"] == one else None
+            return {"config": {"model_reasoning_effort": effort}}
+
+        handle._request = request
+        assert await handle.configured_default_effort() == "xhigh"
+        assert await handle.configured_default_effort() == "xhigh"
+        now = codex_handle_module._CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS + 1
+        assert await handle.configured_default_effort() == "xhigh"
+        handle._cwd = "/tmp/two"
+        assert await handle.configured_default_effort() is None
+        handle._generation += 1
+        assert await handle.configured_default_effort() is None
+        assert calls == [
+            ("config/read", {"cwd": one, "includeLayers": False}),
+            ("config/read", {"cwd": one, "includeLayers": False}),
+            ("config/read", {"cwd": two, "includeLayers": False}),
+            ("config/read", {"cwd": two, "includeLayers": False}),
+        ]
 
     asyncio.run(run())
 
@@ -2549,6 +4205,66 @@ def test_codex_force_reconnect_preserves_live_thread_controls():
     asyncio.run(run())
 
 
+def test_codex_force_reconnect_restores_only_same_scope_explicit_effort():
+    async def reconnect_case(
+        *, resumed_model="gpt-test", resumed_cwd="/tmp/project",
+        resumed_effort=None,
+    ):
+        handle = CodexHandle(_Cfg(), cwd="/tmp/project")
+        handle.thread_id = "resume-thread"
+        handle.model = "gpt-test"
+        handle.effort = "max"
+        handle.applied_effort = "max"
+        handle.display_effort = "max"
+        handle._generation = 7
+
+        async def disconnect():
+            return None
+
+        async def connect(**_kwargs):
+            handle._generation += 1
+            handle.thread_id = "resume-thread"
+            handle.model = resumed_model
+            handle._cwd = resumed_cwd
+            handle.effort = resumed_effort
+            handle.applied_effort = resumed_effort
+            handle.display_effort = resumed_effort
+            handle.display_effort_model = (
+                resumed_model if resumed_effort else None)
+            handle.display_effort_cwd = (
+                os.path.realpath(resumed_cwd) if resumed_effort else None)
+            handle.display_effort_generation = (
+                handle._generation if resumed_effort else None)
+
+        handle.disconnect = disconnect
+        handle.connect = connect
+        await handle.force_reconnect(
+            "resume-thread", "/tmp/project", reason="daemon replaced")
+        return handle
+
+    async def run():
+        restored = await reconnect_case()
+        assert restored.effort == restored.applied_effort == "max"
+        assert restored.display_effort == "max"
+        assert restored.display_effort_model == "gpt-test"
+        assert restored.display_effort_cwd == os.path.realpath("/tmp/project")
+        assert restored.display_effort_generation == 8
+
+        authoritative = await reconnect_case(resumed_effort="high")
+        assert authoritative.effort == authoritative.applied_effort == "high"
+        assert authoritative.display_effort == "high"
+
+        changed_model = await reconnect_case(resumed_model="gpt-new")
+        assert changed_model.effort is None
+        assert changed_model.display_effort is None
+
+        changed_cwd = await reconnect_case(resumed_cwd="/tmp/other")
+        assert changed_cwd.effort is None
+        assert changed_cwd.display_effort is None
+
+    asyncio.run(run())
+
+
 def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         monkeypatch):
     async def run():
@@ -2567,7 +4283,16 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
         with pytest.raises(RuntimeError, match="captured work profile"):
             await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
 
-        assert spawned[:3] == ["/usr/bin/codex", "app-server", "--stdio"]
+        stdio_index = spawned.index("/usr/bin/codex")
+        assert spawned[stdio_index:stdio_index + 3] == [
+            "/usr/bin/codex", "app-server", "--stdio",
+        ]
+        if os.name == "posix":
+            assert spawned[:3] == [
+                codex_handle_module.sys.executable,
+                codex_handle_module._RLIMIT_EXEC,
+                str(codex_handle_module._APP_SERVER_NOFILE_SOFT_LIMIT),
+            ]
         overrides = [
             spawned[index + 1]
             for index, value in enumerate(spawned[:-1])
@@ -2598,6 +4323,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
         handle.thread_id = "work-thread"
         handle.model = "gpt-work"
         handle.effort = None
+        handle.display_effort = codex_models_module.MODEL_DEFAULT_EFFORT
         requests = []
 
         async def request(method, params=None):
@@ -2612,6 +4338,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
         assert params["cwd"] == cwd
         assert params["approvalPolicy"] == "never"
         assert params["permissions"] == "cc_remote_work"
+        assert "effort" not in params
         assert "sandboxPolicy" not in params
 
     asyncio.run(run())
@@ -2621,6 +4348,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
     "work_mode,http_only,web_override,preserve_controls,preserve_profile", [
     (False, False, None, False, True),
     (False, True, None, False, True),
+    (False, True, "live", False, True),
     (False, False, "live", False, True),
     (False, False, "live", True, True),
     (False, False, None, True, False),
@@ -2743,14 +4471,19 @@ def test_codex_resume_adopts_native_settings_unless_controls_are_preserved(
                 "config": _expected_work_config(),
                 "permissions": "cc_remote_work",
             })
-        elif web_override:
-            expected_resume["config"] = {"web_search": web_override}
+        else:
+            code_config = codex_handle_module._code_thread_config(
+                http_only_resume=http_only,
+                web_search=web_override,
+            )
+            if code_config is not None:
+                expected_resume["config"] = code_config
         resume_call = next(call for call in calls if call[0] == "thread/resume")
         assert resume_call == ("thread/resume", expected_resume)
         assert not ({
             "sandbox", "sandboxPolicy", "approvalsReviewer",
         } & resume_call[1].keys())
-        if not work_mode and not web_override:
+        if not work_mode and not web_override and not http_only:
             assert not ({"config", "personality"} & resume_call[1].keys())
         assert (handle.model, handle.effort, handle.approval,
                 handle.permission_profile, handle.service_tier) == (
@@ -2798,6 +4531,56 @@ def test_http_provider_guard_runs_after_every_persisting_request(monkeypatch):
         assert restored == [
             {} for _ in codex_handle_module._HTTP_PROVIDER_PERSISTING_METHODS
         ]
+
+    asyncio.run(run())
+
+
+def test_http_provider_guard_isolated_to_explicit_codex_home(
+    tmp_path, monkeypatch,
+):
+    async def run():
+        codex_home = tmp_path / "codex-stack"
+        handle = CodexHandle(_Cfg(), codex_home=str(codex_home))
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "child-thread"
+        repair_calls = []
+        restored_calls = []
+
+        def repair(**kwargs):
+            repair_calls.append(kwargs)
+            return SimpleNamespace(
+                changed_db_thread_ids=(),
+                changed_rollout_thread_ids=(),
+                deferred_thread_ids=(),
+            )
+
+        def restored(thread_id, **kwargs):
+            restored_calls.append((thread_id, kwargs))
+            return True
+
+        monkeypatch.setattr(
+            codex_handle_module, "repair_http_provider_records", repair)
+        monkeypatch.setattr(
+            codex_handle_module,
+            "canonical_thread_provider_is_restored",
+            restored,
+        )
+
+        await handle._restore_http_provider_state(
+            include_descendants=True, strict=True)
+
+        resolved_home = str(codex_home.resolve())
+        assert repair_calls == [{
+            "apply": True,
+            "roots": {"root-thread"},
+            "include_thread_ids": {"root-thread", "child-thread"},
+            "codex_home": resolved_home,
+            "journal_dir": str(
+                codex_home.resolve()
+                / ".cc-remote-provider-repair-journal"),
+        }]
+        assert restored_calls == [(
+            "root-thread", {"codex_home": resolved_home})]
 
     asyncio.run(run())
 
@@ -3153,11 +4936,11 @@ def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
     asyncio.run(run())
 
 
-def test_codex_model_change_emits_app_server_adjusted_effort():
+def test_codex_model_change_emits_app_server_adjusted_effort(tmp_path):
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("codex-model", "codex-model")
-        handle = CodexHandle(_Cfg())
+        handle = CodexHandle(_Cfg(), codex_home=str(tmp_path))
         handle.thread_id = "codex-model"
         handle.model = "gpt-before"
         handle.effort = "ultra"
@@ -3196,6 +4979,7 @@ def test_codex_model_change_emits_app_server_adjusted_effort():
                 for event in transport.sent] == [
             ("model", "gpt-provider-fallback", None),
             ("effort", None, "max"),
+            ("fast", None, None),
         ]
         handle._reader.cancel()
         await asyncio.gather(handle._reader, return_exceptions=True)
@@ -3466,6 +5250,9 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("claude-question", "claude-question")
+        ctx.state = "running"
+        ctx.active_msg_id = "claude-question-turn"
+        machine.sessions[ctx.key] = ctx
         tool_input = {
             "questions": [
                 {
@@ -3502,18 +5289,21 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
         assert first_event.multi_select is False
         assert first_event.allow_text is True
         assert [option["label"] for option in first_event.options] == ["Mac", "Linux"]
-        ctx.pending_asks[first_id].set_result("Windows")
-
-        while not ctx.pending_asks or first_id in ctx.pending_asks:
-            await asyncio.sleep(0)
-        second_id = next(iter(ctx.pending_asks))
-        second_event = next(
-            message for message in transport.sent
-            if message.type == "ask_user" and message.ask_id == second_id)
-        assert second_event.header == "Checks"
-        assert second_event.multi_select is True
-        assert second_event.allow_text is True
-        ctx.pending_asks[second_id].set_result(["Tests", "Custom audit"])
+        assert len(first_event.questions) == 2
+        assert first_event.questions[1].header == "Checks"
+        assert first_event.questions[1].multi_select is True
+        assert first_event.questions[1].allow_text is True
+        # A stale single-page client must not advance a native batch.
+        partial = await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key, ask_id=first_id, answer="Windows", client_id="client-1"))
+        assert partial.code == "bad_prompt"
+        assert not task.done()
+        assert await machine._handle_answer_question(AnswerQuestion(
+            sid=ctx.key,
+            ask_id=first_id,
+            answers=["Windows", ["Tests", "Custom audit"]],
+            client_id="client-1",
+        )) is None
 
         result = await task
         assert isinstance(result, PermissionResultAllow)
@@ -3529,6 +5319,14 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             and [option["label"] for option in message.options] == ["允许一次", "拒绝"]
             for message in transport.sent
         )
+        receipts = [
+            message for message in transport.sent
+            if isinstance(message, StateEvent)
+            and message.detail == "回答已收到，正在等待 Claude 继续。"
+        ]
+        assert len(receipts) == 1
+        assert receipts[0].msg_id == "claude-question-turn"
+        assert ctx.claude_progress_notice_active is True
 
     asyncio.run(run())
 
@@ -3673,6 +5471,612 @@ def test_codex_goal_notifications_are_sanitized_filtered_and_cleared():
     asyncio.run(run())
 
 
+def test_codex_goal_ignores_late_turn_updates_after_local_replacement(
+    monkeypatch,
+):
+    clock = [100.0]
+    monkeypatch.setattr(
+        codex_handle_module.time, "monotonic", lambda: clock[0])
+
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 30, "createdAt": 1, "updatedAt": 20,
+        }
+        replacement = {
+            "threadId": "thread-1", "objective": "new objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 31, "createdAt": 1, "updatedAt": 21,
+        }
+        stale_progress = {
+            **old_goal, "status": "active", "tokensUsed": 21,
+            "timeUsedSeconds": 34, "createdAt": 1, "updatedAt": 24,
+        }
+        stale_completion = {
+            **old_goal, "status": "complete", "tokensUsed": 22,
+            "timeUsedSeconds": 38, "createdAt": 1, "updatedAt": 28,
+        }
+
+        async def request(method, params=None):
+            if method == "thread/goal/get":
+                assert params == {"threadId": "thread-1"}
+                return {"goal": old_goal}
+            assert (method, params) == (
+                "thread/goal/set",
+                {
+                    "threadId": "thread-1",
+                    "objective": "new objective",
+                    "status": "active",
+                },
+            )
+            return {"goal": replacement}
+
+        handle._request = request
+        assert (await handle.get_goal())["objective"] == "old objective"
+        handle.turn_id = "old-turn"
+        handle.turn_active = True
+        assert (await handle.set_goal(
+            objective="new objective", status="active"
+        ))["objective"] == "new objective"
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+
+        # A previous turn may drain behind a long-running tool. The replacement
+        # boundary is event-driven and must not expire on wall-clock time.
+        clock[0] += 60 * 60
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": stale_progress,
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": stale_completion,
+            },
+        })
+
+        assert seen == []
+        assert handle.last_goal["objective"] == "new objective"
+        assert handle.last_goal["status"] == "active"
+        assert handle.goal_revision == 0
+
+        current_completion = {
+            **replacement, "status": "complete", "updatedAt": 29,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "replacement-turn",
+                "goal": current_completion,
+            },
+        })
+        assert seen[-1]["objective"] == "new objective"
+        assert seen[-1]["status"] == "complete"
+        assert handle.last_goal == seen[-1]
+        assert handle.goal_revision == 1
+
+        # A persisted read is authoritative even when another client restores
+        # the exact objective protected by the short-lived local fence.
+        async def restored_read(method, params=None):
+            assert (method, params) == (
+                "thread/goal/get", {"threadId": "thread-1"})
+            return {"goal": {**old_goal, "updatedAt": 30}}
+
+        handle._request = restored_read
+        assert (await handle.get_goal())["objective"] == "old objective"
+        restored_fence = handle._goal_replacement_fence
+        assert restored_fence is not None and restored_fence.authoritative
+        assert restored_fence.objective == "old objective"
+        assert restored_fence.retired_turn_ids == {
+            "new objective": {"replacement-turn"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_goal_accepts_unowned_shared_daemon_replacement():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 10,
+            "timeUsedSeconds": 20, "createdAt": 1, "updatedAt": 2,
+        }
+        external_replacement = {
+            **old_goal,
+            "objective": "another client's objective",
+            "tokensUsed": 0,
+            "timeUsedSeconds": 0,
+            "updatedAt": 3,
+        }
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": old_goal,
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-continuation",
+                "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 2.5},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "external-turn",
+                "goal": external_replacement,
+            },
+        })
+
+        assert [goal["objective"] for goal in seen] == [
+            "old objective", "old objective",
+            "another client's objective",
+        ]
+        assert handle.last_goal == seen[-1]
+        assert handle.goal_revision == 3
+        external_fence = handle._goal_replacement_fence
+        assert external_fence is not None and external_fence.authoritative
+        assert external_fence.objective == "another client's objective"
+        assert external_fence.current_turn_ids == {"external-turn"}
+        assert external_fence.retired_turn_ids == {
+            "old objective": {"old-turn", "old-continuation"},
+        }
+
+        rapid_replacement = {
+            **external_replacement,
+            "objective": "rapid third objective",
+            "updatedAt": 4,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "rapid-turn",
+                "goal": rapid_replacement,
+            },
+        })
+        rapid_fence = handle._goal_replacement_fence
+        assert rapid_fence is not None and rapid_fence.authoritative
+        assert rapid_fence.objective == "rapid third objective"
+        assert rapid_fence.current_turn_ids == {"rapid-turn"}
+        assert rapid_fence.retired_turn_ids == {
+            "old objective": {"old-turn", "old-continuation"},
+            "another client's objective": {"external-turn"},
+        }
+
+        # Another daemon client may restore an older public objective before its
+        # original turn drains. The new turn is authoritative; retaining the old
+        # turn id still lets us reject only that original generation.
+        restored_old_objective = {
+            **old_goal, "tokensUsed": 0, "timeUsedSeconds": 0,
+            "updatedAt": 5,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "restored-turn",
+                "goal": restored_old_objective,
+            },
+        })
+        assert [goal["objective"] for goal in seen] == [
+            "old objective",
+            "old objective",
+            "another client's objective",
+            "rapid third objective",
+            "old objective",
+        ]
+        restored_fence = handle._goal_replacement_fence
+        assert restored_fence is not None and restored_fence.authoritative
+        assert restored_fence.objective == "old objective"
+        assert restored_fence.current_turn_ids == {"restored-turn"}
+        assert restored_fence.retired_turn_ids == {
+            "old objective": {"old-turn", "old-continuation"},
+            "another client's objective": {"external-turn"},
+            "rapid third objective": {"rapid-turn"},
+        }
+
+        # Turn-owned snapshots from the original Goal stay fenced even though
+        # its objective text is current again under a different turn.
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 6},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {
+                    **old_goal, "status": "usageLimited", "updatedAt": 6.5,
+                },
+            },
+        })
+        assert handle._goal_replacement_fence.retired_turn_ids[
+            "old objective"
+        ] == {"old-turn", "old-continuation"}
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "tokensUsed": 12, "updatedAt": 6.75},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 7},
+            },
+        })
+        assert handle._goal_replacement_fence.retired_turn_ids[
+            "old objective"
+        ] == {"old-continuation"}
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-continuation",
+                "goal": {**old_goal, "tokensUsed": 12, "updatedAt": 7.5},
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-continuation",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 7.6},
+            },
+        })
+        assert len(seen) == 5
+        assert handle.last_goal["objective"] == "old objective"
+        assert handle.last_goal_turn_id == "restored-turn"
+        assert handle.goal_revision == 5
+        assert handle._goal_replacement_fence.retired_turn_ids == {
+            "another client's objective": {"external-turn"},
+            "rapid third objective": {"rapid-turn"},
+        }
+
+        third_objective = {
+            **rapid_replacement,
+            "objective": "authoritative read objective",
+            "updatedAt": 8,
+        }
+
+        async def external_read(method, params=None):
+            assert (method, params) == (
+                "thread/goal/get", {"threadId": "thread-1"})
+            return {"goal": third_objective}
+
+        handle._request = external_read
+        assert (await handle.get_goal())["objective"] == (
+            "authoritative read objective")
+        assert handle.last_goal["objective"] == "authoritative read objective"
+
+        # An explicit set notification is authoritative and may restore the
+        # exact objective currently protected as the previous generation.
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": None,
+                "goal": {**external_replacement, "updatedAt": 9},
+            },
+        })
+        assert len(seen) == 6
+        assert handle.last_goal["objective"] == "another client's objective"
+        fence = handle._goal_replacement_fence
+        assert fence is not None
+        assert fence.objective == "another client's objective"
+        assert fence.retired_turn_ids == {
+            "old objective": {"restored-turn"},
+            "another client's objective": {"external-turn"},
+            "rapid third objective": {"rapid-turn"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_goal_accepts_unbound_turn_owned_restore():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        original = {
+            "threadId": "thread-1", "objective": "original objective",
+            "status": "active", "tokensUsed": 4,
+            "timeUsedSeconds": 8, "createdAt": 1, "updatedAt": 2,
+        }
+
+        async def get_original(method, params=None):
+            assert (method, params) == (
+                "thread/goal/get", {"threadId": "thread-1"})
+            return {"goal": original}
+
+        handle._request = get_original
+        assert (await handle.get_goal())["objective"] == "original objective"
+        initial_fence = handle._goal_replacement_fence
+        assert initial_fence is not None
+        assert initial_fence.current_turn_ids == set()
+
+        intervening = {
+            **original, "objective": "intervening objective", "updatedAt": 3,
+        }
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "intervening-turn",
+                "goal": intervening,
+            },
+        })
+        assert handle.last_goal["objective"] == "intervening objective"
+        assert "original objective" not in (
+            handle._goal_replacement_fence.retired_turn_ids
+        )
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "restored-turn",
+                "goal": {**original, "updatedAt": 4},
+            },
+        })
+        assert [goal["objective"] for goal in seen] == [
+            "intervening objective", "original objective",
+        ]
+        assert handle.last_goal_turn_id == "restored-turn"
+        restored_fence = handle._goal_replacement_fence
+        assert restored_fence is not None and restored_fence.authoritative
+        assert restored_fence.objective == "original objective"
+        assert restored_fence.current_turn_ids == {"restored-turn"}
+        assert restored_fence.retired_turn_ids == {
+            "intervening objective": {"intervening-turn"},
+        }
+
+    asyncio.run(run())
+
+
+def test_codex_goal_same_objective_resume_preserves_replacement_fence():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 10,
+            "timeUsedSeconds": 20, "createdAt": 1, "updatedAt": 2,
+        }
+        paused_goal = {
+            **old_goal, "objective": "current objective", "status": "paused",
+            "updatedAt": 3,
+        }
+        active_goal = {**paused_goal, "status": "active", "updatedAt": 4}
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": old_goal,
+            },
+        })
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "current-turn",
+                "goal": paused_goal,
+            },
+        })
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+        assert fence.retired_turn_ids == {"old objective": {"old-turn"}}
+        seen.clear()
+
+        async def resume_request(method, params=None):
+            assert (method, params) == (
+                "thread/goal/set",
+                {"threadId": "thread-1", "status": "active"},
+            )
+            await handle._dispatch({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-1", "turnId": "old-turn",
+                    "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 5},
+                },
+            })
+            assert handle._goal_replacement_fence is fence
+            assert handle.last_goal["objective"] == "current objective"
+            return {"goal": active_goal}
+
+        handle._request = resume_request
+        resumed = await handle.set_goal(status="active")
+        assert resumed["objective"] == "current objective"
+        assert resumed["status"] == "active"
+        assert seen == []
+        assert handle._goal_replacement_fence is fence
+        assert fence.authoritative
+        assert fence.retired_turn_ids == {"old objective": {"old-turn"}}
+
+    asyncio.run(run())
+
+
+def test_codex_goal_replacement_retires_turn_learned_during_rpc():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 10,
+            "timeUsedSeconds": 20, "createdAt": 1, "updatedAt": 2,
+        }
+        replacement = {
+            **old_goal, "objective": "new objective", "updatedAt": 3,
+        }
+
+        async def request(method, params=None):
+            if method == "thread/goal/get":
+                assert params == {"threadId": "thread-1"}
+                return {"goal": old_goal}
+            assert (method, params) == (
+                "thread/goal/set",
+                {
+                    "threadId": "thread-1",
+                    "objective": "new objective",
+                    "status": "active",
+                },
+            )
+            # The persisted baseline had no turn attribution. Learn the old
+            # turn only after the replacement request has started.
+            await handle._dispatch({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-1", "turnId": "old-turn",
+                    "goal": {**old_goal, "tokensUsed": 11, "updatedAt": 2.5},
+                },
+            })
+            return {"goal": replacement}
+
+        handle._request = request
+        result = await handle.set_goal(
+            objective="new objective", status="active")
+        assert result["objective"] == "new objective"
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+        assert fence.objective == "new objective"
+        assert fence.retired_turn_ids == {
+            "old objective": {"old-turn"},
+        }
+        assert len(seen) == 1
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 4},
+            },
+        })
+        assert len(seen) == 1
+        assert handle.last_goal["objective"] == "new objective"
+        assert handle.last_goal["status"] == "active"
+        assert fence.retired_turn_ids == {}
+
+    asyncio.run(run())
+
+
+def test_codex_goal_replacement_accepts_update_before_lost_response():
+    async def run():
+        seen = []
+
+        async def on_goal(goal):
+            seen.append(goal)
+
+        handle = CodexHandle(_Cfg(), goal_callback=on_goal)
+        handle.thread_id = "thread-1"
+        old_goal = {
+            "threadId": "thread-1", "objective": "old objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 30, "createdAt": 1, "updatedAt": 20,
+        }
+        replacement = {
+            "threadId": "thread-1", "objective": "new objective",
+            "status": "active", "tokensUsed": 20,
+            "timeUsedSeconds": 31, "createdAt": 1, "updatedAt": 21,
+        }
+
+        async def lost_response(method, params=None):
+            assert (method, params) == (
+                "thread/goal/set",
+                {
+                    "threadId": "thread-1",
+                    "objective": "new objective",
+                    "status": "active",
+                },
+            )
+            # turn/started consumes the short-lived prompt candidate. The
+            # independent replacement fence must still admit the matching Goal
+            # notification before this RPC response is lost.
+            await handle._dispatch({
+                "method": "turn/started",
+                "params": {"turn": {"id": "replacement-turn"}},
+            })
+            assert handle._goal_prompt_candidate is None
+            await handle._dispatch({
+                "method": "thread/goal/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "replacement-turn",
+                    "goal": replacement,
+                },
+            })
+            raise TimeoutError("response lost after Goal replacement")
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": old_goal,
+            },
+        })
+        seen.clear()
+        handle._request = lost_response
+        with pytest.raises(TimeoutError, match="response lost"):
+            await handle.set_goal(
+                objective="new objective", status="active")
+
+        assert [goal["objective"] for goal in seen] == ["new objective"]
+        assert handle.last_goal == seen[0]
+        assert handle.goal_revision == 2
+        assert handle.last_goal_turn_id == "replacement-turn"
+        fence = handle._goal_replacement_fence
+        assert fence is not None and fence.authoritative
+        assert handle.take_goal_prompt("replacement-turn") == "new objective"
+
+        await handle._dispatch({
+            "method": "thread/goal/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "old-turn",
+                "goal": {**old_goal, "status": "complete", "updatedAt": 22},
+            },
+        })
+        assert [goal["objective"] for goal in seen] == ["new objective"]
+        assert handle.last_goal == seen[0]
+        assert handle.goal_revision == 2
+
+    asyncio.run(run())
+
+
 def test_machine_goal_emits_authoritative_state():
     async def run():
         machine, transport = _mk_machine()
@@ -3693,7 +6097,7 @@ def test_machine_goal_emits_authoritative_state():
         ctx.sdk.clear_goal = clear_goal
         machine.sessions[ctx.key] = ctx
         await machine._handle_get_goal(SimpleNamespace(
-            sid=ctx.key, client_id="client-1"))
+            sid=ctx.key, client_id="client-1", cmd_id="goal-read-1"))
         await machine._handle_set_goal(SimpleNamespace(
             sid=ctx.key, client_id="client-1", objective="finish",
             status="active", token_budget=None))
@@ -3706,6 +6110,9 @@ def test_machine_goal_emits_authoritative_state():
         # Reads are private one-shot responses; mutations are shared state and are
         # broadcast so another signed-in device updates immediately.
         assert [state.to for state in states] == ["client-1", None, None]
+        assert [state.request_id for state in states] == [
+            "goal-read-1", None, None,
+        ]
 
         await machine._on_codex_goal(ctx, goal)
         assert isinstance(transport.sent[-1], GoalState)
@@ -4489,7 +6896,9 @@ def test_managed_turn_exception_does_not_unlock_live_auto_turn():
             model = None
             effort = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 raise RuntimeError("managed launch failed")
 
         ctx.sdk = FailingSdk()
@@ -4521,7 +6930,9 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "native-turn"
 
             async def receive_response(self):
@@ -4545,6 +6956,274 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
         assert [event.type for event in transport.sent].index("turn_binding") < [
             event.type for event in transport.sent
         ].index("turn_end")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("initial_echo", [False, True])
+def test_managed_codex_turn_projects_external_steers_once(initial_echo):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("managed-steers", "managed-steers")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-original"
+        ctx.turn_task = asyncio.current_task()
+        machine.sessions[ctx.key] = ctx
+        observations = []
+        first_steer_output = asyncio.Event()
+        original_send = transport.send
+
+        async def observe(message):
+            if isinstance(message, Delta):
+                lease = machine._codex_turn_leases.get(ctx.key)
+                observations.append((
+                    message.text, ctx.state, ctx.active_msg_id,
+                    ctx.active_turn_binding.msg_id,
+                    lease.msg_id if lease else None,
+                ))
+                if message.text == "one":
+                    first_steer_output.set()
+            await original_send(message)
+
+        transport.send = observe
+
+        def user(item_id, client_id, *, turn_id="native-turn", method="item/completed"):
+            return {"method": method, "params": {
+                "threadId": ctx.session_id, "turnId": turn_id,
+                "item": {"type": "userMessage", "id": item_id,
+                         "clientId": client_id, "text": "same prompt"},
+            }}
+
+        def delta(name):
+            return {"method": "item/agentMessage/delta", "params": {
+                "threadId": ctx.session_id, "turnId": "native-turn",
+                "itemId": "answer-" + name, "delta": name,
+            }}
+
+        class AcceptedSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+            shared_daemon_affinity = True
+
+            async def query(self, _prompt, images=None, *, client_user_message_id=None):
+                assert client_user_message_id == "browser-original"
+                return "native-turn"
+
+            async def receive_response(self):
+                # An unlabelled first echo cannot prove an external steer.
+                yield user("unattributed", None)
+                if initial_echo:
+                    yield user("native-original", "browser-original")
+                yield delta("original")
+                yield user("foreign-user", "foreign-client", turn_id="other-turn")
+                yield user("native-one", "external-one", method="item/started")
+                yield user("native-one", "external-one")
+                yield delta("one")
+                await first_steer_output.wait()
+                # Simulate _handle_steer's already-published RPC acceptance.
+                accepted = TurnSteered(msg_id="remote-steer", turn_id="native-turn",
+                                       prompt="same prompt")
+                ctx.active_msg_id = accepted.msg_id
+                machine._remember_codex_published_steer(ctx, accepted)
+                machine._rebind_codex_turn(ctx, accepted.turn_id, accepted.msg_id)
+                await machine._emit(ctx, accepted)
+                yield user("native-two", "external-two", method="item/started")
+                yield user("native-one", "external-one")
+                yield user("native-original", "browser-original")
+                yield user("native-remote", "remote-steer")
+                yield user("native-two", "external-two")
+                yield delta("two")
+                yield {"method": "turn/completed", "params": {
+                    "threadId": ctx.session_id,
+                    "turn": {"id": "native-turn", "status": "completed"},
+                }}
+
+        ctx.sdk = AcceptedSdk()
+        machine._ensure_codex_daemon_generation = (
+            lambda *_args, **_kwargs: asyncio.sleep(0, result=True))
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await asyncio.wait_for(machine._run_turn(ctx, "same prompt"), timeout=2)
+
+        assert observations == [
+            ("original", "running", "browser-original", "browser-original", "browser-original"),
+            ("one", "running", "external-one", "external-one", "external-one"),
+            ("two", "running", "external-two", "external-two", "external-two"),
+        ]
+        assert [(event.msg_id, event.turn_id) for event in transport.sent
+                if isinstance(event, TurnSteered)] == [
+            ("external-one", "native-turn"), ("remote-steer", "native-turn"),
+            ("external-two", "native-turn"),
+        ]
+        assert [(event.msg_id, event.client_msg_id) for event in transport.sent
+                if isinstance(event, UserMsg) and event.client_msg_id] == [
+            ("native-one", "external-one"), ("native-two", "external-two"),
+        ]
+        terminals = [event for event in transport.sent if isinstance(event, TurnEnd)]
+        assert len(terminals) == 1 and not terminals[0].result.is_error
+        assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_managed_codex_turn_replaces_stale_effort_with_model_default():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("no-effort-session", "no-effort-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.announced_effort = "ultra"
+        ctx.turn_task = asyncio.current_task()
+
+        class NoEffortSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
+                return "native-turn"
+
+            async def receive_response(self):
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "native-turn",
+                        "item": {
+                            "id": "answer",
+                            "type": "agentMessage",
+                            "text": "done",
+                        },
+                    },
+                }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = NoEffortSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        assert ctx.announced_effort == machine_module.MODEL_DEFAULT_EFFORT
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [machine_module.MODEL_DEFAULT_EFFORT]
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_query_reconnect_refreshes_effort_without_blocking_stream():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("query-reconnect-effort", "query-reconnect-effort")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.announced_effort = "high"
+        ctx.turn_task = asyncio.current_task()
+        resolution_started = asyncio.Event()
+        release_resolution = asyncio.Event()
+
+        class ReconnectingSdk:
+            tier_dirty = False
+            model = "gpt-after-reconnect"
+            effort = None
+            applied_effort = None
+            display_effort = "high"
+            display_effort_model = model
+            display_effort_cwd = os.path.realpath("/tmp")
+            display_effort_generation = 1
+            _display_effort_retry_at = None
+            _cwd = "/tmp"
+            _generation = 1
+            _thread_settings_revision = 0
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
+                # Model CodexHandle.query() repairing a dead app-server after
+                # Machine's normal effort preflight has already completed.
+                self._generation += 1
+                self.display_effort = None
+                self.display_effort_model = None
+                self.display_effort_cwd = None
+                self.display_effort_generation = None
+                return "native-turn"
+
+            async def configured_default_effort(self):
+                resolution_started.set()
+                await release_resolution.wait()
+                return "medium"
+
+            async def receive_response(self):
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "native-turn",
+                        "item": {
+                            "id": "answer",
+                            "type": "agentMessage",
+                            "text": "done",
+                        },
+                    },
+                }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = ReconnectingSdk()
+        machine.sessions[ctx.key] = ctx
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+
+        await asyncio.wait_for(machine._run_turn(ctx, "hello"), timeout=0.5)
+        await asyncio.wait_for(resolution_started.wait(), timeout=0.5)
+
+        # The immediate sentinel removes the stale chip, while the config read
+        # remains entirely outside the already-accepted turn's stream drain.
+        assert ctx.state == "idle"
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [machine_module.MODEL_DEFAULT_EFFORT]
+
+        release_resolution.set()
+        for _ in range(20):
+            if any(
+                isinstance(event, Effort) and event.effort == "medium"
+                for event in transport.sent
+            ):
+                break
+            await asyncio.sleep(0)
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [machine_module.MODEL_DEFAULT_EFFORT, "medium"]
+        assert ctx.announced_effort == "medium"
 
     asyncio.run(run())
 
@@ -4821,13 +7500,14 @@ def test_permission_profiles_are_codex_only_and_broadcast_after_apply():
             "codex").permission_profile == ":danger-full-access"
 
         codex.state = "running"
-        rejected = await machine._handle_set_permission_profile(
+        applied = await machine._handle_set_permission_profile(
             SetPermissionProfile(
                 sid="codex", profile=":workspace"))
-        assert isinstance(rejected, Error)
-        assert rejected.code == "busy"
+        assert isinstance(applied, PermissionProfile)
+        assert applied.profile == ":workspace"
+        assert codex.state == "running"
         assert codex.sdk.permission_profile_calls == [
-            ":danger-full-access",
+            ":danger-full-access", ":workspace",
         ]
         codex.state = "idle"
 
@@ -4846,6 +7526,118 @@ def test_permission_profiles_are_codex_only_and_broadcast_after_apply():
         assert isinstance(rejected, Error)
         assert rejected.code == "auth"
         assert work.sdk.permission_profile_calls == []
+
+    asyncio.run(run())
+
+
+def test_running_permission_switches_publish_in_request_order():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("ordered-permissions", "codex")
+        ctx.state = "running"
+        machine.sessions = {ctx.key: ctx}
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def apply(profile):
+            calls.append(profile)
+            if profile == ":workspace":
+                started.set()
+                await release.wait()
+            ctx.sdk.permission_profile = profile
+
+        ctx.sdk.set_permission_profile = apply
+        first = asyncio.create_task(machine._handle_set_permission_profile(
+            SetPermissionProfile(sid=ctx.key, profile=":workspace")))
+        await started.wait()
+        second = asyncio.create_task(machine._handle_set_permission_profile(
+            SetPermissionProfile(sid=ctx.key, profile=":danger-full-access")))
+        await asyncio.sleep(0)
+        assert calls == [":workspace"]
+        release.set()
+        await asyncio.gather(first, second)
+        assert [event.profile for event in transport.sent
+                if isinstance(event, PermissionProfile)] == [
+                    ":workspace", ":danger-full-access"]
+        assert ctx.state == "running"
+        assert machine._codex_controls.get(
+            ctx.session_id).permission_profile == ":danger-full-access"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_live_permission_profile_timeout_does_not_claim_success(monkeypatch, disconnect):
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp")
+        handle.thread_id = "permission-timeout"
+        handle.permission_profile = ":workspace"
+        handle._reader = asyncio.current_task()
+        monkeypatch.setattr(
+            codex_handle_module, "_THREAD_SETTINGS_NOTIFY_TIMEOUT", 0.01)
+
+        async def request(method, params=None):
+            if method == "permissionProfile/list":
+                return {"data": [{"id": ":danger-full-access", "allowed": True}]}
+            if disconnect:
+                handle._reader = None
+            return {}
+
+        handle._request = request
+        with pytest.raises(RuntimeError, match="did not confirm"):
+            await handle.set_permission_profile(":danger-full-access")
+        assert handle.permission_profile == ":workspace"
+
+    asyncio.run(run())
+
+
+def test_permission_profile_catalog_cannot_cross_a_cwd_change():
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/original")
+        handle.thread_id = "permission-scope"
+        updates = []
+
+        async def request(method, params=None):
+            if method == "permissionProfile/list":
+                handle._cwd = "/tmp/moved"
+                return {"data": [{"id": ":custom", "allowed": True}]}
+            updates.append(method)
+            return {}
+
+        handle._request = request
+        with pytest.raises(RuntimeError, match="scope changed"):
+            await handle.set_permission_profile(":custom")
+        assert updates == []
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("changed", ["_cwd", "thread_id", "_generation"])
+def test_waiting_permission_profile_cannot_update_a_changed_scope(changed):
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/original")
+        handle.thread_id = "permission-scope"
+        catalog_read = asyncio.Event()
+        updates = []
+
+        async def request(method, params=None):
+            if method == "permissionProfile/list":
+                catalog_read.set()
+                return {"data": [{"id": ":custom", "allowed": True}]}
+            updates.append(params)
+            return {}
+
+        handle._request = request
+        async with handle._thread_settings_lock:
+            pending = asyncio.create_task(handle.set_permission_profile(":custom"))
+            await catalog_read.wait()
+            assert not pending.done()
+            value = getattr(handle, changed)
+            setattr(handle, changed, value + 1 if isinstance(value, int) else value + "-moved")
+        with pytest.raises(RuntimeError, match="scope changed"):
+            await pending
+        assert updates == []
 
     asyncio.run(run())
 
@@ -4913,6 +7705,51 @@ def test_web_search_is_codex_code_only_idle_and_broadcast_after_reconnect():
         assert isinstance(rejected, Error)
         assert rejected.code == "auth"
         assert transport.sent[-1] is rejected
+
+    asyncio.run(run())
+
+
+def test_web_search_reconnect_republishes_changed_nullable_effort():
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = _ControlSdk()
+        sdk.model = "gpt-after-search-reconnect"
+        sdk.effort = None
+        sdk.applied_effort = None
+        sdk.display_effort = None
+        sdk._cwd = ctx_cwd = "/tmp/cc-remote-test-cwd"
+        sdk._generation = 2
+
+        async def set_web_search(mode):
+            sdk.web_search_calls.append(mode)
+            sdk.web_search = mode
+            sdk.web_search_override = mode
+            # Model a successful thread/resume whose authoritative thread
+            # setting is null and whose effective config resolves concretely.
+            sdk.display_effort = "medium"
+            sdk.display_effort_model = sdk.model
+            sdk.display_effort_cwd = os.path.realpath(ctx_cwd)
+            sdk.display_effort_generation = sdk._generation
+
+        sdk.set_web_search = set_web_search
+        ctx = _control_ctx("codex", "codex", sdk)
+        ctx.announced_model = "gpt-before-search-reconnect"
+        ctx.announced_effort = "high"
+        machine.sessions = {"codex": ctx}
+        machine._stamp_codex_daemon_epoch = lambda _ctx: asyncio.sleep(0)
+        machine._persist_codex_session_controls = (
+            lambda _ctx: asyncio.sleep(0))
+
+        result = await machine._handle_set_web_search(
+            SetWebSearch(sid="codex", mode="live"))
+
+        assert isinstance(result, WebSearch)
+        assert [event.type for event in transport.sent] == [
+            "model", "effort", "web_search",
+        ]
+        assert transport.sent[0].model == "gpt-after-search-reconnect"
+        assert transport.sent[1].effort == "medium"
+        assert ctx.announced_effort == "medium"
 
     asyncio.run(run())
 
@@ -4991,25 +7828,99 @@ def test_collaboration_modes_are_codex_only_and_broadcast_after_apply():
     asyncio.run(run())
 
 
-def test_client_hello_always_seeds_resident_codex_collaboration_mode():
+def test_client_hello_seeds_codex_defaults_without_control_plane_probes():
     async def run():
         machine, transport = _mk_machine()
         ctx = _control_ctx("codex", "codex")
         ctx.sdk.collaboration_mode = "plan"
-        machine.sessions = {"codex": ctx}
+        ctx.sdk.effort = None
+        ctx.sdk.display_effort = machine_module.MODEL_DEFAULT_EFFORT
+        second = _control_ctx("codex-2", "codex")
+        second.sdk.effort = None
+        second.sdk.display_effort = None
+        machine.sessions = {"codex": ctx, "codex-2": second}
 
-        await machine._handle_client_hello(SimpleNamespace(
-            cursors={"codex": 0}, generations={"codex": machine.instance_id},
-            last_seq=None, client_id="client-1", route_id="route-1",
-        ))
+        async def unexpected_effort_probe(*_args, **_kwargs):
+            raise AssertionError("client hello must remain a no-probe fast path")
+
+        machine._resolve_codex_session_effort = unexpected_effort_probe
+
+        await asyncio.wait_for(
+            machine._handle_client_hello(SimpleNamespace(
+                cursors={"codex": 0},
+                generations={"codex": machine.instance_id},
+                last_seq=None, client_id="client-1", route_id="route-1",
+            )),
+            timeout=0.1,
+        )
 
         modes = [message for message in transport.sent
-                 if message.type == "collaboration_mode"]
+                 if message.type == "collaboration_mode"
+                 and message.sid == "codex"]
         assert len(modes) == 1
         assert modes[0].mode == "plan"
         assert modes[0].sid == "codex"
         assert modes[0].to == "client-1"
         assert modes[0].route_id == "route-1"
+        efforts = [message for message in transport.sent
+                   if message.type == "effort"]
+        assert {(event.sid, event.effort) for event in efforts} == {
+            ("codex", machine_module.MODEL_DEFAULT_EFFORT),
+            ("codex-2", machine_module.MODEL_DEFAULT_EFFORT),
+        }
+        assert all(event.to == "client-1" for event in efforts)
+        assert all(event.route_id == "route-1" for event in efforts)
+
+    asyncio.run(run())
+
+
+def test_client_hello_never_mixes_model_effort_during_settings_update():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("codex", "codex")
+        ctx.sdk.model = "gpt-before"
+        ctx.sdk.effort = "high"
+        ctx.sdk.display_effort = "high"
+        ctx.sdk.display_effort_model = "gpt-before"
+        ctx.sdk.display_effort_cwd = os.path.realpath(ctx.cwd)
+        ctx.sdk.display_effort_generation = 1
+        ctx.sdk._cwd = ctx.cwd
+        ctx.sdk._generation = 1
+        ctx.sdk._thread_settings_revision = 0
+        machine.sessions = {"codex": ctx}
+        original_send = transport.send
+        replaced = False
+
+        async def send(event):
+            nonlocal replaced
+            await original_send(event)
+            if isinstance(event, Model) and not replaced:
+                replaced = True
+                ctx.sdk.model = "gpt-after"
+                ctx.sdk.effort = "medium"
+                ctx.sdk.display_effort = "medium"
+                ctx.sdk.display_effort_model = "gpt-after"
+                ctx.sdk.display_effort_generation = 2
+                ctx.sdk._generation = 2
+                ctx.sdk._thread_settings_revision = 1
+
+        transport.send = send
+        await machine._handle_client_hello(SimpleNamespace(
+            cursors={}, generations={}, last_seq=None,
+            client_id="client-1", route_id="route-1",
+        ))
+
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ] == [
+            ("model", "gpt-before", None),
+            ("effort", None, "high"),
+            ("model", "gpt-after", None),
+            ("effort", None, "medium"),
+        ]
 
     asyncio.run(run())
 
@@ -5036,10 +7947,11 @@ def test_external_codex_turn_refreshes_collaboration_mode_without_changing_appro
     asyncio.run(run())
 
 
-def test_fast_toggle_updates_only_target_codex_thread():
+def test_fast_toggle_updates_only_target_codex_thread_including_work():
     async def run():
         machine, transport = _mk_machine()
         one = _control_ctx("c1", "codex")
+        one.space = "work"
         two = _control_ctx("c2", "codex")
         claude = _control_ctx("cc", "claude")
         machine.sessions = {"c1": one, "c2": two, "cc": claude}
@@ -5073,12 +7985,17 @@ def test_fast_toggle_uses_target_thread_state_and_can_clear_override():
     asyncio.run(run())
 
 
-def test_fast_accepts_app_server_priority_normalization():
+def test_fast_accepts_app_server_priority_normalization(monkeypatch):
+    async def catalog(**_kwargs):
+        return [{"id": "test-model", "service_tiers": [{"id": "priority"}]}]
+
+    monkeypatch.setattr(codex_handle_module, "codex_catalog", catalog)
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("c1", "c1")
         handle = CodexHandle(_Cfg())
         handle.thread_id = "c1"
+        handle.model = "test-model"
         handle._reader = asyncio.create_task(asyncio.Event().wait())
         ctx.engine = "codex"
         ctx.sdk = handle
@@ -5086,7 +8003,7 @@ def test_fast_accepts_app_server_priority_normalization():
 
         async def request(method, params=None):
             assert (method, params) == ("thread/settings/update", {
-                "threadId": "c1", "serviceTier": "fast",
+                "threadId": "c1", "serviceTier": "priority",
             })
             await handle._dispatch({
                 "method": "thread/settings/updated",
@@ -5117,12 +8034,58 @@ def test_fast_accepts_app_server_priority_normalization():
 
 def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sessions(
         monkeypatch):
+    class OwnerSdk(_ControlSdk):
+        def __init__(self):
+            super().__init__()
+            self.thread_id = "codex-id"
+            self.turn_active = False
+            self.turn_start_pending = False
+            self.using_daemon_proxy = True
+            self.shared_daemon_affinity = True
+            self.daemon_mode = "auto"
+            self.calls = []
+            self.thread_archive_notifications_overflowed = False
+
+        async def set_thread_name(self, thread_id, title):
+            self.calls.append(("rename", thread_id, title))
+
+        async def list_thread_delete_candidates(self):
+            return (("codex-id", False),)
+
+        async def read_thread_parent(self, _thread_id):
+            return None
+
+        async def archive_thread(self, thread_id):
+            self.calls.append(("archive", thread_id))
+            self.thread_id = None
+            return (thread_id,)
+
+        async def disconnect(self):
+            self.calls.append(("disconnect",))
+            await super().disconnect()
+
+    class ColdOwner:
+        def __init__(self):
+            self.calls = []
+
+        async def set_thread_name(self, thread_id, title):
+            self.calls.append(("rename", thread_id, title))
+
+        async def unarchive_thread(self, thread_id):
+            self.calls.append(("unarchive", thread_id))
+            return {"id": thread_id}
+
+        async def disconnect(self):
+            self.calls.append(("disconnect",))
+
     async def run():
         machine, transport = _mk_machine()
-        ctx = _control_ctx("codex-id", "codex")
+        owner = OwnerSdk()
+        ctx = _control_ctx("codex-id", "codex", owner)
         machine.sessions = {"codex-id": ctx}
         rpc_calls = []
         refreshes = []
+        cold_owners = []
 
         async def rpc(method, params, cwd=None):
             rpc_calls.append((method, params, cwd))
@@ -5138,6 +8101,47 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
         monkeypatch.setattr(machine_module, "rename_session", claude_only)
         monkeypatch.setattr(machine_module, "tag_session", claude_only)
         machine._list_codex_sessions = refresh
+
+        async def runtime_preflight(*_args, **_kwargs):
+            return None
+
+        async def no_external_owner(_sid):
+            return False
+
+        async def cold_control(_sid):
+            control = ColdOwner()
+            cold_owners.append(control)
+            return control
+
+        machine._runtime_control_preflight = runtime_preflight
+        machine._codex_delete_external_owner = no_external_owner
+        machine._codex_shared_control_for_wire = cold_control
+
+        async def exact_archive_states(_profile, native_sids):
+            return {
+                native_sid: (
+                    native_sid == "cold-codex-id"
+                    or ("archive", native_sid) in owner.calls
+                )
+                for native_sid in native_sids
+            }
+
+        machine._codex_exact_archive_states = exact_archive_states
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_parent_maps",
+            lambda **_kwargs: ({}, {}),
+        )
+        local_rollout = str(
+            machine._codex_profile().home
+            / "sessions"
+            / "rollout-codex-id.jsonl"
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_thread_rollout_record",
+            lambda _sid, **_kwargs: (local_rollout, False),
+        )
 
         rename_hot = SimpleNamespace(session_id="codex-id", title="new")
         archive_hot = SimpleNamespace(session_id="codex-id", archived=True)
@@ -5159,16 +8163,22 @@ def test_codex_rename_archive_and_unarchive_use_app_server_for_hot_and_cold_sess
         await machine._handle_rename_session(rename_cold)
         await machine._handle_archive_session(unarchive_cold)
 
-        assert rpc_calls == [
-            ("thread/name/set", {"threadId": "codex-id", "name": "new"}, None),
-            ("thread/archive", {"threadId": "codex-id"}, None),
-            (
-                "thread/name/set",
-                {"threadId": "cold-codex-id", "name": "cold new"},
-                None,
-            ),
-            ("thread/unarchive", {"threadId": "cold-codex-id"}, None),
+        assert owner.calls == [
+            ("rename", "codex-id", "new"),
+            ("archive", "codex-id"),
+            ("disconnect",),
         ]
+        assert [control.calls for control in cold_owners] == [
+            [
+                ("rename", "cold-codex-id", "cold new"),
+                ("disconnect",),
+            ],
+            [
+                ("unarchive", "cold-codex-id"),
+                ("disconnect",),
+            ],
+        ]
+        assert rpc_calls == []
         assert refreshes == [rename_hot, archive_hot, rename_cold, unarchive_cold]
         assert not [message for message in transport.sent if message.type == "error"]
 
@@ -5306,10 +8316,19 @@ class _FiniteTransport:
             yield command
 
 
+@pytest.mark.parametrize(
+    ("unsupported_cli", "expected_message"),
+    [
+        (False, "Claude 暂时不可用"),
+        (True, "Claude CLI 2.1.257 版本过旧"),
+    ],
+)
 def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
-        monkeypatch, tmp_path):
+        monkeypatch, tmp_path, unsupported_cli, expected_message):
     async def run():
         def fail(_cli_path):
+            if unsupported_cli:
+                raise UnsupportedClaudeCliVersion("2.1.257", "2.1.258")
             raise RuntimeError("claude unavailable")
 
         monkeypatch.setattr(SdkHandle, "preflight", staticmethod(fail))
@@ -5325,8 +8344,10 @@ def test_wrapper_stays_alive_when_claude_bootstrap_preflight_fails(
         assert transport.started is True and transport.stopped is True
         assert machine.sessions == {} and machine.focused_sid is None
         assert any(message.type == "hello" for message in transport.sent)
-        assert any(message.type == "error" and "Claude 暂时不可用" in message.message
-                   for message in transport.sent)
+        assert any(
+            message.type == "error" and expected_message in message.message
+            for message in transport.sent
+        )
 
     asyncio.run(run())
 
@@ -5646,11 +8667,22 @@ def test_codex_handle_inserts_steer_fence_at_response_before_provider_repair(
         assert handle._pending_response_boundaries == {}
 
         # A later live-detail overflow may shed frames, never the ordering
-        # control. The gap belongs before the retained user boundary.
+        # or identity controls. The gap belongs before the retained user
+        # boundary.
+        proof = codex_handle_module.CodexSteerUserIdentityProof(
+            thread_id="thread-1",
+            expected_turn_id="turn-1",
+            native_turn_id="native-turn-1",
+            native_message_id="native-message-2",
+            client_message_id="message-2",
+            generation=0,
+        )
         assert queue.put_nowait(before)
         queue.put_control_nowait(acceptance.fence)
+        queue.put_control_first_nowait(proof)
         queue.begin_gap(CodexManagedOverflow("turn-1"))
         assert isinstance(await queue.get(), CodexManagedOverflow)
+        assert await queue.get() is proof
         assert await queue.get() is acceptance.fence
         acceptance.fence.release_now()
 
@@ -5955,6 +8987,51 @@ def test_wrapper_steer_success_echoes_without_mutating_turn_lifecycle():
     asyncio.run(run())
 
 
+def test_wrapper_steer_rebinds_lease_before_live_echo_failure():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+        shared_daemon_affinity = True
+
+        async def steer(
+            self, prompt, images=None, *, client_user_message_id=None,
+        ):
+            assert prompt == "accepted before disconnect"
+            assert images == []
+            assert client_user_message_id == "steer-message"
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _install_running_steer_context(machine, Sdk())
+        machine._claim_codex_turn(
+            ctx, "native-turn", "original-message")
+        original_send = transport.send
+
+        async def fail_live_echo(message):
+            if isinstance(message, TurnSteered):
+                raise RuntimeError("relay disconnected after native acceptance")
+            await original_send(message)
+
+        transport.send = fail_live_echo
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="accepted before disconnect",
+            msg_id="steer-message",
+        ))
+
+        assert isinstance(result, TurnSteered)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.turn_id == "native-turn"
+        assert lease.msg_id == "steer-message"
+        assert ctx.active_msg_id == "steer-message"
+
+    asyncio.run(run())
+
+
 def test_wrapper_steer_failure_is_correlated_without_lifecycle_mutation():
     class Sdk:
         turn_id = "native-turn"
@@ -6036,6 +9113,82 @@ def test_wrapper_rejects_new_steer_after_interrupt_has_started():
         assert result.code == ERR_NOT_STEERABLE
         assert sdk.calls == 0
         assert ctx.state == "interrupting"
+
+    asyncio.run(run())
+
+
+def test_wrapper_rejects_steer_while_turn_start_owner_is_unproven():
+    class Sdk:
+        turn_id = "unproven-native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        ctx.codex_turn_start_reconciling = True
+
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            prompt="must not reach an unproven turn",
+            msg_id="steer-message",
+            cmd_id="steer-command",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert result.to == "client-1"
+        assert sdk.calls == 0
+        assert not any(
+            isinstance(event, TurnSteered) for event in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_wrapper_rechecks_turn_start_reconciliation_inside_steer_lock():
+    class Sdk:
+        turn_id = "unproven-native-turn"
+        turn_active = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def steer(self, *_args, **_kwargs):
+            self.calls += 1
+            return self.turn_id
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sdk = Sdk()
+        ctx = _install_running_steer_context(machine, sdk)
+        await ctx.steer_lock.acquire()
+        try:
+            task = asyncio.create_task(machine._handle_steer(Steer(
+                sid=ctx.key,
+                prompt="races the generation disconnect",
+                msg_id="steer-message",
+                cmd_id="steer-command",
+                client_id="client-1",
+            )))
+            # Let the command pass its initial check and block on steer_lock.
+            await asyncio.sleep(0)
+            ctx.codex_turn_start_reconciling = True
+        finally:
+            ctx.steer_lock.release()
+
+        result = await asyncio.wait_for(task, timeout=1.0)
+        assert isinstance(result, Error)
+        assert result.code == ERR_NOT_STEERABLE
+        assert sdk.calls == 0
 
     asyncio.run(run())
 
@@ -6378,4 +9531,29 @@ def test_codex_steer_fence_drains_old_backlog_before_new_user_boundary():
             ("turn_end", None),
         ]
 
+    asyncio.run(run())
+
+
+def test_codex_goal_pause_keeps_current_auto_turn_visible_and_confirms_exact_request():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("goal-pause", "goal-pause")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.codex_spontaneous_turn_id = "live-auto-turn"
+        calls = []
+        async def set_goal(**kwargs):
+            calls.append(kwargs)
+            return {"threadId": ctx.session_id, "objective": "ship", "engine": "codex",
+                "status": kwargs["status"], "tokensUsed": 123, "timeUsedSeconds": 3, "tokenBudget": 1000}
+        ctx.sdk = SimpleNamespace(set_goal=set_goal)
+        machine.sessions[ctx.key] = ctx
+        for status in ["paused", "complete"]:
+            result = await machine._handle_set_goal(SimpleNamespace(sid=ctx.key, client_id="viewer",
+                cmd_id="change-" + status, objective=None, token_budget=None, status=status))
+            assert isinstance(result, GoalState) and result.goal.status == status
+            assert result.request_id == "change-" + status
+            assert ctx.state == "running" and ctx.codex_spontaneous_turn_id == "live-auto-turn"
+        assert calls == [{"status": "paused"}, {"status": "complete"}]
+        assert not any(isinstance(frame, (TurnEnd, Error)) for frame in transport.sent)
     asyncio.run(run())

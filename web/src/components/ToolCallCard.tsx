@@ -1,8 +1,14 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { ToolBlock } from "../domain/conversation";
 import { Icon } from "../icons";
 import { buildEditDiffPreview } from "../diff";
+import {
+  cancelDraggedPointer,
+  PointerTapGuard,
+  releaseDraggedPointer,
+} from "../pointer-tap";
 import { isToolFailure, presentTool } from "../tool-presentation";
+import { ToolInput, ToolOutput } from "./ToolDetails";
 
 function EditDiff({ oldString, newString, serverDiff }: {
   oldString: string; newString: string; serverDiff?: string | null;
@@ -32,6 +38,7 @@ function EditDiff({ oldString, newString, serverDiff }: {
 
 export function ToolCallCard({ block }: { block: ToolBlock }) {
   const [open, setOpen] = useState(false);
+  const tapGuard = useRef(new PointerTapGuard());
   const status = !block.done ? "run" : isToolFailure(block) ? "err" : "done";
   const presentation = presentTool(block);
   const inp = block.input as { file_path?: string; old_string?: string; new_string?: string; content?: string };
@@ -71,8 +78,31 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
     );
   }
   return (
-    <details className="tool" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary className="tool-h">{header}</summary>
+    <details className="tool" open={open}>
+      <summary className="tool-h"
+        onPointerDown={(event) => {
+          tapGuard.current.pointerDown(
+            event.pointerId, event.clientX, event.clientY);
+          event.currentTarget.setPointerCapture?.(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (tapGuard.current.pointerMove(
+            event.pointerId, event.clientX, event.clientY,
+          )) {
+            releaseDraggedPointer(
+              event.currentTarget, event.pointerId, event.pointerType);
+          }
+        }}
+        onPointerUp={(event) => tapGuard.current.pointerUp(event.pointerId)}
+        onPointerCancel={(event) => {
+          cancelDraggedPointer(
+            tapGuard.current,
+            event.currentTarget, event.pointerId, event.pointerType);
+        }}
+        onClick={(event) => {
+          event.preventDefault();
+          if (tapGuard.current.consumeClick(event.detail)) setOpen(!open);
+        }}>{header}</summary>
       {open && <div className="tool-b">
         {block.progress && <div className="tool-progress">{block.progress}</div>}
         {resultSummary && resultSummary !== output && (
@@ -89,10 +119,7 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
             <pre className="tool-pre">{inp.content}</pre>
           </>
         ) : hasInput ? (
-          <>
-            <div className="tool-lbl">输入</div>
-            <pre className="tool-pre">{JSON.stringify(block.input, null, 2)}</pre>
-          </>
+          <ToolInput input={block.input} />
         ) : null}
         {diff && !isEdit && (
           <>
@@ -101,13 +128,9 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
           </>
         )}
         {output && (
-          <>
-            <div className="tool-lbl">输出{block.result?.is_error ? " (error)" : ""}</div>
-            <pre className="tool-pre">
-              {output}
-              {block.result?.truncated && "\n…(truncated)"}
-            </pre>
-          </>
+          <ToolOutput output={output} truncated={block.result?.truncated}
+            label={block.result?.is_error ? "输出（失败）"
+              : presentation.group === "搜索" ? "搜索结果" : "输出"} />
         )}
         {block.result && (block.result.exit_code != null || block.result.duration_ms != null) && (
           <div className="tool-meta">

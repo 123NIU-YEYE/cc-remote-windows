@@ -1,3 +1,4 @@
+import { MobileSidebarFixture } from "./fixtures/mobile-sidebar";
 import {
   useCallback,
   useEffect,
@@ -7,6 +8,9 @@ import {
   useState,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { TurnUsageFixture } from "./fixtures/turn-usage";
+import { BackgroundTasksFixture } from "./fixtures/background-tasks";
+import { MermaidArtifactFixture } from "./fixtures/mermaid-artifact";
 
 import "../src/index.css";
 import "../src/App.css";
@@ -20,15 +24,18 @@ import {
   type Turn,
 } from "../src/reducer";
 import type {
+  CodexProfileInfo,
   PermissionProfileInfo,
   QueryFile,
   QueryImg,
   ServerEvent,
+  SessionInfo,
   Space,
   StatusReport,
   ThreadGoal,
 } from "../src/protocol";
 import { PROTOCOL_VERSION } from "../src/protocol";
+import { TimedMessageTag } from "../src/components/TimedMessageTag";
 import {
   ChatView,
 } from "../src/components/ChatView";
@@ -55,13 +62,23 @@ import {
 } from "../src/components/QueuedQueryDialog";
 import { DirPicker } from "../src/components/DirPicker";
 import { HeaderMenu } from "../src/components/HeaderMenu";
+import { useTheme } from "../src/use-theme";
+import { useBoldText } from "../src/use-bold-text";
 import { UsageActivitySheet } from "../src/components/UsageActivitySheet";
 import { displayHistoryProjection } from "../src/history-recovery";
+import { summaryHistoryTurns } from "../src/history-summary";
 import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
-import App from "../src/App";
+import { MARKDOWN_HTML_GITHUB_README, MARKDOWN_HTML_HEADER_SVG, MARKDOWN_HTML_LOCAL_README } from "./fixtures/markdown-html";
+import { SessionsSidebar } from "../src/components/SessionsSidebar";
+import { useMobileViewport } from "../src/use-mobile-viewport";
+import {
+  completedGoalHasNewerUserTurn,
+  latestPlanProgress,
+  type TurnPlanProgress,
+} from "../src/plan-progress";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -219,6 +236,21 @@ function timelineTurn(id: string): Turn {
   };
 }
 
+function persistentPlanTurn(): Turn {
+  const base = timelineTurn("persistent-plan");
+  const plan = base.blocks[0];
+  return {
+    ...base,
+    done: false,
+    doneTs: undefined,
+    blocks: [
+      plan.kind === "process" ? { ...plan, done: false } : plan,
+      ...base.blocks.slice(1, -1),
+      streamingTurn("persistent-plan-output", 180).blocks[0],
+    ],
+  };
+}
+
 function streamingTurn(id: string, paragraphs = 1): Turn {
   const text = Array.from(
     { length: paragraphs },
@@ -232,6 +264,22 @@ function streamingTurn(id: string, paragraphs = 1): Turn {
       message_id: `${id}-message`,
       channel: "final",
       text,
+      done: false,
+    }],
+    done: false,
+    ts: Date.now(),
+  };
+}
+
+function streamingMathTurn(complete: boolean): Turn {
+  return {
+    id: "streaming-math",
+    prompt: "流式公式",
+    blocks: [{
+      kind: "text",
+      message_id: "streaming-math-message",
+      channel: "final",
+      text: String.raw`推导：\(x^2 + y^2 = r^2${complete ? String.raw`\)` : ""}`,
       done: false,
     }],
     done: false,
@@ -306,6 +354,7 @@ function detailPagingTurn(
   page: DetailFixturePage,
   expanded = false,
   retainedPreview = false,
+  autoLoad = false,
 ): Turn {
   const finalBlock = finalTurn("detail-page", 2).blocks[0];
   if (page === "deferred") {
@@ -339,6 +388,8 @@ function detailPagingTurn(
       done: true,
       ts: Date.now(),
       doneTs: Date.now(),
+      processDetailState: "present",
+      detailReasons: ["process"],
       detailEventCount: 24,
       detailLoaded: false,
     };
@@ -369,13 +420,15 @@ function detailPagingTurn(
     done: true,
     ts: Date.now(),
     doneTs: Date.now(),
+    processDetailState: "present",
+    detailReasons: ["process"],
     detailEventCount: 24,
     detailLoaded: true,
     detailHasMore: page === "latest",
     detailOldestCursor: page === "latest" ? "detail-older" : undefined,
     detailHasNewer: false,
     detailNewerCursor: undefined,
-    detailAutoLoad: page === "latest",
+    detailAutoLoad: page === "latest" && autoLoad,
   };
 }
 
@@ -488,22 +541,24 @@ function UsageActivityBrowserFixture({
   engine: "claude" | "codex";
 }) {
   const [activityOpen, setActivityOpen] = useState(false);
+  const { boldText, setBoldText } = useBoldText();
   const report = useMemo(fixtureUsageReport, []);
+  const appearance = useTheme(engine);
+  const { selectTheme } = appearance;
   useEffect(() => {
-    document.documentElement.dataset.engine = engine;
-    document.documentElement.dataset.theme = "dark";
-  }, [engine]);
+    selectTheme("dark");
+  }, [selectTheme]);
   return <main style={{ minHeight: "100dvh", background: "var(--bg)" }}>
     <header className="c-head" style={{ justifyContent: "flex-end" }}>
       <HeaderMenu
         engine={engine}
-        theme="dark"
+        appearance={appearance}
+        boldText={boldText} onBoldText={setBoldText}
         notificationMode="off"
         notificationBinding="off"
         notificationAvailable
         onNotificationMode={async () => true}
         onOpenUsageActivity={() => setActivityOpen(true)}
-        onToggleTheme={() => {}}
         onLogout={() => {}}
       />
     </header>
@@ -554,7 +609,19 @@ function reducerHistoryEvent(
   };
 }
 
-function reducerHistoryInitialState(cachedPagingRace = false): AppState {
+const CLAUDE_ALIAS_HISTORY: Turn[] = Array.from({ length: 10 }, (_, index) => ({
+  id: `claude-native-${index + 1}`,
+  clientMsgId: `claude-browser-${index + 1}`,
+  prompt: index === 0 ? "hi claude" : `Claude question ${index + 1}`,
+  ts: 1_790_000_000_000 + index * 60_000,
+  done: true,
+  blocks: [{
+    kind: "text", message_id: `claude-answer-${index + 1}`,
+    channel: "final", text: `Claude answer ${index + 1}`, done: true,
+  }],
+}));
+
+function reducerHistoryInitialState(cachedPagingRace = false, claudeAliases = false): AppState {
   let state: AppState = {
     ...initialState,
     focusedSid: REDUCER_SESSION_A,
@@ -563,6 +630,20 @@ function reducerHistoryInitialState(cachedPagingRace = false): AppState {
       [REDUCER_SESSION_B]: createRuntime(),
     },
   };
+  if (claudeAliases) {
+    state.runtimes[REDUCER_SESSION_A] = {
+      ...createRuntime(),
+      historyRevision: REDUCER_HISTORY_REVISION,
+      historyGeneration: REDUCER_HISTORY_GENERATION,
+      turns: CLAUDE_ALIAS_HISTORY.map((turn, index) => index === 0 ? turn : {
+        ...turn, id: turn.clientMsgId!, clientMsgId: undefined,
+      }),
+    };
+    return reduce(state, { type: "event", event: reducerHistoryEvent(
+      REDUCER_SESSION_A, CLAUDE_ALIAS_HISTORY.slice(6),
+      { buildSeq: 1, hasMore: true },
+    ) });
+  }
   if (cachedPagingRace) {
     return reduce(state, {
       type: "hydrate_cache",
@@ -604,6 +685,9 @@ function reducerHistoryInitialState(cachedPagingRace = false): AppState {
 }
 
 function ReducerHistoryBrowserFixture() {
+  const claudeAliases = useMemo(
+    () => new URLSearchParams(window.location.search).has("claude-aliases"), [],
+  );
   const cachedPagingRace = useMemo(
     () => new URLSearchParams(window.location.search).has("cached-paging"),
     [],
@@ -611,7 +695,7 @@ function ReducerHistoryBrowserFixture() {
   const [state, dispatch] = useReducer(
     reduce,
     cachedPagingRace,
-    reducerHistoryInitialState,
+    (cached) => reducerHistoryInitialState(cached, claudeAliases),
   );
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -686,7 +770,8 @@ function ReducerHistoryBrowserFixture() {
         before: browse.olderCursor!,
         page: {
           pageKey: "reducer-older-page",
-          turns: Array.from({ length: 20 }, (_, index) =>
+          turns: claudeAliases ? CLAUDE_ALIAS_HISTORY.slice(0, 6)
+            : Array.from({ length: 20 }, (_, index) =>
             finalTurn(`reducer-m${index + 1}`, index === 14 ? 4 : 3)),
           hasOlder: false,
           olderCursor: null,
@@ -695,7 +780,7 @@ function ReducerHistoryBrowserFixture() {
       });
     }, 25);
     return { accepted: true, viewId };
-  }, []);
+  }, [claudeAliases]);
 
   const refreshLiveRuntime = useCallback(() => {
     const current = stateRef.current;
@@ -705,19 +790,20 @@ function ReducerHistoryBrowserFixture() {
       type: "event",
       event: reducerHistoryEvent(
         REDUCER_SESSION_A,
-        Array.from({ length: 16 }, (_, index) =>
+        claudeAliases ? CLAUDE_ALIAS_HISTORY.slice(6)
+          : Array.from({ length: 16 }, (_, index) =>
           finalTurn(`reducer-m${index + 25}`, index === 15 ? 5 : 3)),
         {
           buildSeq: nextBuildSeq,
           hasMore: true,
-          oldestId: "reducer-m25",
-          newestId: "reducer-m40",
+          oldestId: claudeAliases ? CLAUDE_ALIAS_HISTORY[6].id : "reducer-m25",
+          newestId: claudeAliases ? CLAUDE_ALIAS_HISTORY[9].id : "reducer-m40",
           liveSeq: target?.lastLiveSeq ?? 0,
         },
       ),
     });
     setRefreshes((value) => value + 1);
-  }, []);
+  }, [claudeAliases]);
 
   const switchSession = useCallback(() => {
     const target = stateRef.current.focusedSid === REDUCER_SESSION_A
@@ -749,7 +835,7 @@ function ReducerHistoryBrowserFixture() {
       <ChatView
         sid={sid}
         turns={historyView.turns}
-        engine="codex"
+        engine={claudeAliases ? "claude" : "codex"}
         hasMore={historyView.hasMore}
         historyRevision={runtime.historyRevision}
         historyViewRevision={historyView.viewRevision}
@@ -790,6 +876,10 @@ function codexBurstInitialState(): AppState {
 function CodexLiveBurstFixture() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const composerLive = params.has("composer-live");
+  const composerPaste = params.has("composer-paste");
+  const [lastComposerPrompt, setLastComposerPrompt] = useState<string | null>(null);
+  const [lastComposerImageCount, setLastComposerImageCount] = useState(0);
+  const [composerDraft, setComposerDraft] = useState("a");
   const [state, dispatch] = useReducer(
     reduce,
     undefined,
@@ -949,8 +1039,12 @@ function CodexLiveBurstFixture() {
         onEdit={() => {}} onGetDiff={() => {}} />
       {composerLive && (
         <div data-testid="live-composer-shell">
+          {composerPaste && <button data-testid="switch-composer-draft"
+            onClick={() => setComposerDraft((value) => value === "a" ? "b" : "a")}>
+            Switch draft
+          </button>}
           <Composer
-            draftKey="fixture-codex-live-composer"
+            draftKey={`fixture-codex-live-composer-${composerDraft}`}
             draftStore={draftStoreRef.current}
             state={runtime.state}
             connState="connected"
@@ -975,7 +1069,12 @@ function CodexLiveBurstFixture() {
             engine="codex"
             editPrompt={null}
             onEditConsumed={() => {}}
-            onSendQuery={() => false}
+            onSendQuery={(prompt, images) => {
+              if (!composerPaste) return false;
+              setLastComposerPrompt(prompt);
+              setLastComposerImageCount(images?.length ?? 0);
+              return true;
+            }}
             onSteerQuery={() => false}
             onInterrupt={() => {}}
             onEnqueue={() => false}
@@ -993,6 +1092,12 @@ function CodexLiveBurstFixture() {
             onContext={() => {}}
             contextReport={null}
           />
+          {composerPaste && <output data-testid="composer-paste-output">
+            {lastComposerPrompt ?? ""}
+          </output>}
+          {composerPaste && <output data-testid="composer-image-count">
+            {lastComposerImageCount}
+          </output>}
         </div>
       )}
     </main>
@@ -1005,9 +1110,12 @@ function HistoryConversationBrowserFixture() {
   const growthDelayMs = Number(params.get("growth-delay") ?? "500");
   const manualGrowth = params.has("manual-growth");
   const largeCount = Number(params.get("large") ?? "0");
+  const paragraphs = Number(params.get("paragraphs") ?? "2");
   const pageCount = Math.max(1, Number(params.get("pages") ?? "1"));
   const large = largeCount > 0;
   const timeline = params.has("timeline");
+  const persistentPlan = params.has("persistent-plan");
+  const historicalPlan = params.has("historical-plan");
   const interactiveTimeline = params.has("interactive-timeline");
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
@@ -1015,14 +1123,18 @@ function HistoryConversationBrowserFixture() {
   const detailErrorOnce = params.has("detail-error-once");
   const detailOlderErrorOnce = params.has("detail-older-error-once");
   const detailRetainedPreview = params.has("detail-retained-preview");
+  const detailRestoredPage = params.get("detail-restored-page");
+  const detailInitialOpen = params.get("detail-initial-open");
   const detailScrollCancel = params.has("detail-scroll-cancel");
   const mermaid = params.has("mermaid");
   const actualMermaid = params.has("actual-mermaid");
   const invalidMermaid = params.has("invalid-mermaid");
   const mermaidHistory = params.has("mermaid-history");
   const math = params.has("math");
+  const streamingMath = params.has("streaming-math");
   const composerAttachment = params.has("composer-attachment");
   const composerResize = params.has("composer-resize");
+  const mobileScroll = params.has("mobile-scroll");
   const quotaComposer = params.has("quota-composer");
   const queuedQueryFixture = params.has("queued-query-editor");
   const migrationPickerFixture = params.has("migration-picker")
@@ -1030,9 +1142,13 @@ function HistoryConversationBrowserFixture() {
   const migrationPickerNullInitial = params.has("migration-picker-null");
   const newChatControls = params.has("newchat-controls");
   const longProfile = params.has("long-profile");
+  const manyProfiles = params.has("many-profiles");
   const recoveryReplacement = params.has("recovery-replace");
+  const pendingRevisionReplacement = params.has("pending-revision-replace");
   const deepBrowse = params.has("deep-browse");
+  const dirtyLiveBrowse = params.has("dirty-live-browse");
   const runtimeBrowse = params.has("runtime-browse");
+  const generationShift = params.has("generation-shift");
   const delayedHistoryAvailability = params.has("delayed-history-availability");
   const timelineEngine = params.get("engine") === "claude" ? "claude" : "codex";
   const emptyFinalPage = params.has("empty-final");
@@ -1044,8 +1160,27 @@ function HistoryConversationBrowserFixture() {
       return [compactToolsTurn()];
     }
     if (detailPaging) {
+      let detailTurn = detailPagingTurn("deferred", false, detailRetainedPreview);
+      if (detailInitialOpen === "restored") detailTurn.detailRestoreOpen = true;
+      if (detailInitialOpen === "default") detailTurn.done = false;
+      if (detailRestoredPage === "process") {
+        detailTurn = {
+          ...detailPagingTurn("latest"),
+          detailLoaded: false, detailRestoreIncomplete: true,
+          processStartedTs: 10_000, processDoneTs: 10_000 + 129 * 60_000,
+        };
+      } else if (detailRestoredPage === "older" || detailRestoredPage === "newer") {
+        detailTurn = {
+          ...detailTurn,
+          processDetailState: "unknown", detailReasons: [], detailEventCount: 0,
+          detailHasMore: detailRestoredPage === "older",
+          detailOldestCursor: detailRestoredPage === "older" ? "detail-older" : undefined,
+          detailHasNewer: detailRestoredPage === "newer",
+          detailNewerCursor: detailRestoredPage === "newer" ? "detail-newer" : undefined,
+        };
+      }
       return [
-        detailPagingTurn("deferred", false, detailRetainedPreview),
+        detailTurn,
         ...(detailScrollCancel
           ? Array.from({ length: 6 }, (_, index) =>
             finalTurn(`detail-after-${index + 1}`, 3))
@@ -1059,6 +1194,13 @@ function HistoryConversationBrowserFixture() {
       )];
     }
     if (math) return [mathTurn()];
+    if (streamingMath) {
+      return [
+        ...Array.from({ length: 8 }, (_, index) =>
+          finalTurn(`math-before-${index + 1}`, 3)),
+        streamingMathTurn(false),
+      ];
+    }
     if (mermaidHistory) {
       return [
         mermaidTurn(),
@@ -1068,7 +1210,7 @@ function HistoryConversationBrowserFixture() {
     }
     if (large) {
       return Array.from({ length: largeCount }, (_, index) =>
-        finalTurn(`m${index + 1}`, 2));
+        finalTurn(`m${index + 1}`, paragraphs));
     }
     if (deepBrowse) {
       return Array.from({ length: 20 }, (_, index) =>
@@ -1081,6 +1223,14 @@ function HistoryConversationBrowserFixture() {
           finalTurn(`f${index + 1}`, 4)),
       ];
     }
+    if (persistentPlan) return [persistentPlanTurn()];
+    if (historicalPlan) {
+      return [
+        timelineTurn("historical-plan"),
+        ...Array.from({ length: 8 }, (_, index) =>
+          finalTurn(`historical-followup-${index + 1}`, 3)),
+      ];
+    }
     if (interactiveTimeline) {
       return [
         timelineTurn("timeline"),
@@ -1089,11 +1239,11 @@ function HistoryConversationBrowserFixture() {
     }
     return INITIAL;
   }, [
-    actualMermaid, compactTools, detailPaging, detailRetainedPreview,
+    actualMermaid, compactTools, detailPaging, detailRetainedPreview, detailRestoredPage, detailInitialOpen,
     detailScrollCancel, dualImage,
-    interactiveTimeline, math,
-    deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
-    timeline,
+    interactiveTimeline, math, streamingMath,
+    deepBrowse, invalidMermaid, large, largeCount, paragraphs, mermaid, mermaidHistory,
+    historicalPlan, persistentPlan, timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
   const [sessions, setSessions] = useState<Record<string, FixtureSession>>({
@@ -1101,8 +1251,8 @@ function HistoryConversationBrowserFixture() {
       turns: initialA,
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
-        && !mermaidHistory && !math && !timeline && !deepBrowse
-        && !delayedHistoryAvailability,
+        && !mermaidHistory && !math && !streamingMath && !timeline && !deepBrowse
+        && !delayedHistoryAvailability && !historicalPlan,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
       newerPagesLoaded: 0,
@@ -1120,7 +1270,13 @@ function HistoryConversationBrowserFixture() {
   });
   const [loads, setLoads] = useState(0);
   const [historyRevision, setHistoryRevision] = useState("revision-1");
+  const [historyGeneration, setHistoryGeneration] =
+    useState("fixture-generation-1");
   const [historyViewRevision, setHistoryViewRevision] = useState("revision-1");
+  const [historyTransitionPending, setHistoryTransitionPending] =
+    useState(false);
+  const [sessionAuthorityScope, setSessionAuthorityScope] =
+    useState("fixture-authority-a");
   const [historyViewId, setHistoryViewId] = useState(
     deepBrowse ? "browse-1" : "runtime",
   );
@@ -1130,7 +1286,7 @@ function HistoryConversationBrowserFixture() {
     deepBrowse
       ? Array.from({ length: 20 }, (_, index) =>
         finalTurn(`m${index + 21}`, 3))
-      : []);
+      : runtimeBrowse ? initialA : []);
   const nextLiveTurnRef = useRef(41);
   const textSelectionGuardRef = useRef<TextSelectionGuard | null>(null);
   const detailRequestCountRef = useRef(0);
@@ -1152,6 +1308,13 @@ function HistoryConversationBrowserFixture() {
   });
   const [newChatSubmission, setNewChatSubmission] =
     useState<Record<string, unknown> | null>(null);
+  const [newChatAccount, setNewChatAccount] = useState("primary");
+  const [newChatModel, setNewChatModel] = useState<string | null>(null);
+  const [newChatEffort, setNewChatEffort] = useState<string | null>(null);
+  const [newChatSkillRequests, setNewChatSkillRequests] = useState(0);
+  const selectionAccounts = params.has("selection-controls")
+    ? [{ id: "primary", label: "Main" }, { id: "secondary", label: "Secondary" }]
+    : [];
   const [queuedPrompt, setQueuedPrompt] = useState(QUEUED_FULL_PROMPT);
   const [queuedEditor, setQueuedEditor] =
     useState<QueuedQueryEditor | null>(null);
@@ -1166,7 +1329,14 @@ function HistoryConversationBrowserFixture() {
           allowed: true,
         }]
       : []),
-  ], [longProfile]);
+    ...(manyProfiles
+      ? Array.from({ length: 12 }, (_, index) => ({
+          id: `custom-profile-${index}`,
+          description: `Custom execution profile ${index}`,
+          allowed: true,
+        }))
+      : []),
+  ], [longProfile, manyProfiles]);
   const [pendingImages, setPendingImages] = useState<QueryImg[]>(() =>
     composerAttachment ? [{
       media_type: "image/png",
@@ -1189,6 +1359,8 @@ function HistoryConversationBrowserFixture() {
   const [migrationPickerConfirmed, setMigrationPickerConfirmed] =
     useState<string | null>(null);
   const active = sessions[sid];
+  const fixedPlanProgress = persistentPlan || historicalPlan
+    ? latestPlanProgress(active.turns) : null;
   const revealOlderHistory = useCallback(() => {
     setSessions((current) => ({
       ...current,
@@ -1225,6 +1397,8 @@ function HistoryConversationBrowserFixture() {
   const loadMore = useCallback((): boolean | {
     accepted: true;
     viewId: string;
+    scopeKey: string;
+    generation: string | null;
   } => {
     const requestSid = sid;
     if (!sessions[requestSid]?.hasMore) return false;
@@ -1268,7 +1442,12 @@ function HistoryConversationBrowserFixture() {
       }
     }, delayMs);
     return enteringViewId
-      ? { accepted: true, viewId: enteringViewId }
+      ? {
+          accepted: true,
+          viewId: enteringViewId,
+          scopeKey: "fixture-browse-scope",
+          generation: null,
+        }
       : true;
   }, [
     browseMode, delayMs, emptyFinalPage, growOlderRow, growthDelayMs,
@@ -1279,8 +1458,26 @@ function HistoryConversationBrowserFixture() {
     const requestSid = sid;
     const session = sessions[requestSid];
     if (!browseMode || !session?.hasNewer) return false;
+    const requestedNextPage = (session.newerPagesLoaded ?? 0) + 1;
+    const requestedLast = Math.min(
+      40, 21 + (requestedNextPage - 1) * 8 + 7,
+    );
     setNewerLoads((value) => value + 1);
     window.setTimeout(() => {
+      if (dirtyLiveBrowse && requestedLast >= 40) {
+        setBrowseMode(false);
+        setHistoryViewId("runtime");
+        setSessions((current) => ({
+          ...current,
+          [requestSid]: {
+            ...current[requestSid],
+            turns: latestTurns,
+            hasNewer: false,
+            windowEpoch: (current[requestSid].windowEpoch ?? 0) + 1,
+          },
+        }));
+        return;
+      }
       setSessions((current) => {
         const target = current[requestSid];
         if (!target?.hasNewer) return current;
@@ -1326,18 +1523,21 @@ function HistoryConversationBrowserFixture() {
     }, delayMs);
     return true;
   }, [
-    browseMode, delayMs, historyRevision, historyViewId, sessions, sid,
+    browseMode, delayMs, dirtyLiveBrowse, historyRevision, historyViewId,
+    latestTurns, sessions, sid,
   ]);
 
   const loadDetail = useCallback((
     turnId: string,
     before?: string | null,
+    autoLoad = false,
   ): boolean => {
     if (!detailPaging || turnId !== "detail-page") return false;
     detailRequestCountRef.current += 1;
     document.documentElement.dataset.detailRequests =
       String(detailRequestCountRef.current);
-    const page: DetailFixturePage = before === "detail-older"
+    // Either explicit cursor returns the terminal combined process window.
+    const page: DetailFixturePage = before === "detail-older" || before === "detail-newer"
       ? "older" : "latest";
     document.documentElement.dataset.detailLastBefore = before ?? "initial";
     const failThisRequest = (
@@ -1357,7 +1557,8 @@ function HistoryConversationBrowserFixture() {
             detailLoading: true,
             detailError: undefined,
             detailRetryBefore: before ?? null,
-            detailRetryDirection: before == null ? "initial" : "older",
+            detailRetryDirection: before == null ? "initial"
+              : before === "detail-newer" ? "newer" : "older",
           } : turn),
       },
     }));
@@ -1383,7 +1584,8 @@ function HistoryConversationBrowserFixture() {
         [requestSid]: {
           ...current[requestSid],
           turns: current[requestSid].turns.map((turn) =>
-            turn.id === turnId ? detailPagingTurn(page) : turn),
+            turn.id === turnId
+              ? detailPagingTurn(page, false, false, autoLoad) : turn),
         },
       }));
       window.setTimeout(() => {
@@ -1395,7 +1597,7 @@ function HistoryConversationBrowserFixture() {
               turn.id === turnId
                   && (page !== "latest"
                     || turn.detailOldestCursor === "detail-older")
-                ? detailPagingTurn(page, true) : turn),
+                ? detailPagingTurn(page, true, false, autoLoad) : turn),
           },
         }));
       }, growthDelayMs);
@@ -1419,7 +1621,9 @@ function HistoryConversationBrowserFixture() {
 
   const appendTurn = () => {
     if (deepBrowse) {
-      const next = finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
+      const next = dirtyLiveBrowse
+        ? streamingTurn("live-streaming", 4)
+        : finalTurn(`live-${nextLiveTurnRef.current++}`, 4);
       setLatestTurns((current) => [...current, next].slice(-20));
       if (!browseMode) {
         setSessions((current) => {
@@ -1479,6 +1683,20 @@ function HistoryConversationBrowserFixture() {
     });
   };
 
+  const closeStreamingFormula = () => {
+    setSessions((current) => {
+      const session = current[sid];
+      return {
+        ...current,
+        [sid]: {
+          ...session,
+          turns: session.turns.map((turn) => turn.id === "streaming-math"
+            ? streamingMathTurn(true) : turn),
+        },
+      };
+    });
+  };
+
   const growBackgroundStreamingTurn = () => {
     setSessions((current) => {
       const targetSid = "history-browser-session-a";
@@ -1495,7 +1713,7 @@ function HistoryConversationBrowserFixture() {
     });
   };
 
-  const replaceHistoryRevision = () => {
+  const replaceHistoryRevision = (shiftAuthority = false) => {
     if (recoveryReplacement) {
       setSessions((current) => {
         const session = current[sid];
@@ -1519,6 +1737,11 @@ function HistoryConversationBrowserFixture() {
       { length: 24 },
       (_, index) => finalTurn(`r${index + 1}`, 3),
     );
+    setHistoryTransitionPending(pendingRevisionReplacement);
+    if (shiftAuthority) {
+      setSessionAuthorityScope((current) => current === "fixture-authority-a"
+        ? "fixture-authority-b" : "fixture-authority-a");
+    }
     setSessions((current) => ({
       ...current,
       [sid]: {
@@ -1542,16 +1765,26 @@ function HistoryConversationBrowserFixture() {
           pagesLoaded: 0,
         },
       }));
-    }, 0);
+      setHistoryTransitionPending(false);
+    }, pendingRevisionReplacement ? 400 : 0);
   };
 
   return (
-    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+    <main className={mobileScroll ? "shell" : undefined} style={{
+      height: mobileScroll ? "var(--app-height)" : "100dvh",
+      display: "flex", flexDirection: "column",
+    }}>
       <div style={{ flex: "none", minHeight: 24 }}>
         <output data-testid="load-count">{loads}</output>
         <output data-testid="newer-load-count">{newerLoads}</output>
         <output data-testid="newest-turn-id">{
           active.turns[active.turns.length - 1]?.id ?? ""
+        }</output>
+        <output data-testid="history-transition-state">{
+          historyTransitionPending ? "pending" : "ready"
+        }</output>
+        <output data-testid="session-authority-scope">{
+          sessionAuthorityScope
         }</output>
         <button data-testid="switch-session" type="button"
           onClick={() => setSid((current) => current.endsWith("-a")
@@ -1562,9 +1795,23 @@ function HistoryConversationBrowserFixture() {
           append
         </button>
         <button data-testid="replace-revision" type="button"
-          onClick={replaceHistoryRevision}>
+          onClick={() => replaceHistoryRevision()}>
           replace revision
         </button>
+        {pendingRevisionReplacement && (
+          <button data-testid="replace-authority" type="button"
+            onClick={() => replaceHistoryRevision(true)}>
+            replace authority
+          </button>
+        )}
+        {generationShift && (
+          <button data-testid="shift-generation" type="button"
+            onClick={() => setHistoryGeneration((current) =>
+              current === "fixture-generation-1"
+                ? "fixture-generation-2" : "fixture-generation-3")}>
+            shift generation
+          </button>
+        )}
         {migrationPickerFixture && (
           <>
             <button data-testid="open-migration-picker" type="button"
@@ -1631,6 +1878,7 @@ function HistoryConversationBrowserFixture() {
             <output data-testid="newchat-submission">{
               JSON.stringify(newChatSubmission)
             }</output>
+            <output data-testid="newchat-skill-requests">{newChatSkillRequests}</output>
           </>
         )}
         {queuedQueryFixture && (
@@ -1676,6 +1924,12 @@ function HistoryConversationBrowserFixture() {
             </button>
           </>
         )}
+        {streamingMath && (
+          <button data-testid="close-streaming-formula" type="button"
+            onClick={closeStreamingFormula}>
+            close formula
+          </button>
+        )}
         {manualGrowth && (
           <button data-testid="grow-row" type="button"
             onClick={() => deepBrowse
@@ -1692,12 +1946,40 @@ function HistoryConversationBrowserFixture() {
             cwd="/tmp/project"
             controlScopeKey={
               `${newChatSurface.machine}:${newChatSurface.space}:`
-              + newChatSurface.engine
+              + `${newChatSurface.engine}:${newChatAccount}`
             }
             engine={newChatSurface.engine}
             space={newChatSurface.space}
             autoFocus={false}
+            catalog={params.has("newchat-commands") ? {
+              codex: [{
+                id: "fixture-codex", display_name: "GPT-6-Astra",
+                description: "Fixture model", efforts: ["medium", "high", "max"],
+                service_tiers: [{ id: "fast", name: "快速", description: "更快的响应速度" }],
+              }],
+            } : undefined}
+            defaultModel={params.has("newchat-commands") && newChatSurface.engine === "codex" ? "fixture-codex" : undefined}
+            defaultEffort={params.has("newchat-commands") ? "max" : undefined}
+            skills={params.has("newchat-commands") && newChatSkillRequests > 0 ? [
+              { id: "review-skill", kind: "skill", name: "review", description: "Review the current project", enabled: true },
+              { id: "disabled-skill", kind: "skill", name: "retired", enabled: false },
+            ] : undefined}
+            onRequestSkills={() => {
+              if (params.has("newchat-commands")) setNewChatSkillRequests(count => count + 1);
+            }}
             permissionProfiles={newChatProfiles}
+            claudeProfiles={selectionAccounts}
+            codexProfiles={selectionAccounts}
+            defaultClaudeProfileId="primary"
+            defaultCodexProfileId="primary"
+            claudeProfileId={selectionAccounts.length ? newChatAccount : undefined}
+            codexProfileId={selectionAccounts.length ? newChatAccount : undefined}
+            onPickClaudeProfile={setNewChatAccount}
+            onPickCodexProfile={setNewChatAccount}
+            model={newChatModel}
+            effort={newChatEffort}
+            onPickModel={setNewChatModel}
+            onPickEffort={setNewChatEffort}
             onPickCwd={() => {}}
             onSend={(
               prompt: string,
@@ -1711,6 +1993,11 @@ function HistoryConversationBrowserFixture() {
             ) => {
               setNewChatSubmission({
                 prompt,
+                account: newChatAccount,
+                model: newChatModel,
+                effort: newChatEffort,
+                images: _images?.map(image => image.media_type),
+                files: _files?.map(file => file.filename),
                 collaborationMode,
                 permissionMode,
                 permissionProfile,
@@ -1723,14 +2010,18 @@ function HistoryConversationBrowserFixture() {
         </div>
       ) : (
         <ChatView
+          key={sessionAuthorityScope}
           sid={sid}
           turns={active.turns}
           engine={timelineEngine}
+          loading={historyTransitionPending}
           hasMore={active.hasMore}
           historyRevision={historyRevision}
           historyViewRevision={historyViewRevision}
+          historyGeneration={generationShift ? historyGeneration : undefined}
           historyViewId={deepBrowse || browseMode ? historyViewId : undefined}
-          historyScopeKey="fixture-history-scope"
+          historyScopeKey={runtimeBrowse && browseMode
+            ? "fixture-browse-scope" : "fixture-history-scope"}
           historyWindowEpoch={active.windowEpoch ?? 0}
           historyCursor={active.cursor}
           browseMode={browseMode && sid.endsWith("-a")}
@@ -1742,8 +2033,22 @@ function HistoryConversationBrowserFixture() {
           onTextSelectionGuardChange={updateTextSelectionGuard}
           onEdit={() => {}}
           onGetDiff={() => {}}
+          activeTurnId={sid.endsWith("-a")
+            ? interactiveTimeline
+              ? "streaming"
+              : dirtyLiveBrowse && !browseMode
+                ? "live-streaming" : null
+            : null}
+          externalPlanProgress={fixedPlanProgress ? {
+            turnId: fixedPlanProgress.turnId,
+            itemId: fixedPlanProgress.block.item_id,
+          } : null}
         />
       )}
+      {fixedPlanProgress && <GoalPanel engine="codex" goal={null}
+        revealed={false} open={false} plan={fixedPlanProgress}
+        onOpen={() => {}} onClose={() => {}} onDismiss={() => {}}
+        onSave={() => {}} onClear={() => {}} />}
       {composerResize && (
         <div data-testid="fixture-composer" style={{
           flex: "none",
@@ -1847,16 +2152,165 @@ function HistoryConversationBrowserFixture() {
 
 export function HistoryBrowserFixture() {
   const params = new URLSearchParams(window.location.search);
+  if (params.has("background-tasks")) return <BackgroundTasksFixture />;
   const planUi = params.get("plan-ui");
+  if (params.has("profile-sidebar")) return <ProfileSidebarFixture />;
   if (planUi) return <PlanUiFixture mode={planUi} />;
+  if (params.has("plan-lifecycle")) {
+    return <PlanLifecycleFixture mode={params.get("plan-lifecycle") ?? ""} />;
+  }
   if (params.has("goal-ui")) {
-    return <GoalUiFixture status={params.get("goal-status")} />;
+    return <GoalUiFixture status={params.get("goal-status")}
+      withPlan={params.has("plan")} hidden={params.has("goal-hidden")}
+      longGoal={params.has("goal-long")}
+      newerTurn={params.has("goal-next-turn")}
+      longPlan={params.has("plan-long")} />;
   }
   if (params.has("header-menu")) {
     return <UsageActivityBrowserFixture
       engine={params.get("engine") === "claude" ? "claude" : "codex"}
     />;
   }
+  if (params.has("newchat-controls") || params.has("mobile-scroll")) {
+    return <MobileViewportHistoryConversationBrowserFixture />;
+  }
+  return <HistoryConversationBrowserFixture />;
+}
+
+function ProfileSidebarFixture() {
+  const params = new URLSearchParams(window.location.search);
+  const theme = params.get("theme") === "dark"
+    ? "dark"
+    : "light";
+  const [space, setSpace] = useState<Space>(
+    params.get("profile-sidebar") === "work" ? "work" : "code",
+  );
+  const [newProfileId, setNewProfileId] = useState("none");
+  const [activeSessionId, setActiveSessionId] = useState("profile-sidebar-active");
+  const [timedTasks, setTimedTasks] = useState(() => params.has("timed-tasks") ? [{
+    task_id: "timer-test", title: "每分钟向当前会话发送测试",
+    next_message_at: Date.now() / 1000 + 42, interval_seconds: 60,
+    sent_count: 2, total_count: 3, valid_until: Date.now() / 1000 + 90,
+  }] : []);
+  useEffect(() => {
+    const root = document.documentElement;
+    const previousEngine = root.dataset.engine;
+    const previousTheme = root.dataset.theme;
+    root.dataset.engine = "codex";
+    root.dataset.theme = theme;
+    return () => {
+      if (previousEngine === undefined) delete root.dataset.engine;
+      else root.dataset.engine = previousEngine;
+      if (previousTheme === undefined) delete root.dataset.theme;
+      else root.dataset.theme = previousTheme;
+    };
+  }, [theme]);
+  const profiles: CodexProfileInfo[] = [
+    { id: "primary", label: "Main" },
+    { id: "stack", label: "Stack" },
+  ];
+  const sessions: SessionInfo[] = [{
+    session_id: "profile-sidebar-active",
+    first_prompt: "看看当前仓库。",
+    cwd: "/repo/cc-remote",
+    pinned: true,
+    state: "idle",
+    engine: "codex",
+    space,
+    codex_profile_id: "stack",
+    codex_profile_label: "Stack",
+  }, {
+    session_id: "profile-sidebar-default",
+    timed_tasks: timedTasks,
+    summary: "cc-remote 派生",
+    cwd: "/repo/cc-remote",
+    state: "idle",
+    engine: "codex",
+    space,
+    codex_profile_id: "primary",
+    codex_profile_label: "Main",
+  }];
+  const noop = () => {};
+  return (
+    <>
+      <output data-testid="new-work-profile" hidden>{newProfileId}</output>
+      {params.has("timed-tasks") && <div style={{ position: "fixed", left: 400, top: 80 }}>
+        <button data-testid="finish-timed-task" onClick={() => setTimedTasks([])}>结束定时任务</button>
+        <div className="ubub"><TimedMessageTag task={{
+          task_id: "timer-test", title: "每分钟向当前会话发送测试", scheduled_at: Date.now() / 1000,
+        }} />测试</div>
+        <div className="ubub">测试</div>
+      </div>}
+      <SessionsSidebar
+        open
+        engine="codex"
+        space={space}
+        profileScopeKey={`fixture:codex:${space}`}
+        codexProfiles={profiles}
+        defaultCodexProfileId="primary"
+        sessions={sessions}
+        machineId={params.get("machine") ?? "fixture-device"}
+        activeSessionId={activeSessionId}
+        onSpaceChange={setSpace}
+        onSelect={setActiveSessionId}
+        onNew={(profileId) => setNewProfileId(profileId ?? "none")}
+        onNewInDir={noop}
+        onClose={noop}
+        onRename={noop}
+        onArchive={noop}
+        onPin={noop}
+        onDelete={noop}
+        onForkWorktree={noop}
+        onMigrate={noop}
+      />
+    </>
+  );
+}
+
+function PlanLifecycleFixture({ mode }: { mode: string }) {
+  const interrupted = mode === "interrupted";
+  const [turns, setTurns] = useState<Turn[]>(() => [{
+    id: interrupted ? "interrupted-plan-turn" : "completed-plan-turn",
+    prompt: interrupted ? "执行后终止" : "完成当前任务",
+    done: true,
+    interrupted: interrupted || undefined,
+    blocks: [{
+      kind: "process",
+      item_id: interrupted ? "interrupted-plan-item" : "completed-plan-item",
+      processKind: "plan",
+      phase: "end",
+      status: interrupted ? "interrupted" : "succeeded",
+      title: "计划",
+      plan: [
+        { step: "实现功能", status: "completed" },
+        { step: "完成验证", status: interrupted ? "inProgress" : "completed" },
+      ],
+      done: true,
+    }],
+  }]);
+  const plan = latestPlanProgress(turns);
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <button type="button" data-testid="send-next-plan-message"
+        onClick={() => setTurns((current) => [...current, {
+          id: "next-user-turn",
+          prompt: "开始下一个问题",
+          done: false,
+          blocks: [],
+        }])}>
+        send next message
+      </button>
+      <div style={{ flex: 1 }} />
+      <GoalPanel engine="codex" goal={null} revealed={false} open={false}
+        plan={plan} onOpen={() => {}} onClose={() => {}}
+        onDismiss={() => {}} onSave={() => {}} onClear={() => {}} />
+      <div className="composer"><div className="composer-in" /></div>
+    </main>
+  );
+}
+
+function MobileViewportHistoryConversationBrowserFixture() {
+  useMobileViewport();
   return <HistoryConversationBrowserFixture />;
 }
 
@@ -1916,34 +2370,114 @@ function PlanUiFixture({ mode }: { mode: string }) {
           window.setTimeout(() => {
             setAuthoritative(true);
             setRefreshing(false);
-          }, 150);
+          // Leave the provisional frame observable even on the slower mobile
+          // WebKit project before replacing it with authoritative detail.
+          }, 800);
           return true;
         } : undefined} />
     </main>
   );
 }
 
-function GoalUiFixture({ status }: { status: string | null }) {
-  const [open, setOpen] = useState(false);
-  const [revealed, setRevealed] = useState(true);
-  const goalStatus = status === "blocked" ? "blocked" : "active";
-  const goal: ThreadGoal = {
+function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn,
+  longPlan }: {
+  status: string | null;
+  withPlan: boolean;
+  hidden: boolean;
+  longGoal: boolean;
+  newerTurn: boolean;
+  longPlan: boolean;
+}) {
+  const params = new URLSearchParams(window.location.search);
+  const engine = params.get("engine") === "claude" ? "claude" : "codex";
+  const [open, setOpen] = useState(params.has("goal-open"));
+  const [revealed, setRevealed] = useState(!hidden && status !== "none");
+  const [planDetailRequests, setPlanDetailRequests] = useState(0);
+  const loading = status === "loading";
+  const goalStatus = status === "blocked" ? "blocked"
+    : status === "complete" ? "complete" : "active";
+  const [goal, setGoal] = useState<ThreadGoal | null>(loading || status === "none" ? null : {
     threadId: "goal-fixture-thread",
-    objective: "完成 protocol v29 发布并验证所有终端同步升级",
+    objective: longGoal
+      ? "按照计划完成所有功能模块；每个模块验证无误后分别提交并推送，确保核心行为一致。".repeat(8)
+      : "完成 protocol v30 发布并验证所有终端同步升级",
     status: goalStatus,
-    engine: "codex",
-    tokenBudget: 100_000,
+    engine,
+    iterations: engine === "claude" ? 3 : undefined,
+    tokenBudget: engine === "codex" ? 100_000 : null,
     tokensUsed: 37_000,
     timeUsedSeconds: 321,
-  };
+    updatedAt: 1_800_000_000,
+    lastReason: "已完成协议兼容性检查，正在验证三端同步状态。",
+  });
+  useEffect(() => {
+    document.documentElement.dataset.engine = engine;
+    document.documentElement.dataset.theme = new URLSearchParams(window.location.search).get("theme") ?? "light";
+    const refresh = () => setGoal(current => current ? { ...current, tokensUsed: current.tokensUsed + 1000, updatedAt: Date.now() / 1000 } : null);
+    window.addEventListener("goal-fixture-refresh", refresh);
+    return () => window.removeEventListener("goal-fixture-refresh", refresh);
+  }, [engine]);
+  const plan: TurnPlanProgress | null = withPlan ? {
+    turnId: "goal-fixture-turn",
+    block: {
+      kind: "process",
+      item_id: "goal-fixture-plan",
+      processKind: "plan",
+      phase: "update",
+      status: "running",
+      title: "计划",
+      explanation: "让任务进度始终可以从会话底部查看。",
+      plan: longPlan
+        ? Array.from({ length: 28 }, (_, index) => ({
+            step: `验证计划弹层内部滚动 ${index + 1}`,
+            status: index < 2
+              ? "completed" as const
+              : index === 2 ? "inProgress" as const : "pending" as const,
+          }))
+        : [
+            { step: "定位计划状态", status: "completed" },
+            { step: "实现固定入口", status: "inProgress" },
+            { step: "完成浏览器回归", status: "pending" },
+          ],
+      done: false,
+    },
+    detailLoading: false,
+    needsDetail: true,
+  } : null;
+  const completedGoalRetired = completedGoalHasNewerUserTurn(
+    goal,
+    newerTurn ? [{
+      id: "goal-fixture-next-turn",
+      prompt: "开始 Goal 之后的新任务",
+      blocks: [],
+      done: false,
+      ts: 1_800_000_001_000,
+    }] : [],
+  );
   return (
-    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
-      <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
-      <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
+    <main className="pane"
+      style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div className="thread-shell" style={{ flexDirection: "row" }}>
+        <div data-testid="goal-fixture-spacer" style={{ width: 0 }} />
+        <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
+      </div>
+      <output data-testid="plan-detail-requests">{planDetailRequests}</output>
+      <GoalPanel engine={engine} goal={goal} revealed={revealed} open={open}
+        loading={loading} completedGoalRetired={completedGoalRetired} plan={plan}
+        onLoadPlanDetail={() => setPlanDetailRequests((value) => value + 1)}
         onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
-        onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
-        onClear={() => setRevealed(false)} />
-      <div className="composer"><div className="composer-in" /></div>
+        onDismiss={() => setRevealed(false)} onSave={async (objective, nextStatus, budget) => {
+          if (params.has("goal-fail")) throw new Error("原生目标暂时无法更新，输入已保留。");
+          setGoal({ ...goal, threadId: "goal-fixture-thread", engine, objective, status: nextStatus,
+            tokenBudget: budget, tokensUsed: goal?.tokensUsed ?? 0, timeUsedSeconds: goal?.timeUsedSeconds ?? 0 });
+          setRevealed(true);
+        }}
+        onStatus={nextStatus => setGoal(current => current ? { ...current, status: nextStatus } : null)}
+        onClear={() => { setGoal(null); setRevealed(false); setOpen(false); }} />
+      <div className="composer" data-testid="goal-fixture-composer"
+        style={{ height: 48 }}>
+        <div className="composer-in" />
+      </div>
     </main>
   );
 }
@@ -2062,6 +2596,50 @@ function InlineImageEvictionFixture() {
   );
 }
 
+const USER_IMAGE_LAYOUT_SIZES = [[600, 1800], [1200, 650], [1000, 760]];
+
+function UserImageLayoutFixture() {
+  const [stage, setStage] = useState("optimistic");
+  const [shortPrompt, setShortPrompt] = useState(false);
+  const images = useMemo<QueryImg[]>(() => USER_IMAGE_LAYOUT_SIZES.map(([width, height], index) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = ["#dbeafe", "#ede9fe", "#dcfce7"][index];
+    ctx.fillRect(0, 0, width, height);
+    ctx.fillStyle = "#334155";
+    ctx.font = "48px sans-serif";
+    ctx.fillText(`Screenshot ${index + 1}`, 24, 64);
+    return { media_type: "image/png", data: canvas.toDataURL().split(",")[1] };
+  }), []);
+  const turnId = "user-image-layout";
+  const refs = USER_IMAGE_LAYOUT_SIZES.map(([width, height], i) => ({
+    image_id: `image-${i}`, media_type: "image/png" as const,
+    width, height, byte_size: 1024,
+  }));
+  const assets = Object.fromEntries(refs.map((ref, i) => [
+    historyImageAssetKey(turnId, ref.image_id, "thumbnail"),
+    stage === "ready" ? { status: "ready" as const,
+      mediaType: "image/png", data: images[i].data }
+      : { status: "error" as const },
+  ]));
+  return <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+    <div>{["optimistic", "loading", "ready", "error"].map((value) =>
+      <button key={value} onClick={() => setStage(value)}>{value}</button>)}
+      <button onClick={() => setShortPrompt((value) => !value)}>prompt length</button>
+    </div>
+    <ChatView sid="image-layout-session" engine="codex"
+      historyRevision="image-layout-r1"
+      historyImageAssets={stage === "loading" ? {} : assets}
+      onLoadHistoryImage={() => true}
+      turns={[{ id: turnId, prompt: shortPrompt ? "看这三张图。"
+        : "请查看这些截图，文字与图片应共享右侧边界。".repeat(6),
+      ...(stage === "optimistic" ? { images } : { imageRefs: refs }),
+      blocks: [], done: true, ts: 1_000, doneTs: 2_000 }]}
+      onEdit={() => {}} onGetDiff={() => {}} />
+  </main>;
+}
+
 function HistoryImageFallbackErrorFixture() {
   const turnId = "history-fallback-error";
   const imageId = "history-fallback-image";
@@ -2123,19 +2701,137 @@ function HistoryImageFallbackErrorFixture() {
 }
 
 const UNSAFE_SVG = [
+  '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n',
+  '<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"\n',
+  ' "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n',
+  '<!-- Generated by graphviz\n -->\n<!-- Title: test Pages: 1 -->\n',
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 40">',
   "<script>document.documentElement.dataset.bad='yes'</script>",
   '<foreignObject x="0" y="0" width="20" height="20"><div>bad</div></foreignObject>',
   '<image href="https://example.com/tracker.png" width="10" height="10"/>',
   '<rect id="safe-svg-rect" width="120" height="40" fill="#6256b4"/>',
+  '<text x="2" y="20">A&#160;B &amp; &lt;C&gt;</text>',
   "</svg>",
 ].join("");
 
+function buildAudioFixture(): string {
+  const bytes = new Uint8Array(44 + 3 * 8000 * 2);
+  const view = new DataView(bytes.buffer);
+  const text = (at: number, value: string) => {
+    for (let index = 0; index < value.length; index++) bytes[at + index] = value.charCodeAt(index);
+  };
+  text(0, "RIFF"); view.setUint32(4, bytes.length - 8, true);
+  text(8, "WAVEfmt "); view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, 8000, true); view.setUint32(28, 16000, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  text(36, "data"); view.setUint32(40, bytes.length - 44, true);
+  return window.btoa(Array.from(bytes, (value) => String.fromCharCode(value)).join(""));
+}
+
+function AudioPreviewFixture() {
+  const [revision, setRevision] = useState(0);
+  const [closed, setClosed] = useState(false);
+  const fixture = useMemo(() => {
+    const supplied = (window as unknown as {
+      audioFixture?: { data: string; name: string };
+    }).audioFixture;
+    return supplied ?? { data: buildAudioFixture(), name: "reference.wav" };
+  }, []);
+  const invalid = new URLSearchParams(location.search).get("artifact-audio") === "invalid";
+  return <main style={{ height: "100dvh" }}>
+    {closed ? <p data-testid="audio-preview-closed">已关闭</p> : <ArtifactPanel
+      artifact={{ kind: "audio", file: revision ? "second.wav" : fixture.name,
+        sid: "audio-session", requestId: `audio-request-${revision}`,
+        data: invalid && !revision ? window.btoa("RIFF0000WAVE") : fixture.data,
+        mediaType: "audio/wav", size: atob(fixture.data).length }}
+      active="diff" hasBtw={false} onTab={() => {}}
+      onRefresh={() => setRevision((value) => value + 1)}
+      onClose={() => setClosed(true)} />}
+  </main>;
+}
+
+function buildPdfFixture(): string {
+  const firstPage = [
+    "0.15 0.35 0.75 rg",
+    "20 20 260 160 re f",
+    "1 1 1 rg",
+    "BT /F1 18 Tf 45 95 Td (cc-remote PDF page 1) Tj ET",
+  ].join("\n");
+  const secondPage = [
+    "0.85 0.25 0.10 rg",
+    "20 20 260 160 re f",
+    "1 1 1 rg",
+    "BT /F1 18 Tf 45 95 Td (cc-remote PDF page 2) Tj ET",
+  ].join("\n");
+  const objects = [
+    "<< /Type /Catalog /Pages 2 0 R >>",
+    "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    `<< /Length ${firstPage.length} >>\nstream\n${firstPage}\nendstream`,
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>",
+    `<< /Length ${secondPage.length} >>\nstream\n${secondPage}\nendstream`,
+  ];
+  let source = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(source.length);
+    source += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = source.length;
+  source += `xref\n0 ${objects.length + 1}\n`;
+  source += "0000000000 65535 f \n";
+  source += offsets.slice(1).map(
+    (offset) => `${String(offset).padStart(10, "0")} 00000 n \n`,
+  ).join("");
+  source += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n`;
+  source += `startxref\n${xrefOffset}\n%%EOF\n`;
+  return window.btoa(source);
+}
+
+function buildAnimatedGifFixture(): string {
+  return [
+    "R0lGODlhEAAQAPAAAAAAAP///yH/C05FVFNDQVBFMi4wAwEAAAAh+QQECgD/ACwA",
+    "AAAAEAAQAAACDoSPqcvtD6OctNqLsz4FACH5BAUKAAAALAAAAAAQABAAAAIOjI+p",
+    "y+0Po5y02ouzPgUAOw==",
+  ].join("");
+}
+
 function ArtifactPreviewFixture({ kind }: {
-  kind: "html" | "svg" | "markdown-svg";
+  kind: "gif" | "invalid-gif" | "html" | "pdf" | "svg"
+    | "markdown-svg" | "markdown-source" | "markdown-html" | "markdown-github-html";
 }) {
-  const svgData = window.btoa(UNSAFE_SVG);
-  const artifact = kind === "html"
+  const [openedFile, setOpenedFile] = useState("");
+  const svgData = (window as unknown as { svgFixture?: string }).svgFixture
+    || window.btoa(UNSAFE_SVG);
+  const htmlReadme = kind === "markdown-github-html"
+    ? MARKDOWN_HTML_GITHUB_README : MARKDOWN_HTML_LOCAL_README;
+  const artifact = kind === "pdf"
+    ? {
+      file: "report.pdf",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "pdf" as const,
+      data: buildPdfFixture(),
+      mediaType: "application/pdf" as const,
+      size: 1_024,
+      mtimeNs: "1",
+    }
+    : kind === "gif" || kind === "invalid-gif"
+    ? {
+      file: "animation.gif",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "image" as const,
+      data: kind === "gif"
+        ? buildAnimatedGifFixture()
+        : window.btoa("GIF89a-invalid"),
+      mediaType: "image/gif" as const,
+      size: 128,
+      mtimeNs: "1",
+    }
+    : kind === "html"
     ? {
       file: "preview.html",
       sid: "artifact-preview-session",
@@ -2144,10 +2840,20 @@ function ArtifactPreviewFixture({ kind }: {
       content: `<!doctype html><html><head>
         <style>#head-style { color: rgb(12, 34, 56); }</style>
         </head><body><div id="head-style">head css retained</div>
+        <div id="visualization-theme" style="color:var(--foreground);background:var(--background);border:1px solid var(--border)">visualization theme</div>
+        <button id="counter">计数 0</button>
         <script>
           document.body.dataset.scriptRan = "yes";
           try { parent.document.body.dataset.previewEscaped = "yes"; }
           catch (_) { document.body.dataset.parentBlocked = "yes"; }
+          try { localStorage.getItem("preview-isolation-test"); }
+          catch (_) { document.body.dataset.storageBlocked = "yes"; }
+          fetch("https://cc-remote-preview-test.invalid/should-not-load")
+            .catch(() => { document.body.dataset.networkBlocked = "yes"; });
+          let count = 0;
+          document.getElementById("counter").onclick = event => {
+            event.currentTarget.textContent = "计数 " + (++count);
+          };
         </script></body></html>`,
       size: 360,
       mtimeNs: "1",
@@ -2163,6 +2869,37 @@ function ArtifactPreviewFixture({ kind }: {
       mediaType: "image/svg+xml",
       size: UNSAFE_SVG.length,
       mtimeNs: "1",
+    }
+    : kind === "markdown-html" || kind === "markdown-github-html"
+    ? {
+      file: "readme_zh.md", sid: "artifact-preview-session",
+      requestId: "artifact-preview-request", kind: "md" as const,
+      content: htmlReadme, size: htmlReadme.length,
+      mtimeNs: "1", revision: "c".repeat(64),
+      assets: {
+        "header.svg": {
+          mediaType: "image/svg+xml",
+          data: window.btoa(MARKDOWN_HTML_HEADER_SVG),
+        },
+        "local-logo.png": {
+          mediaType: "image/png",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3x8AAAAASUVORK5CYII=",
+        },
+      },
+    }
+    : kind === "markdown-source"
+    ? {
+      file: "LONG_REPORT.md",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "md" as const,
+      content: Array.from(
+        { length: 160 },
+        (_, index) => `## Section ${index + 1}\n\nMobile source line ${index + 1}.`,
+      ).join("\n\n"),
+      size: 12_000,
+      mtimeNs: "1",
+      revision: "c".repeat(64),
     }
     : {
       file: "README.md",
@@ -2181,27 +2918,262 @@ function ArtifactPreviewFixture({ kind }: {
       },
     };
   return <main style={{ height: "100dvh" }}>
+    <output hidden data-testid="artifact-opened-file">{openedFile}</output>
     <ArtifactPanel artifact={artifact} active="diff" hasBtw={false}
+      theme={kind === "html" ? "dark" : "light"}
+      onOpenFile={(path, line) => setOpenedFile(`${path}:${line || ""}`)}
       onTab={() => {}} onClose={() => {}} />
+  </main>;
+}
+
+function HistoricalFilesFixture() {
+  const manyFiles = new URLSearchParams(location.search).has("many-files");
+  const [other, setOther] = useState(false);
+  const [opened, setOpened] = useState("");
+  const [refresh, setRefresh] = useState(0);
+  const [dark, setDark] = useState(false);
+  useEffect(() => {
+    document.documentElement.dataset.engine = "codex";
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  }, [dark]);
+  const paths = manyFiles ? Array.from({ length: 130 }, (_, index) => `src/file-${index}.py`)
+    : ["src/perception/camera.py", "tests/camera.py", "config/rig.json", "deploy/Dockerfile", "deploy/compose.yaml", "scripts/check.sh", "README.md"];
+  const wireTurns = [1, 2].map((number) => ({
+    id: `history-${number}`, prompt: number === 1 ? "完成相机预览相关修改" : "再调整一下相机配置",
+    done: true, ts: number, blocks: [{ kind: "text", done: true, message_id: `answer-${number}`,
+      channel: "final", text: number === 1 ? "已完成代码、配置和使用说明的调整。" : "相机配置已更新，上一轮的改动记录保持不变。" }],
+    fileChanges: { revision: manyFiles ? `revision-${number}-${refresh}` : `revision-${number}`,
+      ...(manyFiles && number === 1 ? { total_files: 130, total_additions: 130, total_deletions: 130, next_offset: 64 } : {}),
+      files: (number === 1 ? paths.slice(0, 64) : paths.slice(0, 1)).map((path, index) => ({
+      path: `/workspace/robot-viewer/${path}`,
+      state: index === 6 ? "unavailable" as const : "available" as const,
+      ...(index === 6 ? {} : { additions: 12 + index, deletions: index + 1 }),
+    })) },
+  }));
+  const turns = summaryHistoryTurns({ v: PROTOCOL_VERSION, ts: refresh, type: "history",
+    session_id: "historical-files", detail: "summary", turns: wireTurns, events: [], has_more: false }) ?? [];
+  return <main style={{ display: "flex", flexDirection: "column", height: "100dvh" }}>
+    <header style={{ padding: "12px 20px", flex: "none" }}>Code · 历史改动</header>
+    <ChatView sid={other ? "other-history" : "historical-files"} engine="codex"
+      turns={other ? [] : turns} activeTurnId={null}
+      onOpenArchivedDiff={(turn, revision, path) => setOpened(`${turn}:${revision}:${path}`)}
+      onLoadFilePage={async (turn, revision, offset, signal) => {
+        const response = await fetch(`/fixture-turn-files?turn=${turn}&revision=${revision}&offset=${offset}`, { signal });
+        if (!response.ok) throw new Error("文件清单加载失败，请重试。");
+        return response.json();
+      }}
+      onPreviewMarkdown={(path) => setOpened(`preview:${path}`)} />
+    <footer style={{ display: "flex", gap: 12, flexWrap: "wrap", padding: 12, flex: "none" }}>
+      <button onClick={() => setOther((value) => !value)}>切换会话</button>
+      <button onClick={() => setRefresh((value) => value + 1)}>刷新历史</button>
+      <button onClick={() => setDark((value) => !value)}>切换主题</button>
+      <output data-testid="historical-file-opened" style={{ overflowWrap: "anywhere", fontSize: 10 }}>{opened}</output>
+    </footer>
+  </main>;
+}
+
+function TurnRegressionFixture() {
+  const sid = "turn-regressions";
+  const [state, dispatch] = useReducer(reduce, {
+    ...initialState, focusedSid: sid, runtimes: { [sid]: {
+      ...createRuntime(), historyRevision: "stable", turns: [
+        { id: "history-one", prompt: "long copyable answer", done: true,
+          ts: 1, doneTs: 2, fileChanges: { revision: "immutable-one", files: [
+            { path: "src/code.py", state: "available", additions: 1, deletions: 1 },
+          ] }, blocks: [{ kind: "text", message_id: "long-answer", done: true, channel: "final",
+            text: "```text\n" + Array.from({ length: 90 }, (_, i) => `Copy entire block line ${i}`).join("\n") + "\n```\n\n"
+              + "```text\n" + Array.from({ length: 60 }, (_, i) => `Second block line ${i}`).join("\n") + "\n```" }] },
+        { id: "working", prompt: "continue work", done: false, blocks: [
+          { kind: "tool", tool_use_id: "command", message_id: "m", tool: "Bash", input: { command: "true" },
+            done: true, result: { content: "ok", is_error: false } },
+        ] },
+      ] as Turn[],
+    } },
+  });
+  const [opened, setOpened] = useState("");
+  const runtime = state.runtimes[sid];
+  return <main style={{ display: "flex", flexDirection: "column", height: "100dvh" }}>
+    <header style={{ height: 54, flex: "none" }}>Thread header</header>
+    <ChatView sid={sid} engine="codex" turns={runtime.turns} historyRevision="stable"
+      activeTurnId={runtime.acceptancePending ?? "working"}
+      onOpenArchivedDiff={(turn, revision, path) => setOpened(`${turn}:${revision}:${path}`)} />
+    <footer style={{ height: 60, flex: "none" }}>
+      <button data-testid="regression-send" onClick={() => dispatch({ type: "query_sent", sid,
+        msg_id: "new-question", prompt: "sent without scrolling", ts: 3 })}>Send</button>
+      <button data-testid="regression-stream" onClick={() => dispatch({ type: "event", event: {
+        v: PROTOCOL_VERSION, ts: 4, type: "delta", sid, turn_id: "new-question", message_id: "new-answer",
+        text: "streamed text\n".repeat(50), channel: "final",
+      } })}>Stream</button>
+      <output data-testid="regression-opened">{opened}</output>
+    </footer>
+  </main>;
+}
+
+function CodeCopyThemeFixture({ theme }: { theme: "light" | "dark" }) {
+  useEffect(() => {
+    const root = document.documentElement;
+    const previousEngine = root.dataset.engine;
+    const previousTheme = root.dataset.theme;
+    root.dataset.engine = "codex";
+    root.dataset.theme = theme;
+    return () => {
+      if (previousEngine === undefined) delete root.dataset.engine;
+      else root.dataset.engine = previousEngine;
+      if (previousTheme === undefined) delete root.dataset.theme;
+      else root.dataset.theme = previousTheme;
+    };
+  }, [theme]);
+  return <main style={{ minHeight: "100dvh", padding: 24, background: "var(--bg)" }}>
+    <MessageBlock text={"```text\nfix(web): keep copy actions readable\n```"} done />
+  </main>;
+}
+
+function LocalFileLinkFixture() {
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <MessageBlock
+      text={"[release-test](/tmp/qwen3-tts-v017-release-test:42) · "
+        + "[source-code](/workspace/project/packages/frontend/src/components/conversation/MessageBlock.tsx:455) · "
+        + "[official-docs](https://preview.example/docs)"
+        + (new URLSearchParams(location.search).has("same-origin-links") ? " · [changelog](https://preview.example/changelog)" : "")
+        + "\n\n正文保持原位，预览只悬浮显示。"}
+      done onOpenFile={() => {}} />
+  </main>;
+}
+
+function CodexVisualizationFixture() {
+  const [opened, setOpened] = useState("");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <output data-testid="visualization-opened-path">{opened}</output>
+    <MessageBlock
+      text={"visualize{\"path\":\"/tmp/private/concept.html\","
+        + "\"title\":\"结构原理草图\"}"}
+      done onOpenFile={(path) => setOpened(path)} />
+  </main>;
+}
+
+function MarkdownBreakFixture() {
+  const [finished, setFinished] = useState(false);
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <button type="button" onClick={() => setFinished(true)}>Finish break stream</button>
+    <section data-testid="plain-answer"><MessageBlock text="正文第一行" done /></section>
+    <section data-testid="break-answer"><MessageBlock text="<br>正文第一行" done /></section>
+    <section data-testid="table-breaks"><MessageBlock done={finished}
+      text={"| 项 | 结果 |\n| --- | --- |\n| 唤醒后下指令 | 先向前<br>再向右<br />最后坐下 |\n\n"
+        + "正文第一行<br>第二行\n\n`<br>` 仍然是代码。\n\n"
+        + "```html\n<br>\n```\n\n"
+        + (finished ? "流式内容<br/>完成" : "流式内容<br")} /></section>
+  </main>;
+}
+
+function MarkdownDisclosureFixture() {
+  const [complete, setComplete] = useState(false);
+  const [opened, setOpened] = useState("");
+  const params = new URLSearchParams(window.location.search);
+  const title = params.has("long-title")
+    ? `文件清单：${"long_source_filename_".repeat(12)}.tsx，21 个源文件，无删除`
+    : "文件清单：21 个源文件，无删除";
+  const files = ["README.md", ...[
+    ".gitattributes", ".gitignore", "README.md", "DESIGN.md", "tools/model.py",
+    "tools/build.py", "tools/check.py", "tools/assembly_check.py",
+    "tools/structural_screen.py", "tools/verify.py", "tools/publish.py",
+    "tools/visual_qa.mjs", "viewer/index.html", "viewer/style.css",
+    "viewer/app.js", "tests/test_model.py", "tests/test_assembly.py",
+    "config/assembly.json", "config/materials.json", "output/manifest.json",
+  ].map((path) => `modules/assembly/${path}`)];
+  const body = params.has("file-list")
+    ? "仓库：example-workspace\n\n" + files.map((path, index) =>
+      `- ${index === 0 ? "修改" : "新建"}：\`${path}\``,
+    ).join("\n") + "\n\n"
+    : "- **Added** `README.md`\n- [source](/tmp/source.py)\n\n"
+      + "<details open>\n<summary>嵌套内容</summary>\n\nInner body\n\n</details>\n\n";
+  const text = `Before\n\n<details>\n<summary>${title}</summary>\n\n`
+    + body
+    + (complete ? "- Last streamed item\n\n</details>\n\nAfter" : "");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <button type="button" onClick={() => setComplete(true)}>Finish stream</button>
+    <output data-testid="disclosure-opened-path">{opened}</output>
+    <section data-testid="markdown-disclosure">
+      <MessageBlock text={text} done={complete} onOpenFile={setOpened} />
+    </section>
+    <section data-testid="inert-disclosure-html">
+      <MessageBlock done text={'<details>\n<summary>Unsafe content</summary>\n\n'
+        + '<img src="https://example.com/raw-image" onerror="alert(1)">\n\n'
+        + '<script>alert(2)</script>\n\n</details>'} />
+    </section>
+  </main>;
+}
+
+function CodexFileCitationFixture() {
+  const [opened, setOpened] = useState("");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <output data-testid="citation-opened-path">{opened}</output>
+    <section data-testid="valid-citations">
+      <MessageBlock
+        text={"英文版 :codex-file-citation{path=\"/tmp/reports/final report.pdf\" "
+          + "label=\"报告 } 终版\" purpose=\"output\"}，动画 "
+          + ":codex-file-citation{purpose=\"output\" "
+          + "path=\"/tmp/demo} final.gif\"}。"}
+        done onOpenFile={(path) => setOpened(path)} />
+    </section>
+    <section data-testid="invalid-citation">
+      <MessageBlock
+        text={'保留 :codex-file-citation{path="/tmp/report.pdf" invalid tail}'}
+        done onOpenFile={(path) => setOpened(path)} />
+    </section>
   </main>;
 }
 
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
-  rootParams.has("assistant-switcher")
-    ? <App />
+  rootParams.has("mobile-sidebar") ? <MobileSidebarFixture />
+    : rootParams.has("turn-usage") ? <TurnUsageFixture />
+    : rootParams.has("artifact-mermaid")
+    ? <MermaidArtifactFixture />
+    : rootParams.has("artifact-audio")
+    ? <AudioPreviewFixture />
     : rootParams.has("artifact-html")
     ? <ArtifactPreviewFixture kind="html" />
+    : rootParams.has("artifact-pdf")
+    ? <ArtifactPreviewFixture kind="pdf" />
+    : rootParams.has("artifact-gif")
+    ? <ArtifactPreviewFixture kind="gif" />
+    : rootParams.has("artifact-invalid-gif")
+    ? <ArtifactPreviewFixture kind="invalid-gif" />
     : rootParams.has("artifact-svg")
     ? <ArtifactPreviewFixture kind="svg" />
     : rootParams.has("artifact-markdown-svg")
     ? <ArtifactPreviewFixture kind="markdown-svg" />
+    : rootParams.has("artifact-markdown-source")
+    ? <ArtifactPreviewFixture kind="markdown-source" />
+    : rootParams.has("artifact-markdown-github-html")
+    ? <ArtifactPreviewFixture kind="markdown-github-html" />
+    : rootParams.has("artifact-markdown-html")
+    ? <ArtifactPreviewFixture kind="markdown-html" />
+    : rootParams.has("historical-files")
+    ? <HistoricalFilesFixture />
+    : rootParams.has("turn-regressions")
+    ? <TurnRegressionFixture />
+    : rootParams.has("code-copy-theme")
+    ? <CodeCopyThemeFixture
+        theme={rootParams.get("theme") === "light" ? "light" : "dark"} />
+    : rootParams.has("local-file-link")
+    ? <LocalFileLinkFixture />
+    : rootParams.has("codex-visualization")
+    ? <CodexVisualizationFixture />
+    : rootParams.has("codex-file-citation")
+    ? <CodexFileCitationFixture />
+    : rootParams.has("markdown-breaks")
+    ? <MarkdownBreakFixture />
+    : rootParams.has("markdown-disclosure")
+    ? <MarkdownDisclosureFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")
     ? <InlineImageEvictionFixture />
     : rootParams.has("history-image-fallback-error")
     ? <HistoryImageFallbackErrorFixture />
+    : rootParams.has("user-image-layout")
+    ? <UserImageLayoutFixture />
     : rootParams.has("reducer-pipeline")
     ? <ReducerHistoryBrowserFixture />
     : rootParams.has("codex-live-burst")

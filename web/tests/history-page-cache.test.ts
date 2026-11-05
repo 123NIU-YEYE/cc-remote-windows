@@ -154,6 +154,18 @@ const heavyPage: HistoryBrowsePage = {
       command: "PROCESS_COMMAND_SECRET",
       done: true,
     }, {
+      kind: "process",
+      item_id: "compaction-1",
+      processKind: "compaction",
+      phase: "end",
+      status: "succeeded",
+      turn_id: "native-compaction-turn",
+      title: "压缩上下文",
+      detail: "COMPACTION_DETAIL_SECRET",
+      input: { secret: "COMPACTION_INPUT_SECRET" },
+      output: "COMPACTION_OUTPUT_SECRET",
+      done: true,
+    }, {
       kind: "text",
       message_id: "answer-1",
       channel: "final",
@@ -183,6 +195,9 @@ for (const forbidden of [
   "PROCESS_DIFF_SECRET",
   "PROCESS_PROGRESS_SECRET",
   "PROCESS_COMMAND_SECRET",
+  "COMPACTION_DETAIL_SECRET",
+  "COMPACTION_INPUT_SECRET",
+  "COMPACTION_OUTPUT_SECRET",
 ]) {
   assert.equal(encoded.includes(forbidden), false, forbidden);
 }
@@ -198,9 +213,35 @@ assert.equal(sanitized.turns[0].detailLoading, false);
 assert.equal(sanitized.turns[0].blocks.at(-1)?.kind, "text");
 assert.deepEqual(
   sanitized.turns[0].blocks.map((block) => block.kind),
-  ["text"],
-  "deferred tool/process shells are dropped instead of cached as empty cards",
+  ["process", "text"],
+  "only compaction proof and final text survive the page-cache projection",
 );
+const cachedCompaction = sanitized.turns[0].blocks[0];
+assert.equal(cachedCompaction.kind, "process");
+assert.equal(cachedCompaction.kind === "process"
+  ? cachedCompaction.processKind : null, "compaction");
+assert.equal(cachedCompaction.kind === "process"
+  ? cachedCompaction.turn_id : null, "native-compaction-turn");
+
+const fallbackPage = sanitizeHistoryPageForCache({ ...heavyPage, turns: [turn("fallback", {
+  fileChangesTurnId: "native-file-turn",
+  fileChanges: { revision: "immutable-revision", files: [{
+    path: "/repo/file.ts", state: "available", additions: 1, deletions: 1,
+  }] },
+  blocks: [{ kind: "process", item_id: "fallback", processKind: "model",
+    tool: "model_refusal_fallback", phase: "snapshot", status: "succeeded", done: true,
+    title: "模型已回退", summary: "claude-one → claude-two · 原模型拒绝响应",
+    input: { raw: "PROVIDER_SECRET" }, detail: "REFUSAL_SECRET",
+  }],
+})] });
+assert.equal(fallbackPage.turns[0].blocks.length, 1);
+const cachedFallback = fallbackPage.turns[0].blocks[0];
+assert.equal(cachedFallback.kind === "process" ? cachedFallback.tool : null, "model_refusal_fallback");
+assert.equal(fallbackPage.turns[0].detailEventCount, 0,
+  "a lightweight fallback notice must not manufacture a process-details entry");
+assert.equal(fallbackPage.turns[0].fileChanges?.revision, "immutable-revision");
+assert.equal(fallbackPage.turns[0].fileChangesTurnId, "native-file-turn");
+assert.doesNotMatch(JSON.stringify(fallbackPage), /PROVIDER_SECRET|REFUSAL_SECRET/);
 
 const storage = new MemoryStorage();
 let now = 100;
@@ -213,9 +254,14 @@ assert.equal((await cache.putPage(scope, heavyPage)).ok, true);
 const cachedHeavy = await cache.getPage(scope, "page-heavy");
 assert.deepEqual(
   cachedHeavy?.turns[0].blocks.map((block) => block.kind),
-  ["text"],
-  "an IndexedDB-style cache reload cannot resurrect empty command rows",
+  ["process", "text"],
+  "a cache reload keeps compaction proof without resurrecting command rows",
 );
+const incompatibleV3Key = cache.pageKey(scope, "page-heavy");
+(storage.records.get(incompatibleV3Key) as { version: number }).version = 3;
+assert.equal(await cache.getPage(scope, "page-heavy"), null,
+  "v3 pages without durable compaction proof are rebuilt after hard refresh");
+assert.equal(storage.deletedKeys.includes(incompatibleV3Key), true);
 const firstWrite = await cache.putPage(scope, {
   pageKey: "page-1",
   turns: [turn("1"), turn("optimistic-2", {
@@ -237,10 +283,86 @@ const mergedWrite = await cache.putPage(scope, {
   newerPageKey: "page-2",
 });
 assert.equal(mergedWrite.ok, true);
+
+// A partial write updates rows in place even when timestamps cannot establish
+// their order. Native alias materialization must also retain the cached slot.
+for (const ts of [undefined, 42]) {
+  for (const alias of [false, true]) {
+    const partialCache = new HistoryPageCache({ storage: new MemoryStorage() });
+    const pageKey = `partial-order-${ts ?? "missing"}-${alias}`;
+    const page = {
+      pageKey,
+      turns: [turn("row-a", { ts }), turn("row-b", { ts, done: false }), turn("row-c", { ts })],
+      hasOlder: false,
+      olderCursor: null,
+    };
+    assert.equal((await partialCache.putPage(scope, page)).ok, true);
+    const updated = turn(alias ? "native-b" : "row-b", {
+      ts,
+      clientMsgId: alias ? "row-b" : undefined,
+      blocks: [{ kind: "text", message_id: "answer-b", channel: "final", text: "updated answer", done: true }],
+    });
+    assert.equal((await partialCache.putPage(scope, { ...page, turns: [updated] })).ok, true);
+    const reloaded = await partialCache.getPage(scope, pageKey);
+    assert.deepEqual(reloaded?.turns.map((item) => item.id), ["row-a", updated.id, "row-c"],
+      "a middle-row update retains cached order without relying on timestamps");
+    assert.equal(reloaded?.turns[1].done, true, "the incoming lifecycle still wins");
+    assert.deepEqual(reloaded?.turns[1].blocks, updated.blocks);
+    assert.equal((await partialCache.putPage(scope, {
+      ...page, turns: [turn("row-c", { ts }), updated, turn("row-d", { ts })],
+    })).ok, true);
+    assert.deepEqual((await partialCache.getPage(scope, pageKey))?.turns.map((item) => item.id),
+      ["row-a", updated.id, "row-c", "row-d"],
+      "reordered overlapping subsets keep established slots and append genuinely new rows");
+  }
+}
 const mergedPage = await cache.getPage(scope, "page-1");
 assert.deepEqual(mergedPage?.turns.map((item) => item.id), [
   "1", "native-2", "3",
 ]);
+
+// A live-only Claude row can be evicted before its native summary arrives.
+// Both write orders must converge without relying on prompt text or a prior
+// historyTurnId binding, and old cached duplicates must heal on read as well.
+const nativeClaudeRow = turn("claude-native", {
+  clientMsgId: "claude-browser", prompt: "same question", ts: 2,
+  detailEventCount: 16, processDetailState: "present",
+});
+const liveClaudeRow = turn("claude-browser", {
+  prompt: "same question", ts: 2,
+});
+for (const [index, copies] of [
+  [liveClaudeRow, nativeClaudeRow],
+  [nativeClaudeRow, liveClaudeRow],
+].entries()) {
+  const pageKey = `claude-alias-${index}`;
+  for (const copy of copies) {
+    assert.equal((await cache.putPage(scope, {
+      pageKey, turns: [copy], hasOlder: false,
+    })).ok, true);
+  }
+  const page = await cache.getPage(scope, pageKey);
+  assert.equal(page?.turns.length, 1);
+  assert.equal(page?.turns[0].historyTurnId ?? page?.turns[0].id, "claude-native");
+  assert.equal(page?.turns[0].clientMsgId, "claude-browser");
+  assert.equal(page?.turns[0].detailEventCount, 16);
+  const stored = storage.records.get(cache.pageKey(scope, pageKey)) as HistoryPageCacheStoredRecord;
+  stored.page.turns = [nativeClaudeRow, liveClaudeRow];
+  assert.equal((await cache.getPage(scope, pageKey))?.turns.length, 1,
+    "existing cache pollution is repaired without discarding history pages");
+}
+
+const repeatedClaudePage = sanitizeHistoryPageForCache({
+  pageKey: "repeated-claude-prompts",
+  turns: [
+    nativeClaudeRow,
+    { ...nativeClaudeRow, id: "claude-native-other", clientMsgId: "claude-browser-other" },
+    turn("display-collision", { historyTurnId: "native-first" }),
+    turn("display-collision", { historyTurnId: "native-second" }),
+  ],
+});
+assert.equal(repeatedClaudePage.turns.length, 4,
+  "identical questions and display-id collisions keep separate native rows");
 
 // Concurrent partial writes to one logical page must serialize their
 // read/merge/write cycle. Otherwise both reads can observe an empty page and
@@ -314,6 +436,137 @@ const corruptKey = corruptCache.pageKey(scope, "corrupt");
 corruptStorage.records.set(corruptKey, { malformed: true });
 assert.equal(await corruptCache.getPage(scope, "corrupt"), null);
 assert.deepEqual(corruptStorage.deletedKeys, [corruptKey]);
+
+// v4 preserves compaction identity proof. Every older page must be rebuilt,
+// including Codex v1/v2 pages which v3 could otherwise reuse: sanitizing those
+// records cannot recover proof that was never stored in the first place.
+const legacyCodexStorage = new MemoryStorage();
+const legacyCodexCache = new HistoryPageCache({ storage: legacyCodexStorage });
+assert.equal((await legacyCodexCache.putPage(scope, {
+  pageKey: "legacy-codex-v1",
+  turns: [turn("legacy-codex")],
+  hasOlder: false,
+  olderCursor: "legacy-codex",
+})).ok, true);
+const legacyCodexKey = legacyCodexCache.pageKey(scope, "legacy-codex-v1");
+(legacyCodexStorage.records.get(legacyCodexKey) as { version: number })
+  .version = 1;
+assert.equal(
+  await legacyCodexCache.getPage(scope, "legacy-codex-v1"),
+  null,
+);
+assert.deepEqual(legacyCodexStorage.deletedKeys, [legacyCodexKey]);
+assert.equal((await legacyCodexCache.putPage(scope, {
+  pageKey: "legacy-codex-v2",
+  turns: [turn("legacy-codex-v2")],
+  hasOlder: false,
+  olderCursor: "legacy-codex-v2",
+})).ok, true);
+const legacyCodexV2Key = legacyCodexCache.pageKey(scope, "legacy-codex-v2");
+(legacyCodexStorage.records.get(legacyCodexV2Key) as { version: number })
+  .version = 2;
+assert.equal(
+  await legacyCodexCache.getPage(scope, "legacy-codex-v2"),
+  null,
+);
+assert.deepEqual(
+  legacyCodexStorage.deletedKeys,
+  [legacyCodexKey, legacyCodexV2Key],
+);
+assert.equal((await legacyCodexCache.putPage(scope, {
+  pageKey: "legacy-codex-v3",
+  turns: [turn("legacy-codex-v3")],
+  hasOlder: false,
+  olderCursor: "legacy-codex-v3",
+})).ok, true);
+const legacyCodexV3Key = legacyCodexCache.pageKey(scope, "legacy-codex-v3");
+(legacyCodexStorage.records.get(legacyCodexV3Key) as { version: number })
+  .version = 3;
+assert.equal(
+  await legacyCodexCache.getPage(scope, "legacy-codex-v3"),
+  null,
+);
+assert.deepEqual(
+  legacyCodexStorage.deletedKeys,
+  [legacyCodexKey, legacyCodexV2Key, legacyCodexV3Key],
+);
+
+// A source revision can stay unchanged when the backend repairs only its
+// summary projection. Reject v6 question-only pages rather than repaint them.
+const staleAsyncStorage = new MemoryStorage();
+const staleAsyncCache = new HistoryPageCache({ storage: staleAsyncStorage });
+const staleAsyncPage: HistoryBrowsePage = {
+  pageKey: "async-legacy-answer",
+  turns: [turn("async-user", { blocks: [{
+    kind: "text", message_id: "question", text: "Question?", done: true,
+    channel: "final", delivery: "async", questions: [{ title: "Question?" }],
+  }] })],
+  hasOlder: false,
+  olderCursor: "async-user",
+};
+assert.equal((await staleAsyncCache.putPage(scope, staleAsyncPage)).ok, true);
+const staleAsyncKey = staleAsyncCache.pageKey(scope, staleAsyncPage.pageKey);
+(staleAsyncStorage.records.get(staleAsyncKey) as { version: number }).version = 6;
+assert.equal(await staleAsyncCache.getPage(scope, staleAsyncPage.pageKey), null);
+assert.deepEqual(staleAsyncStorage.deletedKeys, [staleAsyncKey]);
+staleAsyncPage.turns[0].blocks.push({
+  kind: "text", message_id: "answer", text: "Finished.", done: true, channel: "final",
+});
+assert.equal((await staleAsyncCache.putPage(scope, staleAsyncPage)).ok, true);
+const reopenedAsyncCache = new HistoryPageCache({ storage: staleAsyncStorage });
+assert.deepEqual((await reopenedAsyncCache.getPage(scope, staleAsyncPage.pageKey))
+  ?.turns[0].blocks.map((block) => block.kind === "text" ? block.text : null),
+["Question?", "Finished."]);
+
+const claudeScope = { ...scope, engine: "claude" };
+const recoveryStorage = new MemoryStorage();
+const recoveryCache = new HistoryPageCache({ storage: recoveryStorage });
+const recoveryPage = { pageKey: "internal-recovery", turns: [turn("recovery")],
+  hasOlder: false, olderCursor: "recovery" };
+assert.equal((await recoveryCache.putPage(claudeScope, recoveryPage)).ok, true);
+const recoveryKey = recoveryCache.pageKey(claudeScope, recoveryPage.pageKey);
+(recoveryStorage.records.get(recoveryKey) as { version: number }).version = 9;
+assert.equal(await recoveryCache.getPage(claudeScope, recoveryPage.pageKey), null,
+  "cached native recovery prompts must not return as human turns after upgrade");
+const legacyClaudeStorage = new MemoryStorage();
+const legacyClaudeCache = new HistoryPageCache({ storage: legacyClaudeStorage });
+assert.equal((await legacyClaudeCache.putPage(claudeScope, {
+  pageKey: "legacy-claude-v1",
+  turns: [turn("legacy-claude")],
+  hasOlder: false,
+  olderCursor: "legacy-claude",
+})).ok, true);
+const legacyClaudeKey = legacyClaudeCache.pageKey(
+  claudeScope, "legacy-claude-v1",
+);
+(legacyClaudeStorage.records.get(legacyClaudeKey) as { version: number })
+  .version = 1;
+assert.equal(
+  await legacyClaudeCache.getPage(claudeScope, "legacy-claude-v1"),
+  null,
+);
+assert.deepEqual(legacyClaudeStorage.deletedKeys, [legacyClaudeKey]);
+
+const legacyClaudeV2Storage = new MemoryStorage();
+const legacyClaudeV2Cache = new HistoryPageCache({
+  storage: legacyClaudeV2Storage,
+});
+assert.equal((await legacyClaudeV2Cache.putPage(claudeScope, {
+  pageKey: "legacy-claude-v2",
+  turns: [turn("legacy-claude-v2")],
+  hasOlder: false,
+  olderCursor: "legacy-claude-v2",
+})).ok, true);
+const legacyClaudeV2Key = legacyClaudeV2Cache.pageKey(
+  claudeScope, "legacy-claude-v2",
+);
+(legacyClaudeV2Storage.records.get(legacyClaudeV2Key) as { version: number })
+  .version = 2;
+assert.equal(
+  await legacyClaudeV2Cache.getPage(claudeScope, "legacy-claude-v2"),
+  null,
+);
+assert.deepEqual(legacyClaudeV2Storage.deletedKeys, [legacyClaudeV2Key]);
 
 const legacyMissingAvailabilityStorage = new MemoryStorage();
 const legacyMissingAvailabilityCache = new HistoryPageCache({

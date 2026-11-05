@@ -10,8 +10,12 @@ import type {
 } from "./protocol";
 
 export interface CmdGroup { g: string }
-export interface Cmd { slash: string; name: string; ds: string; ic: string }
+export interface Cmd { slash: string; name: string; ds: string; ic: string; unavailable?: boolean }
+const OPEN_FILES_COMMAND: Cmd = { slash: "open", name: "打开目录或文件", ds: "/open [路径] 浏览会话文件，点击文件在侧栏预览", ic: "folder-open" };
 export type Command = CmdGroup | Cmd;
+const COMPACT_COMMAND: Cmd = {
+  slash: "compact", name: "压缩上下文", ds: "调用原生压缩", ic: "simplify",
+};
 
 export const COMMANDS: Command[] = [
   { g: "模式" },
@@ -41,14 +45,19 @@ export const COMMANDS: Command[] = [
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
   { slash: "diff", name: "查看改动", ds: "打开当前会话的 Git diff 侧栏", ic: "edit" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
+  OPEN_FILES_COMMAND,
   { slash: "clear", name: "清空会话", ds: "开新会话，清空上下文", ic: "close" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用", ic: "cpu" },
+  { slash: "autocompact", name: "自动压缩", ds: "/autocompact [数字]；不填打开设置", ic: "simplify" },
+  COMPACT_COMMAND,
 ];
 
 // Work is a separate product surface, not a differently styled Code session.
-// Keep its palette limited to controls that are meaningful for a private work
-// conversation. Engine/user-provided slash skills may still be typed manually;
-// known Code commands are rejected by the composer instead of leaking through.
+// Keep its base palette limited to controls that are meaningful for a private
+// work conversation. Narrow engine-native settings such as Codex Fast may be
+// added below without exposing Code lifecycle commands. Engine/user-provided
+// slash skills may still be typed manually; known Code commands are rejected
+// by the composer instead of leaking through.
 export const WORK_COMMANDS: Command[] = [
   { g: "设置" },
   { slash: "model", name: "切换模型", ds: "选择本次工作的模型与思考强度", ic: "cpu" },
@@ -64,22 +73,25 @@ export const WORK_COMMANDS: Command[] = [
   { slash: "btw", name: "侧边对话 (btw)", ds: "临时侧聊，不影响当前工作主线", ic: "spark" },
   { slash: "preview", name: "预览 Artifacts", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "context", name: "上下文用量", ds: "查看本次工作的 token 占用", ic: "cpu" },
+  { slash: "autocompact", name: "自动压缩", ds: "/autocompact [数字]；不填打开设置", ic: "simplify" },
   { slash: "clear", name: "新工作", ds: "开始一项独立的新工作", ic: "close" },
+];
+
+const CODEX_WORK_COMMANDS: Command[] = [
+  ...WORK_COMMANDS.slice(0, 2),
+  { slash: "fast", name: "Fast 模式", ds: "更快响应，下条消息生效", ic: "bolt" },
+  ...WORK_COMMANDS.slice(2),
 ];
 
 // `efforts` overrides the engine's baseline effort list for THIS model — reasoning
 // levels are per-model, not per-engine.
 export interface Model { id: string; name: string; ds: string; ic: string; efforts?: Effort[] }
-// Claude Code exposes the active/default model but no supported model catalog.
-// These are presentation-only common aliases, never a capability claim. An
-// advanced user may still type `/model <id>` for a hidden/provider model; the
-// ordinary model sheet stays limited to curated choices.
+// Offline/first-paint suggestions only. Claude's native initialization catalog
+// wins once received, including models this client has never heard of.
 export const MODELS: Model[] = [
-  { id: "claude-opus-5[1m]", name: "Opus 5", ds: "最强推理 · 1M 上下文", ic: "crown" },
-  { id: "claude-mythos-5", name: "Mythos 5", ds: "最强王牌", ic: "gem" },
-  { id: "claude-sonnet-5", name: "Sonnet 5", ds: "均衡 · 更快", ic: "balance" },
-  { id: "claude-haiku-4-5", name: "Haiku 4.5", ds: "轻量 · 极速", ic: "bolt" },
-  { id: "claude-fable-5", name: "Fable 5", ds: "实验模型", ic: "book" },
+  { id: "opus[1m]", name: "Opus", ds: "跟随本机 Claude Code", ic: "crown" },
+  { id: "sonnet", name: "Sonnet", ds: "跟随本机 Claude Code", ic: "balance" },
+  { id: "haiku", name: "Haiku", ds: "跟随本机 Claude Code", ic: "bolt" },
 ];
 
 // Reasoning effort (思考强度). `name` is the RAW level id on purpose: it's what
@@ -213,9 +225,9 @@ const CODEX_LOOKS: Record<string, { name: string; ds: string; ic: string }> = {
   "gpt-5.6-luna": { name: "GPT-5.6 Luna", ds: "轻量 · 更快", ic: "bolt" },
 };
 
-const fromCatalog = (entries: CatalogModel[]): Model[] =>
+const fromCatalog = (entries: CatalogModel[], engine: string): Model[] =>
   entries.map((e) => {
-    const look = CODEX_LOOKS[e.id];
+    const look = engine === "codex" ? CODEX_LOOKS[e.id] : undefined;
     return {
       id: e.id,
       name: look?.name ?? e.display_name ?? e.id,
@@ -229,9 +241,10 @@ const fromCatalog = (entries: CatalogModel[]): Model[] =>
   });
 
 export const modelsFor = (engine?: string, catalog?: Catalog): Model[] => {
-  if (engine !== "codex") return MODELS;
-  const live = catalog?.codex;
-  return live?.length ? fromCatalog(live) : CODEX_MODELS;
+  if (engine === "dsh") return fromCatalog(catalog?.dsh ?? [], "dsh");
+  const key = engine === "codex" ? "codex" : "claude";
+  const live = catalog?.[key];
+  return live?.length ? fromCatalog(live, key) : key === "codex" ? CODEX_MODELS : MODELS;
 };
 
 /** Model a NEW chat starts on: the engine's configured default (codex config.toml's
@@ -245,41 +258,65 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
   // them. Claude may legitimately use a custom/provider alias absent from the
   // common suggestions above, so preserve its wrapper-resolved id.
   return want && (engine !== "codex" || list.some((m) => m.id === want))
-    ? want : list[0].id;
+    ? want : (list[0]?.id ?? "");
 };
 
 /** Effort levels the SELECTED model actually accepts. Unknown/unset model falls back
  *  to the engine's baseline list. */
 export const effortsFor = (engine?: string, model?: string | null, catalog?: Catalog): Effort[] => {
-  const m = model ? modelsFor(engine, catalog).find((x) => x.id === model) : undefined;
+  const m = model ? modelsFor(engine, catalog).find((x) => x.id === model
+    || (engine !== "codex" && x.id.replace(/\[1m\]$/i, "") === model.replace(/\[1m\]$/i, ""))) : undefined;
   if (m?.efforts) return m.efforts;
-  return engine === "codex" ? CODEX_EFFORTS : EFFORTS;
+  return engine === "dsh" ? [] : engine === "codex" ? CODEX_EFFORTS : EFFORTS;
 };
+
+/** A null app-server thread effort is a real model-default state, not loading.
+ * Ordinary effort labels intentionally remain their raw CLI/config ids. */
+export function effortNameForDisplay(
+  id: string | null | undefined,
+): string | null {
+  const normalized = id?.trim();
+  return normalized
+    ? (normalized === "model-default" ? "模型默认" : normalized)
+    : null;
+}
+
+export function effortIsSelectable(
+  id: string | null | undefined,
+): id is string {
+  const normalized = id?.trim();
+  return !!normalized && normalized !== "model-default";
+}
 
 /** Default effort = the HIGHEST level the selected model supports (product decision:
  *  always think as hard as the model allows — we deliberately ignore the server's
  *  own `default_effort`, which is `low` for sol). Also what we clamp to when the user
  *  switches to a model that lacks the current level (sol `ultra` -> luna `max`). */
 export const defaultEffortFor = (engine?: string, model?: string | null, catalog?: Catalog): string => {
+  if (engine === "dsh") return catalog?.dsh?.find(item => item.id === model)?.default_effort ?? "";
   const list = effortsFor(engine, model, catalog);
-  return list.reduce((a, b) => (rank(b.id) > rank(a.id) ? b : a)).id;
+  return list.length ? list.reduce((a, b) => (rank(b.id) > rank(a.id) ? b : a)).id : "model-default";
 };
-export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX_PERMS : PERMS);
+export const permsFor = (engine?: string): Perm[] => (engine === "dsh" ? [] : engine === "codex" ? CODEX_PERMS : PERMS);
 
-// Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.
+/** Localized display only; selections retain the exact native permission ID. */
+export function dshPermissionLabel(value: string, fallback = value): string {
+  return ({ "read-only": "只读", "workspace-write": "工作区写入",
+    "danger-full-access": "完全访问" } as Record<string, string>)[value] ?? fallback;
+}
+
+// Map a cc-reported model id (e.g. "claude-mythos-5-1[1m]") to a MODELS entry id.
 // An id we don't know (any codex model) passes through verbatim — the codex chips
 // resolve it against the live catalog themselves.
 export function matchModelId(m: string, engine?: string): string {
-  const models = modelsFor(engine);
-  const exact = models.find((x) => m === x.id);
-  if (exact) return exact.id;
-
   const base = m.replace(/\[1m\]$/i, "");
-  const hit = models.find((x) => {
-    const candidateBase = x.id.replace(/\[1m\]$/i, "");
-    return base === candidateBase;
-  });
-  return hit ? hit.id : m;
+  // Existing projections used these spellings before native discovery. Keep
+  // their identities stable; new model IDs pass through without a version map.
+  if (engine !== "codex") {
+    if (base === "claude-opus-5") return `${base}[1m]`;
+    if (base === "claude-mythos-5-1" || base === "claude-fable-5-1") return base;
+  }
+  return modelsFor(engine).find((x) => x.id.replace(/\[1m\]$/i, "") === base)?.id ?? m;
 }
 
 export interface Perm { id: string; name: string; short: string; ds: string; ic: string; danger?: boolean }
@@ -303,7 +340,7 @@ const CMD_LIST: Cmd[] = COMMANDS.filter(isCmd) as Cmd[];
 // /rewind stays reserved locally while its UI is hidden so manually typing it
 // cannot fall through to Claude's interactive-only slash layer.
 const EXTENSION_SLASHES = ["extensions", "skills", "plugins", "apps", "mcp", "hooks"];
-export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "goal", "rewind", "btw", "diff", "preview", ...EXTENSION_SLASHES]);
+export const CLIENT_SLASHES = new Set(["model", "plan", "normal", "permissions", "clear", "context", "autocompact", "compact", "goal", "rewind", "btw", "diff", "preview", "open", ...EXTENSION_SLASHES]);
 
 // Codex engine command palette. Native app-server controls are handled locally
 // and never expanded into natural-language lookalikes. /context is the focused
@@ -336,20 +373,25 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "btw", name: "侧边对话 (btw)", ds: "基于当前会话开一个临时 fork 侧聊,不影响主线", ic: "spark" },
   { slash: "diff", name: "查看改动", ds: "打开当前会话的 Git diff 侧栏", ic: "edit" },
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
+  OPEN_FILES_COMMAND,
   { slash: "status", name: "完整状态", ds: "线程 · 配置 · 账户 · 限额 · token", ic: "cpu" },
   { slash: "context", name: "上下文用量", ds: "查看 token 占用与容量", ic: "cpu" },
-  { slash: "compact", name: "压缩上下文", ds: "调用 Codex 原生 compact", ic: "simplify" },
+  { slash: "autocompact", name: "上下文上限", ds: "/autocompact [300k | default] 设置当前会话的最大上下文", ic: "simplify" },
+  COMPACT_COMMAND,
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
-const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
-export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "autocompact", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "open", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
 const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
-  surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS
+  engine === "dsh" ? CODEX_COMMANDS.filter(c => !isCmd(c) || ["model", "context", "diff", "preview", "open", "skills"].includes(c.slash)) : surface === "work"
+    ? engine === "codex" ? CODEX_WORK_COMMANDS : WORK_COMMANDS
+    : engine === "codex" ? CODEX_COMMANDS : COMMANDS
 );
-export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+export const clientSlashesFor = (engine?: string): Set<string> => (engine === "dsh" ? new Set(["model", "context", "diff", "preview", "open", "skills"]) : engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+
+export const DSH_SIDECHAT_UNAVAILABLE = "DSH 侧聊暂未开放，等待官方提供会话删除能力后再接入。";
 
 /** A built-in command intentionally available on Code but absent from Work.
  * Unknown slashes return false so user-installed Claude skills remain usable. */
@@ -358,7 +400,9 @@ export function isKnownCodeOnlySlash(slash: string, engine?: string): boolean {
   return (engine === "codex" && HIDDEN_CODE_ONLY_SLASHES.has(normalized)) || ((
     engine === "codex" ? CODEX_CMD_LIST : CMD_LIST).some(
     (command) => command.slash === normalized,
-  ) && !WORK_CMD_LIST.some((command) => command.slash === normalized));
+  ) && !commandsFor(engine, "work").some((command) => (
+    "slash" in command && command.slash === normalized
+  )));
 }
 // codex slash -> the prompt actually sent to codex (agentic; no TUI slash layer).
 export const CODEX_PROMPTS: Record<string, string> = {
@@ -366,12 +410,12 @@ export const CODEX_PROMPTS: Record<string, string> = {
 };
 
 // The command "token" the user is typing after "/", up to the first space.
-// null when the input isn't an in-progress slash command (no leading "/", or a
-// space already started the arguments). Drives the palette's show/hide.
+// null when the input isn't an in-progress slash command (no leading "/", a
+// path separator, or arguments already started). Drives the palette's show/hide.
 export function slashToken(input: string): string | null {
   if (!input.startsWith("/")) return null;
   const after = input.slice(1);
-  if (/\s/.test(after)) return null; // a space => choosing args, not the command
+  if (/[\s/\\]/.test(after)) return null;
   return after;
 }
 
@@ -407,8 +451,7 @@ export function matchSkills(
 export function matchCommands(token: string, engine?: string,
                               surface: CommandSurface = "code"): Cmd[] {
   const t = token.toLowerCase();
-  const list = surface === "work"
-    ? WORK_CMD_LIST : engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
+  const list = commandsFor(engine, surface).filter(isCmd) as Cmd[];
   return list.filter((c) => c.slash.toLowerCase().startsWith(t));
 }
 
@@ -416,6 +459,38 @@ export function matchCommands(token: string, engine?: string,
 export function parseSlash(input: string): { slash: string; args: string } | null {
   if (!input.startsWith("/")) return null;
   const m = input.slice(1).match(/^(\S+)\s*([\s\S]*)$/);
-  if (!m) return null;
+  // A leading filesystem path is prompt text. Separators in command arguments
+  // remain valid, for example "/open /Users/Tester/My Project".
+  if (!m || /[/\\]/.test(m[1])) return null;
   return { slash: m[1].toLowerCase(), args: m[2].trim() };
+}
+
+/** Shared by the welcome composer and the live conversation. Client commands
+ * must never accidentally become model prompts just because a session is new. */
+export function routeComposerInput(
+  input: string, engine?: string, surface: CommandSurface = "code",
+): { kind: "empty" } | { kind: "blocked"; message: string }
+  | { kind: "client"; slash: string; args: string }
+  | { kind: "prompt"; prompt: string } {
+  const raw = input.trim();
+  if (raw === "/") return { kind: "empty" };
+  const parsed = parseSlash(raw);
+  if (engine === "dsh" && parsed?.slash === "btw") {
+    return { kind: "blocked", message: DSH_SIDECHAT_UNAVAILABLE };
+  }
+  if (surface === "work" && parsed && isKnownCodeOnlySlash(parsed.slash, engine)) {
+    return { kind: "blocked", message: `/${parsed.slash} 是 Code 指令，请切换到 Code 使用` };
+  }
+  if (parsed && clientSlashesFor(engine).has(parsed.slash)) {
+    return { kind: "client", ...parsed };
+  }
+  if (engine === "codex" && parsed) {
+    // Use an own-property lookup: arbitrary slash names are untrusted input.
+    if (Object.hasOwn(CODEX_PROMPTS, parsed.slash)) {
+      return { kind: "prompt", prompt: CODEX_PROMPTS[parsed.slash]
+        + (parsed.args ? "\n\n" + parsed.args : "") };
+    }
+    return { kind: "blocked", message: `Codex 无此指令：/${parsed.slash}` };
+  }
+  return { kind: "prompt", prompt: raw };
 }

@@ -1,5 +1,6 @@
 import type {
   AssistantChannel,
+  AsyncQuestionSpec,
   ConversationImageRef,
   PlanEntry,
   ProcessKind,
@@ -8,7 +9,17 @@ import type {
   QueryImg,
   ServerEvent,
   ToolCategory,
+  TurnChangeSummary,
+  TimedMessage,
+  SessionMessageReceipt,
 } from "../protocol";
+
+/** Browser-only fallback used when an authoritative idle History snapshot
+ * proves that a locally painted turn stopped, but no exact terminal frame was
+ * observed. Kept beside Turn so reconnect repair can recognize legacy cached
+ * projections without comparing arbitrary user-visible errors. */
+export const UNKNOWN_TERMINAL_ERROR =
+  "会话已结束，但未收到完整的终止状态。";
 
 export interface TextBlock {
   kind: "text";
@@ -16,6 +27,12 @@ export interface TextBlock {
   text: string;
   done: boolean;
   channel?: AssistantChannel;
+  delivery?: "async";
+  questions?: AsyncQuestionSpec[];
+  /** Source event time and detached-follow-up scope, preserved for chronology. */
+  startedTs?: number;
+  doneTs?: number;
+  background?: boolean | null;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -44,6 +61,9 @@ export interface ToolBlock {
     duration_ms?: number | null;
   };
   done: boolean;
+  startedTs?: number;
+  doneTs?: number;
+  background?: boolean | null;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -70,9 +90,17 @@ export interface ProcessBlock {
   exit_code?: number | null;
   duration_ms?: number | null;
   truncated?: boolean | null;
+  /** Background Claude Agent work stays visible in its card without reopening
+   * the enclosing session after the parent ResultMessage. */
+  background?: boolean | null;
   explanation?: string | null;
   plan?: PlanEntry[];
   done: boolean;
+  startedTs?: number;
+  updatedTs?: number;
+  /** Completion is a later chronological boundary than a detached start. */
+  terminalOrder?: number;
+  terminalTs?: number;
   /** Local source order for the bounded live spill archive. Never sent on wire. */
   liveOrder?: number;
 }
@@ -102,12 +130,19 @@ export interface TurnDetailProjection {
 
 export interface Turn {
   id: string;
+  timedTask?: TimedMessage | null;
+  sourceThreadId?: string | null;
+  sessionMessages?: SessionMessageReceipt[] | null;
+  fileChanges?: TurnChangeSummary | null;
+  fileChangesTurnId?: string;
   /** Codex turn/steer's browser id persisted beside a distinct history cursor. */
   clientMsgId?: string;
   /** Native history user id when it differs from the optimistic browser id. */
   historyTurnId?: string;
   /** Engine-specific authoritative branch point. */
   forkPointId?: string;
+  /** Some native engines finish a visible steer segment before a forkable turn. */
+  forkAvailable?: boolean;
   /** Claude's authoritative top-level user transcript UUID. */
   checkpointId?: string;
   /** @deprecated Read only while migrating CACHE_VER=5 entries. */
@@ -115,10 +150,17 @@ export interface Turn {
   /** Routing-only native task identity for a steered live segment. */
   liveTaskId?: string;
   prompt: string;
+  /** Native automatic continuation, never inferred from an empty prompt. */
+  continuation?: "subagent" | null;
   blocks: Block[];
   done: boolean;
   interrupted?: boolean;
   error?: string;
+  /** Browser-side provisional terminal classification. It lets a later
+   * authoritative History snapshot repair reconnect/compaction boundaries;
+   * it is never native terminal proof by itself. */
+  terminalSource?: "unexpected_interrupt" | "remote_interrupt" | "failed"
+    | "compact_continuation" | "idle_history_recovery";
   progress?: string;
   images?: QueryImg[];
   imageRefs?: ConversationImageRef[];
@@ -126,6 +168,16 @@ export interface Turn {
   ts?: number;
   doneTs?: number;
   durationMs?: number;
+  /** Exact visible-process evidence, or `unknown` when a bounded native
+   * summary proves only that more detail exists. */
+  processDetailState?: "none" | "present" | "unknown";
+  detailReasons?: Array<
+    "process" | "prompt_truncated" | "answer_truncated" | "image_deferred"
+  >;
+  /** First/last trustworthy visible-process event, never the user-message
+   * timestamp. These drive the process timer without inheriting prompt wait. */
+  processStartedTs?: number;
+  processDoneTs?: number;
   detailEventCount?: number;
   detailLoaded?: boolean;
   detailLoading?: boolean;
@@ -134,6 +186,8 @@ export interface Turn {
   /** Exact failed page request retained only long enough for an in-place retry. */
   detailRetryBefore?: string | null;
   detailRetryDirection?: "initial" | "older" | "newer";
+  /** A stale cursor is being replaced from the authoritative newest page. */
+  detailResetPending?: boolean;
   detailHasMore?: boolean;
   detailOldestCursor?: string | null;
   detailHasNewer?: boolean;

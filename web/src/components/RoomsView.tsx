@@ -1,0 +1,962 @@
+/**
+ * The "协作" surface: rooms on the left, one room's timeline on the right.
+ *
+ * A room is a working directory plus a set of agents, each of which keeps its own
+ * session; typing "@Claude ..." dispatches to that agent's session and its answer
+ * comes back into this timeline. The component is presentation-only: every
+ * mutation goes through a prop so the socket stays in App.
+ */
+import { useMemo, useRef, useState } from "react";
+
+import {
+  filterRooms, roomOrder, runningMembers, runningSeconds,
+  type RoomMemberView, type RoomMessageView, type RoomPlanView, type RoomView, type RoomsState,
+} from "../rooms-state";
+import { handleFor, handoffText, mentionAt, mentionCandidates } from "../rooms-mentions";
+import { quoteSummary, quoteText, toQuoteEntry } from "../rooms-quote";
+import "./RoomsView.css";
+
+export interface RoomMemberDraft {
+  member_id: string;
+  label: string;
+  engine: "claude" | "codex" | "dsh";
+  // Preserved across edits: dropping these would silently unbind a member's
+  // conversation and reset its model whenever a room was renamed.
+  session_id?: string | null;
+  model?: string | null;
+  effort?: string | null;
+}
+
+export interface RoomsViewProps {
+  rooms: RoomsState;
+  activeRoomId: string | null;
+  /** Default directory for a new room (the current session's cwd). */
+  defaultCwd: string;
+  onSelectRoom: (roomId: string) => void;
+  onCreateRoom: (name: string, cwd: string, members: RoomMemberDraft[]) => void;
+  onPostMessage: (roomId: string, text: string) => void;
+  /** 引导: append an instruction to that member's running turn. */
+  onSteer: (roomId: string, memberId: string, text: string) => void;
+  /** Interrupt that member's running turn. */
+  onCancel: (roomId: string, memberId: string) => void;
+  /** 跳转会话: leave the room and open the member's own session. */
+  onOpenSession: (member: RoomMemberView) => void;
+  onRenameRoom: (roomId: string, name: string) => void;
+  /** Invite or remove members: the full replacement list. */
+  onUpdateMembers: (roomId: string, members: RoomMemberDraft[]) => void;
+  /** Re-target the room's working directory. */
+  onChangeCwd: (roomId: string, cwd: string) => void;
+  /** Existing DSH sessions the invite form can bind to (DSH cannot be spawned). */
+  dshSessions: { session_id: string; label: string }[];
+  /** Native model catalog per engine, so a member picks model + effort. */
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
+  /** Human approval of a plan: the only path that starts execution. */
+  onApprovePlan: (roomId: string, executorMember: string) => void;
+  onDiscardPlan: (roomId: string) => void;
+  onSetFlow: (roomId: string, adviseExecute: boolean) => void;
+  onDeleteRoom: (roomId: string) => void;
+  onRefresh: () => void;
+}
+
+function memberInitial(member: RoomMemberView): string {
+  const tail = member.label.split(/[·/|-]/).pop() ?? member.label;
+  return (tail.trim() || member.label).slice(0, 1).toUpperCase();
+}
+
+function Clock({ member }: { member: RoomMemberView }) {
+  // Re-render only needs coarse accuracy; the parent re-renders on every frame.
+  const seconds = runningSeconds(member, Date.now());
+  if (seconds === null) return null;
+  return <span className="rooms-clock">{seconds}s</span>;
+}
+
+function RoomCard({
+  room, active, onSelect, onRename, onDelete, onCwd,
+}: {
+  room: RoomView;
+  active: boolean;
+  onSelect: () => void;
+  onRename: (name: string) => void;
+  onDelete: () => void;
+  onCwd: (cwd: string) => void;
+}) {
+  const [renaming, setRenaming] = useState(false);
+  const [editingCwd, setEditingCwd] = useState(false);
+  const [draftCwd, setDraftCwd] = useState(room.cwd);
+  const [draftName, setDraftName] = useState(room.name);
+  const busy = runningMembers(room).length;
+
+  const commitRename = () => {
+    const name = draftName.trim();
+    if (name && name !== room.name) onRename(name);
+    setRenaming(false);
+  };
+
+  return (
+    <div className={`rooms-card${active ? " is-active" : ""}`}>
+      <div className="rooms-card-head">
+        {renaming ? (
+          <input
+            className="rooms-input rooms-rename"
+            autoFocus
+            value={draftName}
+            onChange={(event) => setDraftName(event.target.value)}
+            onBlur={commitRename}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") commitRename();
+              if (event.key === "Escape") {
+                setDraftName(room.name);
+                setRenaming(false);
+              }
+            }}
+          />
+        ) : (
+          <button type="button" className="rooms-card-open" onClick={onSelect}>
+            <span className="rooms-card-name">{room.name}</span>
+            {active && <span className="rooms-card-current">当前</span>}
+            {busy > 0 && <span className="rooms-card-busy">{busy} 个处理中</span>}
+          </button>
+        )}
+        <span className="rooms-card-tools">
+          <button type="button" title="重命名" onClick={() => setRenaming(true)}>改名</button>
+          <button type="button" title="修改工作目录" onClick={() => setEditingCwd(true)}>目录</button>
+          <button
+            type="button"
+            title="删除房间（成员会话会保留）"
+            onClick={() => {
+              if (window.confirm(`删除房间「${room.name}」？成员的会话会保留。`)) onDelete();
+            }}
+          >
+            删除
+          </button>
+        </span>
+      </div>
+      <button type="button" className="rooms-card-body" onClick={onSelect}>
+        <span className="rooms-card-path">{room.cwd}</span>
+        <span className="rooms-card-members">
+          {room.members.map((member) => (
+            <span
+              key={member.member_id}
+              className={`rooms-avatar rooms-avatar-${member.engine}`}
+              title={member.label}
+              data-state={member.state ?? "idle"}
+            >
+              {memberInitial(member)}
+            </span>
+          ))}
+          {typeof room.message_count === "number" && room.message_count > 0 && (
+            <span className="rooms-card-count">{room.message_count} 条</span>
+          )}
+        </span>
+      </button>
+      {editingCwd && (
+        <input
+          className="rooms-input rooms-rename"
+          autoFocus
+          value={draftCwd}
+          onChange={(event) => setDraftCwd(event.target.value)}
+          onBlur={() => {
+            if (draftCwd.trim() && draftCwd !== room.cwd) onCwd(draftCwd.trim());
+            setEditingCwd(false);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              if (draftCwd.trim() && draftCwd !== room.cwd) onCwd(draftCwd.trim());
+              setEditingCwd(false);
+            }
+            if (event.key === "Escape") {
+              setDraftCwd(room.cwd);
+              setEditingCwd(false);
+            }
+          }}
+        />
+      )}
+    </div>
+  );
+}
+function MemberRow({
+  member, roomId, onSteer, onCancel, onOpenSession, catalog, onConfigure,
+}: {
+  member: RoomMemberView;
+  roomId: string;
+  onSteer: (roomId: string, memberId: string, text: string) => void;
+  onCancel: (roomId: string, memberId: string) => void;
+  onOpenSession: (member: RoomMemberView) => void;
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
+  onConfigure: (memberId: string, patch: { model: string | null; effort: string | null }) => void;
+}) {
+  const [steering, setSteering] = useState(false);
+  const [steerText, setSteerText] = useState("");
+  const running = member.state === "running" || member.state === "queued";
+  const label = member.state === "running" ? "处理中"
+    : member.state === "queued" ? "排队中"
+      : member.state === "failed" ? "失败"
+        : member.state === "done" ? "已完成" : "空闲";
+
+  const submitSteer = () => {
+    const text = steerText.trim();
+    if (!text) return;
+    onSteer(roomId, member.member_id, text);
+    setSteerText("");
+    setSteering(false);
+  };
+
+  return (
+    <div className="rooms-member" data-state={member.state ?? "idle"}>
+      <div className="rooms-member-row">
+        <span className={`rooms-avatar rooms-avatar-${member.engine}`}>
+          {memberInitial(member)}
+        </span>
+        <span className="rooms-member-label">{member.label}</span>
+        <MemberModelPicker
+          member={member}
+          catalog={catalog}
+          disabled={running}
+          onChange={(patch) => onConfigure(member.member_id, patch)} />
+        <span className="rooms-member-state">{label}</span>
+        <Clock member={member} />
+        {member.queued ? <span className="rooms-member-queue">队列 · {member.queued}</span> : null}
+        {member.error ? <span className="rooms-member-error">{member.error}</span> : null}
+        <span className="rooms-member-actions">
+          <button type="button" onClick={() => setSteering((value) => !value)}>
+            引导
+          </button>
+          {running && (
+            <button type="button" onClick={() => onCancel(roomId, member.member_id)}>
+              取消
+            </button>
+          )}
+          {member.session_id && (
+            <button type="button" onClick={() => onOpenSession(member)}>
+              跳转会话 ↗
+            </button>
+          )}
+        </span>
+      </div>
+      {steering && (
+        <div className="rooms-steer">
+          <input
+            className="rooms-input"
+            autoFocus
+            placeholder={`引导 ${member.label} 当前任务…（Enter 发送）`}
+            value={steerText}
+            onChange={(event) => setSteerText(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                submitSteer();
+              }
+              if (event.key === "Escape") setSteering(false);
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+/** Structured card a member produced with a cc-plan block. */
+function PlanCard({ plan }: { plan: RoomPlanView }) {
+  return (
+    <div className="rooms-plan">
+      {plan.summary && <div className="rooms-plan-summary">{plan.summary}</div>}
+      {plan.steps.length > 0 && (
+        <ol className="rooms-plan-list rooms-plan-steps">
+          {plan.steps.map((step, index) => <li key={index}>{step}</li>)}
+        </ol>
+      )}
+      {plan.risks.length > 0 && (
+        <div className="rooms-plan-group">
+          <span className="rooms-plan-label">风险</span>
+          <ul className="rooms-plan-list">{plan.risks.map((item, i) => <li key={i}>{item}</li>)}</ul>
+        </div>
+      )}
+      {plan.needs.length > 0 && (
+        <div className="rooms-plan-group">
+          <span className="rooms-plan-label">待确认</span>
+          <ul className="rooms-plan-list">{plan.needs.map((item, i) => <li key={i}>{item}</li>)}</ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** The advise→execute boundary: the human approves, nothing else dispatches. */
+function PlanFlowBar({ room, onApprove, onDiscard, onSetFlow }: {
+  room: RoomView;
+  onApprove: (executorMember: string) => void;
+  onDiscard: () => void;
+  onSetFlow: (adviseExecute: boolean) => void;
+}) {
+  const plan = room.planState;
+  const phase = plan?.phase ?? "idle";
+  const [executor, setExecutor] = useState("");
+  const others = room.members.filter((member) => member.member_id !== plan?.author_member);
+  const effective = executor || others[0]?.member_id || room.members[0]?.member_id || "";
+
+  if (phase === "planning") {
+    return (
+      <div className="rooms-flow is-planning">
+        <span>顾问正在整理计划…（它的回复会变成可执行步骤）</span>
+        <button type="button" onClick={() => onSetFlow(false)}>退出流程</button>
+      </div>
+    );
+  }
+
+  if (phase === "awaiting_execute") {
+    return (
+      <div className="rooms-flow is-awaiting">
+        <div className="rooms-flow-head">
+          <span>计划待你确认 · {plan?.steps?.length ?? 0} 步</span>
+          <span className="rooms-flow-hint">点「执行」后才会派给执行方</span>
+        </div>
+        <div className="rooms-flow-actions">
+          <select
+            className="rooms-input rooms-flow-select"
+            value={effective}
+            onChange={(event) => setExecutor(event.target.value)}
+          >
+            {room.members.map((member) => (
+              <option key={member.member_id} value={member.member_id}>
+                {member.label}{member.member_id === plan?.author_member ? "（顾问）" : ""}
+              </option>
+            ))}
+          </select>
+          <button type="button" className="rooms-primary"
+            onClick={() => effective && onApprove(effective)}>
+            执行
+          </button>
+          <button type="button" onClick={onDiscard}>丢弃计划</button>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase === "executing") {
+    const owner = room.members.find((m) => m.member_id === plan?.executor_member);
+    return (
+      <div className="rooms-flow is-executing">
+        <span>计划执行中 · 由 {owner?.label ?? "执行方"} 执行</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rooms-flow rooms-flow-off">
+      <span>
+        {room.advise_execute
+          ? "「顾问 → 执行」模式 — 只 @ 一个成员时，它会先给计划"
+          : "自由讨论模式 — 谁被 @ 谁回答"}
+      </span>
+      <button type="button" onClick={() => onSetFlow(!room.advise_execute)}>
+        {room.advise_execute ? "退出流程" : "切换到「顾问 → 执行」"}
+      </button>
+    </div>
+  );
+}
+
+/** Model + effort for one member. Empty means "engine default". */
+/**
+ * Catalog rows for an engine.
+ *
+ * state.catalog is keyed by modelCatalogScopeKey, so entries look like "codex",
+ * "codex\0<profile>" or "claude\0<profile>\0<cwd>". Matching on the leading
+ * segment is what makes the room pickers find anything at all.
+ */
+type CatalogModelRow = { id: string; display_name: string; efforts: string[]; is_default?: boolean };
+function modelsForEngine(
+  catalog: Record<string, CatalogModelRow[]>,
+  engine: string,
+): CatalogModelRow[] {
+  const direct = catalog[engine];
+  if (direct && direct.length) return direct;
+  for (const [key, value] of Object.entries(catalog)) {
+    if (!value || !value.length) continue;
+    if (key === engine || key.startsWith(`${engine}\u0000`) || key.startsWith(`${engine}\x00`)) {
+      return value;
+    }
+  }
+  return [];
+}
+
+
+function MemberModelPicker({ member, catalog, disabled, onChange }: {
+  member: RoomMemberView;
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
+  disabled: boolean;
+  onChange: (patch: { model: string | null; effort: string | null }) => void;
+}) {
+  const models = modelsForEngine(catalog, member.engine ?? "claude");
+  if (models.length === 0) return null;
+  const current = models.find((model) => model.id === member.model);
+  // Only offer efforts the chosen model declares: the wire accepts any string, so
+  // a bogus level would only fail later inside the model API.
+  // With no explicit model the member runs the engine default, so offer the
+  // default model's efforts (or the union) instead of hiding the control.
+  const efforts = current?.efforts?.length
+    ? current.efforts
+    : (models.find((model) => model.is_default)?.efforts?.length
+      ? models.find((model) => model.is_default)!.efforts
+      : Array.from(new Set(models.flatMap((model) => model.efforts ?? []))));
+  const value = member.model || "";
+  const effort = member.effort || "";
+  return (
+    <span className="rooms-model-picker">
+      <select
+        className="rooms-model-select"
+        aria-label={`${member.label} 的模型`}
+        value={value}
+        disabled={disabled}
+        title={disabled ? "该成员正在运行，结束后可改" : "选择该成员使用的模型"}
+        onChange={(event) => {
+          const id = event.target.value;
+          const next = models.find((model) => model.id === id);
+          // A different model may not support the old effort.
+          const keep = next?.efforts?.includes(effort) ? effort : null;
+          onChange({ model: id || null, effort: keep });
+        }}
+      >
+        <option value="">默认模型</option>
+        {models.map((model) => (
+          <option key={model.id} value={model.id}>{model.display_name || model.id}</option>
+        ))}
+      </select>
+      {efforts.length > 0 && (
+        <select
+          className="rooms-effort-select"
+          aria-label={`${member.label} 的强度`}
+          value={effort}
+          disabled={disabled}
+          title={disabled ? "该成员正在运行，结束后可改" : "选择推理强度"}
+          onChange={(event) => onChange({
+      model: member.model ?? null,
+            effort: event.target.value || null,
+          })}
+        >
+          <option value="">默认强度</option>
+          {efforts.map((level) => (
+            <option key={level} value={level}>{level}</option>
+          ))}
+        </select>
+      )}
+    </span>
+  );
+}
+
+
+function toDrafts(members: RoomMemberView[]): RoomMemberDraft[] {
+  return members.map((member) => ({
+    member_id: member.member_id,
+    label: member.label,
+    engine: member.engine as RoomMemberDraft["engine"],
+      session_id: member.session_id ?? null,
+      model: member.model ?? null,
+      effort: member.effort ?? null,
+  }));
+}
+
+const ENGINE_LABELS: Record<RoomMemberDraft["engine"], string> = {
+  claude: "Claude",
+  codex: "Codex",
+  dsh: "DSH",
+};
+
+function InviteRow({ onInvite, onCancel, dshSessions, catalog }: {
+  onInvite: (draft: RoomMemberDraft) => void;
+  onCancel: () => void;
+  dshSessions: { session_id: string; label: string }[];
+  catalog: Record<string, { id: string; display_name: string; efforts: string[]; is_default?: boolean }[]>;
+}) {
+  const [engine, setEngine] = useState<RoomMemberDraft["engine"]>("claude");
+  const [name, setName] = useState("");
+  const [sessionId, setSessionId] = useState("");
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
+  const models = modelsForEngine(catalog, engine);
+  const efforts = models.find((item) => item.id === model)?.efforts ?? [];
+  // DSH cannot be spawned from a directory: its runtime only adopts an existing
+  // native session, so a DSH member has to name the session it drives.
+  const needsSession = engine === "dsh";
+
+  const submit = () => {
+    const suffix = name.trim() || "new";
+    const bound = sessionId.trim();
+    if (needsSession && !bound) return;
+    onInvite({
+      // The id only has to be unique inside this room.
+      member_id: `${engine}-${suffix}-${Date.now().toString(36)}`,
+      label: `${ENGINE_LABELS[engine]} · ${suffix}`,
+      engine,
+      ...(bound ? { session_id: bound } : {}),
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+    });
+  };
+
+  return (
+    <div className="rooms-invite">
+      <select
+        className="rooms-input rooms-invite-engine"
+        value={engine}
+        onChange={(event) => setEngine(event.target.value as RoomMemberDraft["engine"])}
+      >
+        {(Object.keys(ENGINE_LABELS) as RoomMemberDraft["engine"][]).map((key) => (
+          <option key={key} value={key}>{ENGINE_LABELS[key]}</option>
+        ))}
+      </select>
+      <input
+        className="rooms-input"
+        autoFocus
+        placeholder="成员名，如 iris（Enter 邀请）"
+        value={name}
+        onChange={(event) => setName(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") { event.preventDefault(); submit(); }
+          if (event.key === "Escape") onCancel();
+        }}
+      />
+      {models.length > 0 && (
+        <div className="rooms-invite-model">
+          <select
+            className="rooms-input"
+            aria-label="模型"
+            value={model}
+            onChange={(event) => {
+              const id = event.target.value;
+              setModel(id);
+              // Drop an effort the newly chosen model does not declare.
+              const next = models.find((item) => item.id === id);
+              if (!next?.efforts?.includes(effort)) setEffort("");
+            }}
+          >
+            <option value="">默认模型</option>
+            {models.map((item) => (
+              <option key={item.id} value={item.id}>{item.display_name || item.id}</option>
+            ))}
+          </select>
+          {efforts.length > 0 && (
+            <select
+              className="rooms-input"
+              aria-label="强度"
+              value={effort}
+              onChange={(event) => setEffort(event.target.value)}
+            >
+              <option value="">默认强度</option>
+              {efforts.map((level) => (
+                <option key={level} value={level}>{level}</option>
+              ))}
+            </select>
+          )}
+        </div>
+      )}
+      {needsSession && (dshSessions.length > 0 ? (
+        // DSH cannot be spawned: pick the native session this member drives.
+        <select
+          className="rooms-input"
+          value={sessionId}
+          onChange={(event) => setSessionId(event.target.value)}
+        >
+          <option value="">选择已有 DSH 会话…</option>
+          {dshSessions.map((session) => (
+            <option key={session.session_id} value={session.session_id}>
+              {session.label}
+            </option>
+          ))}
+        </select>
+      ) : (
+        <input
+          className="rooms-input"
+          placeholder="DSH 会话 ID（如 dsh@abc123）"
+          value={sessionId}
+          onChange={(event) => setSessionId(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") { event.preventDefault(); submit(); }
+            if (event.key === "Escape") onCancel();
+          }}
+        />
+      ))}
+      <button type="button" className="rooms-primary" onClick={submit}
+        disabled={needsSession && !sessionId.trim()}>
+        邀请
+      </button>
+    </div>
+  );
+}
+
+function NewRoomForm({ defaultCwd, onSubmit }: {
+  defaultCwd: string;
+  onSubmit: (name: string, cwd: string, members: RoomMemberDraft[]) => void;
+}) {
+  const [name, setName] = useState("");
+  const [cwd, setCwd] = useState(defaultCwd);
+  const [claude, setClaude] = useState(true);
+  const [codex, setCodex] = useState(true);
+
+  const submit = () => {
+    const members: RoomMemberDraft[] = [];
+    if (claude) members.push({ member_id: "claude-1", label: "Claude · iris", engine: "claude" });
+    if (codex) members.push({ member_id: "codex-1", label: "Codex · nyx", engine: "codex" });
+    if (!name.trim() || !cwd.trim() || members.length === 0) return;
+    onSubmit(name.trim(), cwd.trim(), members);
+    setName("");
+  };
+
+  return (
+    <div className="rooms-new">
+      <input
+        className="rooms-input"
+        placeholder="房间名，如「架构讨论」"
+        value={name}
+        onChange={(event) => setName(event.target.value)}
+      />
+      <input
+        className="rooms-input"
+        placeholder="工作目录"
+        value={cwd}
+        onChange={(event) => setCwd(event.target.value)}
+      />
+      <div className="rooms-new-members">
+        <label>
+          <input type="checkbox" checked={claude} onChange={(e) => setClaude(e.target.checked)} />
+          Claude
+        </label>
+        <label>
+          <input type="checkbox" checked={codex} onChange={(e) => setCodex(e.target.checked)} />
+          Codex
+        </label>
+        <button type="button" className="rooms-primary" onClick={submit}>创建</button>
+      </div>
+    </div>
+  );
+}
+
+export function RoomsView({
+  rooms, activeRoomId, defaultCwd, onSelectRoom, onCreateRoom, onPostMessage,
+  onSteer, onCancel, onOpenSession, onRenameRoom, onDeleteRoom, onUpdateMembers,
+  dshSessions, catalog, onChangeCwd, onApprovePlan, onDiscardPlan, onSetFlow,
+  onRefresh,
+}: RoomsViewProps) {
+  const [query, setQuery] = useState("");
+  const [draft, setDraft] = useState("");
+  const [composing, setComposing] = useState(false);
+  const [inviting, setInviting] = useState(false);
+  const [handoffFor, setHandoffFor] = useState<string | null>(null);
+  // Ticked timeline entries travel with the next message as an explicit quote.
+  const [quoted, setQuoted] = useState<Record<string, true>>({});
+  const insertMention = (option: { insert: string }) => {
+    if (!mentionQuery) return;
+    const caret = composerRef.current?.selectionStart ?? draft.length;
+    const head = draft.slice(0, mentionQuery.start);
+    const tail = draft.slice(caret);
+    const next = `${head}@${option.insert} ${tail}`;
+    setDraft(next);
+    setMentionQuery(null);
+    // Put the caret after the inserted mention and the space that follows it.
+    const position = head.length + option.insert.length + 2;
+    requestAnimationFrame(() => {
+      const element = composerRef.current;
+      if (!element) return;
+      element.focus();
+      element.setSelectionRange(position, position);
+    });
+  };
+
+  const ordered = useMemo(() => roomOrder(rooms), [rooms]);
+  const listed = useMemo(() => filterRooms(rooms, query), [rooms, query]);
+  const active = activeRoomId ? rooms[activeRoomId] : undefined;
+  const quotedCount = active
+    ? active.messages.filter((message) => quoted[message.msg_id]).length
+    : 0;
+
+  const [mentionQuery, setMentionQuery] = useState<{ start: number; query: string } | null>(null);
+  const [mentionIndex, setMentionIndex] = useState(0);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const mentionOptions = useMemo(
+    () => (mentionQuery && active ? mentionCandidates(active.members, mentionQuery.query) : []),
+    [mentionQuery, active],
+  );
+  const mentionOpen = mentionQuery !== null && active !== undefined;
+
+  const updateMention = (value: string, caret: number) => {
+    setMentionIndex(0);
+    setMentionQuery(mentionAt(value, caret));
+  };
+
+  const handoff = (message: RoomMessageView, member: RoomMemberView) => {
+    if (!active) return;
+    // Quote verbatim: the receiving member has its own session, so this is the
+    // "one advises, the other acts" path and it must be explicit.
+    onPostMessage(active.room_id, handoffText(
+      message.author_label, message.text, handleFor(member, active.members)));
+    setHandoffFor(null);
+  };
+
+  const send = () => {
+    const text = draft.trim();
+    if (!text || !active) return;
+    // Ticked entries are quoted verbatim; with none ticked this is just the ask.
+    const entries = active.messages
+      .filter((message) => quoted[message.msg_id])
+      .map((message) => toQuoteEntry(message));
+    onPostMessage(active.room_id, quoteText(entries, text));
+    setDraft("");
+    setQuoted({});
+  };
+
+  return (
+    <div className="rooms">
+      <aside className="rooms-sidebar">
+        <div className="rooms-sidebar-head">
+          <span>协作</span>
+          <button type="button" className="rooms-icon-button" title="刷新" onClick={onRefresh}>↻</button>
+        </div>
+        <input
+          className="rooms-input rooms-search"
+          placeholder="搜索房间、路径…"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+        />
+        <div className="rooms-list">
+          {listed.map((room) => (
+            <RoomCard
+              key={room.room_id}
+              room={room}
+              active={room.room_id === activeRoomId}
+              onSelect={() => onSelectRoom(room.room_id)}
+              onRename={(name) => onRenameRoom(room.room_id, name)}
+              onDelete={() => onDeleteRoom(room.room_id)}
+              onCwd={(cwd) => onChangeCwd(room.room_id, cwd)}
+            />
+          ))}
+          {listed.length === 0 && (
+            <div className="rooms-empty">
+              {ordered.length === 0 ? "还没有房间。新建一个，把 agent 拉进来一起干活。" : "没有匹配的房间。"}
+            </div>
+          )}
+        </div>
+        {composing
+          ? <NewRoomForm defaultCwd={defaultCwd} onSubmit={(n, c, m) => {
+            onCreateRoom(n, c, m);
+            setComposing(false);
+          }} />
+          : (
+            <button type="button" className="rooms-primary rooms-new-toggle" onClick={() => setComposing(true)}>
+              + 新建房间
+            </button>
+          )}
+      </aside>
+
+      <section className="rooms-detail">
+        {active ? (
+          <>
+            <header className="rooms-detail-head">
+              <div>
+                <div className="rooms-detail-title">{active.name}</div>
+                <div className="rooms-detail-path">{active.cwd}</div>
+              </div>
+              <div className="rooms-detail-members">
+                {active.members.map((member) => (
+                  <span key={member.member_id} className={`rooms-chip rooms-chip-${member.engine}`}>
+                    {member.label}
+                    {active.members.length > 1 && (
+                      <button
+                        type="button"
+                        className="rooms-chip-remove"
+                        title={`移除 ${member.label}（不会删除它的会话）`}
+                        onClick={() => onUpdateMembers(active.room_id,
+                          toDrafts(active.members.filter((item) => item.member_id !== member.member_id)))}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  className="rooms-chip rooms-chip-invite"
+                  onClick={() => setInviting((value) => !value)}
+                >
+                  + 邀请
+                </button>
+              </div>
+            </header>
+            {inviting && (
+              <InviteRow
+                dshSessions={dshSessions}
+                catalog={catalog}
+                onCancel={() => setInviting(false)}
+                onInvite={(draft) => {
+                  onUpdateMembers(active.room_id, toDrafts([...active.members, draft]));
+                  setInviting(false);
+                }} />
+            )}
+
+            <div className="rooms-timeline">
+              {active.messages.map((message) => (
+                <div
+                  key={message.msg_id}
+                  className={`rooms-msg rooms-msg-${message.author_kind}${quoted[message.msg_id] ? " is-quoted" : ""}`}
+                >
+                  <div className="rooms-msg-meta">
+                    <span className="rooms-msg-author">{message.author_label}</span>
+                    <span className="rooms-msg-time">
+                      {new Date(message.ts * 1000).toLocaleTimeString()}
+                    </span>
+                    {message.state === "failed" && <span className="rooms-badge-fail">失败</span>}
+                    <button
+                      type="button"
+                      className={`rooms-msg-quote${quoted[message.msg_id] ? " is-on" : ""}`}
+                      title="把这条作为引用附在下一条消息上"
+                      onClick={() => setQuoted((prev) => {
+                        const next = { ...prev };
+                        if (next[message.msg_id]) delete next[message.msg_id];
+                        else next[message.msg_id] = true;
+                        return next;
+                      })}
+                    >
+                      引用
+                    </button>
+                    <button
+                      type="button"
+                      className="rooms-msg-handoff"
+                      title="把这条内容交给另一个成员继续"
+                      onClick={() => setHandoffFor(
+                        handoffFor === message.msg_id ? null : message.msg_id)}
+                    >
+                      转交
+                    </button>
+                  </div>
+                  <div className="rooms-msg-text">{message.text}</div>
+                  {message.plan && <PlanCard plan={message.plan} />}
+                  {handoffFor === message.msg_id && (
+                    <div className="rooms-handoff">
+                      <span className="rooms-handoff-hint">交给</span>
+                      {active.members.map((member) => (
+                        <button
+                          key={member.member_id}
+                          type="button"
+                          className={`rooms-chip rooms-chip-${member.engine}`}
+                          onClick={() => handoff(message, member)}
+                        >
+                          {member.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+              {active.messages.length === 0 && (
+                <div className="rooms-empty">
+                  用 @ 指派任务，例如「@Claude 先整理一下架构思路」。成员各自在自己的会话里干活。
+                </div>
+              )}
+            </div>
+
+            <div className="rooms-members-bar">
+              {active.members.map((member) => (
+                <MemberRow key={member.member_id} member={member}
+                  roomId={active.room_id} onSteer={onSteer}
+                  onCancel={onCancel} onOpenSession={onOpenSession}
+                         catalog={catalog}
+                         onConfigure={(memberId, patch) => onUpdateMembers(active.room_id, toDrafts(active.members).map((draft) => draft.member_id === memberId ? { ...draft, ...patch } : draft))} />
+              ))}
+            </div>
+
+            <PlanFlowBar room={active}
+              onApprove={(member) => onApprovePlan(active.room_id, member)}
+              onDiscard={() => onDiscardPlan(active.room_id)}
+              onSetFlow={(on) => onSetFlow(active.room_id, on)} />
+            {quotedCount > 0 && (
+              <div className="rooms-quotebar">
+                <span className="rooms-quotebar-label">{quoteSummary(quotedCount)}</span>
+                <span className="rooms-quotebar-hint">发送时会原文附在消息里</span>
+                <button type="button" className="rooms-quotebar-clear"
+                  onClick={() => setQuoted({})}>
+                  清空
+                </button>
+              </div>
+            )}
+            <div className="rooms-composer">
+              {mentionOpen && (
+                <div className="rooms-mentions" role="listbox" aria-label="选择成员">
+                  <div className="rooms-mentions-head">@ 谁</div>
+                  {mentionOptions.map((option, index) => (
+                    <button
+                      key={option.insert}
+                      type="button"
+                      role="option"
+                      aria-selected={index === mentionIndex}
+                      className={`rooms-mention${index === mentionIndex ? " is-active" : ""}`}
+                      onMouseEnter={() => setMentionIndex(index)}
+                      onMouseDown={(event) => {
+                        // mousedown, not click: the textarea would blur first.
+                        event.preventDefault();
+                        insertMention(option);
+                      }}
+                    >
+                      {option.engine
+                        ? <span className={`rooms-avatar rooms-avatar-${option.engine}`}>{option.initial}</span>
+                        : <span className="rooms-avatar rooms-avatar-dsh">全</span>}
+                      <span className="rooms-mention-label">{option.label}</span>
+                      <span className="rooms-mention-insert">@{option.insert}</span>
+                    </button>
+                  ))}
+                  {mentionOptions.length === 0 && (
+                    <div className="rooms-empty">没有匹配的成员</div>
+                  )}
+                </div>
+              )}
+              <textarea
+                ref={composerRef}
+                className="rooms-textarea"
+                placeholder="发消息，或输入 @ 选择 Agent…（Ctrl+Enter 发送）"
+                value={draft}
+                onChange={(event) => {
+                  setDraft(event.target.value);
+                  updateMention(event.target.value, event.target.selectionStart ?? 0);
+                }}
+                onClick={(event) => {
+                  const target = event.currentTarget;
+                  updateMention(target.value, target.selectionStart ?? 0);
+                }}
+                onBlur={() => setMentionQuery(null)}
+                onKeyDown={(event) => {
+                  if (mentionOpen) {
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      setMentionIndex((value) => (value + 1) % mentionOptions.length);
+                      return;
+                    }
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      setMentionIndex((value) => (value - 1 + mentionOptions.length) % mentionOptions.length);
+                      return;
+                    }
+                    if (event.key === "Enter" || event.key === "Tab") {
+                      event.preventDefault();
+                      if (mentionOptions[mentionIndex]) insertMention(mentionOptions[mentionIndex]);
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setMentionQuery(null);
+                      return;
+                    }
+                  }
+                  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                    event.preventDefault();
+                    send();
+                  }
+                }}
+              />
+              <button type="button" className="rooms-primary" onClick={send}>发送</button>
+            </div>
+          </>
+        ) : (
+          <div className="rooms-empty rooms-empty-center">
+            从左侧选择房间，或新建一个。
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}

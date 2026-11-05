@@ -1,9 +1,12 @@
 import {
+  lazy,
+  Suspense,
   useEffect,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type ComponentProps,
 } from "react";
 import type {
   Block,
@@ -12,10 +15,17 @@ import type {
   ToolBlock,
 } from "../domain/conversation";
 import { Icon } from "../icons";
+import { presentTurnOutcome } from "../problem-presentation";
 import { MessageBlock } from "./MessageBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
+import { HistoryUserImage } from "./HistoryUserImage";
 import { ToolGroup } from "./ToolGroup";
-import { hasActiveProcess, processBlocks } from "../process-blocks";
+import { ToolInput, ToolOutput } from "./LazyToolDetails";
+import { displayCommand } from "../tool-command";
+import {
+  hasActiveProcess,
+  presentableProcessBlocks,
+} from "../process-blocks";
 import {
   filePathsFromInput,
   presentFileOperation,
@@ -24,11 +34,22 @@ import type { InlineImageAsset } from "../inline-image-assets";
 import type { PreviewAuthorizationState } from "../reducer";
 import {
   historyImageAssetKey,
+  readyGeneratedImageAsset,
   type HistoryImageAsset,
   type HistoryImageVariant,
 } from "../history-image-assets";
-import { PointerTapGuard } from "../pointer-tap";
-import { PlanProgressPopover } from "./PlanProgressPopover";
+import {
+  cancelDraggedPointer,
+  PointerTapGuard,
+  releaseDraggedPointer,
+} from "../pointer-tap";
+
+const DETAIL_REQUEST_ERROR = "详情请求失败";
+const DshToolTree = lazy(() => import("./DshToolTree"));
+
+const PlanProgressPopover = lazy(() => import("./PlanProgressPopover").then(
+  ({ PlanProgressPopover: Popover }) => ({ default: Popover }),
+));
 
 function durationLabel(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -51,69 +72,107 @@ function statusIcon(status: ProcessBlock["status"], done: boolean) {
   return <Icon name="verify" size={14} />;
 }
 
-function ProcessDisclosure({ className, summary, children, openOverride,
+function useProcessInteraction(
+  onStart?: () => number,
+  onEnd?: (token: number, followOutput?: boolean) => void,
+) {
+  const active = useRef(new Map<number, number>());
+  const pending = useRef(new Map<number, number>());
+  const frame = useRef<number | null>(null);
+  useEffect(() => () => {
+    if (frame.current !== null) window.cancelAnimationFrame(frame.current);
+    frame.current = null;
+    for (const token of active.current.values()) onEnd?.(token, false);
+    for (const token of pending.current.values()) onEnd?.(token, false);
+    active.current.clear();
+    pending.current.clear();
+  }, [onEnd]);
+  const cancel = (pointerId: number) => {
+    const token = active.current.get(pointerId) ?? pending.current.get(pointerId);
+    if (token == null) return;
+    active.current.delete(pointerId);
+    pending.current.delete(pointerId);
+    onEnd?.(token, false);
+  };
+  return {
+    cancel,
+    begin(pointerId: number) {
+      cancel(pointerId);
+      const token = onStart?.();
+      if (token != null) active.current.set(pointerId, token);
+    },
+    release(pointerId: number) {
+      const token = active.current.get(pointerId);
+      if (token == null) return;
+      active.current.delete(pointerId);
+      pending.current.set(pointerId, token);
+      if (frame.current !== null) window.cancelAnimationFrame(frame.current);
+      // Keep the viewport frozen through native click and ResizeObserver.
+      frame.current = window.requestAnimationFrame(() => {
+        frame.current = window.requestAnimationFrame(() => {
+          frame.current = null;
+          for (const token of pending.current.values()) onEnd?.(token);
+          pending.current.clear();
+        });
+      });
+    },
+  };
+}
+
+function ProcessDisclosure({ className, summary, children, defaultOpen = false, openOverride,
   onOpenChange, onInteractionStart, onInteractionEnd }: {
   className: string;
   summary: ReactNode;
   children: ReactNode;
+  defaultOpen?: boolean;
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
 }) {
-  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen);
   const open = openOverride ?? uncontrolledOpen;
   const tapGuard = useRef(new PointerTapGuard());
-  const interactionTokens = useRef(new Map<number, number>());
-  const releaseInteractionFrame = useRef<number | null>(null);
-  useEffect(() => () => {
-    if (releaseInteractionFrame.current !== null) {
-      window.cancelAnimationFrame(releaseInteractionFrame.current);
-    }
-    for (const token of interactionTokens.current.values()) {
-      onInteractionEnd?.(token);
-    }
-    interactionTokens.current.clear();
-  }, [onInteractionEnd]);
+  const interaction = useProcessInteraction(onInteractionStart, onInteractionEnd);
   const setOpen = (next: boolean) => {
     setUncontrolledOpen(next);
     onOpenChange?.(next);
-  };
-  const releaseInteractions = () => {
-    if (releaseInteractionFrame.current !== null) {
-      window.cancelAnimationFrame(releaseInteractionFrame.current);
-    }
-    releaseInteractionFrame.current = window.requestAnimationFrame(() => {
-      releaseInteractionFrame.current = window.requestAnimationFrame(() => {
-        releaseInteractionFrame.current = null;
-        for (const token of interactionTokens.current.values()) {
-          onInteractionEnd?.(token);
-        }
-        interactionTokens.current.clear();
-      });
-    });
   };
   return (
     <details className={className} open={open}>
       <summary
         onPointerDown={(event) => {
+          if (event.pointerType === "mouse" && event.button === 0) {
+            // WebKit can start a range in the next selectable paragraph even
+            // when this control has user-select:none. Suppress only the mouse
+            // selection default, preserving focus, clicks and native touch pan.
+            event.preventDefault();
+            event.currentTarget.focus({ preventScroll: true });
+          }
           tapGuard.current.pointerDown(
             event.pointerId, event.clientX, event.clientY,
           );
           event.currentTarget.setPointerCapture?.(event.pointerId);
-          const token = onInteractionStart?.();
-          if (token != null) interactionTokens.current.set(event.pointerId, token);
+          interaction.begin(event.pointerId);
         }}
-        onPointerMove={(event) => tapGuard.current.pointerMove(
-          event.pointerId, event.clientX, event.clientY,
-        )}
+        onPointerMove={(event) => {
+          if (tapGuard.current.pointerMove(
+            event.pointerId, event.clientX, event.clientY,
+          )) {
+            interaction.cancel(event.pointerId);
+            releaseDraggedPointer(
+              event.currentTarget, event.pointerId, event.pointerType);
+          }
+        }}
         onPointerUp={(event) => {
           tapGuard.current.pointerUp(event.pointerId);
-          releaseInteractions();
+          interaction.release(event.pointerId);
         }}
         onPointerCancel={(event) => {
-          tapGuard.current.pointerCancel(event.pointerId);
-          releaseInteractions();
+          interaction.cancel(event.pointerId);
+          cancelDraggedPointer(
+            tapGuard.current,
+            event.currentTarget, event.pointerId, event.pointerType);
         }}
         onClick={(event) => {
           event.preventDefault();
@@ -177,6 +236,7 @@ function ProcessImagePreview({
   onLoadHistoryImage,
   onPreviewImage,
   onPreviewHistoryImage,
+  generated = false,
 }: {
   path: string;
   previewId?: string;
@@ -196,16 +256,16 @@ function ProcessImagePreview({
   ) => boolean;
   onPreviewImage?: (src: string, alt: string) => void;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
+  generated?: boolean;
 }) {
-  const historyAsset = historyTurnId && historyRef
+  const liveAsset = !historyRef && previewId ? imageAssets?.[previewId] : undefined;
+  const useHistory = !!historyRef;
+  const historyAsset = historyTurnId && historyRef && useHistory
     ? historyImageAssets?.[historyImageAssetKey(
         historyTurnId, historyRef.image_id, "thumbnail")]
     : undefined;
-  const liveAsset = !historyRef && previewId
-    ? imageAssets?.[previewId]
-    : undefined;
   useEffect(() => {
-    if (historyTurnId && historyRef) {
+    if (useHistory && historyTurnId && historyRef) {
       if (!historyAsset) {
         onLoadHistoryImage?.(
           historyTurnId, historyRef.image_id, "thumbnail");
@@ -224,56 +284,110 @@ function ProcessImagePreview({
     onLoadImage,
     path,
     previewId,
+    useHistory,
   ]);
-  const asset = historyRef ? historyAsset : liveAsset;
+  const asset = useHistory ? historyAsset : liveAsset;
   const src = asset?.status === "ready" && asset.data && asset.mediaType
     ? `data:${asset.mediaType};base64,${asset.data}`
     : null;
   const canLoad = Boolean(
     (historyTurnId && historyRef) || previewId,
   );
-  if (!historyRef && liveAsset?.authorization) {
+  if (!useHistory && liveAsset?.authorization) {
     return <PreviewAuthorizationPrompt
       authorization={liveAsset.authorization}
       compact
       onDecision={onAuthorizeImage} />;
   }
   return (
-    <button type="button" className="process-image-preview"
+    <button type="button" className={"process-image-preview" + (generated ? " generated-image-preview" : "")}
       disabled={!canLoad}
       aria-label={
-        src
+        generated ? (src ? "预览生成的图片" : "加载生成的图片") : src
           ? "预览查看过的图片"
           : canLoad ? "加载查看过的图片" : "等待图片读取完成"
       }
       onClick={() => {
-        if (historyTurnId && historyRef) {
+        if (useHistory && historyTurnId && historyRef) {
           onLoadHistoryImage?.(
             historyTurnId, historyRef.image_id, "full");
           onPreviewHistoryImage?.(historyTurnId, historyRef.image_id);
           return;
         }
         if (src) {
-          onPreviewImage?.(src, path || "查看过的图片");
+          onPreviewImage?.(src, path || (generated ? "生成的图片" : "查看过的图片"));
         } else if (previewId) {
           onLoadImage?.(path, previewId);
         }
       }}>
       {src
-        ? <img src={src} alt="" />
+        ? <img src={src} alt="" width={asset?.width} height={asset?.height} />
         : <span className="process-image-placeholder">
             <Icon name="read" size={16} />
           </span>}
-      <span>{path || "查看过的图片"}</span>
+      {(!generated || !src) && <span>{generated
+        ? (asset?.status === "error" ? "图片加载失败 · 点击重试"
+          : !canLoad ? "生成的图片暂不可用" : "正在加载图片…")
+        : path || "查看过的图片"}</span>}
     </button>
   );
 }
 
-function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
+export function GeneratedImagePreview({ block, ...props }: {
+  block: ProcessBlock;
+} & Omit<ComponentProps<typeof ProcessImagePreview>, "path" | "previewId" | "historyRef" | "generated">) {
+  const ref = processImageRef(block.input);
+  // Retain only the snapshot id through live -> canonical projection changes.
+  // Bytes remain in the scoped LRU: eviction and invalidation still win.
+  const snapshotRef = useRef<{ imageId?: string; previewId?: string }>({});
+  if (snapshotRef.current.imageId !== ref?.image_id) {
+    snapshotRef.current = { imageId: ref?.image_id };
+  }
+  if (typeof block.input?.preview_id === "string") {
+    snapshotRef.current.previewId = block.input.preview_id;
+  }
+  const previewId = snapshotRef.current.previewId;
+  const live = previewId ? props.imageAssets?.[previewId] : undefined;
+  const readyHistory = ref
+    ? readyGeneratedImageAsset(props.historyImageAssets, ref.image_id) : undefined;
+  const historyAsset = readyHistory ?? (ref && props.historyTurnId
+    ? props.historyImageAssets?.[historyImageAssetKey(props.historyTurnId, ref.image_id, "full")]
+    : undefined);
+  const history = ref && props.historyTurnId && (readyHistory || !previewId || live?.status === "error");
+  const dimensions = history ? ref : live;
+  const path = filePathsFromInput(block.input)[0] ?? "";
+  const open = () => {
+    if (readyHistory) {
+      props.onPreviewImage?.(`data:${readyHistory.mediaType};base64,${readyHistory.data}`, "生成的图片");
+    } else if (history && ref && props.historyTurnId) {
+      props.onLoadHistoryImage?.(props.historyTurnId, ref.image_id, "full");
+      props.onPreviewHistoryImage?.(props.historyTurnId, ref.image_id);
+    } else if (live?.status === "ready" && live.data && live.mediaType) {
+      props.onPreviewImage?.(`data:${live.mediaType};base64,${live.data}`, "生成的图片");
+    } else if (previewId) props.onLoadImage?.(path, previewId);
+  };
+  return <figure className="generated-output">
+    {history && ref && props.historyTurnId ? <div className="generated-history-image">
+      {/* Reuse history intersection loading and eviction guards. */}
+      <HistoryUserImage turnId={props.historyTurnId} imageId={ref.image_id}
+        width={ref.width} height={ref.height} label="生成的图片" variant="full"
+        asset={historyAsset}
+        onLoad={props.onLoadHistoryImage}
+        onPreview={open} />
+    </div> : <ProcessImagePreview {...props} generated path={path} previewId={previewId} />}
+    <figcaption><Icon name="read" size={14} /><span>生成的图片</span>
+      {!!dimensions?.width && !!dimensions.height && <span className="generated-image-size">· {dimensions.width} × {dimensions.height}</span>}
+      {(history || previewId) && <button type="button" className="generated-image-open" onClick={open}>
+        <Icon name="expand" size={13} />查看大图</button>}
+    </figcaption>
+  </figure>;
+}
+
+export function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   onAuthorizeImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewImage, onPreviewHistoryImage, openOverride, onOpenChange,
-  onInteractionStart, onInteractionEnd }: {
+  onInteractionStart, onInteractionEnd, onOpenAgent }: {
   block: ProcessBlock;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
@@ -294,8 +408,43 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
 }) {
+  if (block.processKind === "compaction" && !block.done && block.status === "running") {
+    return (
+      <div className="process-activity process-compaction-running" role="status">
+        <span className="compact-motion" aria-hidden="true">
+          <i /><i /><i /><i /><i />
+        </span>
+        <span className="process-item-title">正在压缩上下文</span>
+      </div>
+    );
+  }
+  const inlineAgent = block.processKind === "agent" && block.input?.agent_run_id === null;
+  if ((block.processKind === "agent" && !inlineAgent || block.processKind === "task" && block.item_id.startsWith("dsh-job-")) && onOpenAgent) {
+    return (
+      <button type="button"
+        className={`process-activity process-agent-card process-${block.status}`}
+        onClick={() => onOpenAgent(typeof block.input?.agent_run_id === "string"
+          ? block.input.agent_run_id : block.item_id, block.title)}>
+        <span className="process-item-ic"><Icon name="spark" size={15} /></span>
+        <span className="process-agent-copy">
+          <span className="process-item-title">{block.title}</span>
+          {(block.progress || block.summary) && (
+            <span className="process-agent-summary">
+              {block.progress || block.summary}
+            </span>
+          )}
+        </span>
+        {!(block.server === "dsh" && block.tool === "subagent_reference") &&
+          <span className="process-item-status">{statusIcon(block.status, block.done)}</span>}
+        <span className="process-item-chev"><Icon name="chev" size={14} /></span>
+      </button>
+    );
+  }
+  const displayInput = { ...block.input };
+  if (block.processKind === "agent") delete displayInput.agent_run_id;
   const imageView = block.tool?.toLowerCase().replaceAll("_", "") === "viewimage";
   const imagePath = imageView
     ? filePathsFromInput(block.input)[0] ?? ""
@@ -321,7 +470,7 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   const hasBody = !!(block.summary || block.detail || block.output || block.diff
     || block.progress || block.explanation || block.command || block.cwd
     || block.plan?.length || block.exit_code != null || block.duration_ms != null
-    || (block.input && Object.keys(block.input).length));
+    || Object.keys(displayInput).length);
   const body = (
     <>
       {block.progress && <div className="process-progress">{block.progress}</div>}
@@ -336,11 +485,11 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
           ))}
         </ol>
       )}
-      {block.command && <pre className="tool-pre process-command">$ {block.command}</pre>}
+      {block.command && <pre className="tool-pre process-command">$ {displayCommand(block.command)}</pre>}
       {block.cwd && <div className="process-meta">{block.cwd}</div>}
       {block.summary && !imageView
         && <div className="process-copy">{block.summary}</div>}
-      {block.detail && <pre className="tool-pre">{block.detail}</pre>}
+      {block.detail && <ToolOutput output={block.detail} label={inlineAgent ? "消息" : "详情"} />}
       {onOpenFile && filePaths.map((filePath) => (
         <button key={filePath} type="button" className="process-file-link"
           onClick={() => onOpenFile(filePath)}>
@@ -357,11 +506,14 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
           onPreviewImage={onPreviewImage}
           onPreviewHistoryImage={onPreviewHistoryImage} />
       )}
-      {block.input && Object.keys(block.input).length > 0
+      {Object.keys(displayInput).length > 0
         && filePaths.length === 0 && !imageView && (
-        <pre className="tool-pre">{JSON.stringify(block.input, null, 2)}</pre>
+        <ToolInput input={displayInput} omit={[
+          ...(block.command ? ["command", "cmd"] : []),
+          ...(block.cwd ? ["cwd", "workdir"] : []),
+        ]} />
       )}
-      {block.output && <pre className="tool-pre">{block.output}{block.truncated ? "\n…(truncated)" : ""}</pre>}
+      {block.output && <ToolOutput output={block.output} truncated={block.truncated} />}
       {block.diff && <pre className="tool-pre tool-diff">{block.diff}</pre>}
       {(block.exit_code != null || block.duration_ms != null) && (
         <div className="tool-meta">
@@ -399,12 +551,14 @@ function ProcessActivity({ block, onOpenFile, imageAssets, onLoadImage,
   );
 }
 
-function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
+function TimelineItem({ block, expandThinking, onOpenFile, imageAssets, onLoadImage,
   onAuthorizeImage, onPreviewImage,
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
-  itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd }: {
+  itemOpen, onItemOpenChange, onInteractionStart, onInteractionEnd,
+  onOpenAgent }: {
   block: Block;
+  expandThinking: boolean;
   onOpenFile?: (path: string, line?: number) => void;
   imageAssets?: Record<string, InlineImageAsset>;
   onLoadImage?: (path: string, previewId?: string) => boolean;
@@ -424,7 +578,8 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
   itemOpen?: (key: string) => boolean | undefined;
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
 }) {
   if (block.kind === "process") {
     const key = `process:${block.item_id}`;
@@ -440,18 +595,20 @@ function TimelineItem({ block, onOpenFile, imageAssets, onLoadImage,
       openOverride={itemOpen?.(key)}
       onOpenChange={(open) => onItemOpenChange?.(key, open)}
       onInteractionStart={onInteractionStart}
-      onInteractionEnd={onInteractionEnd} />;
+      onInteractionEnd={onInteractionEnd} onOpenAgent={onOpenAgent} />;
   }
   const text = block as TextBlock;
   if (text.channel === "thinking") {
     const key = `reasoning:${text.message_id}`;
     return (
       <ProcessDisclosure className="process-reasoning"
+        defaultOpen={expandThinking}
         openOverride={itemOpen?.(key)}
         onOpenChange={(open) => onItemOpenChange?.(key, open)}
         onInteractionStart={onInteractionStart}
         onInteractionEnd={onInteractionEnd}
-        summary={<><Icon name="spark" size={14} /><span>思考</span>
+        summary={<><Icon name="spark" size={14} />
+          <span className="process-item-title">思考</span>
           <Icon name="chev" size={13} /></>}>
         <div className="process-reasoning-body"><MessageBlock text={text.text}
           done={text.done} onOpenFile={onOpenFile} imageAssets={imageAssets}
@@ -482,18 +639,6 @@ function groupTimelineRows(items: Block[]): TimelineRow[] {
     else rows.push({ kind: "tools", tools: [block] });
   }
   return rows;
-}
-
-function isCodexPresentationNoise(block: Block): boolean {
-  if (block.kind === "text" && block.channel === "thinking") return true;
-  if (block.kind !== "process") return false;
-  if (block.processKind === "reasoning") return true;
-  if (block.processKind !== "hook") return false;
-  // Successful/pending preToolUse hooks are implementation detail around each
-  // command. Rendering them between ToolBlocks splits one useful tool batch
-  // into a noisy Hook -> one tool -> Hook sequence. Keep actionable failures,
-  // but let ordinary hooks disappear so adjacent tools collapse together.
-  return !["failed", "declined", "cancelled", "interrupted"].includes(block.status);
 }
 
 const TERMINAL_PROCESS_STATUSES = new Set([
@@ -551,28 +696,34 @@ function isPayloadFreeUnfinishedCommandShell(block: Block): boolean {
   return !hasPayload;
 }
 
-export function ProcessTimeline({ blocks, done, active, durationMs, startTs, doneTs, onOpenFile,
-  deferredCount = 0, detailLoading = false, detailError, onLoadDetail,
+export function ProcessTimeline({ blocks, done, active, outcome, problem, durationMs, startTs, doneTs, onOpenFile,
+  deferredCount = 0, detailPending = false, detailLoading = false, detailError, onLoadDetail,
   onRetryDetail,
   canLoadEarlier = false, canLoadNewer = false,
   onLoadEarlier, onLoadNewer,
   imageAssets, onLoadImage, onAuthorizeImage, onPreviewImage, engine = "claude",
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
+  externalPlanItemId,
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
-  onInteractionStart, onInteractionEnd }: {
+  onInteractionStart, onInteractionEnd, onOpenAgent }: {
   blocks: Block[];
   done: boolean;
   /** Whether this process shell describes the turn's active live phase. */
   active?: boolean;
+  /** An enclosing terminal failure is separate from individual tool results. */
+  outcome?: "failed" | "interrupted";
+  problem?: string;
   durationMs?: number;
   startTs?: number;
   doneTs?: number;
   onOpenFile?: (path: string, line?: number) => void;
   deferredCount?: number;
+  /** A continuation shares its parent's detail request, but not its item count. */
+  detailPending?: boolean;
   detailLoading?: boolean;
   detailError?: string | null;
-  onLoadDetail?: () => boolean | void;
+  onLoadDetail?: (automatic?: boolean) => boolean | void;
   onRetryDetail?: () => boolean | void;
   canLoadEarlier?: boolean;
   canLoadNewer?: boolean;
@@ -593,24 +744,24 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     variant: HistoryImageVariant,
   ) => boolean;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
+  /** The session-level progress strip owns this plan instead of this row. */
+  externalPlanItemId?: string | null;
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   itemOpen?: (key: string) => boolean | undefined;
   onItemOpenChange?: (key: string, open: boolean) => void;
   onInteractionStart?: () => number;
-  onInteractionEnd?: (token: number) => void;
+  onInteractionEnd?: (token: number, followOutput?: boolean) => void;
+  onOpenAgent?: (runId: string, title?: string) => void;
 }) {
   const retainedPlanBlock = useRef<ProcessBlock | null>(null);
   // Codex does not expose its private chain of thought in official clients.
   // Keep actionable commentary, plans, hook failures and tools, but suppress
   // synthetic reasoning and successful hook plumbing so consecutive tool calls
   // collapse into one useful group.
-  const projectedItems = processBlocks(blocks).filter(
-    (block) => engine !== "codex" || !(
-    isCodexPresentationNoise(block)
-  ));
-  const needsAuthoritativeDetail = deferredCount > 0;
+  const projectedItems = presentableProcessBlocks(blocks, engine);
+  const needsAuthoritativeDetail = deferredCount > 0 || detailPending;
   // Summary History may include bounded lifecycle/tool shells so the header can
   // report that work exists, but their inputs and outputs are intentionally
   // absent. Hide only those payload-free command shells: a same-revision cache
@@ -633,27 +784,39 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   // transition; otherwise one click makes its own popover disappear briefly.
   if (planBlock) retainedPlanBlock.current = planBlock;
   const visiblePlanBlock = planBlock ?? retainedPlanBlock.current;
+  const inlinePlanBlock = visiblePlanBlock?.item_id === externalPlanItemId
+    ? null : visiblePlanBlock;
   const timelineItems = planBlock
     ? items.filter((block) => block !== planBlock)
     : items;
   const processActive = active ?? (!done && (
     hasActiveProcess(projectedItems) || projectedItems.length > 0
   ));
+  const foregroundItems = done ? projectedItems.filter((block) => !(
+    block.kind === "process" && block.background === true
+  )) : projectedItems;
   const terminalComplete = done && !processActive
-    && !hasActiveProcess(projectedItems);
+    && (!!outcome || !hasActiveProcess(foregroundItems));
   const processSettled = !processActive;
+  const terminalOutcome = processSettled && done ? outcome : undefined;
   const [uncontrolledOpen, setUncontrolledOpen] = useState(!terminalComplete);
   const open = openOverride ?? uncontrolledOpen;
   const [localDetailError, setLocalDetailError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
   const manuallyToggled = useRef(false);
+  const detailAttempt = useRef<{ turn?: string; requested: boolean }>({ requested: false });
   const tapGuard = useRef(new PointerTapGuard());
-  const interactionTokens = useRef(new Map<number, number>());
-  const releaseInteractionFrame = useRef<number | null>(null);
+  const interaction = useProcessInteraction(onInteractionStart, onInteractionEnd);
 
   useEffect(() => {
-    if (!manuallyToggled.current) setUncontrolledOpen(!terminalComplete);
-  }, [terminalComplete]);
+    // A steer or a history refresh may settle a visible segment before its
+    // native items finish updating. Auto-close once; later activity updates
+    // content, never reopens the disclosure or overrides a manual choice.
+    if (!terminalComplete || !uncontrolledOpen || openOverride != null
+        || manuallyToggled.current) return;
+    setUncontrolledOpen(false);
+    onOpenChange?.(false);
+  }, [terminalComplete, uncontrolledOpen, openOverride, onOpenChange]);
   useEffect(() => {
     if (detailLoading || !needsAuthoritativeDetail) {
       setLocalDetailError(null);
@@ -664,16 +827,24 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [processActive]);
-  useEffect(() => () => {
-    if (releaseInteractionFrame.current !== null) {
-      window.cancelAnimationFrame(releaseInteractionFrame.current);
-      releaseInteractionFrame.current = null;
+
+  useEffect(() => {
+    // A restored/default-open disclosure needs the same request as a click.
+    // One attempt per opening prevents rerenders, StrictMode and failed loads
+    // from starting a retry loop. Explicit Retry remains available.
+    if (detailAttempt.current.turn !== historyTurnId || !open || !needsAuthoritativeDetail) {
+      detailAttempt.current = { turn: historyTurnId, requested: false };
     }
-    for (const token of interactionTokens.current.values()) {
-      onInteractionEnd?.(token);
+    if (!open || !needsAuthoritativeDetail) return;
+    if (detailLoading) {
+      detailAttempt.current.requested = true;
+      return;
     }
-    interactionTokens.current.clear();
-  }, [onInteractionEnd]);
+    if (detailAttempt.current.requested || detailError || localDetailError || !onLoadDetail) return;
+    detailAttempt.current.requested = true;
+    if (onLoadDetail(true) === false) setLocalDetailError(DETAIL_REQUEST_ERROR);
+  }, [open, needsAuthoritativeDetail, detailLoading, detailError, localDetailError,
+    onLoadDetail, historyTurnId]);
 
   const hasDeferredOnly = timelineItems.length === 0 && needsAuthoritativeDetail;
   const waitingForContent = timelineItems.length === 0
@@ -682,14 +853,16 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   const showOuterDisclosure = timelineItems.length > 0
     || hasDeferredOnly || waitingForContent || !!visibleDetailError
     || canLoadEarlier || canLoadNewer;
-  if (!visiblePlanBlock && !showOuterDisclosure
+  if (!inlinePlanBlock && !showOuterDisclosure
       && !visibleDetailError) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
   const rows = open ? groupTimelineRows(timelineItems) : [];
   const toolCount = timelineItems.reduce(
     (count, block) => count + (block.kind === "tool" ? 1 : 0), 0);
-  const countLabel = needsAuthoritativeDetail
+  const countLabel = visibleDetailError && timelineItems.length === 0
+    ? "加载失败"
+    : deferredCount > 0
     ? `${deferredCount} 项`
     : waitingForContent
       ? "等待响应"
@@ -698,74 +871,60 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     : engine === "codex" && toolCount === timelineItems.length
       ? `${toolCount} 个工具调用`
       : `${timelineItems.length} 项`;
-  const elapsed: number | null = terminalComplete
+  const rawElapsed: number | null = terminalComplete
     ? durationMs != null && durationMs > 0
       ? durationMs
-      : engine === "claude" && startTs != null && doneTs != null
-        ? Math.max(0, doneTs - startTs)
-        : durationMs === 0 && startTs != null && doneTs != null && doneTs > startTs
+      : startTs != null && doneTs != null
+        ? engine === "codex" && durationMs === 0
           ? 0
-          : null
+          : Math.max(0, doneTs - startTs)
+        : null
     : processActive
-      ? Math.max(0, now - (startTs ?? now))
+      ? startTs == null ? null : Math.max(0, now - startTs)
       : durationMs != null && durationMs > 0 ? durationMs : null;
-  const requestDetail = () => {
+  // Rounded sub-second intervals render as "0s", which looks like a broken
+  // clock and can be resurrected from a pre-fix browser cache. Presence and
+  // timing are independent: keep the process label, omit only the unusable
+  // duration until at least one displayable second is available.
+  const elapsed = rawElapsed != null && rawElapsed >= 500
+    ? rawElapsed : null;
+  const requestDetail = (load = onLoadDetail) => {
+    detailAttempt.current = { turn: historyTurnId, requested: true };
     setLocalDetailError(null);
-    if (onLoadDetail?.() === false) {
-      setLocalDetailError("无法发起详情请求，请重试");
-    }
-  };
-  const retryDetail = () => {
-    setLocalDetailError(null);
-    if ((onRetryDetail ?? onLoadDetail)?.() === false) {
-      setLocalDetailError("无法发起详情请求，请重试");
+    if (load?.() === false) {
+      setLocalDetailError(DETAIL_REQUEST_ERROR);
     }
   };
   const toggle = () => {
     manuallyToggled.current = true;
-    if (needsAuthoritativeDetail) {
-      const next = !open;
-      if (next && !detailLoading) requestDetail();
-      setUncontrolledOpen(next);
-      onOpenChange?.(next);
-      return;
-    }
     const next = !open;
+    if (next && needsAuthoritativeDetail && !detailLoading) requestDetail();
     setUncontrolledOpen(next);
     onOpenChange?.(next);
   };
   const pointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerDown(event.pointerId, event.clientX, event.clientY);
-    const token = onInteractionStart?.();
-    if (token != null) interactionTokens.current.set(event.pointerId, token);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    interaction.begin(event.pointerId);
   };
   const pointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    tapGuard.current.pointerMove(event.pointerId, event.clientX, event.clientY);
+    if (tapGuard.current.pointerMove(
+      event.pointerId, event.clientX, event.clientY,
+    )) {
+      interaction.cancel(event.pointerId);
+      releaseDraggedPointer(
+        event.currentTarget, event.pointerId, event.pointerType);
+    }
   };
   const pointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
     tapGuard.current.pointerUp(event.pointerId);
-    releaseInteractions();
+    interaction.release(event.pointerId);
   };
   const pointerCancel = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    tapGuard.current.pointerCancel(event.pointerId);
-    releaseInteractions();
-  };
-  const releaseInteractions = () => {
-    if (releaseInteractionFrame.current !== null) {
-      window.cancelAnimationFrame(releaseInteractionFrame.current);
-    }
-    // Native click is dispatched after pointerup in the same task. Keep the
-    // viewport frozen through the following ResizeObserver frame as well, so
-    // the clicked disclosure can settle before output following resumes.
-    releaseInteractionFrame.current = window.requestAnimationFrame(() => {
-      releaseInteractionFrame.current = window.requestAnimationFrame(() => {
-        releaseInteractionFrame.current = null;
-        for (const token of interactionTokens.current.values()) {
-          onInteractionEnd?.(token);
-        }
-        interactionTokens.current.clear();
-      });
-    });
+    interaction.cancel(event.pointerId);
+    cancelDraggedPointer(
+      tapGuard.current,
+      event.currentTarget, event.pointerId, event.pointerType);
   };
   return (
     <section data-process-detail-root
@@ -782,23 +941,33 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
             }
             toggle();
           }}>
-          <span className={`turn-process-state${processSettled ? " done" : " running"}`}>
+          {(terminalOutcome || (detailLoading && !processActive)) && <span
+            className={`turn-process-state ${terminalOutcome ?? "loading"}`}>
             {detailLoading && !processActive
               ? <span className="process-spin" />
-              : <Icon name={processActive ? "spark" : "verify"} size={14} />}
-          </span>
-          <span>{processSettled ? "已处理" : "正在处理"}
+              : <Icon name={terminalOutcome === "interrupted" ? "stop" : "info"} size={14} />}
+          </span>}
+          <span className={`turn-process-label ${processActive ? "running" : "done"} status-shimmer${processActive ? " is-active" : ""}`}>
+            {terminalOutcome ? presentTurnOutcome(terminalOutcome, problem)
+            : processSettled ? "已处理" : "正在处理"}
             {elapsed == null ? null : ` ${durationLabel(elapsed)}`}</span>
           <span className="turn-process-count">{countLabel}</span>
           <Icon name="chev" size={15} />
         </button>}
-        {visiblePlanBlock && <PlanProgressPopover block={visiblePlanBlock}
-          openOverride={itemOpen?.(`plan:${visiblePlanBlock.item_id}`)}
-          onOpenChange={(next) => onItemOpenChange?.(
-            `plan:${visiblePlanBlock.item_id}`, next)}
-          detailLoading={detailLoading}
-          onNeedDetail={needsAuthoritativeDetail && !detailLoading
-            ? requestDetail : undefined} />}
+        {inlinePlanBlock && <Suspense fallback={
+          <span className="plan-progress-control" role="status"
+            aria-label="正在加载计划进度">
+            <span className="plan-progress-trigger" aria-hidden="true" />
+          </span>
+        }>
+          <PlanProgressPopover block={inlinePlanBlock}
+            openOverride={itemOpen?.(`plan:${inlinePlanBlock.item_id}`)}
+            onOpenChange={(next) => onItemOpenChange?.(
+              `plan:${inlinePlanBlock.item_id}`, next)}
+            detailLoading={detailLoading}
+            onNeedDetail={needsAuthoritativeDetail && !detailLoading
+              ? requestDetail : undefined} />
+        </Suspense>}
       </div>
       {showOuterDisclosure && open && <div className="process-timeline">
         {visibleDetailError && (
@@ -807,7 +976,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
             <button type="button" disabled={detailLoading}
               onClick={(event) => {
                 event.stopPropagation();
-                retryDetail();
+                requestDetail(onRetryDetail ?? onLoadDetail);
               }}>
               重试
             </button>
@@ -816,7 +985,9 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
         {(hasDeferredOnly || waitingForContent)
           && !visibleDetailError && (
           <div className="process-detail-loading" role="status">
-            {hasDeferredOnly ? "正在加载过程…" : "等待模型响应…"}
+            {hasDeferredOnly ? detailLoading ? "正在加载过程…" : (
+              <button type="button" onClick={() => requestDetail()}>加载过程</button>
+            ) : "等待模型响应…"}
           </div>
         )}
         {canLoadEarlier && (
@@ -828,10 +999,14 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
         )}
         {rows.map((row) => (
           row.kind === "tools"
-            ? <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools} />
+            ? engine === "dsh" ? <Suspense key={`tools-${row.tools[0].tool_use_id}`} fallback={<ToolGroup tools={row.tools} active={processActive} />}>
+                <DshToolTree tools={row.tools} active={processActive} />
+              </Suspense> : <ToolGroup key={`tools-${row.tools[0].tool_use_id}`} tools={row.tools}
+                active={processActive} />
             : <TimelineItem key={row.block.kind === "text"
                 ? `text-${row.block.message_id}` : `process-${row.block.item_id}`}
-                block={row.block} onOpenFile={onOpenFile}
+                block={row.block} expandThinking={engine === "claude"}
+                onOpenFile={onOpenFile}
                 imageAssets={imageAssets} onLoadImage={onLoadImage}
                 onAuthorizeImage={onAuthorizeImage}
                 onPreviewImage={onPreviewImage}
@@ -839,6 +1014,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
                 historyImageAssets={historyImageAssets}
                 onLoadHistoryImage={onLoadHistoryImage}
                 onPreviewHistoryImage={onPreviewHistoryImage}
+                onOpenAgent={onOpenAgent}
                 itemOpen={itemOpen} onItemOpenChange={onItemOpenChange}
                 onInteractionStart={onInteractionStart}
                 onInteractionEnd={onInteractionEnd} />

@@ -895,7 +895,8 @@ def test_relay_config_construction_is_test_friendly_but_startup_validation_fails
     validate_relay_config(_cfg(public_origin="http://localhost:8765"))
 
 
-def test_relay_config_rejects_non_tls_public_origin():
+def test_relay_config_rejects_non_tls_public_origin(monkeypatch):
+    monkeypatch.setenv("ALLOW_INSECURE_HTTP", "0")
     with pytest.raises(ValueError, match="PUBLIC_ORIGIN must use https"):
         validate_relay_config(_cfg(public_origin="http://remote.example"))
 
@@ -938,6 +939,27 @@ def test_health_reports_loaded_protocol_without_caching():
     assert response.status_code == 200
     assert response.json()["protocol"] == PROTOCOL_VERSION
     assert response.headers["cache-control"] == "no-store"
+
+
+def test_btw_owner_identity_is_stable_opaque_and_subject_scoped():
+    secret = "relay-secret" * 4
+    alice = server._btw_owner_id(
+        server.SessionClaims(expires_at=10, jti="a" * 16, subject="alice"),
+        secret,
+    )
+    refreshed_alice = server._btw_owner_id(
+        server.SessionClaims(expires_at=20, jti="b" * 16, subject="alice"),
+        secret,
+    )
+    bob = server._btw_owner_id(
+        server.SessionClaims(expires_at=20, jti="c" * 16, subject="bob"),
+        secret,
+    )
+
+    assert alice == refreshed_alice
+    assert alice != bob
+    assert alice.startswith("owner-")
+    assert "alice" not in alice
 
 
 def test_allow_insecure_http_permits_a_plain_http_public_ip_origin():

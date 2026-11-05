@@ -9,16 +9,44 @@ queue is drained on disconnect to avoid double-delivery on reconnect.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import deque
 from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import urlsplit
+from urllib.request import getproxies_environment, proxy_bypass_environment
 
 from websockets.asyncio.client import connect
 
+from cc_remote import __version__
 from cc_remote.log import logger
 from cc_remote.protocol import ProtocolError, deserialize, serialize
 
 log = logger("cc_remote.wrapper.transport")
+
+# Keepalive tuning. The library defaults (20s ping, 20s pong timeout) assume a
+# healthy path; a relay reached through a proxy and a tunnel needs more slack,
+# otherwise a latency spike tears the connection down and the UI stalls.
+_DEFAULT_PING_INTERVAL = 30.0
+_DEFAULT_PING_TIMEOUT = 90.0
+
+
+def _ws_ping_interval() -> float | None:
+    raw = os.environ.get("CC_REMOTE_WS_PING_INTERVAL", "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_PING_INTERVAL
+    except ValueError:
+        value = _DEFAULT_PING_INTERVAL
+    return value if value > 0 else None
+
+
+def _ws_ping_timeout() -> float | None:
+    raw = os.environ.get("CC_REMOTE_WS_PING_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_PING_TIMEOUT
+    except ValueError:
+        value = _DEFAULT_PING_TIMEOUT
+    return value if value > 0 else None
+
 
 
 class _ByteQueue:
@@ -136,17 +164,32 @@ class WrapperTransport:
         backoff = 1.0
         while not self._stop:
             try:
-                headers = {"Authorization": f"Bearer {self.token}"}
+                headers = {"Authorization": f"Bearer {self.token}", "X-CC-Remote-Version": __version__}
                 kw: dict = {
                     "additional_headers": headers,
                     "max_size": self.max_size,
-                    # websockets 16 defaults proxy=True, including NO_PROXY /
-                    # proxy_bypass handling. Do not force a configured proxy for
-                    # loopback relay URLs: that can expose the Bearer token.
+                    # Select only the operator's explicit HTTP proxy variables.
+                    # websockets 16 otherwise consults macOS system settings,
+                    # which may select an unavailable SOCKS proxy.
                     "max_queue": 4,
+                    # The library default (20s/20s) is too tight for a relay
+                    # reached through a proxy and a tunnel: a single latency
+                    # spike makes the client give up with
+                    # "sent 1011 (internal error) keepalive ping timeout",
+                    # which the UI shows as a stalled turn. Ping less often and
+                    # allow a much longer pong wait; a truly dead link is still
+                    # detected, just more patiently.
+                    "ping_interval": _ws_ping_interval(),
+                    "ping_timeout": _ws_ping_timeout(),
                 }
-                if urlsplit(self.url).hostname in {"127.0.0.1", "::1", "localhost"}:
+                target = urlsplit(self.url)
+                proxies = getproxies_environment()
+                if (target.hostname in {"127.0.0.1", "::1", "localhost"}
+                        or proxy_bypass_environment(
+                            target.netloc, proxies)):
                     kw["proxy"] = None
+                else:
+                    kw["proxy"] = proxies.get("https") or proxies.get("http") or None
                 async with connect(self.url, **kw) as ws:
                     log.info("connected to relay", url=self.url)
                     backoff = 1.0

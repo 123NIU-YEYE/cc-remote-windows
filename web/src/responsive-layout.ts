@@ -1,23 +1,10 @@
-export type SidebarSwipeAction = "open" | "close" | null;
-
-const SWIPE_THRESHOLD_PX = 50;
-const HORIZONTAL_INTENT_RATIO = 1.25;
-
-export function resolveSidebarSwipe(
-  startX: number,
-  startY: number,
-  endX: number,
-  endY: number,
-  viewportWidth: number,
-  locked: boolean,
-): SidebarSwipeAction {
-  if (locked) return null;
-  const dx = endX - startX;
-  const dy = endY - startY;
-  if (Math.abs(dx) <= SWIPE_THRESHOLD_PX
-      || Math.abs(dx) <= Math.abs(dy) * HORIZONTAL_INTENT_RATIO) return null;
-  if (dx > 0 && startX < viewportWidth / 3) return "open";
-  return dx < 0 ? "close" : null;
+export function sidebarDragIntent(dx: number, dy: number): "pending" | "horizontal" | "vertical" {
+  const x = Math.abs(dx), y = Math.abs(dy);
+  if (Math.max(x, y) < 10) return "pending";
+  if (x > y * 1.25) return "horizontal";
+  if (y > x * 1.25) return "vertical";
+  // A diagonal first sample is not enough to abandon the entire gesture.
+  return "pending";
 }
 
 const PANEL_MIN_WIDTH_PX = 360;

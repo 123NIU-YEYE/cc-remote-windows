@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # First-install/update entrypoint for a role-scoped wrapper release bundle.
 set -euo pipefail
+installer_args=("$@")
 
 die() {
   echo "ERROR: $*" >&2
@@ -11,7 +12,13 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   install-wrapper.sh BUNDLE --relay https://remote.example.com --pair PAIR-CODE [--name LABEL]
-  install-wrapper.sh BUNDLE [--user USER]
+  install-wrapper.sh BUNDLE [--user USER] [--relay-ssh USER@HOST] [--allow-protocol-change]
+  install-wrapper.sh BUNDLE --user USER --adopt-root /absolute/legacy/installation
+  install-wrapper.sh BUNDLE --user USER --service-manager supervisor \
+    --supervisor-config /etc/supervisor/supervisord.conf --service-name wrapper \
+    --service-file /etc/supervisor/conf.d/wrapper.conf --env-file /etc/cc-remote/wrapper.env \
+    [--install-root /srv/cc-remote] [--home /root] [--device-file /root/.cc-remote/device.json] \
+    [--adopt-supervisor]
 
 The relay and pair arguments are required for the first install. They may be
 omitted on upgrades when a device credential already exists. Linux installs
@@ -28,7 +35,21 @@ relay=""
 pair_code=""
 device_name=""
 target_user="${CC_REMOTE_INSTALL_USER:-}"
+install_root=""
+adopt_root=""
+installed_service_label=""
+relay_ssh=""
+allow_protocol_change=0
 replace_pair=0
+service_manager=systemd
+supervisor_config=""
+supervisor_name=cc-remote-wrapper
+supervisor_file=""
+service_home=""
+wrapper_env_file=""
+paired_file=""
+adopt_supervisor=0
+linux_profile=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --relay)
@@ -53,6 +74,44 @@ while [ "$#" -gt 0 ]; do
       ;;
     --replace-pair)
       replace_pair=1
+      shift
+      ;;
+    --install-root)
+      [ "$#" -ge 2 ] || usage
+      install_root="$2"
+      shift 2
+      ;;
+    --adopt-root)
+      [ "$#" -ge 2 ] || usage
+      adopt_root="$2"
+      shift 2
+      ;;
+    --service-label)
+      [ "$#" -ge 2 ] || usage
+      installed_service_label="$2"
+      shift 2
+      ;;
+    --service-manager|--supervisor-config|--service-name|--service-file|--home|--env-file|--device-file)
+      [ "$#" -ge 2 ] || usage
+      case "$1" in
+        --service-manager) service_manager="$2" ;;
+        --supervisor-config) supervisor_config="$2" ;;
+        --service-name) supervisor_name="$2" ;;
+        --service-file) supervisor_file="$2" ;;
+        --home) service_home="$2" ;;
+        --env-file) wrapper_env_file="$2" ;;
+        --device-file) paired_file="$2" ;;
+      esac
+      shift 2
+      ;;
+    --adopt-supervisor) adopt_supervisor=1; shift ;;
+    --relay-ssh)
+      [ "$#" -ge 2 ] || usage
+      relay_ssh="$2"
+      shift 2
+      ;;
+    --allow-protocol-change)
+      allow_protocol_change=1
       shift
       ;;
     *) die "unknown wrapper installer argument: $1" ;;
@@ -117,6 +176,8 @@ esac
 release_name="release-v${version}-${git_sha:0:12}"
 
 if [ "$system" = darwin ]; then
+  if [ "$service_manager" != systemd ] || [ -n "$supervisor_config$supervisor_file$service_home$wrapper_env_file$paired_file" ] || [ "$adopt_supervisor" -ne 0 ]; then die "Linux service options require Linux"; fi
+  [ -z "$adopt_root" ] || die "--adopt-root is only for an existing Linux system service"
   [ "$(id -u)" -ne 0 ] || \
     die "macOS wrapper installation must run as the logged-in user, not root"
   target_user="$(id -un)"
@@ -124,49 +185,124 @@ if [ "$system" = darwin ]; then
   if [ -z "$target_home" ] || [ ! -d "$target_home" ]; then
     die "HOME is invalid"
   fi
-  appdir="$target_home/Library/Application Support/cc-remote"
+  appdir="${install_root:-$target_home/Library/Application Support/cc-remote}"
   config_dir="$target_home/.cc-remote"
   device_file="$config_dir/device.json"
-  service_file="$target_home/Library/LaunchAgents/com.muggle.cc-remote.wrapper.plist"
-  service_label="com.muggle.cc-remote.wrapper"
+  service_label="${installed_service_label:-com.muggle.cc-remote.wrapper}"
+  case "$service_label" in
+    *[!A-Za-z0-9.-]*|""|[.-]*) die "invalid macOS service label" ;;
+  esac
+  case "$appdir" in
+    /*) ;;
+    *) die "macOS install root must be absolute" ;;
+  esac
+  if [ -n "$install_root" ] || [ -n "$installed_service_label" ]; then
+    [ -L "$appdir/current" ] || die "custom root must already have an immutable current release"
+    [ -f "$target_home/Library/LaunchAgents/$service_label.plist" ] || die "custom LaunchAgent does not exist"
+  fi
+  service_file="$target_home/Library/LaunchAgents/$service_label.plist"
   log_dir="$target_home/Library/Logs/cc-remote"
+  cli_path="$target_home/.local/bin/cc-remote"
 else
+  [ -z "$installed_service_label" ] || die "--service-label is only supported on macOS"
+  case "$service_manager" in systemd|supervisor) ;; *) die "unsupported Linux service manager" ;; esac
+  if [ "$service_manager" = systemd ]; then
+    if [ -n "$install_root$supervisor_config$supervisor_file$service_home$wrapper_env_file$paired_file" ] || [ "$adopt_supervisor" -ne 0 ]; then die "custom Linux service options currently require Supervisor"; fi
+  else
+    if [ -z "$supervisor_config" ] || [ -z "$supervisor_file" ]; then die "Supervisor needs --supervisor-config and --service-file"; fi
+    [ -z "$adopt_root" ] || die "use --install-root and --adopt-supervisor for Supervisor"
+  fi
   [ "$(id -u)" -eq 0 ] || die "Linux wrapper installation must run as root"
-  command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+  if [ "$service_manager" = systemd ]; then
+    command -v systemctl >/dev/null 2>&1 || die "systemd is unavailable; select an existing Supervisor with --service-manager supervisor"
+  fi
   command -v getent >/dev/null 2>&1 || die "getent is required"
-  if [ -z "$target_user" ] || [ "$target_user" = root ]; then
+  if [ -z "$target_user" ] || { [ "$target_user" = root ] && [ "$service_manager" != supervisor ]; }; then
     target_user="${SUDO_USER:-}"
   fi
-  if [ -z "$target_user" ] || [ "$target_user" = root ]; then
+  if [ -z "$target_user" ] || { [ "$target_user" = root ] && [ "$service_manager" != supervisor ]; }; then
     die "Linux wrapper installation needs --user USER"
   fi
   case "$target_user" in
     *[!A-Za-z0-9_.-]*|"") die "Linux service user has an invalid name" ;;
   esac
   id "$target_user" >/dev/null 2>&1 || die "Linux service user does not exist"
-  target_home="$(getent passwd "$target_user" | awk -F: '{print $6}')"
+  target_home="${service_home:-$(getent passwd "$target_user" | awk -F: '{print $6}')}"
   if [ -z "$target_home" ] || [ ! -d "$target_home" ]; then
     die "Linux service user has no usable home directory"
   fi
   case "$target_home" in
     *["	 \"'\\"]*) die "Linux service user home contains unsupported characters" ;;
   esac
-  appdir=/opt/cc-remote-wrapper
+  appdir="${install_root:-/opt/cc-remote-wrapper}"
   config_dir=/etc/cc-remote
   device_file="$config_dir/device.env"
   service_file=/etc/systemd/system/cc-remote-wrapper.service
   service_label=cc-remote-wrapper
   log_dir=""
+  cli_path=/usr/local/bin/cc-remote
+  if [ "$service_manager" = supervisor ]; then
+    service_file="$supervisor_file"
+    service_label="$supervisor_name"
+    device_file="${paired_file:-$config_dir/device.env}"
+    # Before even creating the lock directory, reject writable/symlink roots.
+    "$bundle/bin/uv" run --no-project --no-env-file --managed-python \
+      --python "$python_runtime" python - "$bundle" "$appdir" <<'PY_CHECK'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from deploy.linux_service import absolute, trusted
+trusted(absolute(sys.argv[2]))
+PY_CHECK
+  fi
+fi
+wrapper_env_file="${wrapper_env_file:-$config_dir/wrapper.env}"
+
+
+# Lock before reading rollback state, staging releases or changing credentials.
+# Managed updates pass their open lock; direct installs acquire it and re-enter.
+if [ -z "${CC_REMOTE_INSTALL_LOCK_FD:-}" ]; then
+  exec "$bundle/bin/uv" run --no-project --no-env-file --managed-python \
+    --python "$python_runtime" python "$bundle/deploy/install_lock.py" \
+    "$appdir" bash "$bundle/deploy/install-wrapper.sh" "${installer_args[@]}"
+fi
+"$bundle/bin/uv" run --no-project --no-env-file --managed-python \
+  --python "$python_runtime" python "$bundle/deploy/install_lock.py" \
+  --verify-fd "$CC_REMOTE_INSTALL_LOCK_FD" "$appdir"
+
+if [ "$system" = darwin ] && { [ -n "$install_root" ] || [ -n "$installed_service_label" ]; }; then
+  "$bundle/bin/uv" run --no-project --no-env-file --managed-python \
+    --python "$python_runtime" python - "$appdir" "$service_file" "$service_label" <<'PY'
+from pathlib import Path
+import plistlib
+import sys
+
+root, service = map(Path, sys.argv[1:3])
+with service.open("rb") as stream:
+    payload = plistlib.load(stream)
+arguments = payload.get("ProgramArguments", [])
+if (payload.get("Label") != sys.argv[3] or len(arguments) < 3
+        or arguments[1:3] != ["-m", "cc_remote.wrapper"]
+        or Path(arguments[0]).resolve() != (root / "current/.venv/bin/python").resolve()
+        or Path(payload.get("WorkingDirectory", "")).resolve() != (root / "current").resolve()):
+    raise SystemExit("custom root and LaunchAgent do not identify the same Wrapper")
+PY
 fi
 
+"$bundle/bin/uv" run --no-project --no-env-file --managed-python \
+  --python "$python_runtime" python "$bundle/deploy/install_cli.py" \
+  --destination "$cli_path" --check
+
 claude_bin="$target_home/.local/bin/claude"
-[ -x "$claude_bin" ] || \
-  die "daily Claude Code executable is missing: $claude_bin"
+if [ "$service_manager" != supervisor ]; then
+  [ -x "$claude_bin" ] || die "daily Claude Code executable is missing: $claude_bin"
+fi
 
 releases="$appdir/releases"
 current="$appdir/current"
 runtimes="$appdir/runtimes"
 target="$releases/$release_name"
+rollback_root="$appdir/rollback-data"
 stage=""
 previous=""
 switched=0
@@ -177,14 +313,22 @@ device_had_file=0
 device_backup=""
 device_changed=0
 unit_verify_dir=""
+rollback_snapshot=""
+snapshot_created=0
+service_stopped=0
+codex_stop_receipt=""
+service_was_running=0
+activation_committed=0
+retention_generation=""
 
-mkdir -p "$releases" "$runtimes"
+mkdir -p "$releases" "$runtimes" "$rollback_root"
 if [ "$system" = darwin ]; then
   mkdir -p "$config_dir" "$(dirname "$service_file")" "$log_dir"
-  chmod 0700 "$config_dir"
+  chmod 0700 "$config_dir" "$rollback_root"
 else
   install -d -o root -g root -m 0755 "$appdir" "$releases" "$runtimes"
   install -d -o root -g root -m 0700 "$config_dir"
+  install -d -o root -g root -m 0700 "$rollback_root"
 fi
 
 if [ -L "$current" ]; then
@@ -196,62 +340,170 @@ if [ -L "$current" ]; then
 elif [ -e "$current" ]; then
   die "current must be a symlink"
 fi
+if [ -n "$adopt_root" ]; then
+  [ -z "$pair_code" ] || die "migration preserves pairing; do not supply --pair"
+  previous="$(
+    "$bundle/bin/uv" run --no-project --no-env-file --managed-python \
+      --python "$python_runtime" python "$bundle/deploy/adopt_wrapper.py" \
+      --root "$adopt_root" --destination "$appdir" --user "$target_user"
+  )"
+fi
+if [ "$system" = linux ] && [ -f "$service_file" ] && [ -z "$previous" ]; then
+  die "existing Wrapper service is not registered here; use --adopt-root with its immutable root"
+fi
+
+linux_service() {
+  "$target/.venv/bin/python" "$target/deploy/linux_service.py" "$1" \
+    --profile "$linux_profile" --root "$appdir" "${@:2}"
+}
 
 restart_after_rollback() {
   if [ "$system" = darwin ]; then
     domain="gui/$(id -u)"
     launchctl bootout "$domain/$service_label" >/dev/null 2>&1 || true
-    if [ -n "$previous" ] && [ -f "$service_file" ]; then
-      launchctl bootstrap "$domain" "$service_file" >/dev/null 2>&1 || true
-      launchctl kickstart -k "$domain/$service_label" >/dev/null 2>&1 || true
+    if [ "$service_was_running" -eq 1 ] && [ -n "$previous" ] && \
+       [ -f "$service_file" ]; then
+      launchctl bootstrap "$domain" "$service_file" >/dev/null 2>&1 &&
+        launchctl kickstart -k "$domain/$service_label" >/dev/null 2>&1
+    fi
+  elif [ "${service_manager:-systemd}" = supervisor ]; then
+    if [ "$service_was_running" -eq 1 ] && [ -n "$previous" ] && [ -f "$service_file" ]; then
+      linux_service start || return 1
+      for _attempt in $(seq 1 20); do
+        if wrapper_service_active; then return 0; fi
+        sleep 1
+      done
+      return 1
+    else
+      linux_service stop || return 1
+      if [ "$service_had_file" -eq 0 ] && [ ! -e "$service_file" ]; then
+        # Fresh rollback removed the definition; stop alone leaves a stale
+        # group loaded in Supervisor. Forget only this transaction's group.
+        linux_service remove || return 1
+      fi
     fi
   else
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if [ -n "$previous" ] && [ -f "$service_file" ]; then
-      systemctl restart "$service_label" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    if [ "$service_was_running" -eq 1 ] && [ -n "$previous" ] && \
+       [ -f "$service_file" ]; then
+      systemctl restart "$service_label" >/dev/null 2>&1
     else
       systemctl stop "$service_label" >/dev/null 2>&1 || true
     fi
   fi
 }
 
+stop_wrapper_service() {
+  if [ "$system" = darwin ]; then
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain/$service_label" >/dev/null 2>&1 || true
+  elif [ "${service_manager:-systemd}" = supervisor ]; then
+    linux_service stop || return 1
+  else
+    systemctl stop "$service_label" >/dev/null 2>&1 || true
+  fi
+  for _attempt in $(seq 1 10); do
+    if ! wrapper_service_active; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wrapper_service_active() {
+  if [ "$system" = darwin ]; then
+    domain="gui/$(id -u)"
+    launchctl print "$domain/$service_label" >/dev/null 2>&1
+  elif [ "${service_manager:-systemd}" = supervisor ]; then
+    linux_service state
+  else
+    systemctl is-active --quiet "$service_label"
+  fi
+}
+
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
-  if [ "$status" -ne 0 ]; then
+  if [ -n "${codex_stop_receipt:-}" ] && [ -f "$codex_stop_receipt" ]; then
+    service_stopped=1
+    service_was_running=1
+  fi
+  if [ "$status" -ne 0 ] && [ "$activation_committed" -eq 0 ]; then
+    rollback_ready=1
+    if [ "$snapshot_created" -eq 1 ]; then
+      # Never start old code against data migrated by the failed new release.
+      # Stop the new process first, then restore the SQLite images and every
+      # participant in the matching private profile-migration transaction.
+      if ! stop_wrapper_service; then
+        rollback_ready=0
+        echo "ERROR: new wrapper could not be stopped; data was not restored" >&2
+      elif ! "$target/.venv/bin/python" \
+          "$target/deploy/work_registry_snapshot.py" restore \
+          --snapshot "$rollback_snapshot"; then
+        rollback_ready=0
+        echo "ERROR: wrapper data restore failed; wrapper remains stopped" >&2
+      fi
+    fi
     if [ "$switched" -eq 1 ]; then
-      if [ -n "$previous" ]; then
-        "$target/.venv/bin/python" "$target/deploy/atomic_symlink.py" \
-          "$previous" "$current" >/dev/null 2>&1 || true
+      if [ -n "$adopt_root" ]; then
+        # The original root/current was never modified. Restore the absent
+        # managed link so a failed migration cannot masquerade as registration.
+        rm -f -- "$current" || rollback_ready=0
+      elif [ -n "$previous" ]; then
+        if ! "$target/.venv/bin/python" "$target/deploy/atomic_symlink.py" \
+            "$previous" "$current" >/dev/null 2>&1; then
+          rollback_ready=0
+        fi
       elif [ -L "$current" ]; then
-        rm -f -- "$current"
+        rm -f -- "$current" || rollback_ready=0
       fi
     fi
     if [ "$service_changed" -eq 1 ]; then
       if [ "$service_had_file" -eq 1 ] && [ -n "$service_backup" ]; then
-        cp -p "$service_backup" "$service_file" >/dev/null 2>&1 || true
+        if [ "${service_manager:-systemd}" = supervisor ]; then
+          linux_service restore --template "$service_backup" || rollback_ready=0
+        else
+          cp -p "$service_backup" "$service_file" >/dev/null 2>&1 || rollback_ready=0
+        fi
       elif [ "$service_had_file" -eq 0 ] && [ -f "$service_file" ]; then
-        rm -f -- "$service_file"
+        rm -f -- "$service_file" || rollback_ready=0
       fi
     fi
     if [ "$device_changed" -eq 1 ] && [ "$device_had_file" -eq 1 ] &&
        [ -n "$device_backup" ]; then
       device_recovery="$device_file.failed-$release_name-$$"
-      cp -p "$device_file" "$device_recovery" >/dev/null 2>&1 || true
-      cp -p "$device_backup" "$device_file" >/dev/null 2>&1 || true
+      cp -p "$device_file" "$device_recovery" >/dev/null 2>&1 || \
+        rollback_ready=0
+      cp -p "$device_backup" "$device_file" >/dev/null 2>&1 || \
+        rollback_ready=0
       echo "New device credential retained for recovery: $device_recovery" >&2
     elif [ "$device_changed" -eq 1 ]; then
       echo "New device credential retained for a retry: $device_file" >&2
     fi
-    if [ "$switched" -eq 1 ] || [ "$service_changed" -eq 1 ]; then
-      restart_after_rollback
+    if [ "$rollback_ready" -eq 1 ] && { [ "$service_stopped" -eq 1 ] || \
+       [ "$switched" -eq 1 ] || [ "$service_changed" -eq 1 ]; }; then
+      if ! restart_after_rollback; then
+        rollback_ready=0
+      fi
     fi
-    echo "ERROR: wrapper activation failed; the previous release was restored" >&2
+    if [ "$rollback_ready" -eq 1 ]; then
+      if [ -n "$retention_generation" ]; then
+        "$target/.venv/bin/python" "$target/deploy/release_retention.py" abort \
+          --root "$appdir" --generation "$retention_generation" || true
+      fi
+      echo "ERROR: wrapper activation failed; code and wrapper data were restored" >&2
+    else
+      echo "ERROR: wrapper activation failed; manual data recovery is required" >&2
+    fi
+  elif [ "$status" -ne 0 ]; then
+    echo "WARNING: Wrapper activation was committed; inspect it before retrying." >&2
   fi
   [ -z "$stage" ] || rm -rf -- "$stage"
   [ -z "$service_backup" ] || rm -f -- "$service_backup"
   [ -z "$device_backup" ] || rm -f -- "$device_backup"
   [ -z "$unit_verify_dir" ] || rm -rf -- "$unit_verify_dir"
+  [ -z "${linux_profile:-}" ] || rm -f -- "$linux_profile"
   exit "$status"
 }
 trap cleanup EXIT
@@ -320,6 +572,38 @@ PY
   stage=""
 fi
 
+# Keep base arguments in each array: Bash 3.2 treats empty arrays as unset with -u.
+retention_args=(
+  begin --root "$appdir" --release "$target" --previous "$previous" --role wrapper
+  --home "$target_home" --service "$service_label" --service-file "$service_file"
+  --config "$device_file" --config "$wrapper_env_file"
+  --config "$appdir/installation.json"
+)
+if [ "$system" = linux ] && [ "$service_manager" = supervisor ]; then
+  linux_profile="$(mktemp "${TMPDIR:-/tmp}/cc-remote-linux-service.XXXXXX")"
+  "$target/.venv/bin/python" - "$target" "$linux_profile" "$service_label" "$target_user" "$target_home" "$service_file" "$wrapper_env_file" "$device_file" "$supervisor_config" <<'PY_BIND'
+import json
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from deploy.linux_service import validate
+keys = ['name', 'user', 'home', 'service_file', 'env_file', 'device_file', 'supervisor_config']
+profile = validate(dict(manager='supervisor', **dict(zip(keys, sys.argv[3:]))))
+Path(sys.argv[2]).write_text(json.dumps(profile))
+PY_BIND
+  preflight_args=(preflight)
+  if [ "$adopt_supervisor" -eq 1 ]; then preflight_args+=(--adopt); fi
+  [ -f "$wrapper_env_file" ] || die "Supervisor requires a prepared --env-file (see installation guide)"
+  linux_service "${preflight_args[@]}"
+  retention_args+=(--linux-service "$linux_profile")
+fi
+
+if [ "$previous" != "$target" ]; then
+  retention_generation="$(
+    "$target/.venv/bin/python" "$target/deploy/release_retention.py" "${retention_args[@]}"
+  )"
+fi
+
 if [ -n "$pair_code" ]; then
   pair_args=(pair "$relay" "$pair_code")
   if [ -n "$device_name" ]; then
@@ -328,52 +612,193 @@ if [ -n "$pair_code" ]; then
   if [ "$replace_pair" -eq 1 ]; then
     pair_args+=(--replace)
   fi
-  if [ "$system" = linux ]; then
+  if [ "$system" = linux ] && [[ "$device_file" != *.json ]]; then
     pair_args+=(--env-file "$device_file")
   else
     pair_args+=(--config "$device_file")
   fi
-  (
-    cd "$target"
-    PYTHONPATH="$target" "$target/.venv/bin/python" \
-      -m cc_remote.device "${pair_args[@]}"
-  )
+  if [ "$system" = linux ] && [ "$service_manager" = supervisor ] && [[ "$device_file" = *.json ]] && [ "$target_user" != root ]; then
+    # Native JSON credentials must be created by their actual owner, not root.
+    (
+      cd "$target"
+      runuser -u "$target_user" -- env HOME="$target_home" PYTHONPATH="$target" \
+        "$target/.venv/bin/python" -m cc_remote.device "${pair_args[@]}"
+    )
+  else
+    (
+      cd "$target"
+      PYTHONPATH="$target" "$target/.venv/bin/python" \
+        -m cc_remote.device "${pair_args[@]}"
+    )
+  fi
   device_changed=1
 fi
 
 if [ ! -f "$device_file" ] || [ -L "$device_file" ]; then
-  die "device credential is missing; provide --relay and --pair"
+  # Older system services may keep their original token in wrapper.env.
+  # Preserve that authority in place; never copy it into a new pairing file.
+  if [ "$system" = linux ] && [ -n "$previous" ] && [ ! -e "$device_file" ] && [ ! -L "$device_file" ]; then
+    "$target/.venv/bin/python" - "$wrapper_env_file" <<'PY'
+from pathlib import Path
+import sys
+from dotenv import dotenv_values
+
+path = Path(sys.argv[1])
+if not path.is_file() or path.is_symlink():
+    raise SystemExit("existing wrapper credential configuration is missing")
+env = dotenv_values(path)
+token = env.get("WRAPPER_TOKEN") or ""
+if not env.get("RELAY_URL") or len(token) < 32 or token.startswith("change-me"):
+    raise SystemExit("existing wrapper credentials are incomplete; inspect the installation")
+PY
+  else
+    die "device credential is missing; provide --relay and --pair"
+  fi
+else
+  chmod 0600 "$device_file"
 fi
-chmod 0600 "$device_file"
+
+# Older update commands only invoke the downloaded installer. Check the Relay
+# here too, before stopping or switching the local Wrapper, so their first
+# upgrade has the same server-first behavior. Fresh pairing is a separate flow.
+if [ -n "$previous" ] && [ -z "$pair_code" ]; then
+  upstream_args=(--root "$appdir" --bundle "$target" --user "$target_user")
+  if [ -n "$adopt_root" ]; then
+    upstream_args+=(--previous-root "$adopt_root")
+  fi
+  if [ -n "${linux_profile:-}" ]; then upstream_args+=(--linux-service "$linux_profile"); fi
+  if [ "$system" = darwin ]; then
+    upstream_args+=(--service-label "$service_label")
+  fi
+  if [ -n "$relay_ssh" ]; then
+    upstream_args+=(--relay-ssh "$relay_ssh")
+  fi
+  if [ "$allow_protocol_change" -eq 1 ]; then
+    upstream_args+=(--allow-protocol-change)
+  fi
+  (
+    cd "$target"
+    PYTHONPATH="$target" "$target/.venv/bin/python" \
+      -m cc_remote.update_relay "${upstream_args[@]}"
+  )
+fi
+
+if [ -n "${linux_profile:-}" ] && [ -n "$service_backup" ]; then
+  cmp -s "$service_backup" "$service_file" || die "Supervisor configuration changed during staging; retry after reconciling it"
+fi
+
+# Mutable Work metadata and private wrapper control state live outside immutable
+# release directories. Capture them before activation so a code rollback also
+# restores the schemas understood by the previous wrapper.
+if [ "$service_had_file" -eq 1 ]; then
+  if [ "$system" = darwin ]; then
+    domain="gui/$(id -u)"
+    if launchctl print "$domain/$service_label" >/dev/null 2>&1; then
+      service_was_running=1
+    fi
+  elif wrapper_service_active; then
+    service_was_running=1
+  fi
+fi
+if [ "$system" = linux ] && [ "$service_manager" = systemd ] && [ "$service_had_file" -eq 1 ]; then
+  # Check existing units even when is-active was false: an activating/restarting
+  # legacy service must not bypass the barrier. A stopped unit is a no-op.
+  codex_stop_dir="$(mktemp -d "$rollback_root/codex-stop-$release_name.XXXXXX")"
+  codex_stop_receipt="$codex_stop_dir/attempted.json"
+  "$target/.venv/bin/python" "$target/deploy/check_codex_lifetime.py" \
+    --unit "$service_label" --uid "$(id -u "$target_user")" \
+    --stop-receipt "$codex_stop_receipt"
+  if [ -f "$codex_stop_receipt" ]; then
+    service_stopped=1
+    service_was_running=1
+  fi
+elif [ "$service_was_running" -eq 1 ]; then
+  # A lost stop response may still mean the original process stopped.
+  # Include it in rollback recovery even when the stop call reports failure.
+  service_stopped=1
+  stop_wrapper_service || die "existing wrapper could not be stopped safely"
+fi
+rollback_snapshot="$(
+  mktemp -d "$rollback_root/activation-$release_name.XXXXXX"
+)"
+snapshot_args=(
+  snapshot
+  --destination "$rollback_snapshot"
+  --home "$target_home"
+)
+if [ "$system" = darwin ] && [ "$service_had_file" -eq 1 ]; then
+  snapshot_args+=(--plist "$service_file")
+elif [ "$system" = linux ] && [ -f "$wrapper_env_file" ]; then
+  snapshot_args+=(--env-file "$wrapper_env_file")
+fi
+if [ -n "${linux_profile:-}" ]; then
+  linux_service snapshot --destination "$rollback_snapshot"
+else
+  "$target/.venv/bin/python" "$target/deploy/work_registry_snapshot.py" \
+    "${snapshot_args[@]}" >/dev/null
+fi
+snapshot_created=1
 
 if [ "$system" = darwin ]; then
   "$target/.venv/bin/python" - \
     "$target/deploy/com.muggle.cc-remote.wrapper.plist.in" \
-    "$service_file" "$current" "$target_home" "$log_dir" <<'PY'
+    "$service_file" "$current" "$target_home" "$log_dir" \
+    "$service_backup" "$service_label" <<'PY'
 from pathlib import Path
+import plistlib
 import sys
 from xml.sax.saxutils import escape
 
-source, destination, current, home, log_dir = map(Path, sys.argv[1:])
+source, destination, current, home, log_dir = map(Path, sys.argv[1:6])
+previous_plist = Path(sys.argv[6]) if sys.argv[6] else None
 text = source.read_text(encoding="utf-8")
+previous_environment = {}
+work_roots = {
+    "CLAUDE_WORK_ROOT": str(home / ".claude" / "cc-remote" / "work"),
+    "CODEX_WORK_ROOT": str(home / ".codex" / "cc-remote" / "work"),
+}
+if previous_plist is not None:
+    with previous_plist.open("rb") as stream:
+        previous = plistlib.load(stream)
+    environment = previous.get("EnvironmentVariables", {})
+    if isinstance(environment, dict):
+        previous_environment = environment
+        for key in work_roots:
+            value = environment.get(key)
+            if isinstance(value, str) and value:
+                work_roots[key] = value
 values = {
     "__CURRENT__": escape(str(current)),
     "__HOME__": escape(str(home)),
     "__LOG_DIR__": escape(str(log_dir)),
+    "__CLAUDE_WORK_ROOT__": escape(work_roots["CLAUDE_WORK_ROOT"]),
+    "__CODEX_WORK_ROOT__": escape(work_roots["CODEX_WORK_ROOT"]),
 }
 for marker, value in values.items():
     text = text.replace(marker, value)
-if "__" in text:
+if any(marker in text for marker in values):
     raise SystemExit("unresolved LaunchAgent template marker")
 staged = destination.with_name(f".{destination.name}.new")
-staged.write_text(text, encoding="utf-8")
+payload = plistlib.loads(text.encode("utf-8"))
+payload["Label"] = sys.argv[7]
+# Operator configuration (including the independent Claude service endpoint)
+# survives a Wrapper upgrade. New installs still use the secret-free template.
+payload["EnvironmentVariables"].update(previous_environment)
+if previous_plist is not None:
+    for key in ("StandardOutPath", "StandardErrorPath"):
+        if isinstance(previous.get(key), str):
+            payload[key] = previous[key]
+staged.write_bytes(plistlib.dumps(payload))
 staged.replace(destination)
 PY
   service_changed=1
   chmod 0644 "$service_file"
   plutil -lint "$service_file" >/dev/null
+elif [ "$service_manager" = supervisor ]; then
+  linux_service render --template "$target/deploy/cc-remote-wrapper.service"
+  service_changed=1
 else
-  if [ ! -e "$config_dir/wrapper.env" ]; then
+  if [ ! -e "$wrapper_env_file" ]; then
     umask 077
     env_stage="$(mktemp "$config_dir/.wrapper.env.XXXXXX")"
     {
@@ -387,27 +812,33 @@ else
         'WRAPPER_SEND_QUEUE_CAP=8192' \
         'LOG_LEVEL=INFO'
     } > "$env_stage"
-    install -o root -g root -m 0600 "$env_stage" "$config_dir/wrapper.env"
+    install -o root -g root -m 0600 "$env_stage" "$wrapper_env_file"
     rm -f -- "$env_stage"
   else
-    if [ ! -f "$config_dir/wrapper.env" ] || \
-        [ -L "$config_dir/wrapper.env" ]; then
-      die "$config_dir/wrapper.env must be a regular file"
+    if [ ! -f "$wrapper_env_file" ] || \
+        [ -L "$wrapper_env_file" ]; then
+      die "$wrapper_env_file must be a regular file"
     fi
-    chmod 0600 "$config_dir/wrapper.env"
+    chmod 0600 "$wrapper_env_file"
   fi
   "$target/.venv/bin/python" - \
     "$target/deploy/cc-remote-wrapper.service" "$service_file" \
-    "$target_user" "$current" "$target_home" <<'PY'
+    "$target_user" "$current" "$target_home" "$adopt_root" "$service_backup" <<'PY'
 from pathlib import Path
 import sys
 
 source, destination = map(Path, sys.argv[1:3])
-user, current, home = sys.argv[3:]
-text = source.read_text(encoding="utf-8")
-text = text.replace("youruser", user)
-text = text.replace("/path/to/cc-remote", current)
-text = text.replace(f"/home/{user}", home)
+user, current, home, legacy, backup = sys.argv[3:]
+if backup:
+    sys.path.insert(0, str(source.parents[1]))
+    from deploy.adopt_wrapper import rebase_service
+    old_current = Path(legacy) / "current" if legacy else Path(current)
+    text = rebase_service(Path(backup).read_text(encoding="utf-8"), old_current, Path(current), user)
+else:
+    text = source.read_text(encoding="utf-8")
+    text = text.replace("youruser", user)
+    text = text.replace("/path/to/cc-remote", current)
+    text = text.replace(f"/home/{user}", home)
 staged = destination.with_name(f".{destination.name}.new")
 staged.write_text(text, encoding="utf-8")
 staged.replace(destination)
@@ -425,6 +856,7 @@ fi
 
 "$target/.venv/bin/python" "$target/deploy/atomic_symlink.py" "$target" "$current"
 switched=1
+activation_started="$(date +%s)"
 
 if [ "$system" = darwin ]; then
   domain="gui/$(id -u)"
@@ -432,6 +864,13 @@ if [ "$system" = darwin ]; then
   launchctl bootstrap "$domain" "$service_file"
   launchctl kickstart -k "$domain/$service_label"
   launchctl print "$domain/$service_label" >/dev/null
+elif [ "$service_manager" = supervisor ]; then
+  linux_service start
+  for _attempt in $(seq 1 20); do
+    if wrapper_service_active; then break; fi
+    sleep 1
+  done
+  wrapper_service_active || die "Supervisor Wrapper did not start"
 else
   systemctl daemon-reload
   systemctl enable "$service_label"
@@ -439,14 +878,80 @@ else
   systemctl is-active --quiet "$service_label"
 fi
 
+migration_ready=0
+for _attempt in $(seq 1 20); do
+  if "$target/.venv/bin/python" \
+      "$target/deploy/work_registry_snapshot.py" verify \
+      --snapshot "$rollback_snapshot" >/dev/null 2>&1; then
+    migration_ready=1
+    break
+  fi
+  wrapper_service_active || break
+  sleep 1
+done
+if [ "$migration_ready" -ne 1 ]; then
+  "$target/.venv/bin/python" \
+    "$target/deploy/work_registry_snapshot.py" verify \
+    --snapshot "$rollback_snapshot" || true
+  die "Claude/Codex Work profile migrations did not become ready"
+fi
+
+# The real Wrapper prepares and probes each account as the service user. Read
+# its fresh result here; never run a user's Codex binary as the Linux installer.
+codex_check_args=(--home "$target_home" --release "$target" --after "$activation_started")
+if [ "$system" = darwin ]; then
+  codex_check_args+=(--plist "$service_file")
+elif [ -n "${linux_profile:-}" ]; then
+  codex_check_args+=(--state-dir "$(linux_service probe-state)")
+else
+  codex_check_args+=(--env-file "$wrapper_env_file")
+fi
+echo "==> checking Codex shared connections (no model messages)"
+if ! "$target/.venv/bin/python" "$target/deploy/check_codex_readiness.py" \
+    "${codex_check_args[@]}"; then
+  echo "WARNING: Wrapper is installed; Codex sharing still needs attention."
+fi
+
+if [ -n "${linux_profile:-}" ]; then linux_service health; fi
+
+# Keep registration after the interruptible readiness check. Once it succeeds,
+# post-install output failures must not roll back a registered installation.
+cli_args=(--root "$appdir" --destination "$cli_path" --role wrapper --user "$target_user")
+if [ "$system" = darwin ]; then
+  cli_args+=(--service-label "$service_label")
+elif [ -n "${linux_profile:-}" ]; then
+  cli_args+=(--linux-service "$linux_profile")
+fi
+"$target/.venv/bin/python" "$target/deploy/install_cli.py" "${cli_args[@]}"
+activation_committed=1
+
+# The downloaded installer owns retention, so even an older update command gets
+# the new policy. Never roll back a committed activation because cleanup defers.
+if [ -n "$retention_generation" ]; then
+  if "$target/.venv/bin/python" "$target/deploy/release_retention.py" commit \
+      --root "$appdir" --generation "$retention_generation" --snapshot "$rollback_snapshot"; then
+    "$target/.venv/bin/python" "$target/deploy/release_retention.py" prune --root "$appdir" || \
+      echo "WARNING: Older backups retained; inspect the retention report before cleanup."
+  else
+    echo "WARNING: Installed, but retention acceptance is incomplete; all backups retained."
+  fi
+fi
+
 echo
 echo "Wrapper v$version installed from $git_sha."
 echo "Active release: $target"
 if [ -n "$previous" ] && [ "$previous" != "$target" ]; then
   echo "Previous release retained for rollback: $previous"
+  echo "Matching wrapper data snapshot: $rollback_snapshot"
 fi
 if [ "$system" = darwin ]; then
   echo "Logs: $log_dir"
+elif [ "${service_manager:-systemd}" = supervisor ]; then
+  echo "Logs: supervisorctl -c $supervisor_config tail $service_label"
 else
   echo "Logs: journalctl -u $service_label -f"
+fi
+echo "Updates: $cli_path update (check only: $cli_path update --check)"
+if [ "$system" = darwin ] && ! command -v cc-remote >/dev/null 2>&1; then
+  echo 'Add ~/.local/bin to PATH to use the cc-remote command.'
 fi

@@ -7,11 +7,17 @@ import configparser
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
+import shlex
+import sqlite3
+import stat
 import subprocess
+import sys
 
 import pytest
 
+from cc_remote.protocol import PROTOCOL_VERSION
 from deploy.caddy_managed_block import (
     BEGIN_MARKER,
     END_MARKER,
@@ -23,6 +29,14 @@ from deploy.caddy_managed_block import (
 from deploy.validate_protocol_bundle import (
     ProtocolBundleError,
     validate_protocol_bundle,
+)
+from deploy.work_registry_snapshot import (
+    WorkRegistrySnapshotError,
+    create_snapshot,
+    resolve_work_roots,
+    resolve_wrapper_state_dir,
+    restore_snapshot,
+    verify_profile_migration,
 )
 
 
@@ -78,6 +92,22 @@ def test_live_scripts_require_an_explicit_main_entrypoint():
             assert not _contains_asyncio_run(node), (
                 f"{path.name} starts a live run while being imported"
             )
+
+
+def test_repository_deployment_contract_is_the_agent_entrypoint():
+    agents = (ROOT / "AGENTS.md").read_text()
+    deploy_readme = (ROOT / "deploy" / "README.md").read_text()
+    normalized = " ".join(deploy_readme.split())
+
+    assert "[`deploy/README.md`](deploy/README.md)" in agents
+    assert "out-of-tree instructions" in agents
+    assert "## Deployment contract for automation" in deploy_readme
+    assert "never guess them" in normalized
+    assert "Freeze those tested bytes once" in normalized
+    assert "unknown result" in normalized
+    assert "Never start a second installer" in normalized
+    assert "must not be its own only deployment controller" in normalized
+    assert "stable PIDs without restart loops" in normalized
 
 
 def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
@@ -201,7 +231,8 @@ def test_insecure_caddy_template_is_explicit_http_without_tls_headers():
     assert "ws://cc-remote.example.com" in source
     assert "reverse_proxy 127.0.0.1:8765" in source
     assert "Strict-Transport-Security" not in source
-    assert "https://" not in source
+    # HTTPS-only remote images do not make the application site use TLS.
+    assert "https://cc-remote.example.com" not in source
 
 
 def test_deploy_examples_configure_insecure_flag_on_both_sides():
@@ -246,6 +277,212 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert "--hash=sha256:" in lock
     assert "cryptography==" in lock
     assert "Python 3.10 or newer is required" in source
+
+
+def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
+    tmp_path,
+):
+    claude_root = tmp_path / "claude-work"
+    codex_root = tmp_path / "codex-work"
+    codex_root.mkdir()
+    codex_database = codex_root / "registry.sqlite3"
+    writer = sqlite3.connect(codex_database)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.execute("INSERT INTO marker VALUES ('before')")
+    writer.commit()
+    assert Path(f"{codex_database}-wal").exists()
+
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, {"claude": claude_root, "codex": codex_root})
+
+    writer.execute("ALTER TABLE marker ADD COLUMN migrated INTEGER")
+    writer.execute("INSERT INTO marker VALUES ('after', 1)")
+    writer.commit()
+    writer.close()
+    claude_root.mkdir()
+    with sqlite3.connect(claude_root / "registry.sqlite3") as database:
+        database.execute("CREATE TABLE created_after_snapshot (value INTEGER)")
+
+    restore_snapshot(snapshot)
+
+    with sqlite3.connect(codex_database) as restored:
+        assert restored.execute("SELECT value FROM marker").fetchall() == [
+            ("before",),
+        ]
+        assert [row[1] for row in restored.execute(
+            "PRAGMA table_info(marker)"
+        )] == ["value"]
+    assert not (claude_root / "registry.sqlite3").exists()
+    assert not Path(f"{codex_database}-wal").exists()
+    assert not Path(f"{codex_database}-shm").exists()
+
+
+def test_release_snapshot_restores_versioned_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    original = b'{"version":2,"sessions":{}}\n'
+    controls.write_bytes(original)
+    controls.chmod(0o600)
+
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots, state_dir=state_dir)
+    controls.write_bytes(b'{"version":3,"sessions":{"new":{}}}\n')
+    controls.chmod(0o600)
+
+    restore_snapshot(snapshot)
+
+    assert controls.read_bytes() == original
+    assert stat.S_IMODE(controls.stat().st_mode) == 0o600
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    assert manifest["version"] == 3
+    assert manifest["wrapper_state"]["files"][controls.name]["exists"] is True
+
+
+def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots, state_dir=state_dir)
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    controls.write_text('{"version":3,"sessions":{}}')
+    controls.chmod(0o600)
+
+    restore_snapshot(snapshot)
+
+    assert not controls.exists()
+
+
+def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    controls = state_dir / "claude-session-controls.json"
+    controls.write_text('{"version":3,"sessions":{}}')
+    controls.chmod(0o644)
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="private bounded file",
+    ):
+        create_snapshot(
+            tmp_path / "snapshot", roots, state_dir=state_dir)
+
+
+def test_release_snapshot_rejects_boolean_manifest_version(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots)
+    manifest_path = snapshot / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["version"] = True
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="unsupported wrapper data snapshot",
+    ):
+        restore_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_work_registry_migration_verifier_rejects_unowned_profile_rows(
+    tmp_path, engine,
+):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    for candidate, root in roots.items():
+        root.mkdir()
+        profile_column = f"{candidate}_profile_id"
+        with sqlite3.connect(root / "registry.sqlite3") as database:
+            database.executescript(
+                f"""
+                CREATE TABLE work_sessions (
+                    engine TEXT NOT NULL,
+                    {profile_column} TEXT
+                );
+                CREATE TABLE work_schedules ({profile_column} TEXT);
+                CREATE TABLE work_schedule_runs ({profile_column} TEXT);
+                INSERT INTO work_sessions VALUES ('{candidate}', 'primary');
+                INSERT INTO work_schedules VALUES ('primary');
+                INSERT INTO work_schedule_runs VALUES ('primary');
+                """
+            )
+    database_path = roots[engine] / "registry.sqlite3"
+    profile_column = f"{engine}_profile_id"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            f"UPDATE work_sessions SET {profile_column} = NULL")
+        database.execute(
+            f"UPDATE work_schedules SET {profile_column} = NULL")
+        database.execute(
+            f"UPDATE work_schedule_runs SET {profile_column} = NULL")
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots)
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="ownership migration is incomplete",
+    ):
+        verify_profile_migration(snapshot)
+
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            f"UPDATE work_sessions SET {profile_column} = 'primary'"
+        )
+        database.execute(
+            f"UPDATE work_schedules SET {profile_column} = 'primary'"
+        )
+        database.execute(
+            f"UPDATE work_schedule_runs SET {profile_column} = 'primary'"
+        )
+    verify_profile_migration(snapshot)
+
+
+def test_work_registry_roots_are_read_without_executing_service_config(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = tmp_path / "wrapper.env"
+    env_file.write_text(
+        f'CLAUDE_WORK_ROOT="{tmp_path / "Claude Work"}"\n'
+        f"CODEX_WORK_ROOT={tmp_path / 'codex-env'}\n"
+        f"CC_REMOTE_STATE_DIR={tmp_path / 'state-env'}\n"
+    )
+    plist = tmp_path / "wrapper.plist"
+    plist.write_bytes(plistlib.dumps({
+        "EnvironmentVariables": {
+            "CODEX_WORK_ROOT": str(tmp_path / "Codex Work"),
+            "CC_REMOTE_STATE_DIR": str(tmp_path / "State Dir"),
+        },
+    }))
+
+    roots = resolve_work_roots(home, env_file=env_file, plist=plist)
+
+    assert roots == {
+        "claude": (tmp_path / "Claude Work").resolve(),
+        "codex": (tmp_path / "Codex Work").resolve(),
+    }
+    assert resolve_wrapper_state_dir(
+        home, env_file=env_file, plist=plist,
+    ) == (tmp_path / "State Dir").resolve()
 
 
 @pytest.mark.parametrize("destination_exists", [False, True])
@@ -347,8 +584,11 @@ def test_release_permissions_remove_inherited_group_write_and_other_access(
     assert executable.stat().st_mode & 0o777 == 0o750
 
 
-def test_injected_post_switch_failure_restores_full_release_caddy_and_unit(
-    tmp_path,
+@pytest.mark.parametrize("activation", [
+    "readiness-failure", "registration-failure", "registration-success", "source-success",
+])
+def test_post_switch_activation_commits_or_restores_full_release_caddy_and_unit(
+    tmp_path, activation,
 ):
     appdir = tmp_path / "app"
     releases = appdir / "releases"
@@ -372,6 +612,15 @@ def test_injected_post_switch_failure_restores_full_release_caddy_and_unit(
     unit.write_text("new unit")
     unit_backup.write_text("old unit")
     systemctl_log = tmp_path / "systemctl.log"
+    cli_log = tmp_path / "cli-registration.log"
+    if activation.startswith("registration-"):
+        runtime = new_release / ".venv/bin/python"
+        runtime.parent.mkdir()
+        runtime.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$@" > "$CLI_REGISTRATION_LOG"\n'
+            + ("exit 0\n" if activation.endswith("success") else "exit 23\n")
+        )
+        runtime.chmod(0o755)
 
     harness = r'''
 set -euo pipefail
@@ -410,6 +659,18 @@ RELEASE_SWITCHED=1
 atomic_release_link "$NEW_RELEASE_DIR" "$CURRENT_LINK"
 false  # injected relay readiness failure after the complete release switch
 '''
+    if activation != "readiness-failure":
+        # Execute the real setup tail so registration must finish successfully
+        # before the transaction commits; no system package/service setup runs.
+        setup_tail = (ROOT / "deploy/setup-vps.sh").read_text().split(
+            'echo "==> waiting for relay readiness"', 1)[1]
+        harness = harness.replace(
+            "false  # injected relay readiness failure after the complete release switch",
+            f'MANAGED_RELEASE={0 if activation == "source-success" else 1}\n'
+            'CLI_PATH="$APPDIR/cc-remote"\nRETENTION_GENERATION=""\n'
+            'TARGET=remote.example.test\nPUBLIC_SCHEME=https\nINSECURE_HTTP=0\n'
+            + setup_tail,
+        )
     result = subprocess.run(
         [
             "bash", "-c", harness, "rollback-test",
@@ -418,11 +679,28 @@ false  # injected relay readiness failure after the complete release switch
             str(caddyfile), str(caddy_backup), str(unit), str(unit_backup),
             str(systemctl_log),
         ],
-        env={**os.environ, "CURL_LOG": str(tmp_path / "curl.log")},
+        env={**os.environ, "CURL_LOG": str(tmp_path / "curl.log"),
+             "CLI_REGISTRATION_LOG": str(cli_log)},
         text=True,
         capture_output=True,
     )
 
+    if activation.startswith("registration-"):
+        arguments = cli_log.read_text().splitlines()
+        assert arguments == [
+            str(new_release / "deploy/install_cli.py"),
+            "--root", str(appdir), "--destination", str(appdir / "cc-remote"),
+            "--role", "relay", "--domain", "remote.example.test",
+        ]
+    elif activation == "source-success":
+        assert not cli_log.exists()
+    if activation.endswith("success"):
+        assert result.returncode == 0, result.stderr
+        assert current.resolve() == new_release.resolve()
+        assert caddyfile.read_text() == "new caddy"
+        assert unit.read_text() == "new unit"
+        assert not systemctl_log.exists()
+        return
     assert result.returncode != 0
     assert current.resolve() == old_release.resolve()
     for relative in ("cc_remote", "web/dist", ".venv"):
@@ -442,6 +720,67 @@ false  # injected relay readiness failure after the complete release switch
     assert "previous relay passed /healthz" in result.stderr
     assert not caddy_backup.exists()
     assert not unit_backup.exists()
+
+
+@pytest.mark.parametrize('failure', ['backup-error', 'interrupted-copy'])
+def test_relay_retention_setup_failure_keeps_the_prepared_release(tmp_path, failure):
+    appdir = tmp_path.resolve() / 'app'
+    old = appdir / 'releases/release-old'
+    new = appdir / 'releases/release-new'
+    old.mkdir(parents=True)
+    (new / 'deploy').mkdir(parents=True)
+    (appdir / 'current').symlink_to(old)
+    (new / 'release-manifest.json').write_text(json.dumps({
+        'schema': 1, 'product_version': '4.0.9', 'protocol_version': 74,
+        'git_sha': 'a' * 40, 'role': 'relay', 'os': 'linux', 'arch': 'x86_64',
+        'python': '3.13.9', 'uv': '0.11.16',
+    }))
+    (appdir / 'relay.service').write_text('original service\n')
+    (appdir / '.env').write_text('PUBLIC_ORIGIN=https://relay.test\n')
+    # A genuine backup error after begin has persisted its prepared ledger.
+    (appdir / 'Caddyfile').symlink_to(appdir / '.env')
+    driver = new / 'deploy/release_retention.py'
+    driver.write_text(
+        'import os, runpy, shutil, signal\n'
+        + ('shutil.copyfileobj = lambda *a: os.kill(os.getpid(), signal.SIGTERM)\n'
+           if failure == 'interrupted-copy' else '')
+        + f'runpy.run_path({str(ROOT / "deploy/release_retention.py")!r}, run_name="__main__")\n'
+    )
+    python = new / '.venv/bin/python'
+    python.parent.mkdir(parents=True)
+    python.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' "$@"\n')
+    python.chmod(0o755)
+    setup = (ROOT / 'deploy/setup-vps.sh').read_text()
+    initial_state = setup[setup.index('NEW_RELEASE_DIR=""'):setup.index('[ -r "$SOURCE_DIR/deploy/setup_transaction.sh"')]
+    stop = setup.index('echo "==> Caddy config')
+    begin = setup[setup.rindex('if (( MANAGED_RELEASE )); then', 0, stop):stop]
+    harness = r'''
+set -euo pipefail
+source "$1"
+APPDIR="$2"
+RELEASES_DIR="$APPDIR/releases"
+CURRENT_LINK="$APPDIR/current"
+''' + initial_state + r'''
+MANAGED_RELEASE=1
+NEW_RELEASE_DIR="$RELEASES_DIR/release-new"
+PREVIOUS_RELEASE="$RELEASES_DIR/release-old"
+RELAY_UNIT_FILE="$APPDIR/relay.service"
+CADDYFILE="$APPDIR/Caddyfile"
+ENV_FILE="$APPDIR/.env"
+trap cleanup EXIT
+''' + begin
+    result = subprocess.run(['bash', '-c', harness, 'retention-setup-test',
+                             str(ROOT / 'deploy/setup_transaction.sh'), str(appdir)],
+                            text=True, capture_output=True)
+    assert result.returncode != 0
+    ledger = json.loads((appdir / '.release-generations.json').read_text())
+    [row] = ledger['generations']
+    assert row['phase'] == ledger['phase'] == 'prepared'
+    assert row['release'] == str(new) and row['artifacts'] == {}
+    assert Path(row['backup']).is_dir()
+    assert new.is_dir() and (appdir / 'current').resolve() == old
+    assert (appdir / 'relay.service').read_text() == 'original service\n'
+    assert 'retaining staged release for transaction inspection' in result.stderr
 
 
 def test_failed_release_rollback_never_deletes_the_still_active_release(tmp_path):
@@ -546,7 +885,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v29_layout():
+def test_release_docs_and_examples_describe_one_atomic_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -559,10 +898,12 @@ def test_release_docs_and_examples_describe_one_atomic_v29_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v29" in deploy_readme
+    assert f"Protocol v{PROTOCOL_VERSION}" in deploy_readme
+    assert "both engines' Work ownership backfills" in deploy_readme
+    assert "Snapshot format v3" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v29" in document
+        assert f"v{PROTOCOL_VERSION}" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -571,13 +912,42 @@ def test_release_docs_and_examples_describe_one_atomic_v29_layout():
     assert "CLAUDE_BIN=/home/youruser/.local/bin/claude" in wrapper_env
     assert "<key>CLAUDE_BIN</key>" in wrapper_plist
     assert "<string>__HOME__/.local/bin/claude</string>" in wrapper_plist
+    assert "CC_REMOTE_CODEX_PROFILES_JSON" in wrapper_env
+    assert "CC_REMOTE_CODEX_PROFILES_FILE" in wrapper_env
+    assert "CC_REMOTE_CLAUDE_PROFILES_JSON" in wrapper_env
+    assert "CC_REMOTE_CLAUDE_PROFILES_FILE" in wrapper_env
+    assert "Codex Work uses only that default" not in wrapper_env
+    assert "Work 只使用默认项" not in readme
+    assert "Work uses only the default" not in readme_en
+    assert "<key>CC_REMOTE_CODEX_PROFILES_FILE</key>" in wrapper_plist
+    assert "__HOME__/.cc-remote/codex-profiles.json" in wrapper_plist
+    assert "<key>CC_REMOTE_CLAUDE_PROFILES_FILE</key>" in wrapper_plist
+    assert "__HOME__/.cc-remote/claude-profiles.json" in wrapper_plist
+    assert "<key>CLAUDE_WORK_ROOT</key>" in wrapper_plist
+    assert "<string>__CLAUDE_WORK_ROOT__</string>" in wrapper_plist
+    assert "<key>CODEX_WORK_ROOT</key>" in wrapper_plist
+    assert "<string>__CODEX_WORK_ROOT__</string>" in wrapper_plist
     assert "printf 'CLAUDE_BIN=%s/.local/bin/claude" in wrapper_installer
     assert "daily Claude Code executable is missing" in wrapper_installer
+    snapshot = wrapper_installer.index('"${snapshot_args[@]}"')
+    activate = wrapper_installer.index(
+        '"$target/deploy/atomic_symlink.py" "$target" "$current"'
+    )
+    restore = wrapper_installer.index(
+        '"$target/deploy/work_registry_snapshot.py" restore'
+    )
+    restart = wrapper_installer.index("if ! restart_after_rollback")
+    assert snapshot < activate
+    assert restore < restart
+    assert (
+        "Claude/Codex Work profile migrations did not become ready"
+        in wrapper_installer
+    )
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
-    assert "claude-agent-sdk==0.2.128" in claude
-    assert "protocol v29" in claude
+    assert "claude-agent-sdk==0.2.157" in claude
+    assert f"protocol v{PROTOCOL_VERSION}" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 
@@ -759,6 +1129,7 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
         "not path /html-preview-runner.html /html-preview-runner.js"
         in source
     )
+    assert "not path /html-preview-runner.html /html-preview-runner.js /__cc_viewer/bridge/*" in source
     assert (
         "@html_preview path /html-preview-runner.html /html-preview-runner.js"
         in source
@@ -785,7 +1156,7 @@ def test_html_preview_runner_has_a_narrow_isolated_policy(template):
 
 
 @pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
-def test_caddy_image_policy_allows_only_image_blob_urls(template):
+def test_caddy_blob_policy_is_limited_to_image_and_audio_previews(template):
     source = (ROOT / "deploy" / template).read_text()
     match = re.search(r'Content-Security-Policy "([^"]+)"', source)
     assert match is not None
@@ -795,45 +1166,45 @@ def test_caddy_image_policy_allows_only_image_blob_urls(template):
         if (parts := directive.strip().split())
     }
     assert "blob:" in directives["img-src"]
+    assert directives["media-src"] == ["blob:"]
     assert all(
         "blob:" not in sources
         for name, sources in directives.items()
-        if name != "img-src"
+        if name not in {"img-src", "media-src"}
     )
 
 
 @pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
-def test_caddy_routes_dsh_panel_to_its_own_upstream(template):
-    """The DSH panel is same-origin and must reach the desktop tunnel port.
-
-    ``handle_path`` strips the ``/dsh`` prefix because the DSH shell declares
-    ``<base href="./">`` and relative asset URLs while its own Host answers
-    ``/``; forwarding ``/dsh/...`` verbatim would 404 every asset.
-    """
-    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
-
-    assert "handle_path /dsh/* {" in source
-    assert "reverse_proxy 127.0.0.1:3082" in source
-    # The relay must stay the catch-all upstream for everything else.
-    assert "reverse_proxy 127.0.0.1:8765" in source
-    # Order matters for readability: the specific route is declared first.
-    assert source.index("handle_path /dsh/*") < source.index(
-        "reverse_proxy 127.0.0.1:8765")
-
-
-@pytest.mark.parametrize("template", ["Caddyfile", "Caddyfile.insecure"])
-def test_dsh_panel_is_exempt_from_unframeable_application_headers(template):
-    """@application sets ``frame-ancestors 'none'`` and ``X-Frame-Options DENY``.
-
-    The cc-remote page embeds the DSH panel in an iframe, so ``/dsh/*`` must not
-    inherit either header or every browser refuses to render the panel.
-    """
-    source = (ROOT / "deploy" / template).read_text(encoding="utf-8")
-    matcher = re.search(r"@application \{\s*\n\s*not path ([^\n}]+)\n", source)
-    assert matcher is not None, "expected an @application path matcher"
-    assert "/dsh/*" in matcher.group(1)
-
-    # The unframeable directives must still be present for every other path.
-    application = source.split("header @application", 1)[1].split("}", 1)[0]
-    assert "frame-ancestors 'none'" in application
-    assert 'X-Frame-Options "DENY"' in application
+def test_caddy_github_image_allowlist_does_not_relax_other_capabilities(template):
+    source = (ROOT / "deploy" / template).read_text()
+    policies = re.findall(r'Content-Security-Policy "([^"]+)"', source)
+    assert len(policies) == 2
+    application, preview = (
+        {
+            parts[0]: set(parts[1:])
+            for directive in policy.split(";")
+            if (parts := directive.strip().split())
+        }
+        for policy in policies
+    )
+    github_images = {
+        "https://github.com/user-attachments/assets/",
+        "https://raw.githubusercontent.com",
+        "https://user-images.githubusercontent.com",
+        "https://private-user-images.githubusercontent.com",
+        "https://camo.githubusercontent.com",
+        "https://avatars.githubusercontent.com",
+        "https://github-production-user-asset-6210df.s3.amazonaws.com",
+    }
+    assert application["img-src"] == {"'self'", "data:", "blob:"} | github_images
+    for directive, sources in application.items():
+        if directive != "img-src":
+            assert sources.isdisjoint(github_images)
+    assert application["script-src"] == {"'self'"}
+    ws_scheme = "ws" if template.endswith(".insecure") else "wss"
+    assert application["connect-src"] == {
+        "'self'", f"{ws_scheme}://cc-remote.example.com",
+    }
+    assert application["frame-src"] == {"'self'"}
+    assert preview["img-src"] == {"data:", "blob:"}
+    assert preview["connect-src"] == {"'none'"}

@@ -1,5 +1,5 @@
 import type {
-  Engine,
+  Engine, DshCommandInfo,
   EngineCapabilities,
   EngineCapabilityItem,
   Space,
@@ -9,6 +9,7 @@ export const SKILL_CATALOG_TTL_MS = 5 * 60_000;
 export const MAX_SKILL_CATALOGS = 32;
 
 export interface SkillCatalogCacheEntry {
+  dshCommands?: DshCommandInfo[];
   items: EngineCapabilityItem[];
   fetchedAt: number;
 }
@@ -19,6 +20,10 @@ export interface SkillCatalogRequest {
   space: Space;
   cwd: string;
   skillsOnly: boolean;
+  claudeProfileId?: string | null;
+  codexProfileId?: string | null;
+  sid?: string | null;
+  dshPreset?: string | null;
 }
 
 export interface SkillCatalogReadIdentity extends SkillCatalogRequest {
@@ -44,7 +49,20 @@ export const skillCatalogKey = (
   engine: Engine,
   space: Space,
   cwd: string,
-): string => [machineId, engine, space, cwd || "."].join("\u0000");
+  codexProfileId?: string | null,
+  claudeProfileId?: string | null,
+  sid?: string | null,
+): string => [
+  machineId,
+  engine,
+  space,
+  engine === "codex"
+    ? (codexProfileId || "__default__")
+    : engine === "claude"
+      ? (claudeProfileId || "__default__")
+      : (sid || "__new__"),
+  cwd || ".",
+].join("\u0000");
 
 export const skillCatalogReadKey = (
   catalogKey: string,
@@ -63,6 +81,13 @@ export const skillCatalogResponseMatches = (
   // before the request. Explicit cwd scopes still require exact equality.
   && (!read.cwd || response.cwd === read.cwd)
   && response.skills_only === read.skillsOnly
+  && (read.engine !== "dsh" || (response.sid ?? null) === (read.sid ?? null))
+  && (read.engine !== "codex"
+    || (response.codex_profile_id ?? null)
+      === (read.codexProfileId ?? null))
+  && (read.engine !== "claude"
+    || (response.claude_profile_id ?? null)
+      === (read.claudeProfileId ?? null))
 );
 
 export const skillCatalogMutationResponseMatches = (
@@ -91,8 +116,9 @@ export function cacheSkillCatalog(
   key: string,
   items: EngineCapabilityItem[],
   fetchedAt = Date.now(),
+  dshCommands?: DshCommandInfo[],
 ): Record<string, SkillCatalogCacheEntry> {
-  const next = { ...current, [key]: { items, fetchedAt } };
+  const next = { ...current, [key]: { items, fetchedAt, ...(dshCommands ? {dshCommands} : {}) } };
   const keys = Object.keys(next);
   if (keys.length <= MAX_SKILL_CATALOGS) return next;
   keys.sort((a, b) => next[a].fetchedAt - next[b].fetchedAt);
@@ -195,6 +221,23 @@ export class SkillCatalogRequestCoordinator {
         && skillCatalogReadKey(active.key, active.skillsOnly)
           === readKey
     ) || this.queued.has(readKey);
+  }
+
+  fail(requestId: string): SkillCatalogRequest | null {
+    for (const [lane, read] of this.active) {
+      if (read.requestId !== requestId) continue;
+      this.active.delete(lane);
+      this.drain();
+      return read;
+    }
+    const mutation = this.mutations.get(requestId);
+    if (!mutation) return null;
+    this.mutations.delete(requestId);
+    if (!this.hasPendingMutation(mutation.key)) {
+      this.latestMutationByScope.delete(mutation.key);
+    }
+    this.drain();
+    return mutation;
   }
 
   hasPendingMutation(key: string): boolean {

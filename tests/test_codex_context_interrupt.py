@@ -6,7 +6,9 @@ import os
 import tempfile
 
 import cc_remote.wrapper.codex_sessions as codex_sessions
+import cc_remote.wrapper.codex_handle as codex_handle_module
 
+from cc_remote.protocol import MAX_SAFE_WIRE_INTEGER
 from cc_remote.wrapper.codex_handle import CodexHandle
 from cc_remote.wrapper.codex_stream import CodexStreamTranslator
 
@@ -51,6 +53,145 @@ def test_context_uses_last_not_cumulative_total():
         "modelContextWindow": 258400}}}))
     u = asyncio.run(h.get_context_usage())
     assert u["used_tokens"] == 40000, u   # last, NOT 120000
+
+
+def test_context_rejects_invalid_live_token_usage_values():
+    h = CodexHandle(_Cfg())
+    h.last_token_usage = {
+        "last": {"totalTokens": True},
+        "total": {"totalTokens": -5},
+        "modelContextWindow": "not-a-number",
+    }
+    h.context_window = True
+
+    usage = asyncio.run(h.get_context_usage())
+
+    assert usage["used_tokens"] is None
+    assert isinstance(usage["context_window"], int)
+    assert not isinstance(usage["context_window"], bool)
+
+    h.last_token_usage = {
+        "last": {"totalTokens": MAX_SAFE_WIRE_INTEGER + 1},
+        "total": {"totalTokens": MAX_SAFE_WIRE_INTEGER + 1},
+        "modelContextWindow": MAX_SAFE_WIRE_INTEGER + 1,
+    }
+    h.context_window = MAX_SAFE_WIRE_INTEGER + 1
+    usage = asyncio.run(h.get_context_usage())
+    assert usage["used_tokens"] is None
+    assert 0 < usage["context_window"] <= MAX_SAFE_WIRE_INTEGER
+
+
+def test_work_cold_resume_recovers_context_until_live_notification(monkeypatch):
+    recovered_calls = []
+
+    def recover(session_id, *, codex_home=None):
+        recovered_calls.append((session_id, codex_home))
+        return {
+            "last": {"totalTokens": 103658},
+            "modelContextWindow": 258400,
+        }
+
+    monkeypatch.setattr(codex_handle_module, "recover_codex_context_usage", recover)
+    h = CodexHandle(_Cfg(), work_mode=True, codex_home="/tmp/profile")
+    h.thread_id = "native-session"
+    cold = asyncio.run(h.get_context_usage())
+    assert cold["used_tokens"] == 103658
+    assert cold["context_window"] == 258400
+    assert recovered_calls == [(
+        "native-session", os.path.realpath("/tmp/profile"))]
+
+    asyncio.run(h._dispatch({
+        "method": "thread/tokenUsage/updated",
+        "params": {"tokenUsage": {
+            "last": {"totalTokens": 104321},
+            "modelContextWindow": 300000,
+        }},
+    }))
+    live = asyncio.run(h.get_context_usage())
+    assert live["used_tokens"] == 104321
+    assert live["context_window"] == 300000
+    assert len(recovered_calls) == 1
+
+
+def test_code_cold_resume_recovers_profile_scoped_context(monkeypatch):
+    recovered_calls = []
+
+    def recover(session_id, *, codex_home=None):
+        recovered_calls.append((session_id, codex_home))
+        return {
+            "last": {"totalTokens": 88_765},
+            "modelContextWindow": 258_400,
+        }
+
+    monkeypatch.setattr(
+        codex_handle_module, "recover_codex_context_usage", recover)
+    handle = CodexHandle(_Cfg(), codex_home="/tmp/code-profile")
+    handle.thread_id = "code-native-session"
+
+    usage = asyncio.run(handle.get_context_usage())
+
+    assert usage["used_tokens"] == 88_765
+    assert usage["context_window"] == 258_400
+    assert recovered_calls == [(
+        "code-native-session", os.path.realpath("/tmp/code-profile"))]
+
+
+def test_work_context_recovery_discards_old_thread_race(monkeypatch):
+    async def run():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def recover(_session_id, *, codex_home=None):
+            del codex_home
+            loop.call_soon_threadsafe(started.set)
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result()
+            return {
+                "last": {"totalTokens": 999},
+                "modelContextWindow": 1000,
+            }
+
+        monkeypatch.setattr(
+            codex_handle_module, "recover_codex_context_usage", recover)
+        handle = CodexHandle(_Cfg(), work_mode=True)
+        handle.thread_id = "old-thread"
+        reading = asyncio.create_task(handle.get_context_usage())
+        await started.wait()
+        handle.thread_id = "new-thread"
+        handle._generation += 1
+        release.set()
+        usage = await reading
+        assert usage["used_tokens"] is None
+        assert handle.last_token_usage is None
+
+    asyncio.run(run())
+
+
+def test_work_context_recovery_retries_after_transient_miss(monkeypatch):
+    calls = 0
+
+    def recover(_session_id, *, codex_home=None):
+        nonlocal calls
+        del codex_home
+        calls += 1
+        if calls == 1:
+            return None
+        return {
+            "last": {"totalTokens": 456},
+            "modelContextWindow": 1000,
+        }
+
+    monkeypatch.setattr(
+        codex_handle_module, "recover_codex_context_usage", recover)
+    handle = CodexHandle(_Cfg(), work_mode=True)
+    handle.thread_id = "native-session"
+
+    first = asyncio.run(handle.get_context_usage())
+    second = asyncio.run(handle.get_context_usage())
+
+    assert first["used_tokens"] is None
+    assert second["used_tokens"] == 456
+    assert calls == 2
 
 
 def test_interrupt_status_maps_to_cc_vocab():
@@ -190,6 +331,17 @@ def test_codex_terminal_provider_failures_keep_distinct_safe_copy():
             {"message": "model execution failed"},
             "Codex 本次回复未完成，请重试。",
         ),
+        *[(error, "当前模型繁忙，请稍后重试或切换模型。") for error in (
+            {"codexErrorInfo": "serverOverloaded"},
+            {"codex_error_info": "server_overloaded"},
+            {"codexErrorInfo": {"serverOverloaded": {}}},
+            {"message": "Selected model is at capacity. Please try a different model. "
+                        "https://private.invalid/?token=SECRET"},
+        )],
+        (
+            {"codex_error_info": {"response_stream_disconnected": {"http_status_code": 401}}},
+            "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。",
+        ),
     ]
 
     for error, expected in cases:
@@ -213,6 +365,19 @@ def test_codex_terminal_provider_failures_keep_distinct_safe_copy():
         "请检查当前服务的凭据或账号权限后重试。"
     )
     assert "Codex 登录" not in custom_provider[0].message
+
+
+def test_codex_capacity_retry_remains_progress_until_a_real_terminal():
+    from cc_remote.protocol import Error, StateEvent, TurnEnd
+
+    translator = CodexStreamTranslator(8000)
+    events = translator.feed({"method": "error", "params": {
+        "willRetry": True, "error": {"codexErrorInfo": "serverOverloaded"},
+    }})
+    assert len(events) == 1 and isinstance(events[0], StateEvent)
+    assert events[0].state == "running" and events[0].phase == "retrying"
+    assert events[0].detail == "当前模型繁忙，Codex 正在重试…"
+    assert not any(isinstance(event, (Error, TurnEnd)) for event in events)
 
 
 def test_codex_empty_completed_is_an_error_but_tool_activity_is_not():

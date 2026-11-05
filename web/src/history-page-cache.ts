@@ -1,8 +1,6 @@
-import {
-  canonicalTurnId,
-  type HistoryBrowsePage,
-} from "./history-browse.ts";
-import type { Turn } from "./domain/conversation.ts";
+import type { HistoryBrowsePage } from "./history-browse.ts";
+import type { Block, Turn } from "./domain/conversation.ts";
+import { mergeHistoryPageCopies } from "./history-merge.ts";
 
 /** Deliberately independent from cache.ts. Deep-history browsing is best-effort
  * page storage and must never make an upgrade/failure of the replay/session
@@ -14,7 +12,18 @@ const HISTORY_PAGE_CACHE_SCOPE_INDEX = "scope";
 const HISTORY_PAGE_CACHE_SESSION_INDEX = "session";
 const HISTORY_PAGE_CACHE_LRU_INDEX = "lru";
 const DEFAULT_HISTORY_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
-const RECORD_VERSION = 1;
+// v4 preserves a payload-free context-compaction identity shell. Older page
+// records can otherwise turn a repaired compact orphan into an unprovable
+// empty row after a hard refresh, so they must be rebuilt from History.
+// v5 stores v36's exact/unknown process-detail state. A v4 page can only infer
+// process presence from a generic deferred-event count and is unsafe to paint.
+// v6 restores async question metadata. v7 rebuilds pages where those questions
+// suppressed an ordinary unphased reply; the source revision alone cannot tell.
+// v8 preserves native model-fallback notices and immutable turn-change metadata.
+// v9 discards old official-summary pages which omitted their file lists.
+// v10 removes internal Claude recovery prompts cached as human page boundaries.
+// v11 preserves native Codex cross-thread provenance and sender receipts.
+const RECORD_VERSION = 11;
 
 export interface HistoryPageCacheSessionScope {
   machineId: string;
@@ -28,7 +37,7 @@ export interface HistoryPageCacheScope extends HistoryPageCacheSessionScope {
 }
 
 export interface HistoryPageCacheStoredRecord {
-  version: typeof RECORD_VERSION;
+  version: 1 | 2 | 3 | 4 | typeof RECORD_VERSION;
   key: string;
   scopeKey: string;
   sessionKey: string;
@@ -107,15 +116,43 @@ export function historyPageCachePageKey(
 }
 
 function sanitizeTurn(turn: Turn): Turn {
-  const summaryBlocks = turn.blocks.filter((block) =>
-    block.kind === "text" && block.channel === "final");
+  const summaryBlocks = turn.blocks.flatMap((block): Block[] => {
+    if (block.kind === "text" && block.channel === "final") {
+      return [{ ...block }];
+    }
+    // Context compaction is lightweight narrative metadata, and its native
+    // turn id is the proof used to repair the historical standalone-row bug.
+    // Preserve a payload-free shell across page eviction/cache reload, along
+    // with native model-fallback notices; heavy process bodies stay detail-only.
+    if (block.kind === "process" && (block.processKind === "compaction"
+        || (block.processKind === "model" && block.tool === "model_refusal_fallback"))) {
+      return [{
+        kind: "process" as const,
+        item_id: block.item_id,
+        processKind: block.processKind,
+        phase: block.phase,
+        status: block.status,
+        turn_id: block.turn_id,
+        parent_id: block.parent_id,
+        title: block.title,
+        tool: block.tool,
+        summary: block.summary,
+        duration_ms: block.duration_ms,
+        truncated: block.truncated,
+        done: block.done,
+      }];
+    }
+    return [];
+  });
   const deferredBlocks = turn.blocks.length - summaryBlocks.length;
   return {
     ...turn,
     // Tool/process/thinking bodies are intentionally deferred to
     // GetTurnDetail. Keeping their stripped shells produced dozens of
     // expandable "运行命令" rows with empty bodies after an IndexedDB paint.
-    blocks: summaryBlocks.map((block) => ({ ...block })),
+    blocks: summaryBlocks,
+    detailReasons: turn.detailReasons
+      ? [...turn.detailReasons] : undefined,
     // Summary pages keep canonical metadata only. Attachment bytes are fetched
     // lazily through GetHistoryImage when this row re-enters the viewport.
     images: undefined,
@@ -131,6 +168,7 @@ function sanitizeTurn(turn: Turn): Turn {
     detailError: undefined,
     detailRetryBefore: undefined,
     detailRetryDirection: undefined,
+    detailResetPending: false,
     detailProjection: undefined,
     detailHasMore: undefined,
     detailOldestCursor: undefined,
@@ -147,7 +185,8 @@ export function sanitizeHistoryPageForCache(
 ): HistoryBrowsePage {
   return {
     pageKey: page.pageKey,
-    turns: page.turns.map(sanitizeTurn),
+    turns: mergeHistoryPageCopies(page.turns.map(sanitizeTurn))
+      .filter((turn): turn is Turn => turn != null),
     hasOlder: !!page.hasOlder,
     olderCursor: page.olderCursor ?? null,
     hasNewer: page.isLatest ? false : !!page.hasNewer || !!page.newerPageKey,
@@ -191,6 +230,7 @@ function validRecord(
     scopeKey: string;
     sessionKey: string;
     pageKey: string;
+    engine: string;
   },
 ): value is HistoryPageCacheStoredRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -208,25 +248,15 @@ function validRecord(
     && validPage(record.page);
 }
 
-/** Merge repeated partial evictions of one logical page. New input wins a
- * canonical overlap, while existing-only rows remain recoverable. */
+/** Merge repeated partial evictions of one logical page. New input wins an
+ * overlap's content without moving its established slot; existing-only rows
+ * remain recoverable even when timestamps are missing or equal. */
 function mergePageTurns(
   existing: readonly Turn[],
   incoming: readonly Turn[],
 ): Turn[] {
-  const turns = [...existing];
-  const indexes = new Map<string, number>();
-  turns.forEach((turn, index) => indexes.set(canonicalTurnId(turn), index));
-  for (const turn of incoming) {
-    const key = canonicalTurnId(turn);
-    const index = indexes.get(key);
-    if (index == null) {
-      indexes.set(key, turns.length);
-      turns.push(turn);
-    } else {
-      turns[index] = turn;
-    }
-  }
+  const turns = mergeHistoryPageCopies([...existing, ...incoming], "first")
+    .filter((turn): turn is Turn => turn != null);
   turns.sort((left, right) => {
     if (left.ts != null && right.ts != null && left.ts !== right.ts) {
       return left.ts - right.ts;
@@ -398,8 +428,8 @@ class IndexedDbHistoryPageStorage implements HistoryPageCacheStorage {
         }
         if (!store.indexNames.contains(HISTORY_PAGE_CACHE_LRU_INDEX)) {
           // The compound index exposes ordering and byte sizes through a key
-          // cursor. A v1 upgrade keeps existing page records and indexes them
-          // from the metadata already stored with each page.
+          // cursor. Schema upgrades index legacy records for bounded accounting;
+          // semantic record-version validation removes them lazily on read.
           store.createIndex(
             HISTORY_PAGE_CACHE_LRU_INDEX,
             ["savedAt", "byteSize", "key"],
@@ -713,6 +743,7 @@ export class HistoryPageCache {
       scopeKey: historyPageCacheScopeKey(scope),
       sessionKey: historyPageCacheSessionKey(scope),
       pageKey,
+      engine: scope.engine,
     };
     try {
       if (!this.snapshotMatches(scope, epoch)
@@ -763,6 +794,7 @@ export class HistoryPageCache {
       scopeKey: historyPageCacheScopeKey(scope),
       sessionKey: historyPageCacheSessionKey(scope),
       pageKey: page.pageKey,
+      engine: scope.engine,
     };
     try {
       const previousValue = await this.storage.read(key);

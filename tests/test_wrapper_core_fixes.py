@@ -10,22 +10,37 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from claude_agent_sdk.types import (
+    ResultMessage,
+    TextBlock,
+    ToolResultBlock,
+    UserMessage,
+)
 
 from cc_remote.protocol import (
     AssistantMsgStart, ERR_DRAIN_TIMEOUT, Error, Interrupt, StateEvent,
-    TurnEnd, UserMsg,
+    TurnBinding, TurnEnd, UserMsg,
 )
+from cc_remote.config import WrapperConfig
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.codex_sessions import codex_session_settings
 from cc_remote.wrapper.codex_stream import (
+    codex_history_native_witness, codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
-from cc_remote.wrapper.session import _session_file, load_session_id, save_session_id
-from tests.test_multisession import _mk_ctx, _mk_machine
+from cc_remote.wrapper.session import (
+    _session_file,
+    load_session_id,
+    load_session_state,
+    save_session_id,
+)
+from cc_remote.wrapper.stream import replayed_user_message_id
+from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
 
 
 class _StalledSdk:
@@ -43,7 +58,9 @@ class _StalledSdk:
         self.reconnects = 0
         self.responses = []
 
-    async def query(self, prompt, images=None):
+    async def query(
+        self, prompt, images=None, *, client_user_message_id=None,
+    ):
         return None
 
     async def receive_response(self):
@@ -57,6 +74,377 @@ class _StalledSdk:
 
     async def force_reconnect(self, resume_id, cwd):
         self.reconnects += 1
+
+
+class _ClaudeStalledSdk(_StalledSdk):
+    model = None
+    next_turn_id = None
+
+    def observe_goal_message(self, _message, _thread_id):
+        return False, None
+
+    async def refresh_goal(self, _session_id):
+        return None
+
+    def release_background_messages(self):
+        return None
+
+
+def test_claude_replayed_user_id_excludes_tool_protocol_envelopes():
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    assert replayed_user_message_id(UserMessage(
+        content="继续", uuid=native_id,
+    )) == native_id
+    assert replayed_user_message_id(UserMessage(
+        content=[ToolResultBlock(tool_use_id="tool-1", content="done")],
+        uuid=native_id,
+    )) is None
+    assert replayed_user_message_id(UserMessage(
+        content="subagent input",
+        uuid=native_id,
+        parent_tool_use_id="tool-1",
+    )) is None
+    assert replayed_user_message_id(UserMessage(
+        content="<task-notification>done</task-notification>",
+        uuid=native_id,
+        origin={"kind": "task-notification"},
+    )) is None
+    assert replayed_user_message_id(UserMessage(
+        content=[TextBlock(text="[Request interrupted by user]")],
+        uuid=native_id,
+    )) is None
+
+
+def test_claude_live_replayed_user_uuid_is_persisted_as_browser_alias(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    interrupt_id = "2259073b-7676-455f-b7b0-010101010101"
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+
+    class ReplaySdk:
+        effort = "high"
+        applied_effort = "high"
+        model = None
+        next_turn_id = None
+
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            # A replacement turn can see the preceding turn's late synthetic
+            # interrupt row before its own replayed user UUID.
+            yield UserMessage(
+                content=[TextBlock(text="[Request interrupted by user]")],
+                uuid=interrupt_id,
+            )
+            yield UserMessage(content="继续", uuid=native_id)
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+            )
+
+        def observe_goal_message(self, _message, _thread_id):
+            return False, None
+
+        async def refresh_goal(self, _session_id):
+            return None
+
+        def release_background_messages(self):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.sdk = ReplaySdk()
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_claude_ownership", no_external_owner)
+        await machine._run_turn(ctx, "继续")
+
+        assert machine._claude_client_messages.get(
+            session_id, transcript) == {native_id: client_id}
+        assert ctx.claude_client_message_ids == {}
+        assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_claude_run_turn_binds_transcript_before_delayed_sdk_replay(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-010101010101"
+    native_id = "2259073b-7676-455f-b7b0-020202020202"
+    client_id = "6b09ee37-f861-4422-b98a-030303030303"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+
+    async def run():
+        class DelayedReplaySdk:
+            effort = "high"
+            applied_effort = "high"
+            model = None
+            next_turn_id = None
+
+            def __init__(self):
+                self.query_written = asyncio.Event()
+                self.release_replay = asyncio.Event()
+
+            async def query(self, _prompt):
+                with transcript.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({
+                        "type": "user",
+                        "uuid": native_id,
+                        "entrypoint": "sdk-py",
+                        "message": {"role": "user", "content": "hello"},
+                    }) + "\n")
+                self.query_written.set()
+
+            async def receive_response(self):
+                await self.release_replay.wait()
+                yield UserMessage(content="hello", uuid=native_id)
+                yield ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id=session_id,
+                )
+
+            def observe_goal_message(self, _message, _thread_id):
+                return False, None
+
+            async def refresh_goal(self, _session_id):
+                return None
+
+            def release_background_messages(self):
+                return None
+
+        machine, transport = _mk_machine()
+        sdk = DelayedReplaySdk()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_claude_ownership", no_external_owner)
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.query_written.wait(), timeout=1)
+        assert ctx.claude_client_alias_probe is not None
+        await machine._advance_claude_client_alias_probe(ctx)
+        assert machine._claude_client_messages.get(
+            session_id, transcript) == {native_id: client_id}
+
+        sdk.release_replay.set()
+        await asyncio.wait_for(turn, timeout=1)
+        assert ctx.state == "idle"
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, Error)
+        ]
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(run())
+
+
+def test_claude_alias_flush_never_enters_multi_profile_codex_history(
+    monkeypatch, tmp_path,
+):
+    session_id = "f6cd73f7-86d7-4115-8512-3cf357fbd542"
+    native_id = "759d1121-1009-4882-8218-b31296d7e20b"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n")
+    primary = tmp_path / "codex-primary"
+    stack = tmp_path / "codex-stack"
+    primary.mkdir()
+    stack.mkdir()
+    cfg = WrapperConfig()
+    cfg.state_dir = tmp_path / "state"
+    cfg.claude_work_root = cfg.state_dir / "work" / "claude"
+    cfg.codex_work_root = cfg.state_dir / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps({
+        "primary": {
+            "label": "Primary",
+            "home": str(primary),
+            "default": True,
+        },
+        "stack": {
+            "label": "Stack",
+            "home": str(stack),
+        },
+    })
+    transport = _StubTransport()
+    machine = WrapperMachine(cfg, transport)
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+    ctx = _mk_ctx(session_id, session_id)
+    ctx.active_msg_id = client_id
+    ctx.claude_client_message_ids[native_id] = client_id
+    machine.sessions[ctx.key] = ctx
+
+    async def run():
+        await machine._flush_claude_client_message_ids(ctx)
+
+        assert machine._claude_client_messages.get(
+            session_id, transcript) == {native_id: client_id}
+        assert ctx.claude_client_message_ids == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+    asyncio.run(run())
+
+
+def test_claude_alias_metadata_failure_keeps_turn_binding_idempotent(
+    monkeypatch,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-alias-failure", "claude-alias-failure")
+        ctx.active_msg_id = "browser-message"
+        machine.sessions[ctx.key] = ctx
+
+        async def fail_flush(_ctx):
+            raise RuntimeError("metadata store unavailable")
+
+        monkeypatch.setattr(
+            machine, "_flush_claude_client_message_ids", fail_flush)
+        assert await machine._remember_claude_client_message_id(
+            ctx, "native-message") is True
+        assert await machine._remember_claude_client_message_id(
+            ctx, "native-message") is False
+
+        assert ctx.claude_client_message_ids == {
+            "native-message": "browser-message",
+        }
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [("browser-message", "native-message")]
+
+    asyncio.run(run())
+
+
+def test_claude_alias_binding_rejects_stale_turn_generation():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-generation", "claude-generation")
+        ctx.active_msg_id = "browser-old"
+        machine.sessions[ctx.key] = ctx
+        machine._start_claude_client_alias_probe(ctx)
+        old_generation = ctx.claude_client_alias_generation
+
+        ctx.active_msg_id = "browser-new"
+        machine._start_claude_client_alias_probe(ctx)
+        assert await machine._remember_claude_client_message_id(
+            ctx,
+            "native-old",
+            expected_msg_id="browser-old",
+            expected_generation=old_generation,
+        ) is False
+        assert ctx.claude_client_message_ids == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+    asyncio.run(run())
+
+
+def test_new_claude_session_flushes_pending_browser_alias_after_rekey(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+
+    class NewSessionReplaySdk:
+        effort = "high"
+        applied_effort = "high"
+        model = None
+        next_turn_id = None
+
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            yield UserMessage(content="继续", uuid=native_id)
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+            )
+
+        def observe_goal_message(self, _message, _thread_id):
+            return False, None
+
+        def rekey_goal(self, _session_id):
+            return None
+
+        async def refresh_goal(self, _session_id):
+            return None
+
+        def release_background_messages(self):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("tmp-client-alias", None)
+        ctx.sdk = NewSessionReplaySdk()
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_claude_ownership", no_external_owner)
+        await machine._run_turn(ctx, "继续")
+
+        assert ctx.key == session_id
+        assert machine.sessions[session_id] is ctx
+        assert "tmp-client-alias" not in machine.sessions
+        assert machine._claude_client_messages.get(
+            session_id, transcript,
+        ) == {native_id: client_id}
+        assert ctx.claude_client_message_ids == {}
+
+    asyncio.run(run())
 
 
 def test_codex_session_id_accepts_app_server_thread_id_notifications():
@@ -127,6 +515,91 @@ def test_interrupt_during_preflight_reconnect_never_submits_query():
     asyncio.run(run())
 
 
+def test_managed_finalizer_reconciles_background_result_race(monkeypatch):
+    class FinalizerRaceSdk:
+        effort = "max"
+        applied_effort = "max"
+        model = None
+        next_turn_id = None
+        is_claude_broker = False
+
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session-race",
+            )
+
+        def observe_goal_message(self, _message, _thread_id):
+            return False, None
+
+        async def refresh_goal(self, _session_id):
+            return None
+
+        def release_background_messages(self):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("session-race", "session-race")
+        ctx.sdk = FinalizerRaceSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "message-race"
+        ctx.claude_background_followup_pending = True
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner)
+        original_set_idle = machine._set_idle_after_managed_turn
+        delivered = False
+
+        async def settle_then_deliver_background(
+            target, *, claude_terminal=False,
+        ):
+            nonlocal delivered
+            await original_set_idle(
+                target, claude_terminal=claude_terminal)
+            if claude_terminal and not delivered:
+                delivered = True
+                assert target.state == "running"
+                await machine._on_claude_background_message(
+                    target,
+                    ResultMessage(
+                        subtype="success",
+                        duration_ms=1,
+                        duration_api_ms=1,
+                        is_error=False,
+                        num_turns=1,
+                        session_id="session-race",
+                    ),
+                    "message-race",
+                )
+                assert target.state == "running"
+
+        monkeypatch.setattr(
+            machine, "_set_idle_after_managed_turn",
+            settle_then_deliver_background)
+        turn = asyncio.create_task(machine._run_turn(ctx, "race"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(turn, timeout=1)
+
+        assert delivered is True
+        assert ctx.turn_task is None
+        assert ctx.claude_background_followup_pending is False
+        assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
 def test_session_state_filename_is_utf8_safe_and_state_read_is_bounded(tmp_path):
     cwd = "/" + "界" * 500
     path = _session_file(tmp_path, cwd)
@@ -139,6 +612,23 @@ def test_session_state_filename_is_utf8_safe_and_state_read_is_bounded(tmp_path)
     assert load_session_id(tmp_path, cwd) is None
     path.write_text(json.dumps({"cc_session_id": "../invalid"}))
     assert load_session_id(tmp_path, cwd) is None
+
+
+def test_session_state_persists_claude_profile_revision(tmp_path):
+    cwd = "/workspace/profiled"
+    save_session_id(
+        tmp_path,
+        cwd,
+        "nyx@session-1",
+        claude_profile_id="nyx",
+        claude_profile_revision=4,
+    )
+
+    state = load_session_state(tmp_path, cwd)
+    assert state is not None
+    assert state.session_id == "nyx@session-1"
+    assert state.claude_profile_id == "nyx"
+    assert state.claude_profile_revision == 4
 
 
 def test_session_alias_state_read_is_bounded_and_validated():
@@ -466,10 +956,115 @@ def test_interrupt_wakes_existing_queue_wait_and_enforces_drain_deadline():
     asyncio.run(run())
 
 
-def test_codex_idle_watchdog_warns_without_ending_or_replaying_the_turn():
+@pytest.mark.parametrize("watchdog_first", [False, True])
+def test_claude_managed_interrupt_owns_recovery_with_background_activity(watchdog_first):
     async def run():
         machine, transport = _mk_machine()
-        machine.cfg.codex_turn_idle_warn_seconds = 0.02
+        machine.cfg.drain_timeout = 0.03
+        ctx = _mk_ctx("claude-stop-owner", "claude-stop-owner")
+        ctx.engine = "claude"
+        ctx.state = "running"
+        ctx.active_msg_id = "stop-message"
+        machine.sessions[ctx.key] = ctx
+
+        class StalledSdk(_ClaudeStalledSdk):
+            async def force_reconnect(self, resume_id, cwd, **_kwargs):
+                self.reconnects += 1
+                # Real disconnect/connect yields before lifecycle reset. Both
+                # expired consumers must not reconnect the same native child.
+                await asyncio.sleep(0.02)
+                machine._reset_claude_task_lifecycle(ctx)
+
+        sdk = StalledSdk()
+        ctx.sdk = sdk
+
+        async def no_external_owner(_sid):
+            return False
+
+        machine._prime_claude_ownership = no_external_owner
+        turn = asyncio.create_task(machine._run_turn(ctx, "inspect"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=1)
+        ctx.claude_background_followups["background-request"] = "active"
+        if watchdog_first:
+            # An existing watchdog can gain a managed owner before its deadline
+            # when an already accepted steering input completes its handoff.
+            ctx.turn_task = None
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+        watchdog = ctx.claude_autonomous_interrupt_task
+        ctx.turn_task = turn
+        await asyncio.wait_for(turn, timeout=1)
+        if watchdog is not None:
+            await asyncio.gather(watchdog, return_exceptions=True)
+
+        assert sdk.reconnects == 1
+        assert ctx.state == "idle"
+        assert ctx.claude_autonomous_interrupt_task is None
+        failures = [msg for msg in transport.sent
+                    if getattr(msg, "code", None) == ERR_DRAIN_TIMEOUT]
+        assert len(failures) == 1
+        assert failures[0].msg_id == "stop-message"
+
+    asyncio.run(run())
+
+
+def test_claude_interrupt_hands_remaining_background_work_the_original_deadline():
+    async def run():
+        machine, transport = _mk_machine()
+        machine.cfg.drain_timeout = 0.1
+        ctx = _mk_ctx("claude-stop-handoff", "claude-stop-handoff")
+        ctx.engine = "claude"
+        ctx.state = "running"
+        ctx.active_msg_id = "stop-message"
+        machine.sessions[ctx.key] = ctx
+
+        class StalledSdk(_ClaudeStalledSdk):
+            async def force_reconnect(self, resume_id, cwd, **_kwargs):
+                self.reconnects += 1
+                machine._reset_claude_task_lifecycle(ctx)
+
+        sdk = StalledSdk()
+        sdk.responses = [ResultMessage(
+            subtype="error_during_execution", duration_ms=1,
+            duration_api_ms=1, is_error=True, num_turns=1,
+            session_id=ctx.session_id,
+        )]
+        ctx.sdk = sdk
+
+        async def no_external_owner(_sid):
+            return False
+
+        machine._prime_claude_ownership = no_external_owner
+        turn = asyncio.create_task(machine._run_turn(ctx, "inspect"))
+        ctx.turn_task = turn
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=1)
+        ctx.claude_background_followups["background-request"] = "active"
+        await machine._handle_interrupt(SimpleNamespace(sid=ctx.key))
+        deadline = ctx.interrupt_deadline
+        # A handoff must retain the accepted Stop's deadline, not start a fresh
+        # wait using the config value at the managed terminal.
+        machine.cfg.drain_timeout = 100
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=1)
+
+        assert ctx.state == "interrupting"
+        assert ctx.interrupt_deadline == deadline
+        watchdog = ctx.claude_autonomous_interrupt_task
+        assert watchdog is not None
+        await asyncio.wait_for(watchdog, timeout=1)
+        assert sdk.reconnects == 1
+        assert ctx.state == "idle"
+        assert ctx.claude_autonomous_interrupt_task is None
+        assert len([msg for msg in transport.sent
+                    if getattr(msg, "code", None) == ERR_DRAIN_TIMEOUT]) == 1
+
+    asyncio.run(run())
+
+
+def test_codex_silence_emits_no_synthetic_waiting_notice_and_later_completes(
+        monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
         sdk = _StalledSdk()
         sdk.responses = [
             {"method": "item/reasoning/delta", "params": {
@@ -486,15 +1081,25 @@ def test_codex_idle_watchdog_warns_without_ending_or_replaying_the_turn():
         ctx.active_msg_id = "message-stalled"
         machine.sessions[ctx.key] = ctx
 
+        real_wait = machine_module.asyncio.wait
+        wait_options = []
+
+        async def wait_without_idle_deadline(tasks, *args, **kwargs):
+            wait_options.append(dict(kwargs))
+            return await real_wait(tasks, *args, **kwargs)
+
+        monkeypatch.setattr(
+            machine_module.asyncio, "wait", wait_without_idle_deadline,
+        )
         turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
         await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
         await asyncio.sleep(0.04)
 
+        assert wait_options
+        assert all("timeout" not in options for options in wait_options)
         notices = [msg for msg in transport.sent
                    if isinstance(msg, StateEvent) and msg.phase == "waiting"]
-        assert len(notices) == 1
-        assert notices[0].state == "running"
-        assert notices[0].msg_id == "message-stalled"
+        assert notices == []
         assert ctx.state == "running"
         assert sdk.reconnects == 0
 
@@ -503,63 +1108,183 @@ def test_codex_idle_watchdog_warns_without_ending_or_replaying_the_turn():
 
         assert ctx.state == "idle"
         assert sdk.reconnects == 0
-        clear_index = next(
-            index for index, msg in enumerate(transport.sent)
-            if isinstance(msg, StateEvent) and msg.msg_id == "message-stalled"
-            and msg.detail is None)
-        wait_index = transport.sent.index(notices[0])
-        assert clear_index > wait_index
+        assert [msg.text for msg in transport.sent
+                if getattr(msg, "type", None) == "delta"] == ["done"]
 
     asyncio.run(run())
 
 
-def test_codex_idle_warning_boundary_never_drops_a_consumed_delta(monkeypatch):
+def test_claude_silence_emits_neutral_notices_without_ending_or_reconnecting(
+        monkeypatch):
     async def run():
         machine, transport = _mk_machine()
-        machine.cfg.codex_turn_idle_warn_seconds = 0.02
+        machine.CLAUDE_SILENCE_NOTICE_SECONDS = 0.015
+        machine.CLAUDE_SILENCE_WARNING_SECONDS = 0.04
+        sdk = _ClaudeStalledSdk()
+        sdk.responses = [ResultMessage(
+            subtype="success",
+            duration_ms=50,
+            duration_api_ms=50,
+            is_error=False,
+            num_turns=1,
+            session_id="claude-stalled",
+        )]
+        ctx = _mk_ctx("claude-stalled", "claude-stalled")
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "message-stalled"
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner)
+
+        async def wait_for_notices(count: int):
+            while len([
+                message for message in transport.sent
+                if isinstance(message, StateEvent)
+                and message.phase == "waiting"
+            ]) < count:
+                await asyncio.sleep(0.002)
+
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(wait_for_notices(2), timeout=0.3)
+
+        notices = [
+            message for message in transport.sent
+            if isinstance(message, StateEvent) and message.phase == "waiting"
+        ]
+        assert [message.msg_id for message in notices] == [
+            "message-stalled", "message-stalled",
+        ]
+        assert "思考" in notices[0].detail
+        assert "等待上游响应" in notices[0].detail
+        assert "停止本回合后重试" in notices[1].detail
+        assert ctx.state == "running"
+        assert sdk.reconnects == 0
+
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
+
+        assert ctx.state == "idle"
+        assert sdk.reconnects == 0
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, Error)
+        ]
+        assert any(
+            isinstance(message, StateEvent) and message.detail is None
+            for message in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_claude_silence_notice_is_suppressed_while_question_is_open(
+        monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.CLAUDE_SILENCE_NOTICE_SECONDS = 0.01
+        machine.CLAUDE_SILENCE_WARNING_SECONDS = 0.025
+        sdk = _ClaudeStalledSdk()
+        sdk.responses = [ResultMessage(
+            subtype="success",
+            duration_ms=50,
+            duration_api_ms=50,
+            is_error=False,
+            num_turns=1,
+            session_id="claude-question-wait",
+        )]
+        ctx = _mk_ctx("claude-question-wait", "claude-question-wait")
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "message-question-wait"
+        pending = asyncio.get_running_loop().create_future()
+        ctx.pending_asks["open-question"] = pending
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner)
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.05)
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, StateEvent) and message.phase == "waiting"
+        ]
+
+        ctx.pending_asks.pop("open-question")
+        pending.cancel()
+        machine._mark_claude_activity(ctx)
+
+        async def wait_for_notice():
+            while not any(
+                isinstance(message, StateEvent)
+                and message.phase == "waiting"
+                for message in transport.sent
+            ):
+                await asyncio.sleep(0.002)
+
+        await asyncio.wait_for(wait_for_notice(), timeout=0.2)
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
+        assert ctx.state == "idle"
+        assert sdk.reconnects == 0
+
+    asyncio.run(run())
+
+
+def test_codex_silence_preserves_later_authoritative_provider_error():
+    async def run():
+        machine, transport = _mk_machine()
         sdk = _StalledSdk()
         sdk.responses = [
-            {"method": "item/agentMessage/delta", "params": {
-                "itemId": "boundary-answer", "delta": "visible answer"}},
+            {"method": "error", "params": {
+                "willRetry": False,
+                "error": {
+                    "message": "stream disconnected before completion",
+                    "codexErrorInfo": {
+                        "responseStreamDisconnected": {"httpStatusCode": 502},
+                    },
+                },
+            }},
             {"method": "turn/completed", "params": {
-                "turn": {"status": "completed", "durationMs": 30}}},
+                "turn": {
+                    "id": "provider-failed-turn",
+                    "status": "failed",
+                    "durationMs": 30,
+                    "error": {"message": "HTTP 502"},
+                }}},
         ]
-        ctx = _mk_ctx("codex-boundary", "codex-boundary")
+        ctx = _mk_ctx("codex-provider-error", "codex-provider-error")
         ctx.sdk = sdk
         ctx.engine = "codex"
         ctx.state = "running"
-        ctx.active_msg_id = "message-boundary"
+        ctx.active_msg_id = "message-provider-error"
         machine.sessions[ctx.key] = ctx
 
-        real_wait = machine_module.asyncio.wait
-        forced_boundary = False
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.04)
+        assert not [msg for msg in transport.sent
+                    if isinstance(msg, StateEvent) and msg.phase == "waiting"]
 
-        async def boundary_wait(tasks, *args, **kwargs):
-            nonlocal forced_boundary
-            if kwargs.get("timeout") is not None and not forced_boundary:
-                forced_boundary = True
-                task = next(iter(tasks))
-                sdk.release.set()
-                for _ in range(50):
-                    if task.done():
-                        break
-                    await asyncio.sleep(0)
-                assert task.done()
-                # Simulate timeout bookkeeping winning even though the get task
-                # consumed and completed on the same event-loop boundary.
-                return set(), {task}
-            return await real_wait(tasks, *args, **kwargs)
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
 
-        monkeypatch.setattr(machine_module.asyncio, "wait", boundary_wait)
-        await asyncio.wait_for(machine._run_turn(ctx, "hello"), timeout=0.5)
-
-        assert forced_boundary is True
-        assert not [msg for msg in transport.sent if isinstance(msg, Error)]
-        deltas = [msg.text for msg in transport.sent
-                  if getattr(msg, "type", None) == "delta"]
-        assert deltas == ["visible answer"]
+        errors = [msg for msg in transport.sent if isinstance(msg, Error)]
+        assert errors
+        assert errors[0].msg_id == "message-provider-error"
+        assert errors[0].message == "Codex 上游服务暂时不可用，请稍后重试。"
         terminal = [msg for msg in transport.sent if isinstance(msg, TurnEnd)][-1]
-        assert terminal.result.subtype == "success"
+        assert terminal.result.subtype == "error"
+        assert terminal.result.is_error is True
 
     asyncio.run(run())
 
@@ -877,6 +1602,161 @@ def test_codex_history_goal_continuation_after_completed_turn_is_own_turn(tmp_pa
         "turn-user", "turn-goal"]
 
 
+def test_codex_history_new_goal_objective_is_a_durable_user_prompt(tmp_path):
+    rollout = tmp_path / "rollout-goal-objective.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-goal-objective"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated",
+                     "threadId": "session-goal-objective",
+                     "goal": {
+                         "threadId": "session-goal-objective",
+                         "objective": "证明泰勒展开",
+                         "status": "active", "tokensUsed": 0,
+                         "timeUsedSeconds": 0,
+                         "createdAt": 1, "updatedAt": 1,
+                     }}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-goal"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "证明过程"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-goal"}},
+        # Resuming the same objective may start another automatic turn, but it
+        # must remain an assistant-only continuation rather than repeating the
+        # original user request.
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated",
+                     "threadId": "session-goal-objective",
+                     "goal": {
+                         "threadId": "session-goal-objective",
+                         "objective": "证明泰勒展开",
+                         "status": "active", "tokensUsed": 10,
+                         "timeUsedSeconds": 30,
+                         "createdAt": 1, "updatedAt": 2,
+                     }}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "turn-resume"}},
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "继续处理"}},
+        {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "turn-resume"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    prompts = [event for event in events if isinstance(event, UserMsg)]
+    assert [(event.msg_id, event.prompt) for event in prompts] == [
+        ("turn-goal", "证明泰勒展开"),
+    ]
+    assert [event.turn_id for event in events if isinstance(event, TurnEnd)] == [
+        "turn-goal", "turn-resume",
+    ]
+
+
+def test_codex_history_goal_metadata_without_a_turn_never_steals_next_user(
+        tmp_path):
+    rollout = tmp_path / "rollout-paused-goal.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "旧目标", "status": "active",
+             "createdAt": 1, "updatedAt": 1,
+         }}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "goal-turn",
+                     "started_at": 1}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "目标结果"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "goal-turn"}},
+        # Editing paused metadata does not launch a Goal turn.
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "暂停后的新目标", "status": "paused",
+             "createdAt": 1, "updatedAt": 4,
+         }}},
+        {"timestamp": "2026-01-01T00:01:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "ordinary-turn",
+                     "started_at": 61}},
+        {"timestamp": "2026-01-01T00:01:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "普通问题"}},
+        {"timestamp": "2026-01-01T00:01:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "普通答案"}},
+        {"timestamp": "2026-01-01T00:01:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "ordinary-turn"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "旧目标", "普通问题",
+    ]
+    assert [event.result.subtype for event in events
+            if isinstance(event, TurnEnd)] == ["success", "success"]
+
+
+def test_codex_history_goal_candidate_yields_to_same_task_user_message(
+        tmp_path):
+    rollout = tmp_path / "rollout-goal-user-race.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "候选目标", "status": "active",
+             "createdAt": 1.0, "updatedAt": 1.0,
+         }}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "ordinary-turn"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "普通问题"}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "普通答案"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "ordinary-turn"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "普通问题",
+    ]
+    assert [event.result.subtype for event in events
+            if isinstance(event, TurnEnd)] == ["success"]
+
+
+def test_codex_history_goal_update_inside_user_turn_does_not_split_prompt(
+        tmp_path):
+    rollout = tmp_path / "rollout-goal-inside-user-turn.jsonl"
+    rows = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "managed-turn"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "创建目标"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "thread_goal_updated", "goal": {
+             "objective": "稍后自动执行", "status": "active",
+             "createdAt": 1, "updatedAt": 1,
+         }}},
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "message": "目标已创建"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "task_complete", "turn_id": "managed-turn"}},
+    ]
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    events, _ = codex_translate_history(str(rollout), 10_000)
+
+    assert [event.prompt for event in events if isinstance(event, UserMsg)] == [
+        "创建目标",
+    ]
+    assert [event.result.subtype for event in events
+            if isinstance(event, TurnEnd)] == ["success"]
+
+
 def test_codex_history_goal_continuations_page_as_independent_turns(
         monkeypatch, tmp_path):
     rollout = tmp_path / "rollout-goal-pages.jsonl"
@@ -1051,6 +1931,54 @@ def test_codex_session_settings_restores_last_valid_collaboration_mode(
     }
 
 
+@pytest.mark.parametrize("tail_starts_inside_record", [False, True])
+def test_codex_settings_skip_oversized_record_and_read_newer_selection(
+        monkeypatch, tmp_path, tail_starts_inside_record):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    old = json.dumps({
+        "type": "turn_context", "payload": {"model": "gpt-old"},
+    }) + "\n"
+    latest = json.dumps({
+        "type": "event_msg", "payload": {
+            "type": "thread_settings_applied",
+            "thread_settings": {
+                "model": "gpt-selected", "reasoning_effort": "xhigh",
+                "service_tier": "priority",
+            },
+        },
+    }) + "\n"
+    rollout.write_text(old + ("x" * 6000) + "\n" + latest)
+    monkeypatch.setattr(codex_sessions_module, "MAX_JSONL_RECORD_BYTES", 256)
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+
+    assert codex_session_settings(
+        "session-1", max_bytes=2000 if tail_starts_inside_record else 10000,
+    ) == {
+        "model": "gpt-selected", "effort": "xhigh",
+        "service_tier": "priority",
+    }
+
+
+def test_codex_settings_tail_stops_at_captured_source_size(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "rollout-session-1.jsonl"
+    first = json.dumps({
+        "type": "turn_context", "payload": {"model": "gpt-snapshot"},
+    }) + "\n"
+    appended = json.dumps({
+        "type": "turn_context", "payload": {"model": "gpt-after-snapshot"},
+    }) + "\n"
+    rollout.write_text(first + appended)
+    monkeypatch.setattr(
+        codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
+    monkeypatch.setattr(codex_sessions_module.os.path, "getsize", lambda _p: len(first))
+
+    assert codex_session_settings("session-1", max_bytes=len(first)) == {
+        "model": "gpt-snapshot",
+    }
+
+
 def test_codex_session_settings_restores_applied_update_before_next_turn(
         monkeypatch, tmp_path):
     rollout = tmp_path / "rollout-session-1.jsonl"
@@ -1172,8 +2100,9 @@ def test_codex_history_skips_one_oversized_record_and_continues(
     ]
 
 
+@pytest.mark.parametrize("modern_marker", [False, True])
 def test_account_switch_continuation_is_one_history_and_rollback_turn(
-    tmp_path,
+    tmp_path, modern_marker,
 ):
     rollout = tmp_path / "rollout-account-switch.jsonl"
     internal = machine_module.CODEX_ACCOUNT_SWITCH_CONTINUATION
@@ -1198,9 +2127,28 @@ def test_account_switch_continuation_is_one_history_and_rollback_turn(
         {"type": "event_msg", "payload": {
             "type": "task_started", "turn_id": "turn-new",
         }},
-        {"type": "event_msg", "payload": {
-            "type": "user_message", "turn_id": "turn-new",
-            "message": internal,
+        {"type": "event_msg", "payload": (
+            {
+                "type": "item_completed", "turn_id": "turn-new",
+                "item": {
+                    "id": "account-switch-continuation",
+                    "type": "UserMessage",
+                    "content": [{"type": "text", "text": internal}],
+                },
+            }
+            if modern_marker else
+            {
+                "type": "user_message", "turn_id": "turn-new",
+                "message": internal,
+            }
+        )},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call", "id": "switch-call",
+            "call_id": "switch-call", "name": "exec_command", "input": {},
+        }},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "switch-call",
+            "output": "ok",
         }},
         {"type": "event_msg", "payload": {
             "type": "agent_message", "turn_id": "turn-new",
@@ -1246,5 +2194,21 @@ def test_account_switch_continuation_is_one_history_and_rollback_turn(
         for _offset, cursor in codex_stream_module._history_boundaries(
             str(rollout), use_turns=True)
     ] == ["turn-b", "turn-old"]
+    start, end, has_more, forced, forced_offset = codex_history_window(
+        str(rollout), before="turn-b", limit=1)
+    assert (has_more, forced, forced_offset) == (False, None, None)
+    witness = codex_history_native_witness(
+        str(rollout),
+        max_turns=4,
+        max_scan_bytes=None,
+        required_turn_ids=("turn-old", "turn-new"),
+    )
+    assert witness.turn_ids == ("turn-b", "turn-old")
+    assert set(witness.process_by_visible_id) == {"turn-old"}
+    previous_page, _ = codex_translate_history(
+        str(rollout), 10_000, start_offset=start, end_offset=end)
+    assert [
+        event.prompt for event in previous_page if isinstance(event, UserMsg)
+    ] == ["finish task A"]
     assert codex_native_rollback_turns(str(rollout), 1) == 1
     assert codex_native_rollback_turns(str(rollout), 2) == 3

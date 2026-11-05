@@ -5,24 +5,30 @@ out live events.
   is rejected while different self-hosted machines may share the relay.
 - Clients register by `client_id` (from their hello). A reconnecting phone
   reuses its client_id, replacing any stale connection.
-- Wrapper frames with `to=<client_id>` are routed to that client only (per-
-  client replay); frames without `to` are broadcast to every client.
+- Wrapper frames with `to=<client_id>` are routed to that client only. Frames
+  with `owner_id` are limited to connections for that authenticated account;
+  frames with neither are broadcast to every client on the machine.
 - wrapper hello announces (re)connection -> broadcast `wrapper_reconnected` so
   clients re-hello with per-session cursors and recover missing live tails.
 """
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+import json
+import re
 import uuid
+from weakref import WeakValueDictionary
 from typing import Awaitable, Callable, Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from cc_remote import __version__
 from cc_remote.config import RelayConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
     Error, ProtocolError, WrapperDisconnected, WrapperReconnected,
-    deserialize, is_client_message, serialize,
+    PROTOCOL_VERSION, deserialize, is_client_message, serialize,
     ERR_BUSY, ERR_WRAPPER_OFFLINE, ERR_WRAPPER_ALREADY_CONNECTED, ERR_PROTOCOL,
 )
 from cc_remote.relay.forward import ClientConn, SlowClientError
@@ -67,7 +73,43 @@ class RelayHub:
         # Linearizes client generation replacement with client -> wrapper sends.
         # Once a new generation owns client_id, no old generation can enter a
         # wrapper send after that point.
-        self._wrapper_send_lock = asyncio.Lock()
+        self._wrapper_send_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._wrapper_versions: OrderedDict[str, dict] = OrderedDict()
+
+    def _wrapper_send_lock_for(self, machine_id: str) -> asyncio.Lock:
+        # Hold a strong reference through acquire/release (including waiters).
+        # Idle machine names must not accumulate locks, and a stalled machine's
+        # network write must never hold another machine's registration/send gate.
+        lock = self._wrapper_send_locks.get(machine_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._wrapper_send_locks[machine_id] = lock
+        return lock
+
+    def remember_wrapper_version(self, machine_id: str, protocol: int, version: str | None) -> None:
+        if not isinstance(version, str) or not re.fullmatch(r"\d{1,6}\.\d{1,6}\.\d{1,6}", version):
+            version = None
+        self._wrapper_versions[machine_id] = {
+            "wrapper_version": version, "relay_version": __version__,
+            "wrapper_protocol": protocol, "relay_protocol": PROTOCOL_VERSION,
+        }
+        self._wrapper_versions.move_to_end(machine_id)
+        while len(self._wrapper_versions) > MAX_NAMED_WRAPPERS + 1:
+            self._wrapper_versions.popitem(last=False)
+
+    def device_version(self, machine_id: str) -> dict:
+        info = self._wrapper_versions.get(machine_id)
+        if info and (info["wrapper_protocol"] != PROTOCOL_VERSION
+                     or info["wrapper_version"] != __version__):
+            return {"compatibility": dict(info)}
+        return {}
+
+    @property
+    def versioned_machine_ids(self) -> tuple[str, ...]:
+        return tuple(self._wrapper_versions)
+
+    def forget_wrapper_version(self, machine_id: str) -> None:
+        self._wrapper_versions.pop(machine_id, None)
 
     @property
     def wrapper_connected(self) -> bool:
@@ -164,6 +206,27 @@ class RelayHub:
                 except ProtocolError as e:
                     log.warning("bad frame from wrapper", error=str(e))
                     mismatch = "protocol version mismatch" in str(e)
+                    if mismatch and not announced:
+                        # Version diagnostics must remain readable even when
+                        # strict wire decoding rejects an old peer. Only an
+                        # authenticated, correctly scoped hello can publish it.
+                        try:
+                            hello = json.loads(raw)
+                            peer_id = hello.get("machine_id") or "default"
+                            peer_version = hello.get("v")
+                            valid = (
+                                hello.get("type") == "hello" and hello.get("role") == "wrapper"
+                                and isinstance(peer_id, str)
+                                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}", peer_id)
+                                and type(peer_version) is int and 0 < peer_version < 1000000
+                                and expected_machine_id in (None, peer_id)
+                            )
+                            if (valid and (authorize_machine is None or await authorize_machine(peer_id))
+                                    and self._wrapper_for(peer_id) is None):
+                                self.remember_wrapper_version(peer_id, peer_version,
+                                                              getattr(ws, "headers", {}).get("x-cc-remote-version"))
+                        except (ValueError, TypeError, AttributeError):
+                            pass
                     try:
                         await ws.send_text(serialize(Error(
                             code=ERR_PROTOCOL,
@@ -257,6 +320,8 @@ class RelayHub:
                             pass
                         return
                     log.info("wrapper connected", machine_id=machine_id)
+                    self.remember_wrapper_version(machine_id, PROTOCOL_VERSION,
+                                                  getattr(ws, "headers", {}).get("x-cc-remote-version"))
                 assert machine_id is not None
                 await self._on_wrapper_msg(msg, machine_id)
         except WebSocketDisconnect:
@@ -278,10 +343,19 @@ class RelayHub:
             ), machine_id)
             return
         to = getattr(msg, "to", None)
+        owner_id = getattr(msg, "owner_id", None)
         if to:
             async with self._lock:
                 conn = self._clients_for(machine_id).get(to)
             route_id = getattr(msg, "route_id", None)
+            if (conn is not None and owner_id is not None
+                    and conn.owner_id != owner_id):
+                log.warning(
+                    "owner-mismatched routed frame dropped",
+                    to=to,
+                    type=msg.type,
+                )
+                return
             if (conn is not None and route_id is not None
                     and conn.route_id != route_id):
                 log.debug(
@@ -300,6 +374,8 @@ class RelayHub:
                     await self._drop_client(conn, machine_id=machine_id)
             else:
                 log.debug("routed frame for unknown client, dropping", to=to, type=msg.type)
+        elif owner_id:
+            await self._broadcast_owner(msg, owner_id, machine_id)
         else:
             await self._broadcast(msg, machine_id)
         # Replay is routed to one client via ``to`` and must never generate a
@@ -307,6 +383,7 @@ class RelayHub:
         if (
             msg.type == "turn_end"
             and not to
+            and not owner_id
             and getattr(msg, "notification_context", None) is not None
             and self._on_live_turn_end is not None
         ):
@@ -329,7 +406,8 @@ class RelayHub:
     # ---- client side ----
 
     async def serve_client(self, ws: WebSocket,
-                           machine_id: str = "default") -> None:
+                           machine_id: str = "default",
+                           owner_id: str | None = None) -> None:
         conn: Optional[ClientConn] = None
         client_id: Optional[str] = None
         slot = id(ws)
@@ -391,13 +469,15 @@ class RelayHub:
             conn = ClientConn(
                 ws, self.cfg.client_queue_cap, client_id,
                 getattr(self.cfg, "client_queue_bytes", 16 * 1024 * 1024),
+                owner_id,
             )
             conn.start()
             # Never trust a client-supplied routing generation. It belongs to
             # this accepted WebSocket and is meaningful only inside the relay.
             msg.route_id = conn.route_id
+            msg.owner_id = conn.owner_id
             over_capacity = False
-            async with self._wrapper_send_lock:
+            async with self._wrapper_send_lock_for(machine_id):
                 async with self._lock:
                     clients = self._clients_for(machine_id)
                     old = clients.get(client_id)
@@ -414,7 +494,7 @@ class RelayHub:
                 )
                 return
             if old is not None and old is not conn:
-                await old.stop(code=4009, reason="replaced by reconnect")
+                old.begin_stop(code=4009, reason="replaced by reconnect")
             log.info("client registered", client_id=client_id,
                      machine_id=machine_id, total=self.client_count)
 
@@ -443,6 +523,9 @@ class RelayHub:
                     break
                 if hasattr(msg, "client_id"):
                     msg.client_id = client_id
+                # Both routing identities are relay authority. Never allow a
+                # browser frame to select another account's private forks.
+                msg.owner_id = conn.owner_id
                 # route_id is reserved for the first Hello catch-up response.
                 msg.route_id = None
                 if not await self._forward_client_msg(
@@ -470,7 +553,7 @@ class RelayHub:
         machine_id: str = "default",
     ) -> bool:
         """Forward iff ``conn`` still owns client_id at the send linearization point."""
-        async with self._wrapper_send_lock:
+        async with self._wrapper_send_lock_for(machine_id):
             async with self._lock:
                 current = self._clients_for(machine_id).get(client_id) is conn
                 wrapper = self._wrapper_for(machine_id)
@@ -517,6 +600,24 @@ class RelayHub:
             await self._drop_client(
                 c, code=4008, reason="slow client", machine_id=machine_id)
 
+    async def _broadcast_owner(
+        self, msg, owner_id: str, machine_id: str = "default",
+    ) -> None:
+        async with self._lock:
+            conns = [
+                conn for conn in self._clients_for(machine_id).values()
+                if conn.owner_id == owner_id
+            ]
+        dead: list[ClientConn] = []
+        for conn in conns:
+            try:
+                await conn.send(msg)
+            except (SlowClientError, ConnectionError):
+                dead.append(conn)
+        for conn in dead:
+            await self._drop_client(
+                conn, code=4008, reason="slow client", machine_id=machine_id)
+
     async def _drop_client(self, conn: ClientConn, *, code: int | None = None,
                            reason: str = "", machine_id: str = "default") -> None:
         async with self._lock:
@@ -524,4 +625,6 @@ class RelayHub:
             if clients.get(conn.client_id) is conn:
                 del clients[conn.client_id]
                 self._prune_clients_for(machine_id, clients)
-        await conn.stop(code=code, reason=reason)
+        # Remove the route and stop its sender immediately. Closing a broken
+        # browser is bounded connection cleanup, never part of wrapper ingress.
+        conn.begin_stop(code=code, reason=reason)

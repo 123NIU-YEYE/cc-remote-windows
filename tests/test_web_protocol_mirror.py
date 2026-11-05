@@ -8,6 +8,7 @@ from typing import get_args
 
 from cc_remote.protocol import (
     AssistantChannel,
+    AutoCompactMode,
     CodexThreadStatus,
     CollaborationModeName,
     ControlMode,
@@ -31,7 +32,10 @@ from cc_remote.protocol import (
     PROTOCOL_VERSION,
     SessionInfo,
     StatusDailyUsageBucket,
+    StatusRateLimitResetCredit,
+    StatusRateLimitResetCredits,
     StatusUsage,
+    RateLimitResetOutcome,
     TurnNotificationContext,
 )
 
@@ -123,7 +127,7 @@ def test_every_python_wire_type_has_a_typescript_interface():
     for wire_type, model in _TYPE_MAP.items():
         body_name = mirrored[wire_type]
         for field in model.__annotations__:
-            if field == "type":
+            if field == "type" or field in model.__private_attributes__:
                 continue
             assert _field_optional(body_name, field) is not None, (
                 f"{body_name} is missing Python field {field!r}"
@@ -152,6 +156,8 @@ def test_nested_wire_models_keep_fields_and_requiredness():
         ("ThreadGoal", ThreadGoal),
         ("TurnNotificationContext", TurnNotificationContext),
         ("StatusDailyUsageBucket", StatusDailyUsageBucket),
+        ("StatusRateLimitResetCredit", StatusRateLimitResetCredit),
+        ("StatusRateLimitResetCredits", StatusRateLimitResetCredits),
         ("StatusUsage", StatusUsage),
     ):
         for field, definition in model.model_fields.items():
@@ -173,6 +179,7 @@ def test_literal_unions_match_python_protocol():
         "ProcessStatus": ProcessStatus,
         "ProcessAppendTarget": ProcessAppendTarget,
         "EffortLevel": EffortLevel,
+        "AutoCompactMode": AutoCompactMode,
         "PermissionMode": PermissionMode,
         "CollaborationModeName": CollaborationModeName,
         "ControlMode": ControlMode,
@@ -180,11 +187,13 @@ def test_literal_unions_match_python_protocol():
         "GoalStatus": GoalStatus,
         "NoticeSeverity": NoticeSeverity,
         "NoticeCategory": NoticeCategory,
+        "RateLimitResetOutcome": RateLimitResetOutcome,
         "CodexThreadStatus": CodexThreadStatus,
-        "ServiceTier": SetServiceTier.model_fields["service_tier"].annotation,
     }
     for name, annotation in aliases.items():
         assert _alias_literals(name) == set(get_args(annotation)), name
+    assert SetServiceTier.model_fields["service_tier"].annotation is str
+    assert re.search(r"export type ServiceTier = string;", TS_PROTOCOL)
 
 
 def test_process_timeline_has_an_icon_for_every_process_kind():

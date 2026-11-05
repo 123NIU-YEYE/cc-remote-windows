@@ -8,7 +8,8 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
+  AutoCompactMode, DiffTheme, DshGoalAction, DshReadKind, Engine, GoalStatus, PermissionMode, QueryFile,
+  QueryImg, ServerEvent, SessionControl, Space,
 } from "./protocol.ts";
 import {
   compareSessionControl,
@@ -19,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   sessionControlTargetsSid,
 } from "./protocol.ts";
+import { validAutoCompactThreshold } from "./auto-compact.ts";
 import {
   CommandOutbox,
   QueryAcceptanceLatch,
@@ -29,20 +31,38 @@ import {
 } from "./outbox.ts";
 import { probeSession, shouldReconnectAfterSessionProbe } from "./session-auth.ts";
 import { uuid } from "./util.ts";
+import { RecoverableReadCoordinator } from "./recoverable-read.ts";
 
 export type ConnState = "connecting" | "connected" | "reconnecting" | "disconnected";
 
 export interface EventOwnership {
   scopeKey: string;
   machineId: string;
-  engine: "claude" | "codex";
+  engine: "claude" | "codex" | "dsh";
   space: Space;
+  claudeProfileId?: string | null;
+  codexProfileId?: string | null;
   surfaceEpoch: number;
   connectionGeneration: number;
 }
 
+interface ListRequestOwnership {
+  ownership: EventOwnership;
+  order: number;
+  // Mutations can also return SessionList; their failures must stay visible.
+  readOnly: boolean;
+  deferred?: boolean;
+}
+
+interface InvalidatedListRefresh {
+  requestId: string;
+  engine: "claude" | "codex" | "dsh";
+  space: Space;
+  dirty: boolean;
+}
+
 export function sessionScopeKey(
-  machineId: string, engine: "claude" | "codex", space: Space,
+  machineId: string, engine: "claude" | "codex" | "dsh", space: Space,
 ): string {
   return `${machineId}:${space}:${engine}`;
 }
@@ -52,6 +72,7 @@ export interface WsCallbacks {
   onConnState: (s: ConnState, detail?: string) => void;
   onAuthFail?: () => void;
   onCommandError?: (detail: string) => void;
+  onCommandCompleted?: (commandId: string) => void;
   onWrapperGenerationChanged?: () => void;
   onOutboxChanged?: (protectedSessionIds: string[]) => void;
 }
@@ -66,6 +87,16 @@ const MAX_REPLAY_SESSIONS = 128;
 const PROTOCOL_RELOAD_KEY = "cc-remote:protocol-reload";
 const PROTOCOL_RECOVERY_POLL_MS = 1000;
 const PROTOCOL_RECOVERY_TIMEOUT_MS = 120000;
+let pageClientId: string | null = null;
+
+/** A page-lifetime connection identity. Durable BTW ownership is derived from
+ * authenticated relay claims, so duplicated tabs must never reuse this id and
+ * replace one another's WebSocket generation.
+ */
+export function stableTabClientId(): string {
+  pageClientId ??= uuid();
+  return pageClientId;
+}
 
 function readProtocolReloadMarker(): string | null | undefined {
   try {
@@ -142,24 +173,36 @@ export class RelayWs {
   private controlBySession: Record<string, SessionControl> = {};
   private rebuildingSessions = new Set<string>();
   private replayOrder: string[] = [];
-  private engineBySession: Record<string, "claude" | "codex"> = {};
+  private engineBySession: Record<string, "claude" | "codex" | "dsh"> = {};
   private spaceBySession: Record<string, Space> = {};
+  private claudeProfileBySession: Record<string, string> = {};
+  private codexProfileBySession: Record<string, string> = {};
   private focusedSid: string | null = null;
-  private activeEngine: "claude" | "codex" = "claude";
+  private activeEngine: "claude" | "codex" | "dsh" = "claude";
   private activeSpace: Space = "code";
   // Correlates a create response without using SessionFocus as a trigger for the
   // first query. A later explicit switch clears it, so late create focus cannot
   // override the user's newer navigation intent.
   private newSessionFocusRequestId: string | null = null;
-  private newSessionEngine: "claude" | "codex" = "claude";
+  private newSessionEngine: "claude" | "codex" | "dsh" = "claude";
   private newSessionSpace: Space = "code";
   private connectionGeneration = 0;
   private surfaceEpoch = 1;
   private readonly surfaceEpochByScope: Record<string, number> = {};
   private readonly ownershipBySession: Record<string, EventOwnership> = {};
   private readonly pendingOwnershipByRequest: Record<string, EventOwnership> = {};
+  private readonly pendingListOwnershipByRequest =
+    new Map<string, ListRequestOwnership>();
+  private readonly latestAcceptedListOrderByScope = new Map<string, number>();
+  private readonly listReadRetries = new RecoverableReadCoordinator(
+    (callback, delay) => setTimeout(callback, delay), timer => clearTimeout(timer));
+  private readonly invalidatedListRefreshByScope =
+    new Map<string, InvalidatedListRefresh>();
+  private readonly invalidatedListScopeByRequest = new Map<string, string>();
+  private listRequestOrder = 0;
+  private readonly pendingGoalOwnershipByRequest =
+    new Map<string, EventOwnership>();
   private readonly pendingSwitchOwnership: Record<string, EventOwnership[]> = {};
-  private readonly pendingListOwnership: Record<string, EventOwnership[]> = {};
   private readonly outbox = new CommandOutbox(
     OUTBOX_MAX_COMMANDS, OUTBOX_MAX_BYTES, OUTBOX_MAX_FRAME_BYTES);
   private readonly queryAcceptance = new QueryAcceptanceLatch();
@@ -182,11 +225,13 @@ export class RelayWs {
   private pingSeq = 0;
   private wrapperGeneration: string | null = null;
   private lastGenerationChangeNotice: string | null = null;
+  private readonly knownBtwSids = new Set<string>();
+  private readonly previewReadAttempts = new Map<string, { authorizationId: string; commandId: string }>();
 
   constructor(cb: WsCallbacks, machineId = "default") {
     this.cb = cb;
     this.machineId = machineId;
-    this.clientId = uuid();
+    this.clientId = stableTabClientId();
     const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
     const url = new URL(`${proto}//${window.location.host}/ws`);
     if (machineId !== "default") url.searchParams.set("machine", machineId);
@@ -205,7 +250,16 @@ export class RelayWs {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.cancelProtocolRecovery();
     this.stopHeartbeat();
-    this.ws?.close();
+    this.listReadRetries.clear();
+    this.invalidatedListRefreshByScope.clear();
+    this.invalidatedListScopeByRequest.clear();
+    const ws = this.ws;
+    // Retire the callback generation before close(). Browsers may still deliver
+    // queued open/message/close callbacks synchronously while an App effect is
+    // replacing this RelayWs instance.
+    this.connectionGeneration += 1;
+    this.ws = null;
+    ws?.close();
   }
 
   // App-level heartbeat. The browser's WS onclose does NOT fire for a HALF-OPEN
@@ -255,6 +309,10 @@ export class RelayWs {
     return this.queryAcceptance.pendingMessageId(sid);
   }
 
+  queryReceiptFor(sid: string, messageId: string) {
+    return this.queryAcceptance.receiptFor(sid, messageId);
+  }
+
   private touchReplay(sid: string): void {
     this.replayOrder = this.replayOrder.filter((known) => known !== sid);
     this.replayOrder.push(sid);
@@ -272,6 +330,7 @@ export class RelayWs {
   }
 
   private dropBtwReplayState(): void {
+    this.knownBtwSids.clear();
     for (const knownSid of Object.keys(this.generationBySession)) {
       if (!knownSid.startsWith("btw-")) continue;
       delete this.generationBySession[knownSid];
@@ -406,7 +465,7 @@ export class RelayWs {
     }
   }
 
-  setFocusedSid(sid: string | null, engine?: "claude" | "codex", space?: Space): void {
+  setFocusedSid(sid: string | null, engine?: "claude" | "codex" | "dsh", space?: Space): void {
     this.focusedSid = sid;
     if (sid) {
       if (engine) this.engineBySession[sid] = engine;
@@ -420,11 +479,12 @@ export class RelayWs {
   }
 
   /** Set the visible product surface and drop a focus owned by another one. */
-  setSurface(engine: "claude" | "codex", space: Space): void {
+  setSurface(engine: "claude" | "codex" | "dsh", space: Space): void {
     const changed = engine !== this.activeEngine || space !== this.activeSpace;
     this.activeEngine = engine;
     this.activeSpace = space;
     if (changed) {
+      this.listReadRetries.clear();
       this.surfaceEpoch += 1;
       this.surfaceEpochByScope[
         sessionScopeKey(this.machineId, engine, space)
@@ -446,19 +506,35 @@ export class RelayWs {
     return this.engineBySession[sid] === engine && this.spaceBySession[sid] === space;
   }
 
-  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null; space?: Space | null }>): void {
+  setSessionEngines(sessions: Array<{
+    session_id: string;
+    engine?: string | null;
+    space?: Space | null;
+    claude_profile_id?: string | null;
+    codex_profile_id?: string | null;
+  }>): void {
     for (const session of sessions) {
-      if (session.engine === "codex" || session.engine === "claude") {
+      if (session.engine === "codex" || session.engine === "claude" || session.engine === "dsh") {
         this.engineBySession[session.session_id] = session.engine;
       }
       if (session.space === "work" || session.space === "code") {
         this.spaceBySession[session.session_id] = session.space;
+      }
+      if (session.codex_profile_id) {
+        this.codexProfileBySession[session.session_id] =
+          session.codex_profile_id;
+      }
+      if (session.claude_profile_id) {
+        this.claudeProfileBySession[session.session_id] =
+          session.claude_profile_id;
       }
     }
   }
 
   private ownershipSnapshot(
     engine = this.activeEngine, space = this.activeSpace,
+    codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): EventOwnership {
     const scopeKey = sessionScopeKey(this.machineId, engine, space);
     return {
@@ -466,7 +542,11 @@ export class RelayWs {
       machineId: this.machineId,
       engine,
       space,
-      surfaceEpoch: this.surfaceEpochByScope[scopeKey] ?? 0,
+      claudeProfileId: engine === "claude" ? (claudeProfileId ?? null) : null,
+      codexProfileId: engine === "codex" ? (codexProfileId ?? null) : null,
+      // Background catalog reads may target an engine not yet visited. Record
+      // its initial epoch so its correlated response passes the same guard.
+      surfaceEpoch: this.surfaceEpochByScope[scopeKey] ??= 0,
       connectionGeneration: this.connectionGeneration,
     };
   }
@@ -533,32 +613,48 @@ export class RelayWs {
     });
     return queued ? requestId : null;
   }
-  sendCloseBtw(btwSid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs() });
+  sendCloseBtw(btwSid: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "close_btw", sid: btwSid, ts: nowTs(),
+    });
+  }
+
+  sendSyncBtw(btwSid: string): boolean {
+    const command: Record<string, unknown> = {
+      v: PROTOCOL_VERSION,
+      type: "sync_btw",
+      sid: btwSid,
+      cursor: this.lastSeqFor(btwSid),
+      ts: nowTs(),
+    };
+    const generation = this.generationFor(btwSid);
+    if (generation) command.generation = generation;
+    return this.send(command);
   }
 
   sendForkSessionWorktree(parentSessionId: string, name: string,
                           requestId = uuid(), lastTurnId?: string): string | null {
-    const queued = this.send({
+    const queued = this.sendListRefreshingCommand({
       ...makeForkSessionWorktreeCommand(
         parentSessionId, name, requestId, nowTs(), lastTurnId),
-    });
+    }, "codex", "code") !== null;
     return queued ? requestId : null;
   }
 
   sendForkSession(parentSessionId: string, forkPointId: string,
                   requestId = uuid()): string | null {
-    const queued = this.send({
+    const engine = this.engineBySession[parentSessionId] ?? this.activeEngine;
+    const queued = this.sendListRefreshingCommand({
       ...makeForkSessionCommand(parentSessionId, forkPointId, requestId, nowTs()),
-    });
+    }, engine, "code") !== null;
     return queued ? requestId : null;
   }
 
   sendMigrateSession(sessionId: string, cwd: string,
                      requestId = uuid()): string | null {
-    const queued = this.send({
+    const queued = this.sendListRefreshingCommand({
       ...makeMigrateSessionCommand(sessionId, cwd, requestId, nowTs()),
-    });
+    }, "codex", "code") !== null;
     return queued ? requestId : null;
   }
 
@@ -691,6 +787,35 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_model", sid, model, ts: nowTs() });
   }
 
+  sendDshControl(sid: string, kind: import("./protocol").DshControlKind, value: string, images?: QueryImg[], files?: QueryFile[]): string | null {
+    // PTY keystrokes belong to one physical attachment, never the recovery outbox.
+    if (kind === "terminal" || (kind === "manage" && (() => {
+      try { return JSON.parse(value).action === "schedule_create"; } catch { return false; }
+    })())) {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null;
+      const cmd_id = uuid();
+      this.sendUntracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, cmd_id, client_id: this.clientId });
+      return cmd_id;
+    }
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "set_dsh_control", ts: nowTs(), sid, kind, value, ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) });
+  }
+
+  sendReadDsh(sid: string, kind: DshReadKind, fields: { job_id?: string; query?: string; target_sid?: string; before_seq?: number }): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "read_dsh", ts: nowTs(), sid, kind, ...fields });
+  }
+
+  sendActDshSubagent(sid: string, target_sid: string, action: "queue" | "steer" | "stop", prompt: string): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "act_dsh_subagent", ts: nowTs(), sid, target_sid, action, prompt });
+  }
+
+  sendActDshGoal(sid: string, action: DshGoalAction): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "act_dsh_goal", ts: nowTs(), sid, ...action });
+  }
+
+  sendDownloadDsh(sid: string, export_id?: string, offset = 0, cancel = false): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "download_dsh", ts: nowTs(), sid, export_id, offset, cancel });
+  }
+
   sendSetEffort(effort: string): void {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
   }
@@ -699,8 +824,44 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
   }
 
-  sendSetServiceTier(service_tier: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "set_service_tier", service_tier, ts: nowTs(), ...this.sidObj() });
+  sendSetAutoCompact(
+    mode: AutoCompactMode, thresholdTokens?: number | null,
+  ): boolean {
+    if (mode === "custom" && !validAutoCompactThreshold(thresholdTokens)) {
+      return false;
+    }
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_auto_compact",
+      mode,
+      ...(mode === "custom"
+        ? { threshold_tokens: thresholdTokens }
+        : {}),
+      ts: nowTs(),
+      ...this.sidObj(),
+    });
+  }
+
+  sendSetAutoCompactTo(
+    sid: string, mode: AutoCompactMode, thresholdTokens?: number | null,
+  ): boolean {
+    if (mode === "custom" && !validAutoCompactThreshold(thresholdTokens)) {
+      return false;
+    }
+    return this.send({
+      v: PROTOCOL_VERSION,
+      type: "set_auto_compact",
+      sid,
+      mode,
+      ...(mode === "custom"
+        ? { threshold_tokens: thresholdTokens }
+        : {}),
+      ts: nowTs(),
+    });
+  }
+
+  sendSetServiceTier(service_tier: string, sid?: string): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "set_service_tier", service_tier, ts: nowTs(), ...this.sidObj(sid) });
   }
 
   sendSetCollaborationMode(mode: "default" | "plan"): void {
@@ -711,17 +872,21 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
 
-  sendGetPermissionProfiles(cwd?: string): string | null {
+  sendGetPermissionProfiles(
+    cwd?: string,
+    codexProfileId?: string | null,
+  ): string | null {
     return this.sendTracked({
       v: PROTOCOL_VERSION,
       type: "get_permission_profiles",
       ts: nowTs(),
+      ...(codexProfileId ? { codex_profile_id: codexProfileId } : {}),
       ...(cwd ? { cwd } : this.sidObj()),
     });
   }
 
-  sendSetPermissionProfile(profile: string): void {
-    this.send({
+  sendSetPermissionProfile(profile: string): string | null {
+    return this.sendTracked({
       v: PROTOCOL_VERSION,
       type: "set_permission_profile",
       profile,
@@ -740,21 +905,44 @@ export class RelayWs {
     });
   }
 
-  sendGetContext(): string | null {
+  sendGetContext(refresh = false): string | null {
     return this.sendTracked({
-      v: PROTOCOL_VERSION, type: "get_context", ts: nowTs(), ...this.sidObj(),
-    });
-  }
-
-  sendGetContextTo(sid: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_context", sid, ts: nowTs() });
-  }
-
-  sendGetDiff(file: string, theme: DiffTheme): string | null {
-    return this.sendTracked({
-      v: PROTOCOL_VERSION, type: "get_diff", file, theme,
+      v: PROTOCOL_VERSION, type: "get_context", refresh,
       ts: nowTs(), ...this.sidObj(),
     });
+  }
+
+  sendGetContextTo(sid: string, refresh = false): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_context", sid, refresh, ts: nowTs(),
+    });
+  }
+
+  sendGetDiff(file: string, theme: DiffTheme, turnId?: string, revision?: string, engine?: Engine): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_diff", file, theme,
+      ...(turnId ? { turn_id: turnId, revision, engine } : {}),
+      ts: nowTs(), ...this.sidObj(),
+    });
+  }
+
+  sendGetTurnFileChanges(sid: string, engine: Engine, turnId: string, revision: string, offset: number): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_turn_file_changes", sid, engine,
+      turn_id: turnId, revision, offset, limit: 64, ts: nowTs(),
+    });
+  }
+
+  sendGetSessionArtifacts(sid: string, engine: Engine, space: Space, requestId: string,
+                          before?: number | null, scanHistory = false, historyBefore?: string | null): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "get_session_artifacts", sid, engine, space,
+      request_id: requestId, before, scan_history: scanHistory, history_before: historyBefore, ts: nowTs() });
+  }
+
+  sendGetSessionArtifactPreview(sid: string, engine: Engine, space: Space, id: string, requestId: string,
+                                variant: "full" | "thumbnail" = "full"): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "get_session_artifact_preview", sid, engine, space,
+      artifact_id: id, request_id: requestId, variant, ts: nowTs() });
   }
 
   sendGetFilePreview(
@@ -767,6 +955,18 @@ export class RelayWs {
       ts: nowTs(), ...this.sidObj(targetSid),
     });
     return queued ? requestId : null;
+  }
+
+  sendBrowseFiles(sid: string, path: string, requestId: string,
+                  hidden = false, offset = 0, revision?: string | null): boolean {
+    return this.send({ v: PROTOCOL_VERSION, type: "browse_files", sid, path,
+      request_id: requestId, hidden, offset, limit: 100, revision, ts: nowTs() });
+  }
+
+  sendCodexContext(sid: string, maxTokens: number | null): boolean {
+    if (maxTokens !== null && (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 100_000_000)) return false;
+    return !!this.sendTracked({ v: PROTOCOL_VERSION, type: "set_codex_context",
+      sid, max_context_tokens: maxTokens, ts: nowTs() });
   }
 
   sendSaveMarkdown(path: string, content: string, expectedSize: number,
@@ -805,7 +1005,15 @@ export class RelayWs {
     decision: "allow" | "deny",
     targetSid?: string | null,
   ): string | null {
-    return this.sendTracked({
+    const key = JSON.stringify([this.sidObj(targetSid).sid ?? null, requestId]);
+    const previous = this.previewReadAttempts.get(key);
+    // Automatic read handshakes must not loop if a producer keeps atomically
+    // replacing the file. Same challenge is idempotent; a changed challenge
+    // requires a fresh read request (e.g. the existing Refresh action).
+    if (decision === "allow" && previous) {
+      return previous.authorizationId === authorizationId ? previous.commandId : null;
+    }
+    const commandId = this.sendTracked({
       v: PROTOCOL_VERSION,
       type: "authorize_preview",
       authorization_id: authorizationId,
@@ -814,6 +1022,13 @@ export class RelayWs {
       ts: nowTs(),
       ...this.sidObj(targetSid),
     });
+    if (commandId && decision === "allow") {
+      this.previewReadAttempts.set(key, { authorizationId, commandId });
+      if (this.previewReadAttempts.size > 256) {
+        this.previewReadAttempts.delete(this.previewReadAttempts.keys().next().value!);
+      }
+    }
+    return commandId;
   }
 
   /** Fetch a small canonical conversation page. Heavy per-turn detail remains
@@ -848,6 +1063,22 @@ export class RelayWs {
     return this.send(frame);
   }
 
+  sendGetAgentDetail(
+    sessionId: string, runId: string, revision?: string | null,
+    detailRevision?: string | null, before?: string | null, limit = 192,
+    requestId = uuid(),
+  ): string | null {
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "get_agent_detail",
+      session_id: sessionId, run_id: runId, request_id: requestId,
+      client_id: this.clientId, limit, ts: nowTs(),
+    };
+    if (revision) frame.revision = revision;
+    if (detailRevision) frame.detail_revision = detailRevision;
+    if (before) frame.before = before;
+    return this.send(frame) ? requestId : null;
+  }
+
   sendGetHistoryImage(
     sessionId: string,
     turnId: string,
@@ -867,45 +1098,76 @@ export class RelayWs {
 
   /** Ask the engine for its catalog and explicit new-session defaults. Claude
    *  needs cwd because project/local settings can change the selected model. */
-  sendGetModels(engine: "cc" | "claude" | "codex", cwd?: string | null): void {
+  sendGetModels(
+    engine: "cc" | "claude" | "codex" | "dsh",
+    cwd?: string | null,
+    codexProfileId?: string | null,
+    claudeProfileId?: string | null,
+  ): void {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_models", engine,
       client_id: this.clientId, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     this.send(frame);
   }
 
-  sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
+  sendGetEngineCapabilities(engine: "claude" | "codex" | "dsh", space: Space,
                             cwd?: string | null,
-                            skillsOnly = false): string | null {
+                            skillsOnly = false,
+                            codexProfileId?: string | null,
+                            claudeProfileId?: string | null,
+                            sid?: string | null, dshPreset?: string | null): string | null {
     const frame: Record<string, unknown> = {
-      v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
+      v: PROTOCOL_VERSION, type: "get_engine_capabilities", ...(engine === "dsh" && dshPreset ? {dsh_agent_preset: dshPreset} : {}), engine, space,
       client_id: this.clientId, skills_only: skillsOnly, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
+    if (sid) frame.sid = sid;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     return this.sendTracked(frame);
   }
 
-  sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
+  sendManageEnginePlugin(engine: "claude" | "codex" | "dsh", space: Space,
                          action: "install" | "uninstall", pluginId: string,
-                         cwd?: string | null): string | null {
+                         cwd?: string | null,
+                         codexProfileId?: string | null,
+                         claudeProfileId?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_plugin", engine, space,
       action, plugin_id: pluginId, client_id: this.clientId, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     return this.sendTracked(frame);
   }
 
   sendManageEngineSkill(
-    engine: "claude" | "codex", space: Space,
+    engine: "claude" | "codex" | "dsh", space: Space,
     action: "create" | "remove" | "enable" | "disable",
     options: {
       skillId?: string; name?: string; description?: string;
       instructions?: string; scope?: "user" | "project";
     },
     cwd?: string | null,
+    codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_skill", engine, space, action,
@@ -917,17 +1179,25 @@ export class RelayWs {
     if (options.instructions !== undefined) frame.instructions = options.instructions;
     if (options.scope) frame.scope = options.scope;
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     return this.sendTracked(frame);
   }
 
   sendManageEngineHook(
-    engine: "claude" | "codex", space: Space,
+    engine: "claude" | "codex" | "dsh", space: Space,
     action: "create" | "remove",
     options: {
       hookId?: string; event?: string; matcher?: string; command?: string;
       timeout?: number; scope?: "user" | "project";
     },
     cwd?: string | null,
+    codexProfileId?: string | null,
+    claudeProfileId?: string | null,
   ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_hook", engine, space, action,
@@ -940,20 +1210,52 @@ export class RelayWs {
     if (options.timeout !== undefined) frame.timeout = options.timeout;
     if (options.scope) frame.scope = options.scope;
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      frame.claude_profile_id = claudeProfileId;
+    }
     return this.sendTracked(frame);
   }
 
   sendAnswerQuestion(
-    sid: string, askId: string, answer: string | string[],
+    sid: string, askId: string, answer: string | string[] | undefined,
+    answers?: (string | string[])[],
   ): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "answer_question",
-      ask_id: askId, answer, sid, ts: nowTs(),
+      ask_id: askId, answer, answers, sid, ts: nowTs(),
     });
   }
 
-  sendGetGoal(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "get_goal", ts: nowTs(), ...this.sidObj() });
+  sendGetGoal(): string | null {
+    const sid = this.focusedSid;
+    return sid ? this.sendGetGoalTo(sid) : null;
+  }
+
+  sendGetGoalTo(sid: string): string | null {
+    const engine = this.engineBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeEngine : undefined);
+    const space = this.spaceBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeSpace : undefined);
+    const ownership = engine && space
+      ? this.ownershipSnapshot(engine, space) : undefined;
+    const commandId = uuid();
+    if (ownership) {
+      this.pendingGoalOwnershipByRequest.set(commandId, ownership);
+      while (this.pendingGoalOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
+        const oldest = this.pendingGoalOwnershipByRequest.keys().next().value;
+        if (typeof oldest !== "string") break;
+        this.pendingGoalOwnershipByRequest.delete(oldest);
+      }
+    }
+    const requestId = this.sendTracked({
+      v: PROTOCOL_VERSION, type: "get_goal", sid,
+      client_id: this.clientId, ts: nowTs(),
+    }, commandId);
+    if (!requestId) this.pendingGoalOwnershipByRequest.delete(commandId);
+    return requestId;
   }
 
   sendGetStatus(): string | null {
@@ -970,37 +1272,146 @@ export class RelayWs {
     });
   }
 
-  sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null): void {
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...this.sidObj() };
+  sendConsumeRateLimitResetCredit(
+    sid: string,
+    creditId?: string | null,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "consume_rate_limit_reset_credit",
+      sid,
+      client_id: this.clientId,
+      ...(creditId ? { credit_id: creditId } : {}),
+      ts: nowTs(),
+    });
+  }
+
+  sendSetGoal(objective: string | null, status: GoalStatus | null, tokenBudget: number | null, sid?: string): string | null {
+    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "set_goal", ts: nowTs(), ...(sid ? { sid } : this.sidObj()) };
     if (objective !== null) obj.objective = objective;
     if (status !== null) obj.status = status;
     if (tokenBudget !== null) obj.token_budget = tokenBudget;
-    this.send(obj);
+    return this.sendTracked(obj);
   }
 
-  sendClearGoal(): void {
-    this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
+  sendClearGoal(sid?: string): string | null {
+    return this.sendTracked({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...(sid ? { sid } : this.sidObj()) });
   }
 
-  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
-    const targetEngine = engine ?? "claude";
-    const scopeKey = sessionScopeKey(this.machineId, targetEngine, space);
-    const ownership = this.ownershipSnapshot(targetEngine, space);
-    const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
-    if (engine && engine !== "claude") obj.engine = engine;
-    if (space !== "code") obj.space = space;
-    const queued = this.send(obj);
-    if (queued) {
-      this.queueOwnership(this.pendingListOwnership, scopeKey, ownership);
+  sendDismissGoalTo(sid: string, goalId: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "dismiss_goal",
+      sid,
+      goal_id: goalId,
+      client_id: this.clientId,
+      ts: nowTs(),
+    });
+  }
+
+  sendAcknowledgeCompletionTo(
+    sid: string,
+    completionId: string,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "acknowledge_completion",
+      sid,
+      completion_id: completionId,
+      client_id: this.clientId,
+      ts: nowTs(),
+    });
+  }
+
+  sendListSessions(engine?: "claude" | "codex" | "dsh", space: Space = "code"): boolean {
+    return this.sendSessionListRead(engine ?? "claude", space) !== null;
+  }
+
+  private sendSessionListRead(
+    engine: "claude" | "codex" | "dsh", space: Space, retry = false,
+  ): string | null {
+    return this.sendListRefreshingCommand({
+      v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs(), engine, space,
+    }, engine, space, uuid(), retry);
+  }
+
+  /** Session mutations return a SessionList correlated to the mutation's own
+   * cmd_id. Freeze the same request-time ownership used by an explicit list so
+   * those authoritative refreshes cannot borrow the surface active at receive
+   * time or be dropped as unowned. */
+  private sendListRefreshingCommand(
+    obj: Record<string, unknown>, engine: "claude" | "codex" | "dsh", space: Space,
+    commandId = uuid(), retry = false,
+  ): string | null {
+    const ownership = this.ownershipSnapshot(engine, space);
+    if (!retry) this.listReadRetries.complete(ownership.scopeKey);
+    this.pendingListOwnershipByRequest.set(commandId, {
+      ownership,
+      order: ++this.listRequestOrder,
+      readOnly: obj.type === "list_sessions",
+    });
+    // One insertion can evict at most one entry from this bounded map.
+    if (this.pendingListOwnershipByRequest.size > OUTBOX_MAX_COMMANDS) {
+      this.pendingListOwnershipByRequest.delete(this.pendingListOwnershipByRequest.keys().next().value!);
     }
+    const queued = this.sendTracked(obj, commandId);
+    if (!queued) this.pendingListOwnershipByRequest.delete(commandId);
     return queued;
   }
 
-  sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
+  private refreshInvalidatedSessionList(
+    engine: "claude" | "codex" | "dsh",
+    space: Space,
+    socketGeneration: number,
+  ): void {
+    if (socketGeneration !== this.connectionGeneration
+        || engine !== this.activeEngine || space !== this.activeSpace) return;
+    const scopeKey = sessionScopeKey(this.machineId, engine, space);
+    const inFlight = this.invalidatedListRefreshByScope.get(scopeKey);
+    if (inFlight) {
+      inFlight.dirty = true;
+      return;
+    }
+    const requestId = this.sendSessionListRead(engine, space);
+    if (!requestId) return;
+    this.invalidatedListRefreshByScope.set(scopeKey, {
+      requestId, engine, space, dirty: false,
+    });
+    this.invalidatedListScopeByRequest.set(requestId, scopeKey);
+  }
+
+  private completeInvalidatedSessionListRefresh(
+    requestId: string,
+    socketGeneration: number,
+  ): void {
+    const scopeKey = this.invalidatedListScopeByRequest.get(requestId);
+    if (!scopeKey) return;
+    this.invalidatedListScopeByRequest.delete(requestId);
+    const refresh = this.invalidatedListRefreshByScope.get(scopeKey);
+    if (!refresh || refresh.requestId !== requestId) return;
+    this.invalidatedListRefreshByScope.delete(scopeKey);
+    if (refresh.dirty) {
+      this.refreshInvalidatedSessionList(
+        refresh.engine, refresh.space, socketGeneration);
+    }
+  }
+
+  sendSwitchSession(sessionId: string, engine?: "claude" | "codex" | "dsh", space: Space = "code"): void {
     const targetEngine = engine ?? this.activeEngine;
     if (engine) this.engineBySession[sessionId] = engine;
     this.spaceBySession[sessionId] = space;
-    const ownership = this.ownershipSnapshot(targetEngine, space);
+    const ownership = this.ownershipSnapshot(
+      targetEngine,
+      space,
+      targetEngine === "codex"
+        ? this.codexProfileBySession[sessionId]
+          ?? this.ownershipBySession[sessionId]?.codexProfileId
+        : null,
+      targetEngine === "claude"
+        ? this.claudeProfileBySession[sessionId]
+          ?? this.ownershipBySession[sessionId]?.claudeProfileId
+        : null,
+    );
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
@@ -1009,35 +1420,64 @@ export class RelayWs {
     }
   }
 
-  sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
+  sendNewSession(cwd?: string | null, engine?: "claude" | "codex" | "dsh",
                  model?: string | null, effort?: string | null,
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
                  collaborationMode?: "default" | "plan",
-                 permissionMode?: "never" | "on-request" | "untrusted",
+                 permissionMode?: PermissionMode,
                  permissionProfile?: string,
                  webSearch?: "cached" | "live",
-                 serviceTier?: "default" | "fast",
-                 space: Space = "code", projectId?: string | null): boolean {
+                 serviceTier?: string,
+                 space: Space = "code", projectId?: string | null,
+                 codexProfileId?: string | null,
+                 autoCompact?: {
+                   mode: AutoCompactMode;
+                   thresholdTokens?: number | null;
+                 },
+                 claudeProfileId?: string | null, dshPreset?: string | null, dshPermission?: string): boolean {
+    const targetEngine = engine ?? "claude";
+    if (targetEngine === "claude" && autoCompact?.mode === "custom"
+        && !validAutoCompactThreshold(autoCompact.thresholdTokens)) {
+      return false;
+    }
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
-    this.newSessionEngine = engine ?? "claude";
+    this.newSessionEngine = targetEngine;
     this.newSessionSpace = space;
     const ownership = this.ownershipSnapshot(
-      this.newSessionEngine, this.newSessionSpace);
+      this.newSessionEngine,
+      this.newSessionSpace,
+      this.newSessionEngine === "codex" ? codexProfileId : null,
+      this.newSessionEngine === "claude" ? claudeProfileId : null,
+    );
     this.pendingOwnershipByRequest[requestId] = ownership;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "new_session", request_id: requestId, ts: nowTs(),
     };
     if (cwd) obj.cwd = cwd;
     if (engine && engine !== "claude") obj.engine = engine;
+    if (engine === "codex" && codexProfileId) {
+      obj.codex_profile_id = codexProfileId;
+    }
+    if (targetEngine === "claude" && claudeProfileId) {
+      obj.claude_profile_id = claudeProfileId;
+    }
     if (space !== "code") obj.space = space;
     if (space === "work" && projectId) obj.project_id = projectId;
     if (model) obj.model = model;
-    if (effort) obj.effort = effort;
+    if (effort) obj[targetEngine === "dsh" ? "dsh_effort" : "effort"] = effort;
+    if (targetEngine === "dsh" && dshPermission) obj.dsh_permission = dshPermission;
+    if (targetEngine === "dsh" && dshPreset) obj.dsh_agent_preset = dshPreset;
+    if (targetEngine === "claude" && autoCompact) {
+      obj.auto_compact_mode = autoCompact.mode;
+      if (autoCompact.mode === "custom") {
+        obj.auto_compact_threshold_tokens = autoCompact.thresholdTokens;
+      }
+    }
     if (engine === "codex" && collaborationMode) {
       obj.collaboration_mode = collaborationMode;
     }
-    if (engine === "codex" && permissionMode) {
+    if (permissionMode && (targetEngine === "codex" || space === "code")) {
       obj.permission_mode = permissionMode;
     }
     if (engine === "codex" && permissionProfile) {
@@ -1064,48 +1504,54 @@ export class RelayWs {
   }
 
   sendRenameSession(sessionId: string, title: string,
-                    engine?: "claude" | "codex", space: Space = "code"): void {
+                    engine?: "claude" | "codex" | "dsh", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendArchiveSession(sessionId: string, archived: boolean,
-                     engine?: "claude" | "codex", space: Space = "code"): void {
+                     engine?: "claude" | "codex" | "dsh", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
   sendPinSession(sessionId: string, pinned: boolean,
-                 engine?: "claude" | "codex", space: Space = "code"): void {
+                 engine?: "claude" | "codex" | "dsh", space: Space = "code"): void {
+    const targetEngine = engine
+      ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "pin_session", session_id: sessionId,
       pinned, ts: nowTs(),
     };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
-    this.send(obj);
+    this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
-  sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
-    return this.send({
+  sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex" | "dsh"): boolean {
+    return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,
       engine, space: "work", ts: nowTs(),
-    });
+    }, engine, "work") !== null;
   }
 
-  sendDeleteSession(sessionId: string, engine: "claude" | "codex",
+  sendDeleteSession(sessionId: string, engine: "claude" | "codex" | "dsh",
                     space: Space = "code"): boolean {
-    return this.send({
+    return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_session", session_id: sessionId,
       engine, space, ts: nowTs(),
-    });
+    }, engine, space) !== null;
   }
 
-  sendRollbackSession(sessionId: string, engine: "claude" | "codex",
+  sendRollbackSession(sessionId: string, engine: "claude" | "codex" | "dsh",
                       restore: "conversation" | "files" | "both",
                       numTurns = 1, checkpointId?: string): boolean {
     const command: Record<string, unknown> = {
@@ -1116,10 +1562,10 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendCompactSession(sessionId: string): boolean {
+  sendCompactSession(sessionId: string, engine: "claude" | "codex" | "dsh"): boolean {
     return this.send({
       v: PROTOCOL_VERSION, type: "compact_session", session_id: sessionId,
-      engine: "codex", space: "code", ts: nowTs(),
+      engine, space: "code", ts: nowTs(),
     });
   }
 
@@ -1134,31 +1580,127 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendGetWorkDashboard(engine: "claude" | "codex"): void {
+  sendGetWorkDashboard(engine: "claude" | "codex" | "dsh"): void {
     this.send({
       v: PROTOCOL_VERSION, type: "get_work_dashboard", engine, ts: nowTs(),
     });
   }
+  // ---- collaboration rooms ----
+  sendListRooms(): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "list_rooms", ts: nowTs(), cmd_id: uuid(),
+    });
+  }
 
-  sendGetWorkArtifacts(engine: "claude" | "codex", sessionId: string): void {
+  sendGetRoom(roomId: string, limit = 100, before?: number): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "get_room", room_id: roomId, limit,
+      ...(before === undefined ? {} : { before }), ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendRenameRoom(roomId: string, name: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "update_room", room_id: roomId, name,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendUpdateRoomCwd(roomId: string, cwd: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "update_room", room_id: roomId, cwd,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendApproveRoomPlan(roomId: string, executorMember: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "approve_room_plan", room_id: roomId,
+      executor_member: executorMember, ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendDiscardRoomPlan(roomId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "discard_room_plan", room_id: roomId,
+      ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendSetRoomFlow(roomId: string, adviseExecute: boolean): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "set_room_flow", room_id: roomId,
+      advise_execute: adviseExecute, ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendUpdateRoomMembers(
+    roomId: string,
+    members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null; model?: string | null; effort?: string | null; is_default?: boolean }[],
+  ): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "update_room", room_id: roomId, members,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendDeleteRoom(roomId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "delete_room", room_id: roomId,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendCreateRoom(
+    name: string, cwd: string,
+    members: { member_id: string; label: string; engine?: string; profile_id?: string | null; session_id?: string | null; model?: string | null; effort?: string | null; is_default?: boolean }[],
+  ): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "create_room", name, cwd, members,
+      ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendPostRoomMessage(roomId: string, text: string, delivery: "queue" | "immediate" = "queue"): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "post_room_message", room_id: roomId, text,
+      delivery, ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendSteerRoomMember(roomId: string, memberId: string, text: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "steer_room_member", room_id: roomId,
+      member_id: memberId, text, ts: nowTs(), cmd_id: uuid(), client_id: this.clientId,
+    });
+  }
+
+  sendCancelRoomMember(roomId: string, memberId: string): boolean {
+    return this.send({
+      v: PROTOCOL_VERSION, type: "cancel_room_member", room_id: roomId,
+      member_id: memberId, ts: nowTs(), cmd_id: uuid(),
+    });
+  }
+
+  sendGetWorkArtifacts(engine: "claude" | "codex" | "dsh", sessionId: string): void {
     this.send({
       v: PROTOCOL_VERSION, type: "get_work_artifacts", engine,
       session_id: sessionId, client_id: this.clientId, ts: nowTs(),
     });
   }
 
-  sendCreateWorkProject(engine: "claude" | "codex", name: string,
+  sendCreateWorkProject(engine: "claude" | "codex" | "dsh", name: string,
                         description: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "create_work_project", engine,
       name, description, ts: nowTs() });
   }
 
-  sendDeleteWorkProject(engine: "claude" | "codex", projectId: string): boolean {
+  sendDeleteWorkProject(engine: "claude" | "codex" | "dsh", projectId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_project", engine,
       project_id: projectId, ts: nowTs() });
   }
 
-  sendAddWorkSource(engine: "claude" | "codex", projectId: string,
+  sendAddWorkSource(engine: "claude" | "codex" | "dsh", projectId: string,
                     kind: "file" | "link" | "note", title: string,
                     uri?: string, file?: QueryFile): boolean {
     const command: Record<string, unknown> = {
@@ -1170,12 +1712,12 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendDeleteWorkSource(engine: "claude" | "codex", sourceId: string): boolean {
+  sendDeleteWorkSource(engine: "claude" | "codex" | "dsh", sourceId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_source", engine,
       source_id: sourceId, ts: nowTs() });
   }
 
-  sendCreateWorkPlugin(engine: "claude" | "codex", name: string,
+  sendCreateWorkPlugin(engine: "claude" | "codex" | "dsh", name: string,
                        instructions: string, projectId?: string): boolean {
     const command: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "create_work_plugin", engine,
@@ -1185,24 +1727,32 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendDeleteWorkPlugin(engine: "claude" | "codex", pluginId: string): boolean {
+  sendDeleteWorkPlugin(engine: "claude" | "codex" | "dsh", pluginId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_plugin", engine,
       plugin_id: pluginId, ts: nowTs() });
   }
 
-  sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
+  sendCreateWorkSchedule(engine: "claude" | "codex" | "dsh", title: string,
                          prompt: string, nextRunAt: number,
-                         repeatSeconds?: number, projectId?: string): boolean {
+                         repeatSeconds?: number, projectId?: string,
+                         codexProfileId?: string,
+                         claudeProfileId?: string): boolean {
     const command: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "create_work_schedule", engine,
       title, prompt, next_run_at: nextRunAt, ts: nowTs(),
     };
     if (repeatSeconds) command.repeat_seconds = repeatSeconds;
     if (projectId) command.project_id = projectId;
+    if (engine === "codex" && codexProfileId) {
+      command.codex_profile_id = codexProfileId;
+    }
+    if (engine === "claude" && claudeProfileId) {
+      command.claude_profile_id = claudeProfileId;
+    }
     return this.send(command);
   }
 
-  sendDeleteWorkSchedule(engine: "claude" | "codex", scheduleId: string): boolean {
+  sendDeleteWorkSchedule(engine: "claude" | "codex" | "dsh", scheduleId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_schedule", engine,
       schedule_id: scheduleId, ts: nowTs() });
   }
@@ -1244,7 +1794,7 @@ export class RelayWs {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "switch_session", session_id: sid, ts: nowTs(),
     };
-    if (this.engineBySession[sid] === "codex") frame.engine = "codex";
+    if (this.engineBySession[sid]) frame.engine = this.engineBySession[sid];
     if (this.spaceBySession[sid] === "work") frame.space = "work";
     this.sendUntracked(frame);
   }
@@ -1285,10 +1835,13 @@ export class RelayWs {
   private connect(): void {
     this.cb.onConnState("connecting");
     const socketGeneration = ++this.connectionGeneration;
+    this.invalidatedListRefreshByScope.clear();
+    this.invalidatedListScopeByRequest.clear();
     const ws = new WebSocket(this.url);
     let compatibleFrameSeen = false;
     this.ws = ws;
     ws.onopen = () => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       this.backoff = 1;
       this.sendRecoveryPreamble();
       this.startHeartbeat();  // detect a half-open link and auto-recover
@@ -1315,6 +1868,35 @@ export class RelayWs {
         const msg = this.filterControl(decoded);
         if (!msg) return;
         if ((msg as { type: string }).type === "pong") return;  // heartbeat reply — consume, don't dispatch
+        // A BtwSync can be the first proof of a replacement Wrapper when this
+        // browser slept through wrapper_reconnected. Invalidate the old
+        // generation before installing the new catalog; doing this afterward
+        // would immediately clear the ids below and drop their SyncBtw replay.
+        if (msg.type === "btw_sync") {
+          this.noteWrapperGeneration(msg.generation);
+        }
+        // The lightweight owner catalog establishes which private routing keys
+        // this account may consume. A live BTW frame can race ahead of Hello's
+        // catalog response; drop it without advancing its cursor so SyncBtw can
+        // recover that exact suffix after the catalog arrives.
+        if (msg.type === "btw_sync") {
+          this.knownBtwSids.clear();
+          for (const session of msg.sessions) {
+            this.knownBtwSids.add(session.btw_sid);
+          }
+        } else if (msg.type === "btw_opened") {
+          this.knownBtwSids.add(msg.btw_sid);
+        } else if (msg.type === "btw_closed") {
+          this.knownBtwSids.delete(msg.btw_sid);
+        } else if (msg.sid?.startsWith("btw-")
+            && !this.knownBtwSids.has(msg.sid)) {
+          return;
+        }
+        if (msg.type === "session_list_invalidated") {
+          this.refreshInvalidatedSessionList(
+            msg.engine, msg.space ?? "code", socketGeneration);
+          return;
+        }
         if ((msg.type === "user_msg" || msg.type === "turn_steered"
               || msg.type === "turn_binding"
               || msg.type === "error")
@@ -1362,7 +1944,10 @@ export class RelayWs {
           }
         }
         if (msg.type === "command_ack") {
+          this.completeInvalidatedSessionListRefresh(
+            msg.cmd_id, socketGeneration);
           if (this.outbox.ack(msg.client_id, msg.cmd_id)) {
+            this.cb.onCommandCompleted?.(msg.cmd_id);
             this.cb.onOutboxChanged?.(this.pendingSessionIds());
           }
           return;
@@ -1379,16 +1964,82 @@ export class RelayWs {
           const listedSpace = msg.space ?? "code";
           const scopeKey = sessionScopeKey(
             this.machineId, msg.engine, listedSpace);
-          const listedOwnership = this.shiftOwnership(
-            this.pendingListOwnership, scopeKey);
-          if (this.acceptsOwnership(listedOwnership, socketGeneration)) {
+          const listedRequest = msg.request_id
+            ? this.pendingListOwnershipByRequest.get(msg.request_id)
+            : undefined;
+          const acceptedOrder =
+            this.latestAcceptedListOrderByScope.get(scopeKey) ?? 0;
+          if (listedRequest
+              && listedRequest.ownership.scopeKey === scopeKey
+              && listedRequest.order >= acceptedOrder
+              && this.acceptsOwnership(
+                listedRequest.ownership, socketGeneration)) {
+            const listedOwnership = listedRequest.ownership;
             eventOwnership = listedOwnership;
+            // Advance only when a response is accepted, not when its command is
+            // sent. A newer Error-only mutation then cannot strand an older
+            // valid list, while cached + refreshed frames from one request keep
+            // sharing the same order and a truly newer accepted list wins.
+            this.latestAcceptedListOrderByScope.set(
+              scopeKey, listedRequest.order);
+            this.listReadRetries.complete(scopeKey);
             for (const session of msg.sessions) {
+              const sessionOwnership: EventOwnership = {
+                ...listedOwnership,
+                claudeProfileId: msg.engine === "claude"
+                  ? session.claude_profile_id
+                    ?? msg.default_claude_profile_id
+                    ?? null
+                  : null,
+                codexProfileId: msg.engine === "codex"
+                  ? session.codex_profile_id
+                    ?? msg.default_codex_profile_id
+                    ?? null
+                  : null,
+              };
               this.engineBySession[session.session_id] = msg.engine;
               this.spaceBySession[session.session_id] = listedSpace;
-              this.ownershipBySession[session.session_id] = listedOwnership;
+              if (session.codex_profile_id) {
+                this.codexProfileBySession[session.session_id] =
+                  session.codex_profile_id;
+              }
+              if (session.claude_profile_id) {
+                this.claudeProfileBySession[session.session_id] =
+                  session.claude_profile_id;
+              }
+              this.ownershipBySession[session.session_id] = sessionOwnership;
             }
           }
+        }
+        if (msg.type === "error" && msg.request_id) {
+          const listedRequest = this.pendingListOwnershipByRequest.get(
+            msg.request_id);
+          if (msg.code === "busy" && listedRequest?.readOnly) {
+            // A temporary catalog guard is a deferred background read. Keep
+            // the current sidebar/focus intact and retry only this surface;
+            // never turn it into an unrelated global operation-failed banner.
+            const { ownership, order } = listedRequest;
+            const { scopeKey, engine, space } = ownership;
+            if (!listedRequest.deferred
+                && this.acceptsOwnership(ownership, socketGeneration)
+                && engine === this.activeEngine && space === this.activeSpace
+                && order > (this.latestAcceptedListOrderByScope.get(scopeKey) ?? 0)) {
+              listedRequest.deferred = true;
+              this.listReadRetries.retry(scopeKey, () => {
+                // Surface changes cancel this coordinator; also reject a
+                // replaced connection before issuing its retry.
+                if (this.acceptsOwnership(ownership, socketGeneration)) {
+                  this.sendSessionListRead(engine, space, true);
+                }
+              });
+            }
+            return;
+          }
+          // A failed mutation can deliberately send Error followed by its
+          // authoritative SessionList so the sidebar reconciles an uncertain
+          // outcome. Keep bounded list ownership for that possible second
+          // frame; Error alone never advances the accepted-response order.
+          this.pendingGoalOwnershipByRequest.delete(msg.request_id);
         }
         if (msg.type === "session_focus") {
           // Drop a STALE switch-confirmation: when you click through several
@@ -1424,6 +2075,14 @@ export class RelayWs {
           this.focusedSid = msg.session_id;
           if (isCreatedFocus) this.engineBySession[msg.session_id] = this.newSessionEngine;
           if (isCreatedFocus) this.spaceBySession[msg.session_id] = this.newSessionSpace;
+          if (ownership?.codexProfileId) {
+            this.codexProfileBySession[msg.session_id] =
+              ownership.codexProfileId;
+          }
+          if (ownership?.claudeProfileId) {
+            this.claudeProfileBySession[msg.session_id] =
+              ownership.claudeProfileId;
+          }
           if (ownership) this.ownershipBySession[msg.session_id] = ownership;
           this.touchReplay(msg.session_id);
           this.cb.onEvent(
@@ -1465,6 +2124,18 @@ export class RelayWs {
               this.spaceBySession[session_id] = this.spaceBySession[old_key];
             }
             delete this.spaceBySession[old_key];
+            if (this.claudeProfileBySession[old_key]
+                && !this.claudeProfileBySession[session_id]) {
+              this.claudeProfileBySession[session_id] =
+                this.claudeProfileBySession[old_key];
+            }
+            delete this.claudeProfileBySession[old_key];
+            if (this.codexProfileBySession[old_key]
+                && !this.codexProfileBySession[session_id]) {
+              this.codexProfileBySession[session_id] =
+                this.codexProfileBySession[old_key];
+            }
+            delete this.codexProfileBySession[old_key];
             if (this.historyHeadBySession[old_key]
                 && !this.historyHeadBySession[session_id]) {
               this.historyHeadBySession[session_id] =
@@ -1506,6 +2177,19 @@ export class RelayWs {
             eventOwnership = ownership;
           }
         }
+        if (msg.type === "goal_state" && msg.sid) {
+          const pendingOwnership = msg.request_id
+            ? this.pendingGoalOwnershipByRequest.get(msg.request_id)
+            : undefined;
+          if (msg.request_id) {
+            this.pendingGoalOwnershipByRequest.delete(msg.request_id);
+          }
+          const ownership = pendingOwnership
+            ?? this.ownershipBySession[msg.sid];
+          if (this.acceptsOwnership(ownership, socketGeneration)) {
+            eventOwnership = ownership;
+          }
+        }
         if (msg.type === "replay_start" && msg.sid && msg.generation) {
           this.noteGeneration(msg.sid, msg.generation);
         }
@@ -1542,6 +2226,7 @@ export class RelayWs {
     };
     ws.onclose = (ev: CloseEvent) => {
       if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
+      this.listReadRetries.clear();
       if (this.ws === ws) this.ws = null;
       this.stopHeartbeat();
       if (ev.code === 4406) {
@@ -1561,6 +2246,7 @@ export class RelayWs {
       }
     };
     ws.onerror = () => {
+      if (socketGeneration !== this.connectionGeneration || this.ws !== ws) return;
       /* onclose will follow */
     };
   }

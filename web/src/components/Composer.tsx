@@ -1,28 +1,47 @@
+import type { DshRead } from "../dsh-api";
+import type { DshItem } from "../protocol";
+import { useDshReferences } from "./DshReferences";
+import type { DshState, DshCommandResult } from "../protocol";
+import { dshCommandMatches } from "../dsh-commands";
 import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  lazy,
+  Suspense,
   useRef,
   useState,
+  type ReactNode,
   type ClipboardEvent,
   type SetStateAction,
 } from "react";
 import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
+  StatusRateLimit,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
-  EngineCapabilityItem, PermissionProfileInfo,
+  EngineCapabilityItem, PermissionProfileInfo, AutoCompact, CodexContext,
 } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
 import { Icon } from "../icons";
+import { AttachmentPicker } from "./AttachmentPicker";
+import { parseContextCapacity } from "../codex-context";
+const CodexContextControl = lazy(() => import("./CodexContextControl"));
 import {
-  clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
-  matchCommands, matchSkills, parseSlash, skillToken,
-  modelsFor, effortsFor, permsFor,
+  clientSlashesFor, parseSlash, routeComposerInput, slashToken,
+  matchCommands, matchSkills, skillToken,
+  modelsFor, effortNameForDisplay, permsFor, dshPermissionLabel,
   permissionProfileLabel, type Catalog,
 } from "../data";
-import { CommandSheet } from "./CommandSheet";
-import { attachmentBytes, pickFiles } from "../img";
+const CommandSheet = lazy(() => import("./CommandSheet").then(m => ({ default: m.CommandSheet })));
+import { attachmentBytes, snapshotAttachmentFiles } from "../img";
+import { useAttachmentDrop } from "../use-attachment-drop";
+import { useClipboardPasteGuard } from "../use-clipboard-paste-guard";
+import type { PasteReceipt } from "../clipboard-paste-guard";
+import {
+  readClipboardImport, resolveClipboardImport, insertClipboardText,
+  type ClipboardImport,
+} from "../clipboard-import";
 import type { PendingQuery } from "../reducer";
 import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
 import { ImeSubmitGuard } from "../ime-submit";
@@ -33,15 +52,38 @@ import {
   isSettlingStopDisabled,
   type SendMode,
 } from "../composer-submit";
-import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
+import {
+  composePastePrompt,
+  LONG_PASTE_THRESHOLD,
+  makeComposerPaste,
+} from "../composer-pastes";
 import { PendingImageAttachments } from "./PendingImageAttachments";
-import { QueuedQueryChip } from "./QueuedQueryDialog";
+import { QueuedQueryChip } from "./QueuedQueryChip";
 import { UsageMeter } from "./UsageMeter";
+const SpeedPicker = lazy(() => import("./SpeedPicker").then(m => ({ default: m.SpeedPicker })));
+import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
+import {
+  normalizeAutoCompactSelection,
+  parseAutoCompactArgument,
+  type AutoCompactSelection,
+} from "../auto-compact";
+
+const DshReferences = lazy(() => import("./DshReferenceList"));
+const AutoCompactControl = lazy(() => import("./AutoCompactControl"));
+const ContextPopover = lazy(() => import("./ContextPopover"));
+const DshCommandFeedback = lazy(() => import("./DshCommandFeedback"));
 
 interface Props {
+  dsh?: DshState;
+  dshSid?: string;
+  readDsh?: DshRead;
+  dshCommandResult?: DshCommandResult;
+  onDshCommand?: (line: string, images?: QueryImg[], files?: QueryFile[]) => string | null;
   draftKey: string;
   draftStore: ComposerDraftStore;
+  backgroundTasks?: ReactNode;
   surface?: "code" | "work";
   state: State;
   connState: ConnState;
@@ -57,12 +99,14 @@ interface Props {
   replaceQueueCapacity: QueueCapacity;
   model: string;
   effort: string;
+  autoCompact?: AutoCompact | null;
   perm: string;
   permissionProfile: string | null;
+  permissionProfilePending?: boolean;
   permissionProfiles: PermissionProfileInfo[] | null;
   webSearch: "cached" | "live" | null;
   collaborationMode: CollaborationModeName;
-  fast?: boolean | null;   // null until the wrapper reports the real service tier
+  serviceTier?: string | null;
   control?: SessionControl | null;
   // A native `claude`/`codex` in the terminal owns this session and is appending to
   // its transcript. We mirror it live but must NOT write: a cc session has a single
@@ -70,8 +114,10 @@ interface Props {
   external?: boolean;
   takeoverPending?: boolean;
   takeoverMessage?: string | null;
-  engine?: "claude" | "codex";
+  engine?: "claude" | "codex" | "dsh";
+  archived?: boolean;
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
+  onRequestModels?: () => void;
   editPrompt: string | null;
   onEditConsumed: () => void;
   onSendQuery: (prompt: string, images?: QueryImg[], files?: QueryFile[]) => boolean;
@@ -83,6 +129,9 @@ interface Props {
   onInspectQueued: (query: PendingQuery) => void;
   onSetModel: (model: string) => void;
   onSetEffort: (effort: string) => void;
+  onSetAutoCompact?: (selection: AutoCompactSelection) => boolean;
+  codexContext?: CodexContext | null;
+  onSetCodexContext?: (maxTokens: number | null) => boolean;
   onSetServiceTier?: (tier: string) => void;
   onSetPerm: (perm: string) => void;
   onSetPermissionProfile: (profile: string) => void;
@@ -94,6 +143,7 @@ interface Props {
   onOpenBtw?: () => void;
   onDiff?: () => void;
   onPreview?: (path: string) => void;
+  onOpenFiles?: (path?: string) => void;
   onGoal?: (args: string) => void;
   onStatus?: () => void;
   onRefreshUsage?: () => void;
@@ -108,8 +158,9 @@ interface Props {
   workArtifactCount?: number;
   onOpenArtifacts?: () => void;
   contextReport: ContextReport | null;
-  contextError?: string | null;
+  contextExactReport?: ContextReport | null;
   statusReport?: StatusReport | null;
+  rateLimits?: StatusRateLimit[];
   statusError?: string | null;
   statusLoading?: boolean;
 }
@@ -123,6 +174,7 @@ export function Composer(p: Props) {
   const input = draft.input;
   const images = draft.images;
   const files = draft.files;
+  const pastes = draft.pastes;
   const updateDraft = useCallback((
     update: (current: ComposerDraft) => ComposerDraft,
   ) => {
@@ -146,7 +198,7 @@ export function Composer(p: Props) {
     files: typeof next === "function" ? next(current.files) : next,
   })), [updateDraft]);
   const clearDraft = useCallback(() => updateDraft(() => ({
-    input: "", images: [], files: [],
+    input: "", images: [], files: [], pastes: [],
   })), [updateDraft]);
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
@@ -157,21 +209,28 @@ export function Composer(p: Props) {
   };
   const [ctxOpen, setCtxOpen] = useState(false);
   const [usageOpen, setUsageOpen] = useState(false);
+  const [autoCompactOpen, setAutoCompactOpen] = useState(false);
   const ctxWrapRef = useRef<HTMLDivElement>(null);
   const workSettingsRef = useRef<HTMLDetailsElement>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<number | null>(null);
   const [importing, setImporting] = useState(false);
-  const [dragDepth, setDragDepth] = useState(0);
-  const dragOver = dragDepth > 0;
+  const importingRef = useRef(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const pasteGuard = useClipboardPasteGuard(taRef, p.draftKey);
+  const [referenceCaret, setReferenceCaret] = useState(0);
+  const refs = useDshReferences(p.readDsh, p.dshSid, input, referenceCaret, p.engine === "dsh" && !p.archived);
+  const pickReference = (item: DshItem) => {
+    if (!refs.token || !item.mention) return;
+    const replacement = item.mention + (item.state === "directory" ? "" : " ");
+    const next = input.slice(0, refs.token.start) + replacement + input.slice(refs.token.end);
+    const caret = refs.token.start + replacement.length;
+    setInput(next); setReferenceCaret(caret);
+    requestAnimationFrame(() => { taRef.current?.focus(); taRef.current?.setSelectionRange(caret, caret); });
+  };
   const imeSubmitRef = useRef(new ImeSubmitGuard());
   const buttonSendTimerRef = useRef<number | null>(null);
-  const photoRef = useRef<HTMLInputElement>(null);
-  const fileRef = useRef<HTMLInputElement>(null);
   const requestedSkillScopeRef = useRef<string | null>(null);
-  const pickFilesRef = useRef<(files: FileList | File[] | null) => Promise<void>>(
-    async () => {});
 
   useLayoutEffect(() => {
     if (draftKeyRef.current === p.draftKey) return;
@@ -180,6 +239,7 @@ export function Composer(p: Props) {
     setSheetKind(null);
     setCtxOpen(false);
     setUsageOpen(false);
+    setAutoCompactOpen(false);
     setNotice(null);
     if (noticeTimer.current !== null) {
       window.clearTimeout(noticeTimer.current);
@@ -188,18 +248,20 @@ export function Composer(p: Props) {
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [p.draftKey, p.draftStore]);
 
-  // Context and account-usage popovers share one anchor and close together.
+  // Context, account usage and autocompact share one anchor, but each has its
+  // own small popover. Only one may be visible at a time.
   useEffect(() => {
-    if (!ctxOpen && !usageOpen) return;
+    if (!ctxOpen && !usageOpen && !autoCompactOpen) return;
     const onDoc = (e: MouseEvent) => {
       if (ctxWrapRef.current && !ctxWrapRef.current.contains(e.target as Node)) {
         setCtxOpen(false);
         setUsageOpen(false);
+        setAutoCompactOpen(false);
       }
     };
     document.addEventListener("mousedown", onDoc);
     return () => document.removeEventListener("mousedown", onDoc);
-  }, [ctxOpen, usageOpen]);
+  }, [autoCompactOpen, ctxOpen, usageOpen]);
 
   // <details> has no controlled open state here, so keep one document-level
   // listener active for mouse and touch and close it when focus moves outside.
@@ -209,6 +271,7 @@ export function Composer(p: Props) {
       workSettingsRef.current.open = false;
       setCtxOpen(false);
       setUsageOpen(false);
+      setAutoCompactOpen(false);
     };
     const onPointerDown = (event: PointerEvent) => {
       const details = workSettingsRef.current;
@@ -242,7 +305,7 @@ export function Composer(p: Props) {
       ) : null;
   const controlUi = p.control ? presentSessionControl(p.control) : legacyControl;
   // The connection and authoritative write state independently gate input.
-  const locked = offline || !!controlUi?.locked;
+  const locked = offline || !!controlUi?.locked || p.archived === true;
   const externalClaudeOwner = p.engine === "claude"
     ? (p.control?.control_mode === "external_cli" ? "外部 CLI"
       : p.control?.control_mode === "agent_view" ? "Agent View"
@@ -254,7 +317,7 @@ export function Composer(p: Props) {
   // controls to the Agent SDK. Keep Remote's saved takeover preferences visible,
   // but never present them as the active native runtime state.
   const deferredClaudeControls = externalClaudeOwner !== null;
-  const hasText = input.trim().length > 0;
+  const hasText = input.trim().length > 0 || pastes.length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
 
   useEffect(() => {
@@ -262,17 +325,18 @@ export function Composer(p: Props) {
     setSheetKind(null);
     setCtxOpen(false);
     setUsageOpen(false);
+    setAutoCompactOpen(false);
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [locked]);
 
   // edit: refill the input box with a past prompt (user-bubble edit button)
   useEffect(() => {
     if (editPrompt != null) {
-      setInput(editPrompt);
+      updateDraft((current) => ({ ...current, input: editPrompt, pastes: [] }));
       onEditConsumed();
       setTimeout(() => taRef.current?.focus(), 0);
     }
-  }, [editPrompt, onEditConsumed, setInput]);
+  }, [editPrompt, onEditConsumed, updateDraft]);
 
   const nativeTextareaSizing = typeof CSS !== "undefined"
     && CSS.supports?.("field-sizing", "content");
@@ -295,23 +359,22 @@ export function Composer(p: Props) {
     growTa();
   }, [growTa, input, p.draftKey]);
   const focusTa = () => setTimeout(() => taRef.current?.focus(), 0);
-  const flash = (msg: string) => {
+  const flash = (msg: string, duration = 2200) => {
     setNotice(msg);
     if (noticeTimer.current) clearTimeout(noticeTimer.current);
-    noticeTimer.current = window.setTimeout(() => setNotice(null), 2200);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), duration);
   };
 
-  const onInput = (v: string) => {
-    setInput(v);
-  };
+  const onInput = (v: string) => setInput(v);
 
   // Command/Skill palette = live suggestions derived from the input. A slash
   // matches cc-remote/native commands; "$" matches the Codex app-server's real
   // enabled Skill catalog. Both stop suggesting once arguments begin.
   const cmdToken = slashToken(input);
   const cmdMatches = cmdToken !== null
-    ? matchCommands(cmdToken, p.engine, p.surface ?? "code") : [];
-  const currentSkillToken = p.engine === "codex" ? skillToken(input) : null;
+    ? [...matchCommands(cmdToken, p.engine, p.surface ?? "code"), ...(p.engine === "dsh"
+      ? dshCommandMatches(cmdToken, p.dsh) : [])] : [];
+  const currentSkillToken = p.engine === "codex" || p.engine === "dsh" ? skillToken(input) : null;
   const skillMatches = currentSkillToken !== null && p.skills
     ? matchSkills(currentSkillToken, p.skills) : [];
   const skillLoading = currentSkillToken !== null && p.skills === undefined;
@@ -340,13 +403,23 @@ export function Composer(p: Props) {
     skillRequestScope,
   ]);
 
-  const onPickFiles = async (fl: FileList | File[] | null) => {
-    if (importing) { flash("附件正在导入，请稍候"); return; }
+  const onPickFiles = async (
+    fl: FileList | File[] | null, clipboard?: ClipboardImport, paste?: PasteReceipt,
+  ) => {
+    if (locked) return;
+    if (importingRef.current) { flash("附件正在导入，请稍候"); return; }
     const targetDraftKey = draftKeyRef.current;
+    importingRef.current = true;
     setImporting(true);
     try {
+      const [{ pickFiles }, imported] = await Promise.all([
+        import("../attachment-import"),
+        clipboard ? resolveClipboardImport(clipboard)
+          : Promise.resolve(snapshotAttachmentFiles(fl, images.length + files.length)),
+      ]);
       const batch = await pickFiles(
-        fl, images.length + files.length, attachmentBytes(images, files));
+        imported.files, images.length + files.length, attachmentBytes(images, files));
+      if (paste && !pasteGuard.acceptAttachments(paste, batch)) return;
       if (draftKeyRef.current === targetDraftKey) {
         if (batch.images.length) {
           setImages((previous) => [...previous, ...batch.images]);
@@ -362,70 +435,75 @@ export function Composer(p: Props) {
           files: [...prior.files, ...batch.files],
         });
       }
-      if (batch.errors.length) flash(batch.errors.join("；"));
+      const errors = [...imported.errors, ...batch.errors];
+      if (errors.length) flash(errors.join("；"), 10_000);
+    } catch {
+      flash("附件导入失败，请重新添加；已输入的文字会保留。", 10_000);
     } finally {
+      importingRef.current = false;
       setImporting(false);
     }
   };
-  pickFilesRef.current = onPickFiles;
+  const dragOver = useAttachmentDrop("main", locked || importing, onPickFiles);
 
-  // Whole-window drag-drop overlay. The effect is refreshed with the current
-  // attachment limits/import state so its async drop handler never uses a stale
-  // count or appends after a send.
-  useEffect(() => {
-    const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer?.types || []).includes("Files");
-    const onEnter = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => d + 1); };
-    const onLeave = (e: DragEvent) => { if (hasFiles(e)) setDragDepth((d) => Math.max(0, d - 1)); };
-    const onOver = (e: DragEvent) => { if (hasFiles(e)) e.preventDefault(); };
-    const onDrop = (e: DragEvent) => {
-      if (!hasFiles(e)) return;
-      e.preventDefault();
-      setDragDepth(0);
-      if (e.dataTransfer?.files?.length) void pickFilesRef.current(e.dataTransfer.files);
-    };
-    window.addEventListener("dragenter", onEnter);
-    window.addEventListener("dragleave", onLeave);
-    window.addEventListener("dragover", onOver);
-    window.addEventListener("drop", onDrop);
-    return () => {
-      window.removeEventListener("dragenter", onEnter);
-      window.removeEventListener("dragleave", onLeave);
-      window.removeEventListener("dragover", onOver);
-      window.removeEventListener("drop", onDrop);
-    };
-  }, []);
-
-  // paste images/files straight into the textarea (clipboard API)
+  // Keep the native textarea for reliable selection/undo/IME. Large text is
+  // retained privately by the draft and represented only by an editable card.
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-    const files: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const it = items[i];
-      if (it.kind === "file") {
-        const f = it.getAsFile();
-        if (f) files.push(f);
-      }
+    const clipboard = readClipboardImport(e.clipboardData, images.length + files.length);
+    const paste = pasteGuard.capture(e.currentTarget, clipboard);
+    const { text } = clipboard;
+    const attachments = clipboard.files.length || clipboard.images.length
+      || clipboard.errors.length;
+    if (!paste.acceptText) {
+      e.preventDefault();
+      if (!attachments) return;
     }
-    if (files.length) { e.preventDefault(); void onPickFiles(files); }
+    if (!attachments && text.length <= LONG_PASTE_THRESHOLD) return;
+    e.preventDefault();
+    const textarea = e.currentTarget;
+    if (paste.acceptText && text.length > LONG_PASTE_THRESHOLD) {
+      const id = uuid();
+      updateDraft((current) => ({
+        ...current, pastes: [...current.pastes, makeComposerPaste(text, id)],
+      }));
+    } else if (paste.acceptText && text) insertClipboardText(textarea, text, setInput);
+    if (attachments) void onPickFiles(null, clipboard, paste);
   };
+
+  const dshPendingRef = useRef<{ id: string; scope: string; draft: typeof draft } | null>(null);
+  const dshResult = p.dshCommandResult;
+  useEffect(() => {
+    const pending = dshPendingRef.current;
+    if (pending && pending.scope !== p.draftKey) { dshPendingRef.current = null; return; }
+    if (!pending || pending.scope !== p.draftKey || dshResult?.request_id !== pending.id) return;
+    dshPendingRef.current = null;
+    if (dshResult.status === "success") {
+      updateDraft(current => current === pending.draft ? { ...current, input: "", images: [], files: [], pastes: [] } : current);
+    }
+  }, [dshResult, p.draftKey, updateDraft]);
 
   // Send prompt text to cc, honoring busy/queue/interrupt rules.
   const submitPrompt = (prompt: string) => {
     if (importing) { flash("请等待附件导入完成"); return; }
+    const composed = composePastePrompt(pastes, prompt);
+    if (!composed.ok) {
+      flash(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
+      return;
+    }
+    const expandedPrompt = composed.prompt;
     const query: PendingQuery = {
-      prompt,
+      prompt: expandedPrompt,
       images: images.length ? images : undefined,
       files: files.length ? files : undefined,
     };
     if (busy) {
       const action = classifyBusySubmit(
         p.state, p.sendMode, p.engine ?? "claude",
-        !!prompt || hasAttachments);
+        !!expandedPrompt || hasAttachments);
       if (action === "noop") return;
       if (action === "steer") {
         if (p.onSteerQuery(
-            prompt,
+            expandedPrompt,
             images.length ? images : undefined,
             files.length ? files : undefined)) {
           clearDraft(); resetTaHeight();
@@ -446,15 +524,14 @@ export function Composer(p: Props) {
         }
         return;
       }
-      if (action === "interrupt-and-replace") p.onInterrupt();
       if (p.onSetPending(query)) {
         clearDraft(); resetTaHeight();
       }
       return;
     }
-    if (!prompt && !hasAttachments) return;
+    if (!expandedPrompt && !hasAttachments) return;
     if (p.onSendQuery(
-        prompt, images.length ? images : undefined, files.length ? files : undefined)) {
+        expandedPrompt, images.length ? images : undefined, files.length ? files : undefined)) {
       clearDraft(); resetTaHeight();
     }
   };
@@ -465,7 +542,7 @@ export function Composer(p: Props) {
     switch (slash) {
       case "model":
         if (args) { p.onSetModel(args); flash(`正在切换模型：${args}`); }
-        else setSheetKind("models");
+        else { p.onRequestModels?.(); setSheetKind("models"); }
         break;
       case "permissions": openPermissions(); break;
       case "clear": p.onClear(); break;
@@ -473,8 +550,47 @@ export function Composer(p: Props) {
       case "context":
         p.onContext();
         setUsageOpen(false);
+        setAutoCompactOpen(false);
         setCtxOpen(true);
         break;
+      case "autocompact": {
+        if (p.engine === "codex") {
+          if (args.trim()) {
+            const value = parseContextCapacity(args);
+            if (value === undefined) { flash("格式：/autocompact 200k 或 default"); return; }
+            if (!p.onSetCodexContext?.(value)) flash("上下文设置暂不可用");
+          } else {
+            p.onContext(); setUsageOpen(false); setCtxOpen(false); setAutoCompactOpen(true);
+          }
+          break;
+        }
+        if (!args.trim()) {
+          p.onContext();
+          setUsageOpen(false);
+          setCtxOpen(false);
+          setAutoCompactOpen(true);
+          if (p.surface === "work" && workSettingsRef.current) {
+            workSettingsRef.current.open = true;
+          }
+          break;
+        }
+        const parsed = parseAutoCompactArgument(args);
+        if (!parsed.ok) {
+          flash(parsed.error);
+          return;
+        }
+        if (p.autoCompact && !p.autoCompact.mutable) {
+          flash("本机 Claude TUI 正在控制此会话，请在终端启动时设置。");
+          return;
+        }
+        const queued = p.onSetAutoCompact?.(parsed.selection) ?? false;
+        flash(queued
+          ? (busy
+            ? "已保存，将在下一次可确认的回合终态或下一条消息前切换。"
+            : "正在应用自动压缩设置…")
+          : "自动压缩设置暂未发送，请稍后重试。");
+        break;
+      }
       case "status": p.onStatus?.(); break;
       case "goal": p.onGoal?.(args); break;
       case "rewind": flash("Claude Rewind 暂未开放"); break;
@@ -504,7 +620,6 @@ export function Composer(p: Props) {
       case "compact":
         if (args.trim()) { flash("/compact 不接受参数"); return; }
         p.onCompact?.();
-        flash("正在启动 Codex 原生上下文压缩…");
         break;
       case "rollback": flash("Codex Rollback 暂未开放"); break;
       // /btw: open an ephemeral side-fork panel (both engines).
@@ -513,6 +628,10 @@ export function Composer(p: Props) {
         if (args.trim()) { flash("/diff 不接受参数"); return; }
         p.onDiff?.();
         break;
+      case "open":
+        p.onOpenFiles?.(args || ".");
+        setInput("");
+        return;
       case "preview":
         if (!args) {
           setInput("/preview ");
@@ -559,40 +678,57 @@ export function Composer(p: Props) {
   // Pick a command from the palette. Client commands run now; cc skills
   // (/code-review …) fill the composer so the user can add args, then send.
   const pickCommand = (slash: string) => {
-    if (clientSlashesFor(p.engine).has(slash)) { runClientSlash(slash, ""); focusTa(); return; }
+    const command = cmdMatches.find(c => c.slash === slash);
+    if (command?.unavailable) { flash(command.ds); return; }
+    // Autocompact is intentionally command-only: choosing its suggestion fills
+    // the composer, and only an explicit send may apply a value or open the UI.
+    if (slash === "autocompact") {
+      setInput("/autocompact ");
+      focusTa();
+      growTa();
+      return;
+    }
+    if (clientSlashesFor(p.engine).has(slash) || p.engine === "dsh" && slash === "goal") {
+      runClientSlash(slash, "");
+      if (slash !== "btw" && slash !== "goal") focusTa();
+      return;
+    }
     setInput("/" + slash + " ");
     focusTa(); growTa();
   };
 
   const pickSkill = (name: string) => {
-    setInput("$" + name + " ");
+    setInput((p.engine === "dsh" ? "/" : "$") + name + " ");
     focusTa(); growTa();
   };
 
   const send = (value = taRef.current?.value ?? input) => {
     if (locked || importing) return;
+    const route = routeComposerInput(value, p.engine, p.surface);
+    if (route.kind === "blocked") { flash(route.message); return; }
     const raw = value.trim();
-    if (raw === "/") return;
     const parsed = parseSlash(raw);
-    if (p.surface === "work" && parsed
-        && isKnownCodeOnlySlash(parsed.slash, p.engine)) {
-      flash(`/${parsed.slash} 是 Code 指令，请切换到 Code 使用`);
+    const nativeSkill = parsed && p.engine === "dsh" && p.skills?.some(skill => skill.name === parsed.slash)
+      && !p.dsh?.commands.some(command => command.name === parsed.slash);
+    if (p.engine === "dsh" && parsed && !nativeSkill && !clientSlashesFor("dsh").has(parsed.slash)) {
+      if (p.dsh?.commands.length && !p.dsh.commands.some(command => command.name === parsed.slash)) {
+        flash(`此 DSH 会话没有 /${parsed.slash} 命令`); return;
+      }
+      const command = p.dsh?.commands.find(command => command.name === parsed.slash);
+      if (parsed.slash === "goal" && !parsed.args && !hasAttachments && !pastes.length && command) {
+        runClientSlash("goal", ""); return;
+      }
+      if (hasAttachments && command && !command.attachments) { flash(`/${parsed.slash} 不接受附件`); return; }
+      if (dshPendingRef.current) { flash("正在等待 DSH 确认命令"); return; }
+      const composed = composePastePrompt(pastes, raw);
+      if (!composed.ok || composed.prompt.length > 65536) { flash("命令内容超过上限（65,536 字符）"); return; }
+      const requestId = p.onDshCommand?.(composed.prompt, images.length ? images : undefined, files.length ? files : undefined);
+      if (requestId) dshPendingRef.current = { id: requestId, scope: p.draftKey, draft };
       return;
     }
-    if (parsed && clientSlashesFor(p.engine).has(parsed.slash)) { runClientSlash(parsed.slash, parsed.args); return; }
-    // Codex has no TUI slash layer over the app-server. /init is the one
-    // compatibility prompt left; lifecycle operations above use native RPCs.
-    if (p.engine === "codex" && parsed && CODEX_PROMPTS[parsed.slash]) {
-      submitPrompt(CODEX_PROMPTS[parsed.slash] + (parsed.args ? "\n\n" + parsed.args : ""));
-      return;
-    }
-    // Codex has no TUI slash layer, so an unknown "/xxx" is NOT a command — don't
-    // ship it to the model as literal text (it would just improvise a fake reply,
-    // e.g. "/fast" -> "已切到快节奏…"). Hint and keep the input. (cc is different:
-    // it has its own slash/skill layer, so unknown slashes fall through to it.)
-    if (p.engine === "codex" && parsed) { flash(`Codex 无此指令：/${parsed.slash}`); return; }
-    // plain text, or a cc skill slash (/code-review …) forwarded verbatim to cc
-    submitPrompt(raw);
+    if (route.kind === "empty") return;
+    if (route.kind === "client") { runClientSlash(route.slash, route.args); return; }
+    submitPrompt(route.prompt);
   };
 
   const requestButtonSend = () => {
@@ -600,7 +736,7 @@ export function Composer(p: Props) {
     buttonSendTimerRef.current = window.setTimeout(() => {
       buttonSendTimerRef.current = null;
       const buttonPrompt = taRef.current?.value ?? input;
-      if (busy && !buttonPrompt.trim() && !hasAttachments) {
+      if (busy && !buttonPrompt.trim() && !hasAttachments && pastes.length === 0) {
         if (p.state === "running") p.onInterrupt();
         return;
       }
@@ -610,23 +746,53 @@ export function Composer(p: Props) {
 
   const stopping = busy && !hasText && !hasAttachments;
   const interruptSettling = isInterruptSettling(p.state);
-  const primaryIsInterrupt = (p.engine ?? "claude") !== "codex";
   const sendIcon = !busy ? "send" : stopping ? "stop"
-    : p.sendMode === "steer" ? (primaryIsInterrupt ? "bolt" : "send")
+    : p.sendMode === "steer" ? "send"
       : "queue";
-  const sendClass = "sendbtn" + ((stopping
-    || (busy && p.sendMode === "steer" && primaryIsInterrupt
-      && (hasText || hasAttachments))) ? " interrupt" : "");
+  const sendClass = "sendbtn" + (stopping ? " interrupt" : "");
   const disabled = locked || importing || (!busy && !hasText && !hasAttachments)
     || isSettlingStopDisabled(p.state, hasText || hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
-  const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
+  const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = p.engine === "dsh"
+    ? (p.dsh?.permissions ?? []).map(option => ({ id: option.value, name: dshPermissionLabel(option.value, option.name), short: dshPermissionLabel(option.value, option.name), ds: option.description, ic: "shield", danger: option.value === "danger-full-access" }))
+    : permsFor(p.engine);
   const workSurface = p.surface === "work";
-  const contextAvailable = p.contextReport?.available !== false;
-  const workContext = workSurface && p.contextReport && contextAvailable
-    ? workContextMetrics(p.contextReport)
-    : null;
+  const currentContextReport = p.contextReport?.available !== false ? p.contextReport : null;
+  const retainedContextReport = p.contextExactReport?.available !== false ? p.contextExactReport : null;
+  // A background read may temporarily return billing usage or no estimate.
+  // Keep the last native reading until another arrives. Runtime invalidation
+  // already clears both reports when the session's model or capacity changes.
+  const exactContextReport = currentContextReport
+    && (p.engine !== "codex" || currentContextReport.source !== "recent_turn")
+    && (currentContextReport.max_tokens > 0 || (retainedContextReport?.max_tokens ?? 0) <= 0)
+    ? currentContextReport : retainedContextReport ?? currentContextReport;
+  const codexEstimate = p.engine !== "codex"
+    || exactContextReport?.source === "native_estimate";
+  const contextHasCapacity = codexEstimate && (exactContextReport?.max_tokens ?? 0) > 0;
+  const contextRingHasCapacity = contextHasCapacity;
+  const workContext = workSurface ? exactContextReport : null;
+  const autoCompactSelection = normalizeAutoCompactSelection(
+    p.autoCompact?.mode ?? "inherit",
+    p.autoCompact?.threshold_tokens ?? null,
+  );
+  const autoCompactControl = (
+    <Suspense fallback={
+      <div className="ctx-pop-loading">读取自动压缩设置…</div>}>
+      <AutoCompactControl
+        value={autoCompactSelection}
+        state={p.autoCompact}
+        effectiveThresholdTokens={
+          p.contextReport?.auto_compact_threshold_tokens}
+        rawMaxTokens={p.contextReport?.raw_max_tokens}
+        disabled={locked || !p.onSetAutoCompact}
+        onChange={(selection) => {
+          if (!p.onSetAutoCompact?.(selection)) {
+            flash("自动压缩设置暂未发送，请稍后重试。");
+          }
+        }} />
+    </Suspense>
+  );
   // Do not substitute catalog defaults for an existing session.  Until the
   // wrapper reports its authoritative settings, the controls explicitly show
   // that they are still being read.  Unknown/hidden ids remain visible verbatim.
@@ -634,11 +800,7 @@ export function Composer(p: Props) {
     ? (MODELS_E.find((m) => m.id === p.model)
       || { id: p.model, name: p.model, ds: "", ic: "cpu" })
     : null;
-  const EFFORTS_E = effortsFor(p.engine, model?.id, p.catalog);
-  const effort = p.effort
-    ? (EFFORTS_E.find((e) => e.id === p.effort)
-      || { id: p.effort, name: p.effort, ds: "", ic: "gauge3" })
-    : null;
+  const effortName = effortNameForDisplay(p.effort);
   const perm = p.perm
     ? (PERMS_E.find((x) => x.id === p.perm)
       || { id: p.perm, name: p.perm, short: p.perm, ds: "", ic: "shield" })
@@ -655,17 +817,22 @@ export function Composer(p: Props) {
 
   const inputControl = (placeholder: string) => (
     <textarea
+      data-chat-composer
       ref={taRef}
       rows={1}
       value={input}
       placeholder={importing ? "正在安全导入附件…"
         : offline ? "机器离线 — 等待重连…"
+        : p.archived ? "会话已归档 — 取消归档后可继续对话"
         : (controlUi?.placeholder
           ?? (busy && (p.engine ?? "claude") === "codex"
             ? "输入以引导当前任务，或选择排队…"
             : placeholder))}
       disabled={locked}
-      onChange={(e) => onInput(e.target.value)}
+      onChange={(e) => { onInput(e.target.value); setReferenceCaret(e.target.selectionStart); }}
+      onSelect={(e) => setReferenceCaret(e.currentTarget.selectionStart)}
+      aria-controls={refs.open ? "dsh-reference-list" : undefined}
+      aria-activedescendant={refs.open && refs.items.length ? `dsh-reference-${refs.selected}` : undefined}
       onCompositionStart={() => imeSubmitRef.current.startComposition()}
       onCompositionEnd={(e) => {
         imeSubmitRef.current.endComposition();
@@ -673,6 +840,15 @@ export function Composer(p: Props) {
       }}
       onPaste={onPaste}
       onKeyDown={(e) => {
+        if (refs.open && !e.nativeEvent.isComposing && e.nativeEvent.keyCode !== 229) {
+          if (e.key === "Escape") { e.preventDefault(); refs.dismiss(); return; }
+          if (refs.items.length && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+            e.preventDefault(); refs.setSelected((refs.selected + (e.key === "ArrowDown" ? 1 : -1) + refs.items.length) % refs.items.length); return;
+          }
+          if (refs.items.length && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+            e.preventDefault(); pickReference(refs.items[refs.selected] ?? refs.items[0]); return;
+          }
+        }
         if (e.key === "Escape" && suggestionOpen) {
           setInput(""); resetTaHeight(); return;
         }
@@ -717,7 +893,7 @@ export function Composer(p: Props) {
           }
             data-lock-horizontal-swipe="true">
             {currentSkillToken === null ? cmdMatches.map((c) => (
-              <button key={c.slash} type="button" className="cmd" onClick={() => pickCommand(c.slash)}>
+              <button key={c.slash} type="button" className="cmd" disabled={c.unavailable} onClick={() => pickCommand(c.slash)}>
                 <span className="cmd-ic"><Icon name={c.ic} size={17} /></span>
                 <span className="cmd-tx">
                   <span className="cmd-nm"><span className="slash">/{c.slash}</span></span>
@@ -743,6 +919,8 @@ export function Composer(p: Props) {
           </div>
         )}
         {notice && <div className="composer-notice">{notice}</div>}
+        {p.engine === "dsh" && <Suspense fallback={null}><DshCommandFeedback
+          scope={p.draftKey} state={p.dsh} result={dshResult} /></Suspense>}
         {(p.queue.length > 0 || p.pendingSend || p.failedDeferred.length > 0) && (
           <div className="queued show">
             {[
@@ -757,7 +935,7 @@ export function Composer(p: Props) {
           </div>
         )}
 
-        {hasAttachments && (
+        {(hasAttachments || pastes.length > 0) && (
           <div className="attach show">
             <PendingImageAttachments key={p.draftKey} images={images}
               onRemove={(index) => setImages((previous) =>
@@ -769,29 +947,27 @@ export function Composer(p: Props) {
                 <button className="attach-x" onClick={() => setFiles(files.filter((_, j) => j !== i))} aria-label="移除"><Icon name="close" size={12} /></button>
               </span>
             ))}
+            <PasteCards pastes={pastes}
+              onChange={(nextPastes) => updateDraft((current) => ({
+                ...current, pastes: nextPastes,
+              }))} />
           </div>
         )}
 
-        {busy && (
+        {(busy || p.backgroundTasks) && (
           <div className="runbar show">
-            <div className="seg">
+            {p.backgroundTasks}
+            {busy && <div className="seg">
               <button className={p.sendMode === "steer" ? "on" : ""}
                 onClick={() => p.setSendMode("steer")}>
-                <Icon name={primaryIsInterrupt ? "bolt" : "send"} size={14} />
-                {primaryIsInterrupt ? "打断并发送" : "引导"}
+                <Icon name="send" size={14} />引导
               </button>
               <button className={p.sendMode === "queue" ? "on" : ""} onClick={() => p.setSendMode("queue")}>
                 <Icon name="queue" size={14} />排队
               </button>
-            </div>
+            </div>}
           </div>
         )}
-
-        <input ref={photoRef} type="file" accept="image/*" multiple hidden
-          aria-label="添加照片"
-          onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
-        <input ref={fileRef} type="file" multiple hidden aria-label="添加文件"
-          onChange={(e) => { void onPickFiles(e.target.files); e.target.value = ""; }} />
 
         {workSurface ? (
           <div className="work-compose-card">
@@ -805,11 +981,10 @@ export function Composer(p: Props) {
               {sendControl}
             </div>
             <div className="work-compose-foot">
-              <button type="button" className="work-compose-tool"
-                onClick={() => fileRef.current?.click()} disabled={locked || importing}
-                aria-label="添加资料" title="添加资料">
-                <Icon name="plus" size={15} /><span>添加资料</span>
-              </button>
+              <AttachmentPicker key={p.draftKey} className="work-compose-tool"
+                onPick={onPickFiles} disabled={locked || importing} label="添加资料">
+                <Icon name="paperclip" size={15} /><span>添加资料</span>
+              </AttachmentPicker>
               {!!p.workArtifactCount && (
                 <button type="button" className="work-compose-tool"
                   onClick={p.onOpenArtifacts}
@@ -819,45 +994,53 @@ export function Composer(p: Props) {
                   <span>Artifacts · {p.workArtifactCount}</span>
                 </button>
               )}
-              <details className="work-settings" ref={workSettingsRef}>
+              <details className="work-settings" ref={workSettingsRef}
+                onToggle={(event) => {
+                  if (event.currentTarget.open) return;
+                  setCtxOpen(false);
+                  setUsageOpen(false);
+                  setAutoCompactOpen(false);
+                }}>
                 <summary><Icon name="plan" size={15} /><span>工作设置</span></summary>
                 <div className="work-settings-pop" ref={ctxWrapRef}>
-                  <button type="button" onClick={() => setSheetKind("models")}
+                  <button type="button" onClick={() => { p.onRequestModels?.(); setSheetKind("models"); }}
                     disabled={locked}>
                     <span>模型</span><b>{model?.name ?? "读取中"}</b>
                   </button>
                   <button type="button" onClick={() => setSheetKind("efforts")}
                     disabled={locked}>
-                    <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
+                    <span>思考强度</span><b>{effortName ?? "读取中"}</b>
                   </button>
-                  <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
-                    <span>会话上下文</span><b>{p.contextReport?.available === false
-                      ? "暂不可用"
-                      : workContext ? `${workContext.sessionPercentage.toFixed(0)}%` : "查看"}</b>
+                  {p.engine === "codex" && (
+                    <Suspense fallback={null}><SpeedPicker row model={p.model} catalog={p.catalog}
+                      scopeKey={p.draftKey} value={p.serviceTier}
+                      disabled={locked || !p.onSetServiceTier}
+                      onRefresh={p.onRequestModels}
+                      onChange={(tier) => p.onSetServiceTier?.(tier)} /></Suspense>
+                  )}
+                  <button type="button" aria-expanded={ctxOpen}
+                    onClick={() => {
+                      if (!ctxOpen) p.onContext();
+                      setUsageOpen(false);
+                      setAutoCompactOpen(false);
+                      setCtxOpen((o) => !o);
+                    }}>
+                    <span>会话上下文</span><b>{workContext && contextHasCapacity
+                        ? `${(workContext.session_percentage ?? workContext.percentage).toFixed(0)}%`
+                        : workContext && codexEstimate
+                          ? `${(workContext.session_tokens ?? workContext.total_tokens).toLocaleString()} tokens`
+                          : "查看"}</b>
                   </button>
                   {ctxOpen && (
-                    <div className="ctx-pop work-ctx-pop" role="dialog" aria-label="Work 上下文占用">
-                      {p.contextReport?.available === false ? (
-                        <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后更新。</div>
-                      ) : p.contextReport && workContext ? (
-                        <>
-                          <div className="ctx-pop-row"><span>{workContext.hasBreakdown ? "会话新增上下文" : "上下文窗口"}</span>
-                            <span className="ctx-pop-nums">{workContext.sessionTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.sessionPercentage.toFixed(0)}%)</span>
-                          </div>
-                          <div className="ctx-pop-bar"><i style={{ width: `${Math.min(workContext.sessionPercentage, 100)}%` }} /></div>
-                          {workContext.hasBreakdown && (
-                            <div className="work-ctx-details">
-                              <div className="ctx-pop-row"><span>真实总占用</span>
-                                <span className="ctx-pop-nums">{workContext.totalTokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({workContext.totalPercentage.toFixed(0)}%)</span>
-                              </div>
-                              <div className="ctx-pop-row"><span>Work 启动基线</span>
-                                <span className="ctx-pop-nums">{workContext.fixedTokens.toLocaleString()}</span>
-                              </div>
-                            </div>
-                          )}
-                          <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
-                        </>
-                      ) : <div className="ctx-pop-loading">读取上下文占用…</div>}
+                    <Suspense fallback={null}>
+                      <ContextPopover report={exactContextReport}
+                        work codex={p.engine === "codex"} />
+                    </Suspense>
+                  )}
+                  {p.engine === "claude" && autoCompactOpen && (
+                    <div className="ctx-pop work-ctx-pop auto-compact-pop"
+                      role="dialog" aria-label="Work 自动压缩">
+                      {autoCompactControl}
                     </div>
                   )}
                 </div>
@@ -868,19 +1051,19 @@ export function Composer(p: Props) {
             </div>
           </div>
         ) : (<>
+          {refs.open && <Suspense fallback={null}><DshReferences value={refs} onPick={pickReference} /></Suspense>}
           <div className="inrow">
-            <button className="cmdbtn" onClick={() => photoRef.current?.click()}
-              aria-label="添加照片" title="添加照片"
-              disabled={locked || importing}><Icon name="plus" size={19} /></button>
-            {inputControl(p.engine === "codex"
+            <AttachmentPicker key={p.draftKey} onPick={onPickFiles} disabled={locked || importing} />
+            {inputControl(p.engine === "codex" || p.engine === "dsh"
               ? "输入 / 命令，$ Skill"
               : "输入 / 命令")}
             {sendControl}
           </div>
           <div className="hint">
-          <button
+          {(p.engine !== "dsh" || !!p.dsh?.permissions.length) && <button
             type="button"
             className={"hint-mode" + modeCls}
+            aria-busy={p.permissionProfilePending || undefined}
             onClick={openPermissions}
             disabled={locked}
             title={deferredClaudeControls
@@ -891,11 +1074,11 @@ export function Composer(p: Props) {
           >
             {deferredClaudeControls
               ? externalClaudeOwner
-              : modeLabel}
+              : p.permissionProfilePending ? "环境切换中…" : modeLabel}
             {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
-          </button>
+          </button>}
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
-            p.engine === "codex" && <> · <kbd>$</kbd> Skills</>
+            (p.engine === "codex" || p.engine === "dsh") && <> · <kbd>$</kbd> Skills</>
           }</span>
           <div className="hint-right" ref={ctxWrapRef}>
             {deferredClaudeControls && (
@@ -904,7 +1087,7 @@ export function Composer(p: Props) {
                 接管后
               </span>
             )}
-            <button className="hint-ctl" onClick={() => setSheetKind("models")}
+            <button className="hint-ctl" onClick={() => { p.onRequestModels?.(); setSheetKind("models"); }}
               disabled={locked}
               title={deferredClaudeControls
                 ? `Remote 接管后模型：${model?.name ?? "读取中"}；不是${externalClaudeOwner}当前模型`
@@ -912,8 +1095,8 @@ export function Composer(p: Props) {
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
               disabled={locked}
               title={deferredClaudeControls
-                ? `Remote 接管后思考强度：${effort?.name ?? "读取中"}；不是${externalClaudeOwner}当前强度`
-                : "思考强度"}>{effort?.name ?? "强度读取中"}</button>
+                ? `Remote 接管后思考强度：${effortName ?? "读取中"}；不是${externalClaudeOwner}当前强度`
+                : "思考强度"}>{effortName ?? "强度读取中"}</button>
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
@@ -924,86 +1107,84 @@ export function Composer(p: Props) {
               >Plan</button>
             )}
             {p.engine === "codex" && (
-              <button
-                className={"hint-ctl fast-chip" + (p.fast ? " on" : "")}
-                onClick={() => p.onSetServiceTier?.("toggle")}
-                disabled={locked}
-                title="Fast 服务档位:快 / 标准(下条消息生效)"
-              >{p.fast == null ? "档位读取中" : p.fast ? "快速" : "标准"}</button>
+              <Suspense fallback={null}><SpeedPicker model={p.model} catalog={p.catalog}
+                scopeKey={p.draftKey} value={p.serviceTier}
+                disabled={locked || !p.onSetServiceTier}
+                onRefresh={p.onRequestModels}
+                onChange={(tier) => p.onSetServiceTier?.(tier)} /></Suspense>
             )}
-            {p.engine === "codex" && (
+            {(p.engine === "codex" || p.engine === "claude") && (
               <UsageMeter
+                engine={p.engine}
                 open={usageOpen}
                 report={p.statusReport ?? null}
+                rateLimits={p.rateLimits}
                 error={p.statusError}
                 loading={p.statusLoading}
+                disabled={locked}
                 onToggle={() => {
+                  if (locked) return;
                   const opening = !usageOpen;
                   setCtxOpen(false);
+                  setAutoCompactOpen(false);
                   setUsageOpen(opening);
                   if (opening) p.onRefreshUsage?.();
                 }}
                 onRefresh={() => p.onRefreshUsage?.()}
-                onOpenStatus={p.onStatus ? () => {
+                onOpenStatus={p.engine === "codex" && p.onStatus ? () => {
                   setUsageOpen(false);
                   p.onStatus?.();
                 } : undefined}
               />
             )}
             <button
-              className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
+              className={"hint-ring"
+                + (contextRingHasCapacity ? "" : " unavailable")}
+              aria-expanded={ctxOpen}
               aria-label="上下文占用"
               title="上下文占用"
+              disabled={locked}
               onClick={() => {
-                p.onContext();
+                if (locked) return;
+                if (!ctxOpen) p.onContext();
                 setUsageOpen(false);
+                setAutoCompactOpen(false);
                 setCtxOpen((o) => !o);
               }}
             >
               <svg viewBox="0 0 36 36" width="20" height="20" aria-hidden="true">
                 <circle className="hr-track" cx="18" cy="18" r="15" />
-                <circle
+                {contextRingHasCapacity ? <circle
                   className="hr-fill"
                   cx="18" cy="18" r="15"
                   strokeDasharray="94.25"
-                  strokeDashoffset={94.25 * (1 - Math.min(
-                    contextAvailable ? p.contextReport?.percentage ?? 0 : 0, 100) / 100)}
+                  strokeDashoffset={94.25 * (1 - Math.min(exactContextReport?.percentage ?? 0, 100) / 100)}
                   transform="rotate(-90 18 18)"
-                />
+                /> : null}
               </svg>
             </button>
             {ctxOpen && (
-              <div className="ctx-pop" role="dialog" aria-label="上下文占用">
-                {p.contextError ? (
-                  <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
-                ) : p.contextReport?.available === false ? (
-                  <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后会自动更新。上下文仍由 Codex 原生管理。</div>
-                ) : p.contextReport ? (
-                  <>
-                    <div className="ctx-pop-row">
-                      <span>上下文窗口</span>
-                      <span className="ctx-pop-nums">
-                        {p.contextReport.total_tokens.toLocaleString()} / {p.contextReport.max_tokens.toLocaleString()} ({p.contextReport.percentage.toFixed(0)}%)
-                      </span>
-                    </div>
-                    <div className="ctx-pop-bar"><i style={{ width: `${Math.min(p.contextReport.percentage, 100)}%` }} /></div>
-                    {p.contextReport.categories.length > 0 && (
-                      <div className="ctx-pop-cats">
-                        {p.contextReport.categories.map((c, i) => (
-                          <div className="ctx-pop-cat" key={i}>
-                            <span className="ctx-cat-dot" style={{ background: c.color }} />
-                            <span className="ctx-pop-cat-name">{c.name}</span>
-                            <span className="ctx-pop-cat-tok">{c.tokens.toLocaleString()}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                    {p.contextReport.is_auto_compact_enabled && <div className="ctx-pop-auto">autocompact 已启用</div>}
-                    <div className="ctx-pop-foot">{p.contextReport.model || ""}</div>
-                  </>
-                ) : (
-                  <div className="ctx-pop-loading">读取上下文占用…</div>
-                )}
+              <Suspense fallback={null}>
+                <ContextPopover report={exactContextReport}
+                  codex={p.engine === "codex"}
+                  dsh={p.engine === "dsh"}
+                  codexContext={p.engine === "codex" ? p.codexContext : null}
+                  autoCompact={p.engine === "claude" ? p.autoCompact : null}
+                  onAutoCompact={p.engine === "codex" && p.onSetCodexContext
+                    ? () => { setCtxOpen(false); setAutoCompactOpen(true); } : undefined} />
+              </Suspense>
+            )}
+            {p.engine === "claude" && autoCompactOpen && (
+              <div className="ctx-pop auto-compact-pop" role="dialog"
+                aria-label="自动压缩">
+                {autoCompactControl}
+              </div>
+            )}
+            {p.engine === "codex" && autoCompactOpen && (
+              <div className="ctx-pop auto-compact-pop" role="dialog" aria-label="Codex 上下文上限">
+                <Suspense fallback={<p>加载设置…</p>}><CodexContextControl
+                  key={`${p.codexContext?.max_context_tokens}:${p.codexContext?.pending}`}
+                  state={p.codexContext ?? null} onChange={(value) => p.onSetCodexContext?.(value) ?? false} /></Suspense>
               </div>
             )}
           </div>
@@ -1011,11 +1192,12 @@ export function Composer(p: Props) {
         </>)}
       </div>
 
-      <CommandSheet
+      {sheetKind !== null && <Suspense fallback={null}><CommandSheet
         open={sheetKind !== null}
         kind={sheetKind ?? "models"}
         engine={p.engine}
         catalog={p.catalog}
+        dsh={p.dsh}
         onClose={() => setSheetKind(null)}
         currentModel={p.model}
         onPickModel={(m) => { p.onSetModel(m); setSheetKind(null); }}
@@ -1031,10 +1213,10 @@ export function Composer(p: Props) {
         onPickPermissionProfile={p.onSetPermissionProfile}
         currentWebSearch={p.webSearch}
         onPickWebSearch={p.onSetWebSearch}
-      />
+      /></Suspense>}
 
       {dragOver && (
-        <div className="drop-overlay" aria-hidden="true">
+        <div className="drop-overlay drop-overlay-main" aria-hidden="true">
           <div className="drop-card">
             <span className="dc-ic"><Icon name="plus" size={36} /></span>
             <div className="dc-tx">拖拽文件到此处发送</div>

@@ -1,59 +1,120 @@
-import { useCallback, useEffect, useReducer, useRef, useState, type TouchEvent } from "react";
+import { lazyDshApi } from "./lazy-dsh-api";
+import type { DshPanelSelection } from "./components/DshPanel";
+import {
+  harmonyPushSnapshot, subscribeHarmonyPush, hasHarmonyPush,
+  requestHarmonyPermission, confirmHarmonyPermission,
+} from "./harmony-push";
+import { RightPanelPresentation, rekeyPanelScope } from "./right-panel-presentation";
+import type { DshCommandInfo, FilePreview } from "./protocol";
+import { resolveRelatedSession, relatedSessionTitle } from "./session-messages";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
+import type { QueryAcceptanceResult } from "./outbox";
+import { RemoteViewerContext, useRemoteViewerLinks } from "./remote-viewer-context";
+import { ViewerPagesProvider } from "./components/ViewerPagesProvider";
+import { MANUAL_UNREAD_STORAGE } from "./manual-unread-storage";
+import type { ViewerPage } from "./remote-viewer";
+import { readViewerSelections, writeViewerSelections, viewerScopeKey, setViewerSelection,
+  type ViewerSelection } from "./remote-viewer";
 import {
   createRuntime,
   deferredQueueCapacity,
   initialState,
+  modelCatalogScopeKey,
+  nativeProfileSessionId,
   reduce,
   type PendingQuery,
   type PreviewAuthorizationState,
 } from "./reducer";
 import type { Turn } from "./domain/conversation";
 import { uuid } from "./util";
+import { TurnFilePageRequests, type LoadTurnFilePage } from "./turn-file-pages";
 import { Icon } from "./icons";
-import { ChatView } from "./components/ChatView";
+import { ChatView, type ChatViewHandle } from "./components/ChatView";
+import { applyRoomEvent, type RoomsState } from "./rooms-state";
+import type { QuestionDraft } from "./components/QuestionSheet";
 import { Composer } from "./components/Composer";
-import {
-  QueuedQueryDialog,
-  type QueuedQueryEditor,
-} from "./components/QueuedQueryDialog";
+import { usePanelWidthPreference } from "./use-panel-width";
+import { SidebarToggle } from "./components/SidebarToggle";
+import { SidebarShell, SidebarState } from "./components/SidebarLayout";
+import { useSidebarController } from "./sidebar-state";
+
+const BackgroundTaskControl = lazy(() => import("./components/BackgroundTaskControl"));
+import type { QueuedQueryEditor } from "./components/QueuedQueryDialog";
 import { ReconnectBanner } from "./components/ReconnectBanner";
 import { NoticeStack } from "./components/NoticeStack";
 import { presentCommandProblem } from "./problem-presentation";
-import { LoginForm } from "./components/LoginForm";
-import { SessionsSidebar } from "./components/SessionsSidebar";
-import { DirPicker } from "./components/DirPicker";
+const LoginForm = lazy(() => import("./components/LoginForm").then(m => ({ default: m.LoginForm })));
 import {
   compatibleNewChatEffort,
   newChatCatalogRequest,
-  NewChatView,
   reconcileNewChatSelection,
   resolveNewChatLocalDefaults,
-} from "./components/NewChatView";
-import { ArtifactPanel } from "./components/ArtifactPanel";
-import { BtwPanel } from "./components/BtwPanel";
-import { QuestionSheet } from "./components/QuestionSheet";
-import { GoalPanel } from "./components/GoalPanel";
-import { StatusSheet } from "./components/StatusSheet";
-import { UsageActivitySheet } from "./components/UsageActivitySheet";
-import { ForkWorktreeSheet } from "./components/ForkWorktreeSheet";
-import { WorkDashboardSheet } from "./components/WorkDashboardSheet";
-import { WorkArtifactsSheet } from "./components/WorkArtifactsSheet";
-import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components/CapabilitiesSheet";
+} from "./new-chat-selection";
+const NewChatView = lazy(() => import("./components/NewChatView").then(m => ({ default: m.NewChatView })));
+const QuestionSheet = lazy(() => import("./components/QuestionSheet").then(
+  m => ({ default: m.QuestionSheet })));
+const WorkDashboardSheet = lazy(() => import("./components/WorkDashboardSheet").then(m => ({ default: m.WorkDashboardSheet })));
+
+// The rooms surface is a separate chunk: it must not join the initial bundle.
+const RoomsView = lazy(() => import("./components/RoomsView").then(
+  ({ RoomsView: View }) => ({ default: View }),
+));
+import type { HookDraft, SkillDraft } from "./components/CapabilitiesSheet";
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
-import { HeaderMenu } from "./components/HeaderMenu";
-import { EngineSwitcher, type EngineSurface } from "./components/EngineSwitcher";
-import { DshPanel } from "./components/DshPanel";
-import { parseGoalCommand } from "./goal-command";
-import { shouldOpenCodexStatus } from "./status-capabilities";
-import { permsFor } from "./data";
+import { deviceVersionNotice } from "./device-version";
+import { EngineSelector } from "./components/EngineSelector";
 import {
+  claudeProfileIdForSession,
+  claudeProfilePresentation,
+  codexProfileIdForSession,
+  codexProfilePresentation,
+} from "./codex-profile-presentation";
+import type { GoalApi } from "./goal-api";
+import { parseGoalCommand } from "./goal-command";
+import {
+  BTW_PANEL_SCOPES_KEY, btwPanelScopeKey, readBtwPanelScopes,
+  rekeyBtwPanelScope, setBtwPanelScope,
+} from "./btw-panel-state";
+import {
+  dismissGoalUi,
+  goalStableIdentity,
+  goalUiScopeForEvent,
+  goalUiScopeKey,
+  readGoalUiPreferences,
+  reconcileGoalUiPreference,
+  shouldRecoverGoalUi,
+  rekeyGoalUiPreference,
+  rememberGoalUi,
+  resetGoalDismissMigrationTracking,
+  writeGoalUiPreferences,
+  type GoalUiPreferences,
+} from "./scoped-goal-ui";
+import { shouldOpenCodexStatus } from "./status-capabilities";
+import { permsFor, type Catalog } from "./data";
+import type { AutoCompactSelection } from "./auto-compact";
+import {
+  normalizeSessionList,
+  scopedFocusForSessionList,
   shouldAcceptSessionList,
+  shortSessionId,
   updateScopedSessionLifecycle,
 } from "./session-list";
 import { clearLegacyAuthMarkers, probeSession } from "./session-auth";
-import { nextAutoLoadDetailTurn } from "./history-detail-projection";
+import {
+  nextActiveDetailRequest,
+  nextAutoLoadDetailTurn,
+} from "./history-detail-projection";
 import {
   canEnqueueQuery,
   collectUnconfirmedQueries,
@@ -61,6 +122,8 @@ import {
 import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import {
+  FORK_FOCUS_REFRESH_MS,
+  forkFocusLeaseSession,
   isTerminalSessionMigrationError,
   isTerminalWorktreeForkError,
   matchesSessionForkRequest,
@@ -68,24 +131,26 @@ import {
   matchesWorktreeForkRequest,
   reconcileOpenMigrationSession,
   type PendingSessionFork,
+  type ForkFocusLease,
   type PendingSessionMigration,
   type PendingWorktreeFork,
+  withoutForkFocusPlaceholder,
 } from "./session-worktree";
-import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
-  normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
-  type QueryFile, type SessionInfo, type CodexPermissionMode,
+import { matchesBtwRequest,
+  normalizeEngine, type Snapshot, type QueryImg,
+  type QueryFile, type SessionInfo, type PermissionMode,
   type CodexWebSearchMode, type PermissionProfileInfo,
   type CodexServiceTier, type CollaborationModeName,
-  type DiffTheme, type Engine, type Space,
-  type SessionControl, type History, sessionControlLocksInput } from "./protocol";
+  type Engine, type Space,
+  type SessionControl, type History,
+  sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
 import { parseGitDiff } from "./diff";
-import { resolveSidebarSwipe } from "./responsive-layout";
 import {
   bumpSessionActivity,
-  compareSessionsByActivity,
   mergeSessionActivityState,
+  selectSurfaceSession,
   sessionCommandTarget,
   setSessionPinned,
 } from "./session-order";
@@ -125,8 +190,10 @@ import {
   HistoryRequestCoordinator,
   HistoryDetailRequestCoordinator,
   resolveHistoryCwdHint,
+  type CancelledHistoryBrowseRequest,
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
+  type HistoryRequestOptions,
 } from "./history-requests";
 import { RecoverableReadCoordinator } from "./recoverable-read";
 import { InlineImageAssetCache } from "./inline-image-assets";
@@ -142,6 +209,7 @@ import {
 import {
   acceptsCachedNewerPage,
   appendNewerPage,
+  cachedLatestRequiresLiveRuntime,
   canonicalTurnId,
   prependOlderPage,
   type HistoryBrowsePage,
@@ -163,12 +231,21 @@ import {
 import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
 import {
   acknowledgeCompletion,
+  acknowledgeMatchingCompletion,
+  catalogCompletionProjection,
+  completionAcknowledgementId,
   completionBadgeKind,
+  completionNeedsHistoryRepair,
   discardBtwCompletionReceipts,
+  idleTurnNeedsHistoryRepair,
   markCompletionUnread,
+  nextTerminalHistoryRepairAttempt,
+  newestCompletionProjection,
   rekeyCompletionReceipts,
+  settleTerminalHistoryRepairAttempt,
   type CompletionBadgeKind,
   type CompletionReceipts,
+  type TerminalHistoryRepairAttempt,
 } from "./completion-badges";
 import {
   cacheSkillCatalog,
@@ -179,11 +256,79 @@ import {
   type SkillCatalogCacheEntry,
   type SkillCatalogRequest,
 } from "./skill-catalog-cache";
+import {
+  completedGoalHasNewerUserTurn,
+  latestPlanProgress,
+  planFollowsCompletedGoal,
+  SessionPlanProgressCache,
+} from "./plan-progress";
+import {
+  ENGINE_SPACES_KEY,
+  LEGACY_SPACE_KEY,
+  readEngineSpaces,
+  rememberEngineSpace,
+} from "./surface-preferences";
+import {
+  activeTurnCandidateIds,
+  displayActiveTurnOwnerId,
+} from "./process-blocks";
+import type { AgentDetail, FilesListed, SessionArtifacts, SessionArtifactInfo } from "./protocol";
+import type { AgentDetailSelection } from "./components/AgentDetailController";
+import type { RightPanelView } from "./components/PanelTabs";
+import { useTheme } from "./use-theme";
+import { useBoldText } from "./use-bold-text";
 
-const THEME_KEY = "cc_remote_theme";
+const HeaderMenu = lazy(() => import("./components/HeaderMenu").then(
+  ({ HeaderMenu: Menu }) => ({ default: Menu }),
+));
+
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
-const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
+const DshGoalPanel = lazy(() => import("./components/DshGoalPanel"));
+const GoalPanel = lazy(() => import("./components/GoalPanel").then(
+  ({ GoalPanel: Panel }) => ({ default: Panel }),
+));
+const BtwPanel = lazy(() => import("./components/BtwPanel").then(
+  ({ BtwPanel: Panel }) => ({ default: Panel }),
+));
+const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
+  ({ ArtifactPanel: Panel }) => ({ default: Panel }),
+));
+const SessionArtifactsPanel = lazy(() => import("./components/SessionArtifactsPanel"));
+const SessionFilesPanel = lazy(() => import("./components/SessionFilesPanel"));
+const DirPicker = lazy(() => import("./components/DirPicker").then(
+  ({ DirPicker }) => ({ default: DirPicker }),
+));
+const QueuedQueryDialog = lazy(() => import("./components/QueuedQueryDialog").then(
+  ({ QueuedQueryDialog: Dialog }) => ({ default: Dialog }),
+));
+const RemoteViewerPanel = lazy(() => import("./components/RemoteViewerPanel").then(
+  ({ RemoteViewerPanel: Panel }) => ({ default: Panel }),
+));
+const StatusSheet = lazy(() => import("./components/StatusSheet").then(
+  ({ StatusSheet: Sheet }) => ({ default: Sheet }),
+));
+const ForkWorktreeSheet = lazy(() => import("./components/ForkWorktreeSheet").then(
+  ({ ForkWorktreeSheet: Sheet }) => ({ default: Sheet }),
+));
+const UsageActivitySheet = lazy(() => import("./components/UsageActivitySheet").then(
+  ({ UsageActivitySheet: Sheet }) => ({ default: Sheet }),
+));
+const WorkArtifactsSheet = lazy(() => import("./components/WorkArtifactsSheet").then(
+  ({ WorkArtifactsSheet: Sheet }) => ({ default: Sheet }),
+));
+const CapabilitiesSheet = lazy(() => import("./components/CapabilitiesSheet").then(
+  ({ CapabilitiesSheet: Sheet }) => ({ default: Sheet }),
+));
+const AgentDetailController = lazy(() => import("./components/AgentDetailController").then(
+  ({ AgentDetailController: Controller }) => ({ default: Controller }),
+));
+const DesktopDshPanel = lazy(() => import("./components/DesktopDshPanel").then(m => ({ default: m.DesktopDshPanel })));
+const DshPanel = lazy(() => import("./components/DshPanel"));
+const DshConnectionNotice = lazy(() => import("./components/DshCommandFeedback").then(m => ({ default: m.DshConnectionNotice })));
+const SessionsSidebar = lazy(() => import("./components/SessionsSidebar").then(
+  ({ SessionsSidebar: Sidebar }) => ({ default: Sidebar }),
+));
 
 interface QueuedQueryEditorState extends QueuedQueryEditor {
   detailRequestId: string | null;
@@ -191,40 +336,109 @@ interface QueuedQueryEditorState extends QueuedQueryEditor {
   pendingPrompt: string | null;
 }
 
-// The sidebar is an overlay on mobile (<980px, matches index.css) but a
-// persistent grid column on desktop. So auto-close it after picking a session
+const MAX_TERMINAL_HISTORY_REPAIR_ATTEMPTS = 2;
+
+// The sidebar pushes the page on mobile (<980px, matches index.css) but is a
+// persistent column on desktop. So auto-close it after picking a session
 // ONLY on mobile; on desktop keep it open.
 const isMobile = () => window.matchMedia("(max-width: 979px)").matches;
 
+/** Present one account's catalog under the historical engine key used by
+ * model pickers. The underlying cache remains profile-keyed, so a missing
+ * secondary-account response never falls back to another account's models. */
+function catalogForEngineProfile(
+  catalog: Catalog,
+  engine: Engine,
+  profileId?: string | null,
+  cwd?: string | null,
+): Catalog {
+  const scoped = catalog[modelCatalogScopeKey(engine, profileId, cwd)];
+  return {
+    ...catalog,
+    [engine]: scoped ?? [],
+  };
+}
+
 export default function App() {
-  const [theme, setTheme] = useState<DiffTheme>(
-    () => normalizeDiffTheme(localStorage.getItem(THEME_KEY)));
-  const [engine, setEngine] = useState<Engine>(
-    () => normalizeEngine(localStorage.getItem(ENGINE_KEY)));
-  const [dshOpen, setDshOpen] = useState(false);
-  const [dshMounted, setDshMounted] = useState(false);
-  const [space, setSpace] = useState<Space>(
-    () => localStorage.getItem(SPACE_KEY) === "work" ? "work" : "code");
+  usePanelWidthPreference();
+  const initialEngineRef = useRef(normalizeEngine(localStorage.getItem(ENGINE_KEY)));
+  const initialSpacesRef = useRef(readEngineSpaces(localStorage, initialEngineRef.current));
+  const [engine, setEngine] = useState<Engine>(initialEngineRef.current);
+  const appearance = useTheme(engine);
+  const { mode: theme, selectTheme } = appearance;
+  const { boldText, setBoldText } = useBoldText();
+  const [space, setSpace] = useState<Space>(initialSpacesRef.current[initialEngineRef.current]);
+  const spacesByEngineRef = useRef<Record<Engine, Space>>(initialSpacesRef.current);
   const [authed, setAuthed] = useState(false);
+  const changingNotificationModeRef = useRef(false);
+  const [notificationBindingRevision, recheckNotificationBinding] = useReducer((value: number) => value + 1, 0);
+  const [harmonyPush, setHarmonyPush] = useState(harmonyPushSnapshot);
+  useEffect(() => subscribeHarmonyPush(() => setHarmonyPush(harmonyPushSnapshot())), []);
   const [authReady, setAuthReady] = useState(false);
-  useEffect(() => {
-    if (!authed) { setDshOpen(false); setDshMounted(false); }
-  }, [authed]);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const sidebar = useSidebarController();
+  const setSidebarOpen = sidebar.setOpen;
   const [dirPickerOpen, setDirPickerOpen] = useState(false);
+  const [dshPresetSelection, setDshPresetSelection] = useState<{ scope: string; value: string } | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [newChatAutoFocus, setNewChatAutoFocus] = useState(true);
+  // A cold Work/Code or engine switch has no trustworthy row to paint until
+  // its scoped SessionList arrives. Keep that gap non-interactive: rendering a
+  // default `~` composer here can create a real session in the wrong cwd before
+  // the wrapper has had a chance to restore the remembered conversation.
+  const [restoringSurfaceScope, setRestoringSurfaceScope] =
+    useState<string | null>(null);
   const [editPrompt, setEditPrompt] = useState<string | null>(null);
   const [queuedQueryEditor, setQueuedQueryEditor] =
     useState<QueuedQueryEditorState | null>(null);
-  // right slot is shared by diff + /btw; rightView picks which shows.
-  const [rightView, setRightView] = useState<"diff" | "btw">("diff");
+  // File panels share one slot; centered BTW is an independent overlay above it.
+  const [expandedPanel, setExpandedPanel] = useState<{
+    scope: string;
+  } | null>(null);
+  const [centeredBtwScopes, setCenteredBtwScopes] = useState<string[]>([]);
+  const btwChatViewRef = useRef<ChatViewHandle>(null);
+  // A user action owns one focus request; restored panels and streaming updates
+  // must not move the caret away from whatever the user is editing.
+  const [btwFocusScope, setBtwFocusScope] = useState<string | null>(null);
+  const consumeBtwFocus = useCallback(() => setBtwFocusScope(null), []);
+  const [btwPanelScopes, setBtwPanelScopes] = useState(
+    () => readBtwPanelScopes(sessionStorage));
+  const [rightView, setRightView] = useState<RightPanelView>(
+    btwPanelScopes.length ? "btw" : "diff");
+  const [agentPanel, setAgentPanel] = useState<AgentDetailSelection | null>(null);
+  const [fileBrowser, setFileBrowser] = useState<{
+    sid: string; machineId: string; engine: string; space: string;
+    path: string; preview: boolean; id: string;
+  } | null>(null);
+  const [sessionArtifacts, setSessionArtifacts] = useState<{
+    parentSid: string; sid: string; machineId: string; engine: Engine; space: Space;
+    selected: SessionArtifactInfo | null; id: string;
+  } | null>(null);
+  const artifactsListenerRef = useRef<((message: SessionArtifacts | FilePreview) => boolean) | null>(null);
+  const listenArtifacts = useCallback((listener: ((message: SessionArtifacts | FilePreview) => boolean) | null) => {
+    artifactsListenerRef.current = listener;
+  }, []);
+  const filesListenerRef = useRef<((message: FilesListed) => void) | null>(null);
+  const listenFiles = useCallback((listener: ((message: FilesListed) => void) | null) => {
+    filesListenerRef.current = listener;
+  }, []);
+  const [viewerSelections, setViewerSelections] = useState(() => readViewerSelections(sessionStorage));
+  const [viewerUrl, setViewerUrl] = useState<{ key: string; href: string; openId: string } | null>(null);
+  useEffect(() => writeViewerSelections(sessionStorage, viewerSelections), [viewerSelections]);
+  const agentDetailListenerRef = useRef<((message: AgentDetail) => void) | null>(null);
+  const setAgentDetailListener = useCallback(
+    (listener: ((message: AgentDetail) => void) | null) => {
+      agentDetailListenerRef.current = listener;
+    }, []);
   // true from the moment /btw is clicked until the fork's btw_opened arrives — so
   // the panel appears instantly (spinner) instead of waiting ~1s for the fork.
   const [btwOpeningByParentSid, setBtwOpeningByParentSid] = useState<Record<string, boolean>>({});
-  // Goal is deliberately opt-in UI: no empty bar and no RPC until /goal runs.
-  // Keep reveal/editor state per session so switching sessions never leaks it.
-  const [goalUiBySid, setGoalUiBySid] = useState<Record<string, { revealed: boolean; open: boolean }>>({});
+  // Goal remains opt-in, but its reveal preference is scoped across machines,
+  // Work/Code and engines so a refresh can restore the correct session only.
+  const [goalUiByScope, setGoalUiByScope] = useState<Record<string, {
+    revealed: boolean;
+    open: boolean;
+    loading: boolean;
+  }>>({});
   const [statusOpenSid, setStatusOpenSid] = useState<string | null>(null);
   const [usageActivityOpen, setUsageActivityOpen] = useState(false);
   const [forkWorktreeSession, setForkWorktreeSession] = useState<SessionInfo | null>(null);
@@ -244,6 +458,7 @@ export default function App() {
     useState<Record<string, EngineCapabilities>>({});
   const [skillCatalogs, setSkillCatalogs] =
     useState<Record<string, SkillCatalogCacheEntry>>({});
+  const [skillCatalogErrors, setSkillCatalogErrors] = useState<Record<string, boolean>>({});
   const [notificationMode, setNotificationMode] = useState<NotificationMode>(
     () => readNotificationMode(localStorage));
   const [pushBinding, setPushBinding] = useState<PushBindingSnapshot>({
@@ -251,6 +466,8 @@ export default function App() {
   });
   const [machineId, setMachineId] = useState(
     () => localStorage.getItem(MACHINE_KEY) || "default");
+  const notificationScopeRef = useRef({ machineId, authed });
+  notificationScopeRef.current = { machineId, authed };
   const [remoteDevices, setRemoteDevices] = useState<RemoteDevice[]>([]);
   const [devicesLoadState, setDevicesLoadState] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -278,22 +495,44 @@ export default function App() {
   });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+
+  // Collaboration rooms live in App-local state: a room is not a session, so it
+  // deliberately stays out of the session reducer and its surfaces.
+  const [rooms, setRooms] = useState<RoomsState>({});
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(null);
+  const [roomsOpen, setRoomsOpen] = useState(false);
+  const [workDashboardMachineId, setWorkDashboardMachineId] =
+    useState(machineId);
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [completionReceipts, setCompletionReceipts] = useState<CompletionReceipts>({});
+  const completionReceiptsRef = useRef(completionReceipts);
+  completionReceiptsRef.current = completionReceipts;
   const [btwSendModeBySid, setBtwSendModeBySid] = useState<
     Record<string, SendMode>
   >({});
   const [newChatPermissionCatalog, setNewChatPermissionCatalog] = useState<{
     machineId: string;
     cwd: string;
+    codexProfileId: string | null;
     profiles: PermissionProfileInfo[];
   } | null>(null);
   const [state, dispatch] = useReducer(reduce, initialState);
+
+  const roomDshSessions = useMemo(
+    () => state.sessions
+      .filter((session) => session.engine === "dsh")
+      .map((session) => ({
+        session_id: session.session_id,
+        label: session.summary || session.first_prompt || session.session_id,
+      })),
+    [state.sessions],
+  );
   const inlineImageAssetsRef = useRef(new InlineImageAssetCache());
   const [, bumpInlineImageRevision] = useReducer((value: number) => value + 1, 0);
   const historyImageAssetsRef = useRef(new HistoryImageAssetCache());
   const composerDraftsRef = useRef(new ComposerDraftStore());
   const btwDraftsRef = useRef(new ComposerDraftStore());
+  const questionDraftsRef = useRef(new Map<string, QuestionDraft>());
   const [, bumpHistoryImageRevision] = useReducer((value: number) => value + 1, 0);
   const dismissBanner = useCallback((banner: string) => {
     dispatch({ type: "dismiss_banner", banner });
@@ -308,9 +547,72 @@ export default function App() {
   }
   const stateRef = useRef(state);
   stateRef.current = state;
-  const rightViewRef = useRef(rightView);
-  rightViewRef.current = rightView;
   const wsRef = useRef<RelayWs | null>(null);
+  const goalApiRef = useRef<GoalApi | null>(null);
+  const getGoalApi = useCallback(async () => {
+    const transport = wsRef.current;
+    const { GoalApi } = await import("./goal-api");
+    if (!transport || transport !== wsRef.current) throw new Error("连接已切换，请重试。");
+    return goalApiRef.current ??= new GoalApi(() => wsRef.current);
+  }, []);
+  const [dshApi] = useState(() => lazyDshApi(() => wsRef.current));
+  const [desktopDshMounted, setDesktopDshMounted] = useState(false);
+  const [desktopDshOpen, setDesktopDshOpen] = useState(false);
+  const [dshPanel, setDshPanel] = useState<{ sid: string; scope: string; selection: DshPanelSelection } | null>(null);
+  const [permissionProfileRequests, setPermissionProfileRequests] =
+    useState<Record<string, string>>({});
+  const archivedBrowseRef = useRef<string | null>(null);
+  // Reducer state becomes visible after React commits. Keep the command id in a
+  // synchronous ref as well so a close/reopen double click (or two idle frames
+  // in one WebSocket batch) cannot enqueue duplicate native Context RPCs.
+  const contextRequestLaunchesRef = useRef<Map<string, string>>(new Map());
+  // An idle State can be published a few milliseconds before the managed
+  // Claude runner drops its final task/write claims.  Bound the compensating
+  // retries for that narrow finalizer race; a genuinely active turn still
+  // waits for its next authoritative idle frame.
+  const contextDeferredRetryAttemptsRef = useRef<Map<string, number>>(new Map());
+  const wsLifecycleEpochRef = useRef(0);
+  const goalUiPreferencesRef = useRef<GoalUiPreferences>(
+    readGoalUiPreferences(localStorage));
+  const goalRecoveryRequestsRef = useRef<Set<string>>(new Set());
+  const goalDismissMigrationsRef = useRef<Set<string>>(new Set());
+  const goalDismissMigrationByRequestRef = useRef<Map<string, string>>(
+    new Map());
+  const planProgressCacheRef = useRef(new SessionPlanProgressCache());
+  const goalRequestScopeByIdRef = useRef<Map<
+    string, { scopeKey: string; sid: string }
+  >>(new Map());
+  const persistGoalUiPreferences = useCallback((next: GoalUiPreferences) => {
+    goalUiPreferencesRef.current = writeGoalUiPreferences(localStorage, next);
+  }, []);
+  const sendContextRequestTo = useCallback((
+    sid: string,
+    refresh: boolean,
+    transport: RelayWs | null = wsRef.current,
+  ): string | null => {
+    const runtime = stateRef.current.runtimes[sid];
+    if (runtime?.contextRequestId
+        || contextRequestLaunchesRef.current.has(sid)) return null;
+    const requestId = transport?.sendGetContextTo(sid, refresh) ?? null;
+    if (!requestId) return null;
+    contextRequestLaunchesRef.current.set(sid, requestId);
+    dispatch({ type: "begin_context_request", sid, requestId, refresh });
+    return requestId;
+  }, []);
+  const resumeListedSession = useCallback((
+    session: SessionInfo,
+    targetEngine: Engine,
+    targetSpace: Space,
+    transport: RelayWs | null = wsRef.current,
+  ) => {
+    if (session.tag === "archived") {
+      archivedBrowseRef.current = session.session_id;
+      return;
+    }
+    archivedBrowseRef.current = null;
+    transport?.sendSwitchSession(
+      session.session_id, targetEngine, targetSpace);
+  }, []);
   const skillCatalogsRef =
     useRef<Record<string, SkillCatalogCacheEntry>>({});
   const skillCatalogRequestsRef =
@@ -322,6 +624,9 @@ export default function App() {
         request.space,
         request.cwd,
         request.skillsOnly,
+        request.codexProfileId,
+        request.claudeProfileId,
+        request.sid, request.dshPreset,
       ) ?? null,
     );
   }
@@ -331,16 +636,45 @@ export default function App() {
     space: Space;
     cwd: string;
     skillsOnly: boolean;
+    sid?: string | null;
+    claudeProfileId?: string | null;
+    codexProfileId?: string | null;
   } | null>(null);
+  const capabilitiesScopeRef = useRef<SkillCatalogRequest | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
+  const turnFileRequestsRef = useRef(new TurnFilePageRequests());
+  const terminalHistoryRepairRef = useRef<Map<
+    string, TerminalHistoryRepairAttempt
+  >>(new Map());
+  const [terminalHistoryRepairEpoch, setTerminalHistoryRepairEpoch] =
+    useState(0);
+  const btwHydrationKeyRef = useRef("");
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
     (context) => {
       dispatch({ type: "history_detail_cancelled", context });
     },
   ));
+  const historyDetailResetAttemptsRef = useRef(new Set<string>());
   const clearHistoryDetailRequests = useCallback(() => {
     for (const context of historyDetailRequestsRef.current.clear()) {
       dispatch({ type: "history_detail_cancelled", context });
+    }
+  }, []);
+  const settleCancelledHistoryBrowse = useCallback((
+    cancelled: readonly CancelledHistoryBrowseRequest[],
+  ) => {
+    for (const request of cancelled) {
+      const browse = request.browse;
+      dispatch({
+        type: "history_browse_page_failed",
+        sid: request.sid,
+        scopeKey: browse.scopeKey,
+        revision: request.revision,
+        generation: request.generation,
+        viewId: browse.viewId,
+        windowEpoch: browse.windowEpoch,
+        before: browse.pendingBefore,
+      });
     }
   }, []);
   const historyPageCacheRef = useRef(new HistoryPageCache());
@@ -360,11 +694,15 @@ export default function App() {
   }>>(new Map());
   const pendingBtwByParentRef = useRef<Map<string, string>>(new Map());
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
+  const forkFocusLeaseRef = useRef<ForkFocusLease | null>(null);
+  const forkFocusLeaseTimerRef = useRef<number | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const pendingSessionMigrationRef =
     useRef<PendingSessionMigration | null>(null);
   const sessionListsBySurfaceRef = useRef<Record<string, SessionInfo[]>>({});
   const historySessionListsRef = useRef<Record<string, SessionInfo[]>>({});
+  const findMessageSession = (id: string) => resolveRelatedSession(id, focusedSid,
+    [...state.sessions, ...Object.values(sessionListsBySurfaceRef.current).flat()]);
   // Cached lists are paint-only during a surface switch. A surface may choose
   // its remembered/latest focus only after a fresh wrapper list is accepted.
   const authoritativeSurfaceListsRef = useRef<Set<string>>(new Set());
@@ -376,11 +714,10 @@ export default function App() {
   const activeBtwByParentRef = useRef<Map<
     string, { requestId: string; sid: string }
   >>(new Map());
-  // Retain recently cancelled ids so a late response can be identified and
-  // discarded (and a late successful fork can be closed) without disturbing a
-  // newer opening spinner. Bounded because a peer may disappear permanently.
+  // Correlate each pending creation with its original parent. Navigating away
+  // never destroys the result: the owner-scoped open remains pinned there
+  // until its explicit close button is used.
   const btwRequestParentsRef = useRef<Map<string, string>>(new Map());
-  const discardedBtwSidsRef = useRef<Set<string>>(new Set());
   // A marker may arrive while its session is in the background and while an
   // IndexedDB read is already in flight. The set blocks new cache use; the
   // epoch rejects reads that started before the destructive mutation.
@@ -394,9 +731,6 @@ export default function App() {
   const notificationListRequestRef = useRef<string | null>(null);
   const notificationOriginRef = useRef<NotificationOrigin | null>(null);
   const pendingNotificationErrorRef = useRef<string | null>(null);
-  const touchStartX = useRef(0);
-  const touchStartY = useRef(0);
-  const touchSwipeLocked = useRef(false);
   const artifactDirtyRef = useRef(false);
   const setArtifactDirty = useCallback((dirty: boolean) => {
     artifactDirtyRef.current = dirty;
@@ -418,6 +752,52 @@ export default function App() {
       return next;
     });
   }, []);
+  const clearForkFocusLease = useCallback((
+    refresh = false,
+    dropPlaceholder = true,
+  ) => {
+    const lease = forkFocusLeaseRef.current;
+    if (forkFocusLeaseTimerRef.current !== null) {
+      window.clearTimeout(forkFocusLeaseTimerRef.current);
+      forkFocusLeaseTimerRef.current = null;
+    }
+    if (!lease) return;
+    forkFocusLeaseRef.current = null;
+    if (!dropPlaceholder) return;
+    const surfaceKey = `${lease.space}:${lease.engine}`;
+    const current = sessionListsBySurfaceRef.current[surfaceKey] ?? [];
+    const sessions = withoutForkFocusPlaceholder(current, lease);
+    sessionListsBySurfaceRef.current[surfaceKey] = sessions;
+    historySessionListsRef.current[surfaceKey] = sessions;
+    dispatch({
+      type: "drop_fork_placeholder",
+      sid: lease.childSessionId,
+      parentSid: lease.parentSessionId,
+    });
+    if (refresh) wsRef.current?.sendListSessions(lease.engine, lease.space);
+  }, []);
+  const startForkFocusLease = useCallback((lease: ForkFocusLease) => {
+    // Replacing one successful fork with another is explicit navigation. The
+    // old synthetic row no longer has a lease and must not linger undeletable.
+    clearForkFocusLease(false, true);
+    forkFocusLeaseRef.current = lease;
+    const refresh = () => {
+      const current = forkFocusLeaseRef.current;
+      if (current?.requestId !== lease.requestId
+          || current.childSessionId !== lease.childSessionId) return;
+      wsRef.current?.sendListSessions(current.engine, current.space);
+      current.refreshAt = Date.now() + FORK_FOCUS_REFRESH_MS;
+      forkFocusLeaseTimerRef.current = window.setTimeout(
+        refresh, FORK_FOCUS_REFRESH_MS);
+    };
+    forkFocusLeaseTimerRef.current = window.setTimeout(
+      refresh, Math.max(0, lease.refreshAt - Date.now()));
+  }, [clearForkFocusLease]);
+  useEffect(() => () => {
+    if (forkFocusLeaseTimerRef.current !== null) {
+      window.clearTimeout(forkFocusLeaseTimerRef.current);
+    }
+  }, []);
   const requestHistory = useCallback((
     sid: string,
     before: string | null | undefined,
@@ -425,9 +805,22 @@ export default function App() {
     generation?: string | null,
     revision?: string | null,
     browse?: HistoryBrowseRequestContext,
+    options?: HistoryRequestOptions,
   ) => {
     const ws = wsRef.current;
     if (!ws) return false;
+    const current = stateRef.current;
+    const completion = newestCompletionProjection(
+      current.runtimes[sid]?.completion,
+      catalogCompletionProjection(current.sessions.find(
+        (session) => session.session_id === sid)),
+    );
+    const requestOptions: HistoryRequestOptions = {
+      ...options,
+      causalKey: options?.causalKey === undefined
+        ? completion?.id ?? null
+        : options.causalKey,
+    };
     return historyRequestsRef.current.request({
       sid, before, limit,
       generation: generation ?? ws.generationFor(sid),
@@ -438,7 +831,21 @@ export default function App() {
       before,
       limit,
       resolveHistoryCwdHint(historySessionListsRef.current, sid),
-    ));
+    ), settleCancelledHistoryBrowse, requestOptions);
+  }, [settleCancelledHistoryBrowse]);
+  const settleTerminalHistoryRepair = useCallback((
+    sid: string,
+    causalKey: string,
+  ) => {
+    const current = terminalHistoryRepairRef.current.get(sid);
+    if (!current || causalKey !== current.key) return;
+    const settled = settleTerminalHistoryRepairAttempt(current);
+    if (!settled) return;
+    terminalHistoryRepairRef.current.set(sid, settled);
+    // The matching History reducer runs in the same inbound-message batch.
+    // This local epoch gives the repair effect an explicit response boundary,
+    // including when the reducer correctly rejects an older build_seq page.
+    setTerminalHistoryRepairEpoch((value) => value + 1);
   }, []);
   const cancelPendingNotificationTarget = useCallback(() => {
     setPendingNotificationTarget(null);
@@ -452,12 +859,15 @@ export default function App() {
   const shortcutRef = useRef<{
     artifact: typeof state.artifact;
     btwSid: string | null;
-    rightView: "diff" | "btw";
+    btwAvailable: boolean;
+    rightView: RightPanelView;
     getDiff: (file: string) => void;
     openBtw: () => void;
-    closeBtw: () => void;
-  }>({ artifact: null, btwSid: null, rightView: "diff",
-    getDiff: () => {}, openBtw: () => {}, closeBtw: () => {} });
+    collapseBtw: () => void;
+    toggleCenteredBtw: () => void;
+  }>({ artifact: null, btwSid: null, btwAvailable: false, rightView: "diff",
+    getDiff: () => {}, openBtw: () => {}, collapseBtw: () => {},
+    toggleCenteredBtw: () => {} });
 
   useEffect(() => {
     const current = reconcileOpenMigrationSession(
@@ -478,28 +888,50 @@ export default function App() {
     pendingCreateRef.current = null;
     createRequestsRef.current.clear();
     pendingSessionMigrationRef.current = null;
+    clearForkFocusLease(false);
     setMigrateSession(null);
     setMigrateCreating(false);
     setMigrateError(null);
     pendingBtwByParentRef.current.clear();
     activeBtwByParentRef.current.clear();
     btwRequestParentsRef.current.clear();
-    discardedBtwSidsRef.current.clear();
     setBtwOpeningByParentSid({});
     setBtwSendModeBySid({});
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
+    questionDraftsRef.current.clear();
+    setCenteredBtwScopes([]);
     setCompletionReceipts({});
+    resetGoalDismissMigrationTracking(
+      goalDismissMigrationsRef.current,
+      goalDismissMigrationByRequestRef.current,
+    );
+    planProgressCacheRef.current.reset();
     sessionListsBySurfaceRef.current = {};
     historySessionListsRef.current = {};
+    preferredSurfaceFocusRef.current = null;
     authoritativeSurfaceListsRef.current.clear();
     notificationListRequestRef.current = null;
+    setRestoringSurfaceScope(null);
     sessionActivityPendingRef.current.clear();
     skillCatalogsRef.current = {};
     skillCatalogRequestsRef.current?.reset();
     setSkillCatalogs({});
+    setSkillCatalogErrors({});
     setCapabilitiesByScope({});
+    setStatusOpenSid(null);
     setUsageActivityOpen(false);
+    setWorkManagerOpen(false);
+    setWorkProjectId(null);
+    setWorkDashboards({});
+    setWorkDashboardMachineId(machineId);
+    setWorkArtifactsOpen(false);
+    setWorkArtifactsBySid({});
+    setGoalUiByScope((current) => Object.fromEntries(
+      Object.entries(current).map(([key, value]) => [
+        key, { ...value, open: false },
+      ]),
+    ));
     deferredStatusRefreshRef.current.clear();
     historyRequestsRef.current.clear();
     clearHistoryDetailRequests();
@@ -522,25 +954,196 @@ export default function App() {
     }
     void import("./cache").then((module) => module.clearCache());
     void historyPageCacheRef.current.clear();
-  }, [clearHistoryDetailRequests, machineId]);
+  }, [clearForkFocusLease, clearHistoryDetailRequests, machineId]);
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
   const focusedSid = state.focusedSid;
-  const visibleParentSid = state.newChat ? null : focusedSid;
-  const activeBtw = visibleParentSid ? state.btwByParentSid[visibleParentSid] : undefined;
+  const visibleParentSid = state.newChat || previousMachineRef.current !== machineId
+    ? null : focusedSid;
+  // DSH forks persist natively and cannot yet be deleted. Keep the side-chat
+  // implementation dormant, including any retained panel visibility.
+  const btwPanelKey = visibleParentSid && engine !== "dsh"
+    ? btwPanelScopeKey(machineId, space, engine, visibleParentSid) : null;
+  const btwPanelVisible = !!btwPanelKey && btwPanelScopes.includes(btwPanelKey);
+  const btwPanelVisibleRef = useRef(btwPanelVisible);
+  btwPanelVisibleRef.current = btwPanelVisible;
+  const activeBtwGroup = visibleParentSid
+    ? state.btwByParentSid[visibleParentSid] : undefined;
+  const activeBtw = activeBtwGroup?.chats.find(
+    (chat) => chat.sid === activeBtwGroup.activeSid);
   const activeBtwSid = activeBtw?.sid ?? null;
   const btwOpening = visibleParentSid
     ? !!btwOpeningByParentSid[visibleParentSid] : false;
+  // The rendered slot owns desktop split space, never retained chat data.
+  // A hidden BTW can keep running; an empty/opening visible BTW still needs room.
+  const btwShowing = btwPanelVisible && !!visibleParentSid;
+  const viewerKey = visibleParentSid
+    ? viewerScopeKey({ machineId, space, engine, sid: visibleParentSid }) : null;
+  const viewerShowing = !!viewerKey && Object.hasOwn(viewerSelections, viewerKey);
+  const closeViewer = useCallback(() => {
+    if (!viewerKey) return;
+    setViewerSelections((current) => {
+      const next = { ...current };
+      delete next[viewerKey];
+      return next;
+    });
+    setViewerUrl(null);
+  }, [viewerKey]);
+  const openViewer = useCallback((href?: string) => {
+    if (!viewerKey || !confirmArtifactDiscard()) return;
+    setAgentPanel(null);
+    setViewerSelections((current) => setViewerSelection(current, viewerKey, href ? null : current[viewerKey] ?? null));
+    setViewerUrl(href ? { key: viewerKey, href, openId: uuid() } : null);
+  }, [viewerKey, confirmArtifactDiscard]);
+  const openViewerLink = useRemoteViewerLinks(
+    authed && state.connState === "connected" ? viewerKey : null, openViewer);
+  const openViewerPage = useCallback((page: ViewerPage) => {
+    if (!viewerKey || !confirmArtifactDiscard()) return;
+    setAgentPanel(null);
+    setViewerUrl(null);
+    setViewerSelections((current) => setViewerSelection(current, viewerKey,
+      { machine_id: page.machine_id, site_id: page.site_id, entry: page.entry }));
+  }, [viewerKey, confirmArtifactDiscard]);
+  const selectViewer = (selection: ViewerSelection | null) => {
+    if (viewerKey) setViewerSelections((current) => setViewerSelection(current, viewerKey, selection));
+  };
+  const filesShowing = fileBrowser?.sid === visibleParentSid
+    && fileBrowser?.machineId === machineId && fileBrowser?.engine === engine
+    && fileBrowser?.space === space;
+  const artifactsShowing = sessionArtifacts?.parentSid === visibleParentSid
+    && sessionArtifacts?.machineId === machineId && sessionArtifacts?.engine === engine
+    && sessionArtifacts?.space === space;
+  const visibleRightPanel = dshPanel?.scope === sessionScopeKey(machineId, engine, space) && dshPanel.sid === visibleParentSid ? "dsh" : viewerShowing ? "viewer" : agentPanel ? "agent"
+    : artifactsShowing ? "artifacts" : filesShowing ? "files"
+    : rightView === "btw" && btwShowing ? "btw"
+      : state.artifact ? "diff" : btwShowing ? "btw" : null;
+  const panelScope = (kind: string, identity?: string) =>
+    JSON.stringify([machineId, space, engine, visibleParentSid, kind, identity ?? null]);
+  const rightPanelKey = visibleRightPanel ? panelScope(visibleRightPanel,
+    visibleRightPanel === "artifacts" ? sessionArtifacts?.id
+      : visibleRightPanel === "files" ? fileBrowser?.id
+      : visibleRightPanel === "agent" ? agentPanel?.runId : undefined) : null;
+  const btwScope = panelScope("btw");
+  // Keep each surface's presentation when navigating away; only an explicit
+  // open/close changes it. Returning must not request composer autofocus.
+  const setCenteredBtw = (visible: boolean) => setCenteredBtwScopes(
+    current => setBtwPanelScope(current, btwScope, visible));
+  const btwExpanded = !!btwPanelKey && centeredBtwScopes.includes(btwScope);
+  const btwRendered = visibleRightPanel === "btw" || btwExpanded;
+  const panelExpanded = !!rightPanelKey && expandedPanel?.scope === rightPanelKey;
+  useEffect(() => {
+    setExpandedPanel(current => current && current.scope !== rightPanelKey ? null : current);
+  }, [rightPanelKey]);
+  useEffect(() => {
+    setBtwFocusScope(current => current === btwScope ? current : null);
+  }, [btwScope]);
+  // Questions, hydration and completion receipts must agree with the rendered
+  // slot, including when an agent or artifact covers a retained side chat.
+  const visibleBtwSid = btwRendered ? activeBtwSid : null;
+  const visibleBtwSidRef = useRef(visibleBtwSid);
+  visibleBtwSidRef.current = visibleBtwSid;
+  const activeBtwQuestionVisible = !!(
+    visibleBtwSid && state.runtimes[visibleBtwSid]?.pendingQuestion
+  );
+  useEffect(() => {
+    if (!visibleBtwSid
+        || state.connState !== "connected" || !state.wrapperOnline) {
+      btwHydrationKeyRef.current = "";
+      return;
+    }
+    if (btwHydrationKeyRef.current === visibleBtwSid) return;
+    if (wsRef.current?.sendSyncBtw(visibleBtwSid)) {
+      btwHydrationKeyRef.current = visibleBtwSid;
+    }
+  }, [
+    visibleBtwSid,
+    state.connState,
+    state.wrapperOnline,
+  ]);
+  const completionBadgeSids = new Set([
+    ...Object.keys(completionReceipts),
+    ...state.sessions.filter(
+      (session) => session.completion_unread === true,
+    ).map((session) => session.session_id),
+    ...Object.keys(state.runtimes).filter(
+      (sid) => state.runtimes[sid]?.completion?.unread === true),
+  ]);
+  const catalogCompletionBySid = new Map(state.sessions.flatMap((session) => {
+    const completion = catalogCompletionProjection(session);
+    return completion
+      ? [[session.session_id, completion] as const]
+      : [];
+  }));
   const completionBadges = Object.fromEntries(
-    Object.entries(completionReceipts).flatMap(([sid, receipt]) => {
-      const kind = completionBadgeKind(receipt);
+    [...completionBadgeSids].flatMap((sid) => {
+      const local = completionReceipts[sid] ?? {
+        main: false, mainCompletionId: null,
+        mainTurnEndSeq: null, mainTurnEndGeneration: null, btwSids: [],
+      };
+      const authoritative = newestCompletionProjection(
+        state.runtimes[sid]?.completion,
+        catalogCompletionBySid.get(sid),
+      );
+      const kind = completionBadgeKind(local, authoritative?.unread);
       return kind ? [[sid, kind]] : [];
     }),
   ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
+  useEffect(() => () => goalApiRef.current?.reset(), [activeScopeKey]);
+  useEffect(() => () => dshApi.reset(), [activeScopeKey, dshApi]);
+  const activeWorkDashboard = workDashboardMachineId === machineId
+    ? workDashboards[engine] ?? null
+    : null;
+  const activeWorkProjectId = workDashboardMachineId === machineId
+    ? workProjectId
+    : null;
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
   const newChatCwd = state.newChat?.cwd ?? null;
+  const knownClaudeProfileIds = new Set(
+    state.claudeProfiles.map((profile) => profile.id));
+  const knownCodexProfileIds = new Set(
+    state.codexProfiles.map((profile) => profile.id));
+  const requestedNewChatClaudeProfileId = engine === "claude"
+    ? state.newChat?.claudeProfileId
+      ?? state.claudeProfileByScope[activeScopeKey]
+      ?? state.defaultClaudeProfileId
+    : null;
+  const requestedNewChatCodexProfileId = engine === "codex"
+    ? state.newChat?.codexProfileId
+      ?? state.codexProfileByScope[activeScopeKey]
+      ?? state.defaultCodexProfileId
+    : null;
+  // Preserve an explicitly selected id even if a later registry refresh drops
+  // it. Silently replacing a drafted Work turn with the default account would
+  // cross the user's billing and conversation boundary.
+  const newChatClaudeProfileId = engine === "claude"
+    ? requestedNewChatClaudeProfileId
+      ?? state.claudeProfiles.find(
+        (profile) => profile.id === state.defaultClaudeProfileId)?.id
+      ?? state.claudeProfiles[0]?.id
+      ?? null
+    : null;
+  const newChatCodexProfileId = engine === "codex"
+    ? requestedNewChatCodexProfileId
+      ?? state.codexProfiles.find(
+        (profile) => profile.id === state.defaultCodexProfileId)?.id
+      ?? state.codexProfiles[0]?.id
+      ?? null
+    : null;
+  const newChatCodexProfileMissing = engine === "codex"
+    && !!newChatCodexProfileId
+    && !knownCodexProfileIds.has(newChatCodexProfileId);
+  const newChatClaudeProfileMissing = engine === "claude"
+    && !!newChatClaudeProfileId
+    && !knownClaudeProfileIds.has(newChatClaudeProfileId);
+  const newChatProfileId = engine === "codex"
+    ? newChatCodexProfileId : newChatClaudeProfileId;
+  const newChatCatalogScopeKey = modelCatalogScopeKey(
+    engine, newChatProfileId);
+  const newChatCatalog = catalogForEngineProfile(
+    state.catalog, engine, newChatProfileId,
+    space === "code" ? newChatCwd : undefined);
   const newChatDefaults = resolveNewChatLocalDefaults(
     engine,
     space,
@@ -548,6 +1151,7 @@ export default function App() {
     state.catalogDefault,
     state.catalogDefaultEffort,
     state.catalogDefaultCwd,
+    newChatCatalogScopeKey,
   );
   const rt = state.runtimes[focusedSid ?? ""] ?? createRuntime();
   const historyView = displayHistoryProjection(
@@ -559,23 +1163,161 @@ export default function App() {
   );
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
-  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  const archivedBrowse = focusedSession?.tag === "archived";
+  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex" | "dsh";
+  useEffect(() => {
+    if (space !== "code" || state.connState !== "connected" || !state.wrapperOnline) return;
+    if (!historyView.turns.some((turn) => turn.sourceThreadId?.startsWith("ccr:")
+      || turn.sessionMessages?.some((receipt) => receipt.threadId.startsWith("ccr:"))
+      || turn.blocks.some((block) => block.kind === "tool" && (block.tool.includes("cc_remote_messages")
+        || block.tool === "mcp__cc-remote-ask__send_message")))) return;
+    const other = focusedEngine === "codex" ? "claude" : "codex";
+    const key = `code:${other}`;
+    if (!prefetchedSurfacesRef.current.has(key) && wsRef.current?.sendListSessions(other, "code")) {
+      prefetchedSurfacesRef.current.add(key);
+    }
+  }, [space, focusedEngine, historyView.turns, state.connState, state.wrapperOnline]);
+  useEffect(() => {
+    if (!focusedSid || state.newChat) {
+      archivedBrowseRef.current = null;
+      return;
+    }
+    const focusedSpace = focusedSession?.space === "work" ? "work" : space;
+    if (focusedSession?.tag === "archived") {
+      archivedBrowseRef.current = focusedSid;
+      return;
+    }
+    const archivedBrowse = archivedBrowseRef.current;
+    if (archivedBrowse !== focusedSid) return;
+    if (state.connState !== "connected" || !state.wrapperOnline) return;
+    archivedBrowseRef.current = null;
+    wsRef.current?.sendSwitchSession(
+      focusedSid, focusedEngine, focusedSpace);
+  }, [
+    focusedEngine,
+    focusedSession?.space,
+    focusedSession?.tag,
+    focusedSid,
+    space,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
+  useEffect(() => {
+    setAgentPanel(null);
+  }, [activeScopeKey, focusedSid, focusedEngine, space, rt.historyRevision]);
+  const focusedCodexProfileId = focusedEngine === "codex"
+    ? focusedSession?.codex_profile_id
+      ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
+    : null;
+  const focusedClaudeProfileId = focusedEngine === "claude"
+    ? focusedSession?.claude_profile_id
+      ?? claudeProfileIdForSession(focusedSid, state.defaultClaudeProfileId)
+    : null;
+  const focusedAccountProfileId = focusedEngine === "codex"
+    ? focusedCodexProfileId : focusedClaudeProfileId;
+  const focusedWorkProfile = space === "work" && !state.newChat
+    && focusedAccountProfileId
+    ? (focusedEngine === "codex"
+      ? codexProfilePresentation(
+        state.codexProfiles,
+        state.defaultCodexProfileId,
+        focusedAccountProfileId,
+      )
+      : claudeProfilePresentation(
+        state.claudeProfiles,
+        state.defaultClaudeProfileId,
+        focusedAccountProfileId,
+      ))
+    : null;
+  const focusedNativeSessionId = focusedSession?.native_session_id
+    ?? (rt.ccSessionId
+      ? nativeProfileSessionId(rt.ccSessionId)
+      : rt.ccSessionId);
+  const focusedCatalog = catalogForEngineProfile(
+    state.catalog, focusedEngine, focusedAccountProfileId,
+    space === "code" ? focusedSession?.cwd || currentCwd : undefined);
+  const completedGoalRetired = completedGoalHasNewerUserTurn(
+    rt.goal, rt.turns,
+  ) || completedGoalHasNewerUserTurn(rt.goal, historyView.turns);
+  // A live plan always wins over plans found while browsing older history.
+  // When the runtime's small newest-turn window has no plan, the displayed
+  // history may still reveal the plan which owns this session's long task.
+  const runtimePlanProgress = latestPlanProgress(rt.turns);
+  const historyPlanProgress = historyView.browsing || historyView.recovering
+    ? latestPlanProgress(historyView.turns) : null;
+  let planProgress = focusedSid
+      ? planProgressCacheRef.current.resolve({
+        machineId,
+        engine: focusedEngine,
+        space,
+        sid: focusedSid,
+        runtime: runtimePlanProgress,
+        history: historyPlanProgress,
+        runtimeTurns: rt.turns,
+        historyTurns: historyView.turns,
+        recovering: historyView.recovering,
+        runtimeLoading: rt.loading === true,
+      })
+    : null;
+  // An unfinished snapshot from the completed Goal must not briefly become the
+  // standalone monitor for the next task. Keep only a Plan whose owning user
+  // turn starts after the authoritative Goal completion boundary.
+  if (completedGoalRetired && planProgress
+      && !planFollowsCompletedGoal(rt.goal, planProgress)) {
+    planProgressCacheRef.current.clear({
+      machineId, engine: focusedEngine, space, sid: focusedSid!,
+    });
+    planProgress = null;
+  }
+  const planProgressSource = planProgress?.source ?? null;
   const capabilityCwd = focusedSession?.cwd || currentCwd;
+  const requestFocusedModels = () => wsRef.current?.sendGetModels(
+    focusedEngine, focusedEngine === "claude" && space === "code" ? capabilityCwd : undefined,
+    focusedCodexProfileId, focusedClaudeProfileId);
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
   );
+  const newChatDshPreset = dshPresetSelection?.scope === activeScopeKey
+    ? dshPresetSelection.value : state.dshPresets?.find(preset => preset.is_default)?.id ?? null;
   const focusedSkillCatalogKey = skillCatalogKey(
-    machineId, focusedEngine, space, capabilityCwd);
+    machineId, focusedEngine, space, capabilityCwd,
+    focusedCodexProfileId, focusedClaudeProfileId,
+    focusedEngine === "dsh" ? focusedSid : undefined);
+  const newChatSkillCatalogKey = skillCatalogKey(
+    machineId, engine, space, state.newChat?.cwd ?? currentCwd,
+    newChatCodexProfileId, newChatClaudeProfileId,
+    engine === "dsh" ? `preset:${newChatDshPreset ?? ""}` : undefined);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
     space,
     cwd: capabilityCwd,
     skillsOnly: true,
+    claudeProfileId: focusedClaudeProfileId,
+    codexProfileId: focusedCodexProfileId,
+    sid: focusedSid,
   };
+  // New-chat account/cwd overrides belong to the draft, not the last focused
+  // session. Work has no private cwd until creation, so cannot read a catalog.
+  const capabilitiesScope = useMemo<SkillCatalogRequest | null>(() => {
+    if (newChatCwd !== null) {
+      if (space === "work" || newChatClaudeProfileMissing || newChatCodexProfileMissing) return null;
+      return { key: newChatSkillCatalogKey, engine, space, cwd: newChatCwd,
+        skillsOnly: false, claudeProfileId: newChatClaudeProfileId,
+        codexProfileId: newChatCodexProfileId, dshPreset: newChatDshPreset };
+    }
+    return { key: focusedSkillCatalogKey, engine: focusedEngine, space,
+      cwd: capabilityCwd, skillsOnly: false,
+      claudeProfileId: focusedClaudeProfileId, codexProfileId: focusedCodexProfileId, sid: focusedSid };
+  }, [newChatCwd, space, newChatClaudeProfileMissing, newChatCodexProfileMissing,
+    newChatSkillCatalogKey, engine, newChatClaudeProfileId, newChatCodexProfileId,
+    focusedSkillCatalogKey, focusedEngine, capabilityCwd,
+    focusedClaudeProfileId, focusedCodexProfileId, focusedSid, newChatDshPreset]);
+  capabilitiesScopeRef.current = capabilitiesOpen ? capabilitiesScope : null;
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
-    (activeBtw?.engine === "codex" ? "codex" : "claude"),
+    (activeBtw?.engine ?? focusedEngine),
     `btw:${activeBtwSid ?? visibleParentSid ?? "opening"}`,
   );
   const inlineImageAssets = focusedSid
@@ -596,6 +1338,31 @@ export default function App() {
     state, activeBtwSid);
   const activeBtwSendMode = activeBtwSid
     ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
+  const focusedGoalScopeKey = focusedSid
+    ? goalUiScopeKey(machineId, space, focusedEngine, focusedSid) : null;
+  const storedGoalPreference = focusedGoalScopeKey
+    ? goalUiPreferencesRef.current[focusedGoalScopeKey] : undefined;
+  const storedGoalIdentity = goalStableIdentity(rt.goal);
+  const goalUi = focusedGoalScopeKey
+    ? goalUiByScope[focusedGoalScopeKey] ?? (storedGoalPreference?.known
+      ? {
+          revealed: rt.goalDismissed ? false : storedGoalPreference.hiddenGoal
+            ? !!rt.goal && storedGoalPreference.hiddenGoal !== storedGoalIdentity
+            : !!rt.goal || shouldRecoverGoalUi(storedGoalPreference),
+          open: false,
+          loading: !rt.goal,
+        }
+      : undefined)
+    : undefined;
+  const focusedCompletion = newestCompletionProjection(
+    rt.completion,
+    catalogCompletionProjection(focusedSession),
+  );
+  const terminalRepairState = mergeSessionActivityState(
+    focusedSession?.state,
+    rt.state,
+    rt.mirroredRunning,
+  );
 
   useEffect(() => {
     setQueuedQueryEditor((current) => (
@@ -608,19 +1375,142 @@ export default function App() {
   }, [activeBtwSid, focusedSid]);
 
   useEffect(() => {
+    if (focusedEngine === "dsh" || !authed || !focusedSid || !focusedGoalScopeKey || state.newChat
+        || archivedBrowse
+        || state.connState !== "connected" || !state.wrapperOnline) {
+      return;
+    }
+    const requestKey = `${wsLifecycleEpochRef.current}\0${focusedGoalScopeKey}`;
+    if (goalRecoveryRequestsRef.current.has(requestKey)) return;
+    const requestId = wsRef.current?.sendGetGoalTo(focusedSid) ?? null;
+    if (!requestId) return;
+    goalRecoveryRequestsRef.current.add(requestKey);
+    goalRequestScopeByIdRef.current.set(requestId, {
+      scopeKey: focusedGoalScopeKey,
+      sid: focusedSid,
+    });
+    setGoalUiByScope((current) => {
+      if (current[focusedGoalScopeKey]?.open) return current;
+      const preference = goalUiPreferencesRef.current[focusedGoalScopeKey];
+      const runtime = stateRef.current.runtimes[focusedSid];
+      const goal = runtime?.goal;
+      return {
+        ...current,
+        [focusedGoalScopeKey]: {
+          // Discover an existing Goal silently on a new browser/device. The
+          // authoritative non-null response reveals it unless the wrapper says
+          // this exact generation was dismissed. Legacy local dismissals are
+          // migrated when that response arrives.
+          revealed: goal
+            ? !runtime.goalDismissed
+              && preference?.hiddenGoal !== goalStableIdentity(goal)
+            : shouldRecoverGoalUi(preference),
+          open: false,
+          loading: !goal,
+        },
+      };
+    });
+  }, [
+    authed,
+    archivedBrowse,
+    focusedEngine,
+    focusedGoalScopeKey,
+    focusedSid,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+  ]);
+
+  useEffect(() => {
+    // Request/build ordering is scoped to one wrapper connection. Keep each
+    // sid's bounded attempts across ordinary focus changes so a legacy receipt
+    // outside the newest page cannot rescan a multi-megabyte transcript every
+    // time the user returns to the session.
+    terminalHistoryRepairRef.current.clear();
+  }, [machineId, state.connState]);
+
+  useEffect(() => {
+    const completionId = focusedCompletion?.id ?? null;
+    if (!focusedSid || state.newChat
+        || historyView.browsing || state.connState !== "connected"
+        || !state.wrapperOnline || !rt.syncReady
+        || terminalRepairState !== "idle" || rt.acceptancePending) return;
+    const completionMissing = completionNeedsHistoryRepair(
+      historyView.turns, completionId);
+    const idleTailMissing = idleTurnNeedsHistoryRepair(historyView.turns);
+    if (!completionMissing && !idleTailMissing) {
+      terminalHistoryRepairRef.current.delete(focusedSid);
+      return;
+    }
+    const latest = historyView.turns[historyView.turns.length - 1];
+    // A successful completion receipt is the strongest post-TurnEnd causal
+    // key. Failed/interrupted turns have no unread receipt, so bind their
+    // fallback to the exact idle generation/lifecycle and newest display row.
+    const repairKey = completionMissing && completionId
+      ? completionId
+      : [
+          "idle",
+          wsRef.current?.generationFor(focusedSid) ?? "",
+          rt.lastLifecycleSeq,
+          latest?.clientMsgId ?? latest?.historyTurnId ?? latest?.id ?? "",
+        ].join("\0");
+    const attempt = nextTerminalHistoryRepairAttempt(
+      terminalHistoryRepairRef.current.get(focusedSid),
+      repairKey,
+      MAX_TERMINAL_HISTORY_REPAIR_ATTEMPTS,
+    );
+    if (!attempt) return;
+    const accepted = requestHistory(
+      focusedSid,
+      undefined,
+      HISTORY_INITIAL_PAGE,
+      wsRef.current?.generationFor(focusedSid),
+      undefined,
+      undefined,
+      { supersedePending: true, causalKey: repairKey },
+    );
+    if (accepted) {
+      terminalHistoryRepairRef.current.set(focusedSid, attempt);
+    }
+  }, [
+    focusedCompletion?.id,
+    focusedSid,
+    historyView.browsing,
+    historyView.turns,
+    requestHistory,
+    rt.acceptancePending,
+    rt.lastLifecycleSeq,
+    rt.syncReady,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
+    terminalHistoryRepairEpoch,
+    terminalRepairState,
+  ]);
+
+  useEffect(() => {
     const acknowledgeVisible = () => {
       if (document.hidden) return;
       const current = stateRef.current;
       const parentSid = current.newChat ? null : current.focusedSid;
       if (!parentSid) return;
-      const binding = current.btwByParentSid[parentSid];
+      const btwSid = visibleBtwSidRef.current;
+      const completion = newestCompletionProjection(
+        current.runtimes[parentSid]?.completion,
+        catalogCompletionProjection(current.sessions.find(
+          (session) => session.session_id === parentSid)),
+      );
+      const completionId = completionAcknowledgementId(
+        completionReceiptsRef.current[parentSid], completion);
+      const mainAcknowledgementQueued = completionId !== null
+        && wsRef.current?.sendAcknowledgeCompletionTo(
+          parentSid, completionId) !== null;
       setCompletionReceipts((receipts) => {
         let next = acknowledgeCompletion(
-          receipts, parentSid, { main: true });
-        if (binding
-            && (rightViewRef.current === "btw" || !current.artifact)) {
+          receipts, parentSid, { main: mainAcknowledgementQueued });
+        if (btwSid) {
           next = acknowledgeCompletion(
-            next, parentSid, { btwSid: binding.sid });
+            next, parentSid, { btwSid });
         }
         return next;
       });
@@ -629,18 +1519,34 @@ export default function App() {
     document.addEventListener("visibilitychange", acknowledgeVisible);
     return () => document.removeEventListener(
       "visibilitychange", acknowledgeVisible);
-  }, [visibleParentSid, activeBtwSid, rightView, state.artifact]);
+  }, [
+    visibleParentSid,
+    visibleBtwSid,
+    rt.completion?.id,
+    rt.completion?.unread,
+    focusedSession?.completion_id,
+    focusedSession?.completion_revision,
+    focusedSession?.completion_unread,
+  ]);
 
-  const goalUi = focusedSid ? goalUiBySid[focusedSid] : undefined;
+  const clearSkillCatalogError = useCallback((key: string) => {
+    setSkillCatalogErrors(current => {
+      if (!current[key]) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
   const storeSkillCatalog = useCallback((
     key: string,
-    items: EngineCapabilityItem[],
+    items: EngineCapabilityItem[], dshCommands?: DshCommandInfo[],
   ) => {
     const next = cacheSkillCatalog(
-      skillCatalogsRef.current, key, items);
+      skillCatalogsRef.current, key, items, Date.now(), dshCommands);
     skillCatalogsRef.current = next;
     setSkillCatalogs(next);
-  }, []);
+    clearSkillCatalogError(key);
+  }, [clearSkillCatalogError]);
   const requestSkillCatalog = useCallback((
     request: SkillCatalogRequest,
     force = false,
@@ -658,7 +1564,9 @@ export default function App() {
     if (!accepted.superseded && skillCatalogRefreshSucceeded(msg)) {
       storeSkillCatalog(
         matchedScope.key,
-        msg.items.filter((item) => item.kind === "skill"));
+        msg.items.filter((item) => item.kind === "skill"), msg.dsh_commands);
+    } else if (!accepted.superseded && msg.skills_only) {
+      setSkillCatalogErrors(current => ({ ...current, [matchedScope.key]: true }));
     }
     if (!accepted.superseded && !msg.skills_only) {
       setCapabilitiesByScope((current) => ({
@@ -666,7 +1574,7 @@ export default function App() {
         [matchedScope.key]: msg,
       }));
     }
-    if (focusedSkillScopeRef.current?.key === matchedScope.key
+    if (capabilitiesScopeRef.current?.key === matchedScope.key
         && !coordinator.hasPendingMutation(matchedScope.key)
         && !coordinator.hasPendingRead(matchedScope.key, false)) {
       setCapabilitiesLoading(false);
@@ -689,7 +1597,7 @@ export default function App() {
     const current = stateRef.current;
     const focusedSid = current.newChat ? null : current.focusedSid;
     const activeBtwSid = focusedSid
-      ? current.btwByParentSid[focusedSid]?.sid ?? null : null;
+      ? current.btwByParentSid[focusedSid]?.activeSid ?? null : null;
     if (!ws || (focusedSid !== sid && activeBtwSid !== sid)) return false;
     const cache = inlineImageAssetsRef.current;
     const assetKey = stablePreviewId ?? path;
@@ -809,7 +1717,7 @@ export default function App() {
     }
     setDevicesLoadState("loading");
     let cancelled = false;
-    void fetch("/api/devices", {
+    const refreshDevices = () => void fetch("/api/devices", {
       credentials: "same-origin", cache: "no-store",
     }).then(async (response) => response.ok ? response.json() : null)
       .then((payload) => {
@@ -835,12 +1743,17 @@ export default function App() {
       }).catch(() => {
         if (!cancelled) setDevicesLoadState("error");
       });
-    return () => { cancelled = true; };
-  }, [authed, machineId]);
+    refreshDevices();
+    const timer = window.setInterval(refreshDevices, 15000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [authed, machineId, state.connState, state.wrapperOnline]);
 
   useEffect(() => {
-    if (!("serviceWorker" in navigator)) return;
-    const onMessage = (event: MessageEvent) => {
+    const onMessage = (event: MessageEvent | CustomEvent) => {
+      if (event instanceof CustomEvent) {
+        if (!hasHarmonyPush()) return;
+        event = { data: { type: "cc-remote-notification", route: event.detail } } as MessageEvent;
+      }
       if (event.data?.type !== "cc-remote-notification") return;
       const target = parseNotificationRoute(event.data.route);
       if (!target) return;
@@ -850,52 +1763,48 @@ export default function App() {
       catch { /* retain the in-memory route below */ }
       setPendingNotificationTarget(target);
     };
-    navigator.serviceWorker.addEventListener("message", onMessage);
-    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+    const onNative = () => {
+      if (!hasHarmonyPush() || !window.ccRemoteHarmonyNotification) return;
+      onMessage(new CustomEvent("cc-remote-harmony-notification", {
+        detail: window.ccRemoteHarmonyNotification,
+      }));
+      delete window.ccRemoteHarmonyNotification;
+    };
+    window.addEventListener("cc-remote-harmony-notification", onNative);
+    window.addEventListener("cc-remote-harmony-ready", onNative);
+    onNative();
+    navigator.serviceWorker?.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("cc-remote-harmony-notification", onNative);
+      window.removeEventListener("cc-remote-harmony-ready", onNative);
+      navigator.serviceWorker?.removeEventListener("message", onMessage);
+    };
   }, []);
 
   useEffect(() => pushCoordinatorRef.current?.subscribe(setPushBinding), []);
 
   useEffect(() => {
+    if (changingNotificationModeRef.current) return;
     const enabled = notificationMode !== "off"
-      && typeof Notification !== "undefined"
-      && Notification.permission === "granted";
+      && (harmonyPush.available ? harmonyPush.granted
+        : typeof Notification !== "undefined" && Notification.permission === "granted");
     void pushCoordinatorRef.current?.setTarget(
       authed && enabled
         ? { machineId, mode: notificationMode }
         : null,
+      // Reconcile native bindings after reload/foreground, including stored Off.
+      harmonyPush.available && authed,
     );
-  }, [authed, machineId, notificationMode]);
-
-  // Swipe right -> open sidebar, swipe left -> close (mobile). Interactive
-  // vertical scrollers opt out so a diagonal scroll never becomes navigation.
-  const onTouchStart = (e: TouchEvent) => {
-    const touch = e.touches[0];
-    touchStartX.current = touch.clientX;
-    touchStartY.current = touch.clientY;
-    touchSwipeLocked.current = e.target instanceof Element
-      && !!e.target.closest("[data-lock-horizontal-swipe]");
-  };
-  const onTouchEnd = (e: TouchEvent) => {
-    if (dshOpen) return;
-    const touch = e.changedTouches[0];
-    const action = resolveSidebarSwipe(
-      touchStartX.current,
-      touchStartY.current,
-      touch.clientX,
-      touch.clientY,
-      window.innerWidth,
-      touchSwipeLocked.current,
-    );
-    if (action === "open") setSidebarOpen(true);
-    else if (action === "close") setSidebarOpen(false);
-  };
+  }, [authed, machineId, notificationMode, harmonyPush.available, harmonyPush.granted, harmonyPush.revision, notificationBindingRevision]);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-theme", theme);
-    localStorage.setItem(THEME_KEY, theme);
-  }, [theme]);
-  const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
+    try {
+      sessionStorage.setItem(
+        BTW_PANEL_SCOPES_KEY, JSON.stringify(btwExpanded && btwPanelKey
+          ? setBtwPanelScope(btwPanelScopes, btwPanelKey, true) : btwPanelScopes));
+    } catch { /* storage is best-effort in private browsing */ }
+  }, [btwPanelScopes, btwExpanded, btwPanelKey]);
+  const toggleTheme = () => selectTheme(theme === "dark" ? "light" : "dark");
 
   // `engine` selects the backend (Claude Code / Codex): the whole UI re-skins via
   // data-engine, and the sidebar re-lists that engine's own sessions.
@@ -916,7 +1825,7 @@ export default function App() {
         .find((session) => session.session_id === sid);
     const scope: HistoryPageCacheScope = {
       machineId,
-      engine: listed?.engine === "codex" || listed?.engine === "claude"
+      engine: listed?.engine === "codex" || listed?.engine === "claude" || listed?.engine === "dsh"
         ? listed.engine : fallbackEngine,
       space: listed?.space === "work" || listed?.space === "code"
         ? listed.space : fallbackSpace,
@@ -1054,18 +1963,29 @@ export default function App() {
   }, [engine, space]);
   useEffect(() => {
     document.documentElement.setAttribute("data-space", space);
-    localStorage.setItem(SPACE_KEY, space);
-  }, [space]);
+    localStorage.setItem(LEGACY_SPACE_KEY, space);
+    spacesByEngineRef.current = rememberEngineSpace(
+      spacesByEngineRef.current, engine, space);
+    localStorage.setItem(ENGINE_SPACES_KEY, JSON.stringify(spacesByEngineRef.current));
+  }, [engine, space]);
   useEffect(() => {
     if (newChatCwd === null || state.connState !== "connected"
-        || !state.wrapperOnline) return;
+        || !state.wrapperOnline || newChatCodexProfileMissing
+        || newChatClaudeProfileMissing) return;
     const request = newChatCatalogRequest(
-      engine, space, newChatCwd);
+      engine, space, newChatCwd,
+      newChatCodexProfileId, newChatClaudeProfileId);
     if (!request) return;
-    wsRef.current?.sendGetModels(request.engine, request.cwd);
+    wsRef.current?.sendGetModels(
+      request.engine, request.cwd,
+      request.codexProfileId, request.claudeProfileId);
   }, [
     engine,
     newChatCwd,
+    newChatClaudeProfileId,
+    newChatClaudeProfileMissing,
+    newChatCodexProfileId,
+    newChatCodexProfileMissing,
     space,
     state.connState,
     state.wrapperOnline,
@@ -1076,17 +1996,36 @@ export default function App() {
       engine,
       state.newChat.model,
       state.newChat.effort,
-      state.catalog,
+      newChatCatalog,
       newChatDefaults.model,
+      state.newChat.modelSource,
     );
     if (reconciled.model === state.newChat.model
         && reconciled.effort === state.newChat.effort) return;
     dispatch({ type: "set_new_chat_selection", ...reconciled });
   }, [
     engine,
+    newChatCatalog,
     newChatDefaults.model,
-    state.catalog,
     state.newChat,
+  ]);
+  useEffect(() => {
+    if (state.newChat || state.connState !== "connected" || !state.wrapperOnline) return;
+    wsRef.current?.sendGetModels(
+      focusedEngine,
+      focusedEngine === "claude" && space === "code" ? capabilityCwd : undefined,
+      focusedCodexProfileId,
+      focusedClaudeProfileId);
+  }, [
+    capabilityCwd,
+    focusedAccountProfileId,
+    focusedClaudeProfileId,
+    focusedCodexProfileId,
+    focusedEngine,
+    space,
+    state.connState,
+    state.newChat,
+    state.wrapperOnline,
   ]);
   useEffect(() => {
     // TurnDetail has no request id. Any view navigation revokes the frozen
@@ -1101,46 +2040,92 @@ export default function App() {
     currentSpace: Space,
   ) => {
     if (focusedSid && !state.newChat) {
-      lastFocusBySurfaceRef.current[`${currentSpace}:${currentEngine}`] = focusedSid;
+      lastFocusBySurfaceRef.current[
+        sessionScopeKey(machineId, currentEngine, currentSpace)
+      ] = focusedSid;
     }
-  }, [focusedSid, state.newChat]);
+  }, [focusedSid, machineId, state.newChat]);
 
   const prepareSurfaceSwitch = useCallback((
     nextEngine: Engine,
     nextSpace: Space,
     preserveAuthority = false,
   ) => {
+    clearForkFocusLease(false);
     rememberSurfaceFocus(engine, space);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
+    const focusScopeKey = sessionScopeKey(
+      machineId, nextEngine, nextSpace);
     if (!preserveAuthority) {
       authoritativeSurfaceListsRef.current.delete(surfaceKey);
     }
+    const cachedSessions = sessionListsBySurfaceRef.current[surfaceKey] ?? [];
     dispatch({
       type: "restore_session_list",
-      sessions: sessionListsBySurfaceRef.current[surfaceKey] ?? [],
+      sessions: cachedSessions,
     });
-    const remembered = lastFocusBySurfaceRef.current[surfaceKey];
+    const remembered = lastFocusBySurfaceRef.current[focusScopeKey];
+    const immediate = preserveAuthority
+      ? null : selectSurfaceSession(cachedSessions, remembered);
     preferredSurfaceFocusRef.current = preserveAuthority
       ? null
-      : remembered ? { key: surfaceKey, sid: remembered } : null;
+      : remembered ? { key: focusScopeKey, sid: remembered } : null;
     didInitFocusRef.current = preserveAuthority;
-    wsRef.current?.setSurface(nextEngine, nextSpace);
-    wsRef.current?.setFocusedSid(null);
-    // Keep the previous surface's transcript out of view while its accepted
-    // list is restored. The focus effect below exits this temporary new page as
-    // soon as the remembered (or latest valid) session is available.
-    dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
+    const ws = wsRef.current;
+    ws?.setSurface(nextEngine, nextSpace);
+    if (immediate) {
+      // The cached list is scoped to this machine+engine+space. Paint its exact
+      // remembered row synchronously; the accepted list still validates it and
+      // clears/falls back if another client deleted it meanwhile.
+      dispatch({ type: "exit_new_chat" });
+      dispatch({ type: "focus_session", sid: immediate.session_id });
+      ws?.setFocusedSid(immediate.session_id, nextEngine, nextSpace);
+      requestHistory(
+        immediate.session_id, undefined, HISTORY_INITIAL_PAGE);
+      resumeListedSession(immediate, nextEngine, nextSpace, ws);
+      if (nextSpace === "work") {
+        ws?.sendGetWorkArtifacts(nextEngine, immediate.session_id);
+      }
+      setRestoringSurfaceScope(null);
+    } else {
+      // Do not expose a sendable home-directory draft while the target
+      // catalog is still unknown. The accepted list either restores a session
+      // or, only after confirming it is empty, creates the scoped default
+      // draft in the initial-focus effect below.
+      ws?.setFocusedSid(null);
+      dispatch({ type: "exit_new_chat" });
+      setRestoringSurfaceScope(focusScopeKey);
+    }
     setNewChatAutoFocus(false);
-  }, [engine, rememberSurfaceFocus, space]);
+  }, [
+    clearForkFocusLease,
+    engine,
+    machineId,
+    rememberSurfaceFocus,
+    requestHistory,
+    resumeListedSession,
+    space,
+  ]);
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
-      || selected.engine === "claude"
+      || selected.engine === "claude" || selected.engine === "dsh"
       ? selected.engine : engineRef.current;
     const selectedSpace: Space = selected.space === "work"
       || selected.space === "code"
       ? selected.space : spaceRef.current;
     const id = selected.session_id;
+    const focusScopeKey = sessionScopeKey(
+      machineId, selectedEngine, selectedSpace);
+    // The click is newer than any surface-restore intent already in flight.
+    // Claim the target synchronously because a SessionList can arrive before
+    // React commits the focus_session dispatch below.
+    didInitFocusRef.current = true;
+    preferredSurfaceFocusRef.current = null;
+    lastFocusBySurfaceRef.current[focusScopeKey] = id;
+    if (forkFocusLeaseRef.current?.childSessionId !== id) {
+      clearForkFocusLease(false);
+    }
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
@@ -1148,14 +2133,15 @@ export default function App() {
     setWorkArtifactsOpen(false);
     dispatch({ type: "exit_new_chat" });
     dispatch({ type: "focus_session", sid: id });
+    setRestoringSurfaceScope(null);
     wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
     requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
-    wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
+    resumeListedSession(selected, selectedEngine, selectedSpace);
     if (selectedSpace === "work") {
       wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
     }
     if (isMobile()) setSidebarOpen(false);
-  }, [requestHistory]);
+  }, [clearForkFocusLease, machineId, requestHistory, resumeListedSession, setSidebarOpen]);
 
   useEffect(() => {
     const target = pendingNotificationTarget;
@@ -1202,9 +2188,14 @@ export default function App() {
         try { sessionStorage.removeItem(NOTIFICATION_TARGET_KEY); }
         catch { /* best-effort stale route cleanup */ }
         preferredSurfaceFocusRef.current = origin.sid
-          ? { key: `${origin.space}:${origin.engine}`, sid: origin.sid }
+          ? {
+              key: sessionScopeKey(
+                origin.machineId, origin.engine, origin.space),
+              sid: origin.sid,
+            }
           : null;
         didInitFocusRef.current = false;
+        setRestoringSurfaceScope(null);
         setEngine(origin.engine);
         setSpace(origin.space);
         setMachineId(origin.machineId);
@@ -1257,31 +2248,26 @@ export default function App() {
 
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
-  const selectEngineSurface = (surface: EngineSurface) => {
-    if (surface === "dsh") {
-      cancelPendingNotificationTarget();
-      setSidebarOpen(false);
-      setDshMounted(true);
-      setDshOpen(true);
-      return;
-    }
-    setDshOpen(false);
-    if (surface === engine) return;
+  const toggleEngine = (nextEngine: Engine) => {
+    if (nextEngine === engine || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
-    const nextEngine = surface;
+    const nextSpace = spacesByEngineRef.current[nextEngine];
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
     setUsageActivityOpen(false);
     setWorkArtifactsOpen(false);
     setWorkProjectId(null);
-    prepareSurfaceSwitch(nextEngine, space);
+    prepareSurfaceSwitch(nextEngine, nextSpace);
+    engineRef.current = nextEngine;
+    spaceRef.current = nextSpace;
     setEngine(nextEngine);
+    setSpace(nextSpace);
     if (isMobile()) setSidebarOpen(false);
   };
 
   const switchSpace = (next: Space) => {
-    if (next === space || !confirmArtifactDiscard()) return;
+    if ((engine === "dsh" && next !== "code") || next === space || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
     pendingCreateRef.current = null;
     setCreateError(null);
@@ -1290,6 +2276,7 @@ export default function App() {
     setForkWorktreeError(null);
     setWorkArtifactsOpen(false);
     prepareSurfaceSwitch(engine, next);
+    spaceRef.current = next;
     setSpace(next);
   };
 
@@ -1297,21 +2284,77 @@ export default function App() {
   useEffect(() => {
     if (!authed) return;
     const historyRequests = historyRequestsRef.current;
+    const turnFileRequests = turnFileRequestsRef.current;
+    const contextRequestLaunches = contextRequestLaunchesRef.current;
+    const contextDeferredRetryAttempts =
+      contextDeferredRetryAttemptsRef.current;
+    const lifecycleEpoch = ++wsLifecycleEpochRef.current;
+    setPermissionProfileRequests((current) =>
+      Object.keys(current).length ? {} : current);
     didInitFocusRef.current = false;  // re-arm initial-focus for this connection lifecycle
     authoritativeSurfaceListsRef.current.delete(`${spaceRef.current}:${engineRef.current}`);
 
     let cancelled = false;
+    let effectWs: RelayWs | null = null;
+    const acceptsLifecycle = () => !cancelled
+      && wsLifecycleEpochRef.current === lifecycleEpoch;
+    const deferredContextRetryTimers = new Set<string>();
+    const scheduleDeferredClaudeContextRefresh = (
+      sid: string,
+      engineHint?: Engine,
+      afterBusy = false,
+    ) => {
+      if (engineHint && engineHint !== "claude") return;
+      let delayMs = 0;
+      if (afterBusy) {
+        const attempt = contextDeferredRetryAttempts.get(sid) ?? 0;
+        const delays = [100, 300, 750] as const;
+        if (attempt >= delays.length) return;
+        contextDeferredRetryAttempts.set(sid, attempt + 1);
+        delayMs = delays[attempt];
+      } else {
+        // A real idle boundary starts a fresh bounded catch-up window.
+        contextDeferredRetryAttempts.delete(sid);
+      }
+      if (deferredContextRetryTimers.has(sid)) return;
+      deferredContextRetryTimers.add(sid);
+      window.setTimeout(() => {
+        deferredContextRetryTimers.delete(sid);
+        if (!acceptsLifecycle()) return;
+        const current = stateRef.current;
+        const runtime = current.runtimes[sid];
+        if (!runtime?.contextRefreshDeferred
+            || runtime.contextRequestId
+            || runtime.state !== "idle") return;
+        const session = current.sessions.find(
+          (candidate) => candidate.session_id === sid);
+        const eventEngine = engineHint
+          ?? session?.engine
+          ?? (current.focusedSid === sid ? engineRef.current : undefined);
+        if (eventEngine !== "claude") return;
+        sendContextRequestTo(sid, true, effectWs);
+      }, delayMs);
+    };
+    goalRecoveryRequestsRef.current.clear();
+    goalRequestScopeByIdRef.current.clear();
     const recoverableReads = new RecoverableReadCoordinator(
       (callback, delayMs) => window.setTimeout(callback, delayMs),
       (timer) => window.clearTimeout(timer),
     );
-
     // A snapshot announces a session (cc_session_id/state/cwd). We do NOT reset
     // the cursor here anymore — cursors are seeded from the IndexedDB cache before
     // connecting, so hello asks the wrapper only for the DELTA instead of a full
     // history replay of every resident session (that flood wedged reconnect).
     function handleSnapshot(e: Snapshot, ownership?: EventOwnership) {
       dispatch({ type: "event", event: e, ownership });
+      const sid = e.sid ?? e.cc_session_id;
+      if (sid && e.state === "idle") {
+        // A replacement Wrapper normally restores a resident session with a
+        // Snapshot rather than another direct State(idle). Preserve an explicit
+        // refresh intent across that generation boundary instead of leaving the
+        // popover waiting forever.
+        scheduleDeferredClaudeContextRefresh(sid, ownership?.engine);
+      }
     }
 
     (async () => {
@@ -1321,7 +2364,247 @@ export default function App() {
       try { seeded = await import("./cache").then((m) => m.loadAllReplayState()); } catch { /* best-effort */ }
       if (cancelled) return;
       const ws = new RelayWs({
-        onEvent: (msg, ownership) => {
+        onEvent: (msg, ownership) => {          // Room frames are folded here and never reach the session reducer.
+          if (msg.type.startsWith("room_")) {
+            setRooms((prev) => applyRoomEvent(prev, msg) ?? prev);
+          }
+          if (!acceptsLifecycle()) return;
+          if (turnFileRequestsRef.current.accept(msg)) return;
+          if (goalApiRef.current?.accept(msg)) return;
+          if (dshApi.accept(msg)) return;
+          const settlesContextRequest = !!(
+            (msg.type === "context_report"
+                || (msg.type === "error" && msg.code !== "wrapper_offline"))
+              && msg.sid
+              && msg.request_id
+              && (
+                contextRequestLaunchesRef.current.get(msg.sid)
+                  === msg.request_id
+                || stateRef.current.runtimes[msg.sid]?.contextRequestId
+                  === msg.request_id
+              )
+          );
+          if (settlesContextRequest && msg.sid) {
+            contextRequestLaunchesRef.current.delete(msg.sid);
+            if (msg.type !== "error" || msg.code !== "busy") {
+              contextDeferredRetryAttempts.delete(msg.sid);
+            }
+          }
+          if (msg.type === "history_invalidated") {
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.session_id);
+            const scoped = ownership ?? {
+              machineId,
+              engine: session?.engine ?? engineRef.current,
+              space: session?.space ?? spaceRef.current,
+            };
+            planProgressCacheRef.current.clear({
+              machineId: scoped.machineId,
+              engine: scoped.engine,
+              space: scoped.space,
+              sid: msg.session_id,
+            });
+          } else if (msg.type === "session_rekey") {
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.old_key
+                || candidate.session_id === msg.session_id);
+            const scoped = ownership ?? {
+              machineId,
+              engine: session?.engine ?? engineRef.current,
+              space: session?.space ?? spaceRef.current,
+            };
+            planProgressCacheRef.current.rekey({
+              machineId: scoped.machineId,
+              engine: scoped.engine,
+              space: scoped.space,
+            }, msg.old_key, msg.session_id);
+          }
+          // SessionList is a scoped response, not a broadcast catalog. Without
+          // the exact request ownership it may belong to an older surface or
+          // WebSocket generation and must not mutate any sidebar/focus cache.
+          if (msg.type === "session_list" && !ownership) return;
+          if (msg.type === "goal_state" && msg.sid) {
+            const completedGoalRequest = msg.request_id
+              ? goalRequestScopeByIdRef.current.get(msg.request_id)
+              : undefined;
+            if (msg.request_id) {
+              goalRequestScopeByIdRef.current.delete(msg.request_id);
+            }
+            if (completedGoalRequest) {
+              goalRecoveryRequestsRef.current.delete(
+                `${lifecycleEpoch}\0${completedGoalRequest.scopeKey}`);
+            }
+            const key = goalUiScopeForEvent(msg.sid, ownership);
+            if (key) {
+              const localGoalIdentity = goalStableIdentity(msg.goal);
+              const localPreference = goalUiPreferencesRef.current[key];
+              const legacyDismissed = !!localGoalIdentity
+                && localPreference?.hiddenGoal === localGoalIdentity;
+              const authoritativeDismissed = msg.dismissed === true;
+              const goalSessionArchived = stateRef.current.sessions.find(
+                (session) => session.session_id === msg.sid,
+              )?.tag === "archived";
+              const migrationKey = msg.goal_id
+                ? `${machineId}\0${msg.sid}\0${msg.goal_id}` : null;
+              if (migrationKey && authoritativeDismissed) {
+                goalDismissMigrationsRef.current.delete(migrationKey);
+                for (const [requestId, pendingKey] of
+                  goalDismissMigrationByRequestRef.current) {
+                  if (pendingKey === migrationKey) {
+                    goalDismissMigrationByRequestRef.current.delete(requestId);
+                  }
+                }
+              } else if (migrationKey && legacyDismissed
+                  && !goalSessionArchived
+                  && !goalDismissMigrationsRef.current.has(migrationKey)) {
+                const requestId = ws.sendDismissGoalTo(
+                  msg.sid, msg.goal_id!);
+                if (requestId) {
+                  goalDismissMigrationsRef.current.add(migrationKey);
+                  goalDismissMigrationByRequestRef.current.set(
+                    requestId, migrationKey);
+                }
+              }
+              const reconciled = reconcileGoalUiPreference(
+                goalUiPreferencesRef.current,
+                key,
+                msg.goal,
+                Date.now(),
+                authoritativeDismissed,
+              );
+              persistGoalUiPreferences(reconciled.preferences);
+              setGoalUiByScope((current) => {
+                const previous = current[key] ?? {
+                  revealed: false,
+                  open: false,
+                  loading: false,
+                };
+                return {
+                  ...current,
+                  [key]: {
+                    revealed: reconciled.revealed,
+                    open: previous.open,
+                    loading: false,
+                  },
+                };
+              });
+              for (const [requestId, requestScope] of
+                goalRequestScopeByIdRef.current) {
+                if (requestScope.scopeKey === key) {
+                  goalRequestScopeByIdRef.current.delete(requestId);
+                }
+              }
+              recoverableReads.complete(["goal", key].join("\u0000"));
+            }
+          } else if (msg.type === "completion_state" && msg.sid
+              && msg.unread !== true) {
+            // Clear the page-local fallback as soon as the wrapper confirms an
+            // acknowledgement for the same completion from any browser. A
+            // delayed read receipt for an older completion cannot clear a
+            // newer turn_end fallback.
+            const authoritative = newestCompletionProjection(
+              stateRef.current.runtimes[msg.sid]?.completion,
+              {
+                id: msg.completion_id ?? null,
+                unread: msg.unread ?? false,
+                revision: msg.revision ?? 0,
+              },
+            );
+            setCompletionReceipts((receipts) => (
+              acknowledgeMatchingCompletion(
+                receipts, msg.sid!, authoritative,
+                {
+                  authoritativeSeq: msg.seq,
+                  authoritativeGeneration: ws.generationFor(msg.sid!),
+                })));
+          } else if (msg.type === "session_list") {
+            // A sleeping browser can miss the live acknowledgement and later
+            // reconnect after the session was evicted. Its catalog row carries
+            // the same durable receipt, so clear any older page-local fallback
+            // instead of letting it reappear if the runtime is pruned.
+            setCompletionReceipts((receipts) => {
+              let next = receipts;
+              for (const session of msg.sessions) {
+                const catalog = catalogCompletionProjection(session);
+                if (!catalog) continue;
+                const authoritative = newestCompletionProjection(
+                  stateRef.current.runtimes[session.session_id]?.completion,
+                  catalog,
+                );
+                next = acknowledgeMatchingCompletion(
+                  next, session.session_id, authoritative);
+              }
+              return next;
+            });
+          } else if (msg.type === "error" && msg.request_id) {
+            const coordinator = skillCatalogRequestsRef.current;
+            const failedSkills = msg.code === "wrapper_offline"
+              ? null : coordinator?.fail(msg.request_id);
+            if (failedSkills?.skillsOnly) {
+              setSkillCatalogErrors(current => ({ ...current, [failedSkills.key]: true }));
+            }
+            if (failedSkills && failedSkills.key === capabilitiesScopeRef.current?.key
+                && !coordinator?.hasPendingRead(failedSkills.key, false)
+                && !coordinator?.hasPendingMutation(failedSkills.key)) {
+              setCapabilitiesLoading(false);
+            }
+            const failedMigration =
+              goalDismissMigrationByRequestRef.current.get(msg.request_id);
+            if (failedMigration && msg.code !== "wrapper_offline") {
+              goalDismissMigrationByRequestRef.current.delete(msg.request_id);
+              goalDismissMigrationsRef.current.delete(failedMigration);
+            }
+            const request = goalRequestScopeByIdRef.current.get(msg.request_id);
+            if (request) {
+              goalRequestScopeByIdRef.current.delete(msg.request_id);
+              const { scopeKey: key, sid } = request;
+              goalRecoveryRequestsRef.current.delete(
+                `${lifecycleEpoch}\0${key}`);
+              setGoalUiByScope((current) => {
+                const previous = current[key];
+                if (!previous) return {
+                  ...current,
+                  [key]: {
+                    revealed: !!goalUiPreferencesRef.current[key]?.known,
+                    open: false,
+                    loading: false,
+                  },
+                };
+                return {
+                  ...current,
+                  [key]: {
+                    ...previous,
+                    loading: false,
+                  },
+                };
+              });
+              recoverableReads.retry(["goal", key].join("\u0000"), () => {
+                const current = stateRef.current;
+                if (cancelled || current.focusedSid !== sid
+                    || current.sessions.find(
+                      (session) => session.session_id === sid,
+                    )?.tag === "archived") return;
+                const requestId = ws.sendGetGoalTo(sid);
+                if (!requestId) return;
+                goalRequestScopeByIdRef.current.set(
+                  requestId, { scopeKey: key, sid });
+                setGoalUiByScope((current) => ({
+                  ...current,
+                  [key]: {
+                    ...(current[key] ?? {
+                      revealed: true, open: false, loading: false,
+                    }),
+                    loading: true,
+                  },
+                }));
+              });
+              // This is a one-shot read repair, not a failed model/control
+              // operation. The Goal chip owns its retry state; feeding the same
+              // correlated Error into the reducer would also create a global
+              // "操作未完成" banner on every transient refresh failure.
+              return;
+            }
+          }
           if (msg.type === "session_rekey"
               && inlineImageAssetsRef.current.rekeySession(
                 msg.old_key,
@@ -1356,6 +2639,10 @@ export default function App() {
           if (msg.type === "history_image"
               && historyImageAssetsRef.current.accept(msg)) {
             bumpHistoryImageRevision();
+            if (msg.error && msg.session_id === stateRef.current.focusedSid
+                && msg.revision !== stateRef.current.runtimes[msg.session_id]?.historyRevision) {
+              requestHistory(msg.session_id, undefined, HISTORY_INITIAL_PAGE);
+            }
           }
           if (msg.type === "queued_query_detail") {
             setQueuedQueryEditor((current) => (
@@ -1424,7 +2711,7 @@ export default function App() {
           if (msg.type === "turn_end" && msg.sid && !msg.result.is_error) {
             const current = stateRef.current;
             const btwOwner = Object.entries(current.btwByParentSid).find(
-              ([, binding]) => binding.sid === msg.sid,
+              ([, group]) => group.chats.some((chat) => chat.sid === msg.sid),
             );
             const isBtw = !!btwOwner;
             // A closed/stale fork can still drain one final terminal frame.
@@ -1434,16 +2721,21 @@ export default function App() {
               const sameVisibleParent = !document.hidden
                 && !current.newChat
                 && current.focusedSid === parentSid;
-              const btwPanelVisible = isBtw
+              const isBtwPanelVisible = isBtw
                 && sameVisibleParent
-                && (rightViewRef.current === "btw" || !current.artifact);
-              const alreadySeen = isBtw ? btwPanelVisible : sameVisibleParent;
+                && visibleBtwSidRef.current === msg.sid;
+              const alreadySeen = isBtw
+                ? isBtwPanelVisible : sameVisibleParent;
               if (!alreadySeen) {
                 setCompletionReceipts((receipts) => markCompletionUnread(
                   receipts,
                   parentSid,
                   msg.sid!,
                   isBtw ? "btw" : "main",
+                  isBtw ? null
+                    : msg.checkpoint_id ?? msg.turn_id ?? null,
+                  isBtw ? null : msg.seq ?? null,
+                  isBtw ? null : ws.generationFor(msg.sid!),
                 ));
               }
             }
@@ -1512,6 +2804,9 @@ export default function App() {
               );
             }
           } else if (msg.type === "replay_start" && msg.sid
+              && !msg.sid.startsWith("btw-")
+              && !Object.values(stateRef.current.btwByParentSid).some((group) =>
+                group.chats.some((chat) => chat.sid === msg.sid))
               && (msg.truncated || msg.rebuild)) {
             const sid = msg.sid;
             clearHistoryDetailRequests();
@@ -1572,9 +2867,25 @@ export default function App() {
                 module.allowSessionCache(msg.session_id));
             }
           }
+          let settledHistoryCausalKey: string | undefined;
           if (msg.type === "history") {
-            const browseWaiters =
+            const completedHistory =
               historyRequestsRef.current.complete(msg);
+            settledHistoryCausalKey = completedHistory.settledCausalKey;
+            const browseWaiters = completedHistory.matched;
+            for (const browse of completedHistory.stale) {
+              dispatch({
+                type: "history_browse_page_failed",
+                sid: msg.session_id,
+                scopeKey: browse.scopeKey,
+                revision: stateRef.current.historyBrowse?.revision
+                  ?? msg.revision,
+                generation: stateRef.current.historyBrowse?.generation,
+                viewId: browse.viewId,
+                windowEpoch: browse.windowEpoch,
+                before: browse.pendingBefore,
+              });
+            }
             const retryKey = ["history", msg.session_id, msg.before ?? "",
               msg.revision ?? ""].join("\u0000");
             let retryScheduled = false;
@@ -1601,6 +2912,30 @@ export default function App() {
               recoverableReads.complete(retryKey);
             }
             if (msg.before) {
+              if (completedHistory.stale.some((waiter) => {
+                const browse = stateRef.current.historyBrowse;
+                return browse?.sid === msg.session_id
+                  && browse.scopeKey === waiter.scopeKey
+                  && browse.viewId === waiter.viewId
+                  && browse.windowEpoch === waiter.windowEpoch;
+              })
+                  && stateRef.current.focusedSid === msg.session_id) {
+                // The cursor came from an obsolete revision/generation. Exit
+                // that read-only browse lifetime and refresh the canonical head
+                // rather than leaving mobile paging in a permanent spinner.
+                dispatch({ type: "return_to_latest", sid: msg.session_id });
+                const currentRuntime =
+                  stateRef.current.runtimes[msg.session_id];
+                const currentGeneration = ws.generationFor(msg.session_id)
+                  ?? currentRuntime?.pendingHistoryGeneration
+                  ?? currentRuntime?.historyGeneration;
+                const currentRevision = currentRuntime?.pendingHistoryRevision
+                  ?? (currentRuntime?.historyInvalidated
+                    ? undefined : currentRuntime?.historyRevision);
+                requestHistory(
+                  msg.session_id, undefined, HISTORY_INITIAL_PAGE,
+                  currentGeneration, currentRevision);
+              }
               if (msg.authoritative !== false) {
                 void installBrowseHistoryPage(msg, browseWaiters);
               } else if (!retryScheduled) {
@@ -1640,9 +2975,40 @@ export default function App() {
               "detail", msg.session_id, msg.revision, msg.turn_id,
               msg.before ?? "",
             ].join("\u0000");
-            if (msg.authoritative === false) {
+            const activeDetailTargets = (
+              targets: readonly HistoryDetailRequestContext[],
+              retrying = false,
+            ) => {
+              const current = stateRef.current;
+              return targets.filter((detailTarget) => {
+                if (detailTarget.target === "browse") {
+                  const browse = current.historyBrowse;
+                  return !!browse
+                    && current.focusedSid === detailTarget.sid
+                    && browse.sid === detailTarget.sid
+                    && browse.scopeKey === detailTarget.scopeKey
+                    && browse.viewId === detailTarget.viewId
+                    && browse.revision === detailTarget.revision
+                    && browse.turns.some((turn) =>
+                      canonicalTurnId(turn) === detailTarget.turnId
+                      || turn.id === detailTarget.turnId);
+                }
+                const runtime = current.runtimes[detailTarget.sid];
+                const turn = runtime?.turns.find(
+                  (item) => canonicalTurnId(item) === detailTarget.turnId
+                    || item.id === detailTarget.turnId);
+                return current.focusedSid === detailTarget.sid
+                  && !!turn
+                  && (!retrying
+                    || !!detailTarget.before || !turn.detailLoaded)
+                  && runtime?.historyRevision === detailTarget.revision;
+              });
+            };
+            const releaseDetailFailure = (
+              targets: readonly HistoryDetailRequestContext[],
+            ) => {
               let runtimeReleased = false;
-              for (const detailTarget of detailTargets) {
+              for (const detailTarget of targets) {
                 if (detailTarget.target === "browse") {
                   dispatch({
                     type: "history_browse_detail",
@@ -1654,6 +3020,7 @@ export default function App() {
                     turnId: detailTarget.turnId,
                     events: [],
                     error: msg.error,
+                    resetRequired: msg.reset_required,
                     before: detailTarget.before,
                   });
                 } else if (!runtimeReleased) {
@@ -1661,28 +3028,93 @@ export default function App() {
                   runtimeReleased = true;
                 }
               }
+            };
+            if (msg.authoritative === false) {
+              if (msg.reset_required) {
+                recoverableReads.complete(retryKey);
+                const resetKey = [
+                  msg.session_id, msg.revision, msg.turn_id,
+                ].join("\u0000");
+                if (historyDetailResetAttemptsRef.current.has(resetKey)) {
+                  releaseDetailFailure(detailTargets);
+                  return;
+                }
+                const cancelledTargets =
+                  historyDetailRequestsRef.current.cancelTurn({
+                    sid: msg.session_id,
+                    revision: msg.revision,
+                    turnId: msg.turn_id,
+                  });
+                const activeTargets = activeDetailTargets([
+                  ...detailTargets,
+                  ...cancelledTargets,
+                ]);
+                if (activeTargets.length === 0) return;
+                const resetTargets: HistoryDetailRequestContext[] =
+                  activeTargets.map((target) => ({
+                    ...target,
+                    before: null,
+                  }));
+                const uniqueTargets = new Map<string,
+                  HistoryDetailRequestContext>();
+                for (const target of resetTargets) {
+                  const key = target.target === "browse"
+                    ? [target.target, target.scopeKey, target.viewId,
+                        target.windowEpoch].join("\u0000")
+                    : [target.target, target.scopeKey,
+                        target.autoLoad ? 1 : 0].join("\u0000");
+                  uniqueTargets.set(key, target);
+                }
+                const registrations = [...uniqueTargets.values()].map(
+                  (detailTarget) => ({
+                    detailTarget,
+                    registration:
+                      historyDetailRequestsRef.current.register(detailTarget),
+                  }),
+                ).filter(({ registration }) => registration.accepted);
+                if (registrations.length === 0) {
+                  releaseDetailFailure(detailTargets);
+                  return;
+                }
+                historyDetailResetAttemptsRef.current.add(resetKey);
+                if (historyDetailResetAttemptsRef.current.size > 256) {
+                  const oldest = historyDetailResetAttemptsRef.current
+                    .values().next().value;
+                  if (oldest) {
+                    historyDetailResetAttemptsRef.current.delete(oldest);
+                  }
+                }
+                if (registrations.some(
+                    ({ registration }) => registration.send)) {
+                  const target = registrations[0].detailTarget;
+                  const sent = ws.sendGetTurnDetail(
+                    msg.session_id, msg.turn_id, target.revision, null);
+                  if (!sent) {
+                    historyDetailResetAttemptsRef.current.delete(resetKey);
+                    for (const { detailTarget } of registrations) {
+                      historyDetailRequestsRef.current.cancel(detailTarget);
+                      dispatch({
+                        type: "history_detail_cancelled",
+                        context: detailTarget,
+                      });
+                    }
+                    return;
+                  }
+                }
+                for (const { detailTarget } of registrations) {
+                  dispatch({
+                    type: "history_detail_reset_requested",
+                    context: detailTarget,
+                  });
+                }
+                return;
+              }
+              releaseDetailFailure(detailTargets);
               recoverableReads.retry(retryKey, () => {
                 if (cancelled) return;
                 if (stateRef.current.focusedSid !== msg.session_id) return;
-                const current = stateRef.current;
-                const activeTargets = detailTargets.filter((detailTarget) => {
-                  if (detailTarget.target === "browse") {
-                    const browse = current.historyBrowse;
-                    return !!browse
-                      && browse.scopeKey === detailTarget.scopeKey
-                      && browse.viewId === detailTarget.viewId
-                      && browse.revision === detailTarget.revision
-                      && browse.turns.some((turn) =>
-                        canonicalTurnId(turn) === detailTarget.turnId
-                        || turn.id === detailTarget.turnId);
-                  }
-                  const runtime = current.runtimes[msg.session_id];
-                  const turn = runtime?.turns.find(
-                    (item) => canonicalTurnId(item) === msg.turn_id
-                      || item.id === msg.turn_id);
-                  return !!turn && (!!detailTarget.before || !turn.detailLoaded)
-                    && runtime?.historyRevision === detailTarget.revision;
-                });
+                const activeTargets = activeDetailTargets(
+                  detailTargets, true);
                 if (activeTargets.length === 0) return;
                 const registrations = activeTargets.map((detailTarget) => ({
                   detailTarget,
@@ -1761,39 +3193,75 @@ export default function App() {
               && stateRef.current.focusedSid === msg.session_id) {
             setEditPrompt(msg.prefill_text);
           }
+          if (msg.type === "btw_sync"
+              && msg.revision >= stateRef.current.btwRevision) {
+            const retained = new Set(msg.sessions.map((chat) => chat.btw_sid));
+            const removed = Object.entries(stateRef.current.btwByParentSid)
+              .flatMap(([parentSid, group]) => group.chats
+                .filter((chat) => !retained.has(chat.sid))
+                .map((chat) => [parentSid, chat] as const));
+            for (const [, chat] of removed) {
+              for (const draftSpace of ["code", "work"] as const) {
+                btwDraftsRef.current.delete(composerDraftKey(
+                  machineId, draftSpace, chat.engine, `btw:${chat.sid}`,
+                ));
+              }
+            }
+            if (removed.length > 0) {
+              setBtwSendModeBySid((current) => {
+                const next = { ...current };
+                for (const [, chat] of removed) delete next[chat.sid];
+                return next;
+              });
+              setCompletionReceipts((current) => removed.reduce(
+                (next, [parentSid, chat]) => acknowledgeCompletion(
+                  next, parentSid, { btwSid: chat.sid }),
+                current,
+              ));
+            }
+          }
           if (msg.type === "btw_opened") {
+            const knownChat = Object.values(
+              stateRef.current.btwByParentSid).some((group) =>
+              group.chats.some((chat) => chat.sid === msg.btw_sid));
             const requestedParent = btwRequestParentsRef.current.get(
               msg.request_id) ?? null;
             const pendingRequestId = requestedParent
               ? pendingBtwByParentRef.current.get(requestedParent) ?? null
               : null;
+            if (msg.revision < stateRef.current.btwRevision) {
+              // A newer authoritative sync/close already decided this fork's
+              // existence. Settle this exact pending command as well: after a
+              // reload the catalog can restore the fork before its cached open
+              // response arrives, and leaving the spinner behind would disable
+              // creation of every later sibling side chat.
+              if (requestedParent && matchesBtwRequest(
+                pendingRequestId, msg.request_id)) {
+                pendingBtwByParentRef.current.delete(requestedParent);
+                setBtwOpeningFor(requestedParent, false);
+              }
+              btwRequestParentsRef.current.delete(msg.request_id);
+              return;
+            }
+            if (knownChat && !matchesBtwRequest(
+              pendingRequestId, msg.request_id)) {
+              // Reliable response replay after BtwSync. The catalog already
+              // owns it, and re-applying the open would steal tab selection.
+              btwRequestParentsRef.current.delete(msg.request_id);
+              return;
+            }
             const activeRequest = activeBtwByParentRef.current.get(
               msg.parent_sid)
               ?? (requestedParent
                 ? activeBtwByParentRef.current.get(requestedParent) : undefined)
               ?? null;
-            const disposition = classifyBtwOpened(
-              pendingRequestId, activeRequest, msg);
-            if (disposition === "duplicate") {
+            if (activeRequest?.requestId === msg.request_id
+                && activeRequest.sid === msg.btw_sid) {
               btwRequestParentsRef.current.delete(msg.request_id);
               return; // cached replay after a lost ACK; the fork is already open
             }
-            if (disposition === "stale") {
-              // The user cancelled, navigated, or started a newer request while
-              // this fork was connecting. Never let the stale response open the
-              // panel, and tear down the now-unowned ephemeral session.
-              const discarded = discardedBtwSidsRef.current;
-              discarded.add(msg.btw_sid);
-              while (discarded.size > 64) {
-                const oldest = discarded.values().next().value as string | undefined;
-                if (!oldest) break;
-                discarded.delete(oldest);
-              }
-              btwRequestParentsRef.current.delete(msg.request_id);
-              ws.sendCloseBtw(msg.btw_sid);
-              return;
-            }
-            if (requestedParent) {
+            if (requestedParent && matchesBtwRequest(
+              pendingRequestId, msg.request_id)) {
               pendingBtwByParentRef.current.delete(requestedParent);
               activeBtwByParentRef.current.delete(requestedParent);
               setBtwOpeningFor(requestedParent, false);
@@ -1803,7 +3271,29 @@ export default function App() {
               requestId: msg.request_id,
               sid: msg.btw_sid,
             });
-            setBtwOpeningFor(msg.parent_sid, false);
+          } else if (msg.type === "btw_closed") {
+            const group = stateRef.current.btwByParentSid[msg.parent_sid];
+            const chat = group?.chats.find(
+              (candidate) => candidate.sid === msg.btw_sid);
+            const tracked = activeBtwByParentRef.current.get(msg.parent_sid);
+            if (tracked?.sid === msg.btw_sid) {
+              activeBtwByParentRef.current.delete(msg.parent_sid);
+            }
+            if (chat) {
+              for (const draftSpace of ["code", "work"] as const) {
+                btwDraftsRef.current.delete(composerDraftKey(
+                  machineId, draftSpace, chat.engine, `btw:${msg.btw_sid}`,
+                ));
+              }
+            }
+            setBtwSendModeBySid((current) => {
+              if (!(msg.btw_sid in current)) return current;
+              const next = { ...current };
+              delete next[msg.btw_sid];
+              return next;
+            });
+            setCompletionReceipts((current) => acknowledgeCompletion(
+              current, msg.parent_sid, { btwSid: msg.btw_sid }));
           } else if (msg.type === "error" && msg.request_id
               && btwRequestParentsRef.current.has(msg.request_id)) {
             const parentSid = btwRequestParentsRef.current.get(msg.request_id)!;
@@ -1843,7 +3333,43 @@ export default function App() {
             setSpace("code");
             dispatch({ type: "exit_new_chat" });
             dispatch({ type: "focus_session", sid: msg.session_id });
-            ws.setSessionEngines([{ session_id: msg.session_id, engine: targetEngine, space: "code" }]);
+            const parentSession = stateRef.current.sessions.find(
+              (session) => session.session_id === msg.parent_session_id,
+            );
+            const parentCodexProfileId = targetEngine === "codex"
+              ? parentSession?.codex_profile_id
+                ?? codexProfileIdForSession(
+                  msg.parent_session_id,
+                  stateRef.current.defaultCodexProfileId,
+                )
+              : undefined;
+            const parentClaudeProfileId = targetEngine === "claude"
+              ? parentSession?.claude_profile_id
+                ?? claudeProfileIdForSession(
+                  msg.parent_session_id,
+                  stateRef.current.defaultClaudeProfileId,
+                )
+              : undefined;
+            startForkFocusLease({
+              requestId: msg.request_id,
+              parentSessionId: msg.parent_session_id,
+              childSessionId: msg.session_id,
+              engine: targetEngine,
+              space: "code",
+              machineId,
+              cwd: msg.cwd,
+              gitBranch: msg.git_branch,
+              claudeProfileId: parentClaudeProfileId,
+              codexProfileId: parentCodexProfileId,
+              refreshAt: Date.now() + FORK_FOCUS_REFRESH_MS,
+            });
+            ws.setSessionEngines([{
+              session_id: msg.session_id,
+              engine: targetEngine,
+              space: "code",
+              claude_profile_id: parentClaudeProfileId,
+              codex_profile_id: parentCodexProfileId,
+            }]);
             ws.setFocusedSid(msg.session_id, targetEngine, "code");
             ws.sendListSessions(targetEngine, "code");
             requestHistory(
@@ -1923,14 +3449,23 @@ export default function App() {
             }
           }
           if (msg.type === "snapshot") {
-            if (consumeDiscardedBtwSnapshot(discardedBtwSidsRef.current, msg)) return;
             handleSnapshot(msg, ownership);
             return;
           }
           if (msg.type === "permission_profiles" && !msg.sid && msg.cwd) {
+            const current = stateRef.current;
+            const expectedProfileId = current.newChat?.codexProfileId
+              ?? current.codexProfileByScope[
+                sessionScopeKey(machineId, "codex", "code")]
+              ?? current.defaultCodexProfileId;
+            const responseProfileId = msg.codex_profile_id
+              ?? current.defaultCodexProfileId;
+            if (!current.newChat || current.newChat.cwd !== msg.cwd
+                || responseProfileId !== expectedProfileId) return;
             setNewChatPermissionCatalog({
               machineId,
               cwd: msg.cwd,
+              codexProfileId: responseProfileId,
               profiles: msg.profiles,
             });
             return;
@@ -1965,11 +3500,38 @@ export default function App() {
               if (!targetParentBtw) {
                 activeBtwByParentRef.current.set(
                   msg.session_id, activeParentBtw);
-              } else if (targetParentBtw.sid !== activeParentBtw.sid) {
-                ws.sendCloseBtw(activeParentBtw.sid);
               }
+              // This ref is only a response-replay hint. The reducer's BTW
+              // catalog owns every resident child, so a rekey collision must
+              // not discard either side chat.
             }
             if (ownership) {
+              setCenteredBtwScopes(current => [...new Set(current.map(
+                scope => rekeyPanelScope(scope, msg.old_key, msg.session_id)!))]);
+              setBtwFocusScope(current => rekeyPanelScope(current, msg.old_key, msg.session_id));
+              setExpandedPanel(current => current ? { ...current,
+                scope: rekeyPanelScope(current.scope, msg.old_key, msg.session_id)! } : null);
+              setSessionArtifacts(current => current && current.machineId === machineId ? { ...current,
+                parentSid: current.parentSid === msg.old_key ? msg.session_id : current.parentSid,
+                sid: current.sid === msg.old_key ? msg.session_id : current.sid } : current);
+              setFileBrowser(current => current && current.machineId === machineId && current.sid === msg.old_key
+                ? { ...current, sid: msg.session_id } : current);
+
+              setViewerSelections((current) => {
+                const old = viewerScopeKey({ ...ownership, sid: msg.old_key });
+                if (!Object.hasOwn(current, old)) return current;
+                const key = viewerScopeKey({ ...ownership, sid: msg.session_id });
+                const next = { ...current, [key]: current[key] ?? current[old] };
+                delete next[old];
+                return next;
+              });
+              setBtwPanelScopes((current) => rekeyBtwPanelScope(
+                current,
+                btwPanelScopeKey(ownership.machineId, ownership.space,
+                  ownership.engine, msg.old_key),
+                btwPanelScopeKey(ownership.machineId, ownership.space,
+                  ownership.engine, msg.session_id),
+              ));
               composerDraftsRef.current.rekey(
                 composerDraftKey(
                   ownership.machineId, ownership.space, ownership.engine,
@@ -2000,25 +3562,65 @@ export default function App() {
                 ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
               }
             }
-            setGoalUiBySid((current) => {
-              const prior = current[msg.old_key];
-              if (!prior) return current;
-              const next = { ...current, [msg.session_id]: prior };
-              delete next[msg.old_key];
-              return next;
-            });
+            if (ownership) {
+              const oldGoalKey = goalUiScopeKey(
+                ownership.machineId, ownership.space, ownership.engine,
+                msg.old_key);
+              const nextGoalKey = goalUiScopeKey(
+                ownership.machineId, ownership.space, ownership.engine,
+                msg.session_id);
+              setGoalUiByScope((current) => {
+                const prior = current[oldGoalKey];
+                if (!prior) return current;
+                const next = { ...current, [nextGoalKey]: prior };
+                delete next[oldGoalKey];
+                return next;
+              });
+              persistGoalUiPreferences(rekeyGoalUiPreference(
+                goalUiPreferencesRef.current,
+                oldGoalKey,
+                nextGoalKey,
+              ));
+            }
           }
-          if (msg.type === "session_list" && ownership) {
-            const listedSpace = msg.space ?? "code";
-            historySessionListsRef.current[
-              `${listedSpace}:${msg.engine}`
-            ] = msg.sessions;
-          }
+          // RelayWs only assigns ownership to a correlated, current-generation
+          // catalog response. Reject an old/unknown list before it can rewrite
+          // session/profile maps or warm a sibling surface.
+          if (msg.type === "session_list" && !ownership) return;
+          let normalizedListedSessions: SessionInfo[] | null = null;
           if (msg.type === "session_list") {
-            ws.setSessionEngines(msg.sessions);
             const listedSpace = msg.space ?? "code";
             const surfaceKey = `${listedSpace}:${msg.engine}`;
-            sessionListsBySurfaceRef.current[surfaceKey] = msg.sessions;
+            const normalized = normalizeSessionList(
+              sessionListsBySurfaceRef.current[surfaceKey] ?? [],
+              stateRef.current.codexProfiles,
+              stateRef.current.defaultCodexProfileId,
+              msg,
+            );
+            const lease = forkFocusLeaseSession(
+              forkFocusLeaseRef.current,
+              normalized.sessions,
+              machineId,
+              msg.engine,
+              listedSpace,
+            );
+            if (!lease && forkFocusLeaseRef.current
+                && forkFocusLeaseRef.current.machineId === machineId
+                && forkFocusLeaseRef.current.engine === msg.engine
+                && forkFocusLeaseRef.current.space === listedSpace) {
+              const materialized = normalized.sessions.some(
+                (session) => session.session_id
+                  === forkFocusLeaseRef.current?.childSessionId,
+              );
+              clearForkFocusLease(false, !materialized);
+            }
+            normalizedListedSessions = lease
+              ? [lease, ...normalized.sessions] : normalized.sessions;
+            historySessionListsRef.current[
+              surfaceKey
+            ] = normalizedListedSessions;
+            ws.setSessionEngines(normalizedListedSessions);
+            sessionListsBySurfaceRef.current[surfaceKey] = normalizedListedSessions;
             authoritativeSurfaceListsRef.current.add(surfaceKey);
             bumpNotificationListRevision();
             prefetchedSurfacesRef.current.add(surfaceKey);
@@ -2027,7 +3629,7 @@ export default function App() {
             // not start a second app-server and the user's first toggle is fast.
             const siblingSpace: Space = listedSpace === "work" ? "code" : "work";
             const siblingKey = `${siblingSpace}:${msg.engine}`;
-            if (!prefetchedSurfacesRef.current.has(siblingKey)) {
+            if (msg.engine !== "dsh" && !prefetchedSurfacesRef.current.has(siblingKey)) {
               prefetchedSurfacesRef.current.add(siblingKey);
               ws.sendListSessions(msg.engine, siblingSpace);
             }
@@ -2054,6 +3656,7 @@ export default function App() {
             );
           }
           if (msg.type === "work_dashboard") {
+            setWorkDashboardMachineId(machineId);
             setWorkDashboards((current) => ({ ...current, [msg.engine]: msg }));
             setWorkProjectId((current) => current && msg.projects.some(
               (project) => project.project_id === current) ? current : null);
@@ -2104,8 +3707,19 @@ export default function App() {
               && !shouldAcceptSessionList(engineRef.current, spaceRef.current, msg)) return;
           if (msg.type === "session_list") {
             const currentSid = stateRef.current.focusedSid;
-            if (currentSid && !currentSid.startsWith("tmp-")
-                && !msg.sessions.some((session) => session.session_id === currentSid)) {
+            const listedSpace = msg.space ?? "code";
+            const listedScopeKey = sessionScopeKey(
+              machineId, msg.engine, listedSpace);
+            const scopedCurrentSid = scopedFocusForSessionList(
+              currentSid,
+              stateRef.current.sessions,
+              lastFocusBySurfaceRef.current[listedScopeKey],
+              msg.engine,
+              listedSpace,
+            );
+            if (scopedCurrentSid && !scopedCurrentSid.startsWith("tmp-")
+                && !normalizedListedSessions?.some(
+                  (session) => session.session_id === scopedCurrentSid)) {
               didInitFocusRef.current = false;
               preferredSurfaceFocusRef.current = null;
             }
@@ -2119,7 +3733,53 @@ export default function App() {
               || (msg.type === "error"
                 && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
             );
-          dispatch({ type: "event", event: msg, ownership });
+          if (msg.type === "session_artifacts") {
+            artifactsListenerRef.current?.(msg);
+            return;
+          }
+          if (msg.type === "file_preview" && artifactsListenerRef.current?.(msg)) return;
+          if (msg.type === "files_listed") {
+            filesListenerRef.current?.(msg);
+            return;
+          }
+          if (msg.type === "file_preview" && msg.directory && !msg.error) {
+            const current = stateRef.current;
+            const artifact = current.artifact;
+            if (artifact && msg.sid && artifact.sid === msg.sid && artifact.requestId === msg.request_id) {
+              dispatch({ type: "clear_artifact" });
+              setFileBrowser({ sid: msg.sid, machineId, engine: engineRef.current, space: spaceRef.current,
+                path: msg.path, preview: false, id: uuid() });
+            }
+            return;
+          }
+          if (msg.type === "agent_detail") {
+            agentDetailListenerRef.current?.(msg);
+            // Requester-scoped details never belong in the conversation
+            // reducer or another browser's side panel.
+            return;
+          }
+          if (msg.type === "session_list" && normalizedListedSessions) {
+            dispatch({ type: "event", event: {
+              ...msg, sessions: normalizedListedSessions,
+            }, ownership });
+          } else {
+            dispatch({ type: "event", event: msg, ownership });
+          }
+          if (msg.type === "history" && !msg.before
+              && msg.authoritative !== false
+              && settledHistoryCausalKey) {
+            settleTerminalHistoryRepair(
+              msg.session_id, settledHistoryCausalKey);
+          }
+          if (settlesContextRequest && msg.type === "error"
+              && msg.code === "busy" && msg.sid) {
+            // The reducer first converts this exact request into a deferred
+            // intent. If the UI already saw idle before the runner finished its
+            // finalizer, there will be no second idle frame to wake it; retry a
+            // few times with backoff instead of polling indefinitely.
+            scheduleDeferredClaudeContextRefresh(
+              msg.sid, ownership?.engine, true);
+          }
           if (msg.sid && completesStatusRequest
               && deferredStatusRefreshRef.current.delete(msg.sid)) {
             const requestId = ws.sendGetStatusTo(msg.sid);
@@ -2140,7 +3800,7 @@ export default function App() {
             const eventEngine = session?.engine
               ?? (stateRef.current.focusedSid === msg.sid
                 ? engineRef.current : undefined);
-            if (eventEngine === "codex") {
+            if (eventEngine === "codex" || eventEngine === "claude") {
               if (stateRef.current.runtimes[msg.sid]?.statusRequestId) {
                 deferredStatusRefreshRef.current.add(msg.sid);
               } else {
@@ -2154,13 +3814,23 @@ export default function App() {
                 }
               }
             }
+            if (eventEngine === "claude") {
+              // TurnEnd is emitted before the wrapper releases its query lock.
+              // Retry only after the following authoritative idle frame has
+              // reached the reducer; otherwise the refresh can race that
+              // release, receive busy, and wait forever for another TurnEnd.
+              scheduleDeferredClaudeContextRefresh(msg.sid, "claude");
+            }
           }
           if (msg.type === "wrapper_reconnected") {
             skillCatalogsRef.current = {};
             setSkillCatalogs({});
+            setSkillCatalogErrors({});
             skillCatalogRequestsRef.current?.resetReads();
+            const extensionScope = capabilitiesScopeRef.current;
+            if (extensionScope) requestSkillCatalog(extensionScope, true);
             const focusedSkills = focusedSkillScopeRef.current;
-            if (focusedSkills?.engine === "codex" && focusedSkills.cwd) {
+            if (!stateRef.current.newChat && focusedSkills?.cwd) {
               requestSkillCatalog(focusedSkills, true);
             }
             ws.sendListSessions(engineRef.current, spaceRef.current);
@@ -2172,9 +3842,14 @@ export default function App() {
             if (currentSid) requestHistory(
               currentSid, undefined, HISTORY_INITIAL_PAGE, msg.generation);
           }
-          // refresh the context ring after each turn (local SDK query, no model tokens)
+          // Refresh from wrapper-owned live/transcript usage. Automatic reads
+          // never issue Claude's optional native control request or use model tokens.
           if (msg.type === "turn_end" && msg.sid) {
-            ws.sendGetContextTo(msg.sid);
+            const runtime = stateRef.current.runtimes[msg.sid];
+            if (!runtime?.contextRequestId
+                && !runtime?.contextRefreshDeferred) {
+              sendContextRequestTo(msg.sid, false, ws);
+            }
             if (sessionActivityPendingRef.current.delete(msg.sid)) {
               const listed = Object.values(sessionListsBySurfaceRef.current)
                 .flat().find((session) => session.session_id === msg.sid);
@@ -2193,13 +3868,34 @@ export default function App() {
           }
         },
         onConnState: (s, detail) => {
+          if (!acceptsLifecycle()) return;
           dispatch({ type: "conn", connState: s, detail });
           if (s !== "connected") {
+            turnFileRequestsRef.current.clear();
+            goalApiRef.current?.reset();
+            dshApi.reset();
             skillCatalogRequestsRef.current?.resetReads();
+            // The fork result is authoritative only for this live connection.
+            // A reconnect will obtain a fresh native SessionList, so do not
+            // preserve a synthetic child indefinitely across disconnects.
+            clearForkFocusLease(false);
           }
           if (s === "connected") {
+            setSkillCatalogErrors({});
+            goalRecoveryRequestsRef.current.clear();
+            goalRequestScopeByIdRef.current.clear();
+            // Recovery preamble replay happens before this callback. Forget
+            // both halves of the old-socket correlation together, then let
+            // the focused Goal's fresh GetGoal response deliberately enqueue
+            // a new idempotent migration. Keeping only the in-flight key would
+            // suppress that retry forever when the replay returns an Error.
+            resetGoalDismissMigrationTracking(
+              goalDismissMigrationsRef.current,
+              goalDismissMigrationByRequestRef.current,
+            );
             recoverableReads.clear();
-            historyRequestsRef.current.beginConnection();
+            settleCancelledHistoryBrowse(
+              historyRequestsRef.current.beginConnection());
             clearHistoryDetailRequests();
             notificationListRequestRef.current = null;
             bumpNotificationListRevision();
@@ -2216,6 +3912,8 @@ export default function App() {
           }
         },
         onAuthFail: () => {
+          if (!acceptsLifecycle()) return;
+          turnFileRequestsRef.current.clear();
           setAuthReady(false);
           clearLegacyAuthMarkers(localStorage);
           pendingCreateRef.current = null;
@@ -2224,12 +3922,12 @@ export default function App() {
           pendingSessionForkRef.current = null;
           pendingWorktreeForkRef.current = null;
           pendingSessionMigrationRef.current = null;
+          clearForkFocusLease(false);
           setMigrateSession(null);
           setMigrateCreating(false);
           setMigrateError(null);
           activeBtwByParentRef.current.clear();
           btwRequestParentsRef.current.clear();
-          discardedBtwSidsRef.current.clear();
           historyInvalidationsRef.current.clear();
           historyInvalidationGenerationsRef.current.clear();
           historyCacheEpochRef.current.clear();
@@ -2237,6 +3935,7 @@ export default function App() {
           skillCatalogsRef.current = {};
           skillCatalogRequestsRef.current?.reset();
           setSkillCatalogs({});
+          setSkillCatalogErrors({});
           setCapabilitiesByScope({});
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
@@ -2249,11 +3948,13 @@ export default function App() {
           setBtwOpeningByParentSid({});
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
+          questionDraftsRef.current.clear();
+          setCenteredBtwScopes([]);
           setForkingPointId(null);
           setForkWorktreeSession(null);
           setForkWorktreeCreating(false);
           setForkWorktreeError(null);
-          setGoalUiBySid({});
+          setGoalUiByScope({});
           setStatusOpenSid(null);
           setUsageActivityOpen(false);
           setWorkArtifactsOpen(false);
@@ -2267,21 +3968,39 @@ export default function App() {
             setAuthReady(true);
           })();
         },
-        onCommandError: (detail) => dispatch({ type: "command_error", detail }),
+        onCommandError: (detail) => {
+          if (!acceptsLifecycle()) return;
+          dispatch({ type: "command_error", detail });
+        },
         onOutboxChanged: (protectedSids) => {
+          if (!acceptsLifecycle()) return;
           dispatch({ type: "prune_runtimes", protectedSids });
         },
+        onCommandCompleted: (commandId) => {
+          if (!acceptsLifecycle()) return;
+          setPermissionProfileRequests((current) =>
+            Object.values(current).includes(commandId)
+              ? Object.fromEntries(Object.entries(current)
+                .filter(([, id]) => id !== commandId))
+              : current);
+        },
         onWrapperGenerationChanged: () => {
+          if (!acceptsLifecycle()) return;
+          turnFileRequestsRef.current.clear();
+          setAgentPanel(null);
+          agentDetailListenerRef.current = null;
           clearHistoryDetailRequests();
           inlineImageAssetsRef.current.clear();
           historyImageAssetsRef.current.clear();
           bumpInlineImageRevision();
           bumpHistoryImageRevision();
-          discardedBtwSidsRef.current.clear();
           setCompletionReceipts(discardBtwCompletionReceipts);
           setBtwSendModeBySid({});
           btwDraftsRef.current.clear();
+          questionDraftsRef.current.clear();
+          setCenteredBtwScopes([]);
           if (Object.keys(stateRef.current.btwByParentSid).length > 0
+              || stateRef.current.btwRevision > 0
               || pendingBtwByParentRef.current.size > 0
               || activeBtwByParentRef.current.size > 0
               || btwRequestParentsRef.current.size > 0) {
@@ -2295,6 +4014,7 @@ export default function App() {
           }
         },
       }, machineId);
+      effectWs = ws;
       ws.setSurface(engineRef.current, spaceRef.current);
       // Seed both transport and reducer watermarks before Hello. This prevents
       // an older replay/snapshot from reviving a lock already superseded in the
@@ -2312,22 +4032,36 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      wsRef.current?.stop();
-      wsRef.current = null;
+      if (wsLifecycleEpochRef.current === lifecycleEpoch) {
+        wsLifecycleEpochRef.current += 1;
+      }
+      effectWs?.stop();
+      if (wsRef.current === effectWs) wsRef.current = null;
       historyRequests.clear();
       clearHistoryDetailRequests();
+      turnFileRequests.clear();
       recoverableReads.clear();
+      contextRequestLaunches.clear();
+      contextDeferredRetryAttempts.clear();
     };
   }, [
     acceptSkillCatalog,
+    dshApi,
     authed,
+    clearForkFocusLease,
     clearHistoryDetailRequests,
     installBrowseHistoryPage,
     invalidateHistoryPageScopes,
     machineId,
+    persistGoalUiPreferences,
     requestHistory,
     requestSkillCatalog,
+    sendContextRequestTo,
     setBtwOpeningFor,
+    setSidebarOpen,
+    settleCancelledHistoryBrowse,
+    settleTerminalHistoryRepair,
+    startForkFocusLease,
   ]);
 
   // Land on the preferred/recent session only after an accepted list for the
@@ -2336,13 +4070,45 @@ export default function App() {
     if (pendingNotificationTarget) return;
     if (didInitFocusRef.current || !wsRef.current) return;
     const surfaceKey = `${spaceRef.current}:${engineRef.current}`;
+    const focusScopeKey = sessionScopeKey(
+      machineId, engineRef.current, spaceRef.current);
     if (!authoritativeSurfaceListsRef.current.has(surfaceKey)) return;
-    if (state.sessions.length === 0) {
+    // A directory chosen in New Chat is an explicit user destination. A
+    // reconnect/list refresh may validate the catalog, but it must not navigate
+    // away from that draft. Cold surface restoration clears the old surface's
+    // draft first, so it is deliberately excluded from this guard.
+    if (state.newChat?.cwdSource === "explicit"
+        && restoringSurfaceScope !== focusScopeKey) {
       preferredSurfaceFocusRef.current = null;
       didInitFocusRef.current = true;
       return;
     }
-    const preferred = preferredSurfaceFocusRef.current?.key === surfaceKey
+    if (state.sessions.length === 0) {
+      preferredSurfaceFocusRef.current = null;
+      didInitFocusRef.current = true;
+      const current = stateRef.current;
+      if (!current.newChat) {
+        const inheritedCwd = current.cwdByScope[focusScopeKey];
+        dispatch({
+          type: "enter_new_chat",
+          cwd: inheritedCwd || "~",
+          cwdSource: inheritedCwd ? "inherited" : "default",
+          claudeProfileId: engineRef.current === "claude"
+            ? current.claudeProfileByScope[focusScopeKey]
+              ?? current.defaultClaudeProfileId
+            : null,
+          codexProfileId: engineRef.current === "codex"
+            ? current.codexProfileByScope[focusScopeKey]
+              ?? current.defaultCodexProfileId
+            : null,
+        });
+      }
+      setRestoringSurfaceScope((scope) => (
+        scope === focusScopeKey ? null : scope
+      ));
+      return;
+    }
+    const preferred = preferredSurfaceFocusRef.current?.key === focusScopeKey
       ? state.sessions.find((session) => (
           session.session_id === preferredSurfaceFocusRef.current?.sid
           && (session.space ?? "code") === spaceRef.current
@@ -2350,25 +4116,30 @@ export default function App() {
         ))
       : undefined;
     preferredSurfaceFocusRef.current = null;
-    const latest = preferred ?? [...state.sessions]
-      .filter((s) => s.tag !== "archived")
-      .sort(compareSessionsByActivity)[0]
-      ?? state.sessions[0];
+    const latest = preferred ?? selectSurfaceSession(state.sessions);
     didInitFocusRef.current = true;
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "exit_new_chat" });
       dispatch({ type: "focus_session", sid: latest.session_id });
-      const latestEngine = (latest.engine as "claude" | "codex") || engineRef.current;
+      const latestEngine = (latest.engine as "claude" | "codex" | "dsh") || engineRef.current;
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
       requestHistory(
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
-      wsRef.current.sendSwitchSession(latest.session_id, latestEngine, spaceRef.current);
+      resumeListedSession(
+        latest, latestEngine, spaceRef.current, wsRef.current);
     }
+    setRestoringSurfaceScope((scope) => (
+      scope === focusScopeKey ? null : scope
+    ));
   }, [
+    machineId,
     pendingNotificationTarget,
+    restoringSurfaceScope,
+    state.newChat,
     state.sessions,
     state.focusedSid,
     requestHistory,
+    resumeListedSession,
   ]);
 
   // Direct sidebar selection and newly-created sessions both update the
@@ -2381,14 +4152,16 @@ export default function App() {
     if (!selected) return;
     const selectedEngine = (selected.engine as Engine | undefined) ?? engine;
     const selectedSpace: Space = selected.space === "work" ? "work" : "code";
-    lastFocusBySurfaceRef.current[`${selectedSpace}:${selectedEngine}`] = focusedSid;
-  }, [focusedSid, state.newChat, state.sessions, engine]);
+    lastFocusBySurfaceRef.current[
+      sessionScopeKey(machineId, selectedEngine, selectedSpace)
+    ] = focusedSid;
+  }, [focusedSid, state.newChat, state.sessions, engine, machineId]);
 
-  // Warm the cwd-scoped Codex Skill catalog when a session becomes usable.
+  // Warm the cwd/account-scoped Skill catalog when a session becomes usable.
   // Composer completion then reads memory synchronously; an expired entry stays
   // visible while this refresh runs in the background.
   useEffect(() => {
-    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+    if (!authed || !focusedSid || state.newChat
         || !capabilityCwd || state.connState !== "connected"
         || !state.wrapperOnline) return;
     requestSkillCatalog({
@@ -2397,11 +4170,16 @@ export default function App() {
       space,
       cwd: capabilityCwd,
       skillsOnly: true,
+      claudeProfileId: focusedClaudeProfileId,
+      codexProfileId: focusedCodexProfileId,
+      sid: focusedSid,
     });
   }, [
     authed,
     capabilityCwd,
+    focusedClaudeProfileId,
     focusedEngine,
+    focusedCodexProfileId,
     focusedSid,
     focusedSkillCatalogKey,
     requestSkillCatalog,
@@ -2411,31 +4189,26 @@ export default function App() {
     state.wrapperOnline,
   ]);
 
-  // An open Extensions sheet follows the focused authorization scope. Switching
+  const refreshCapabilities = useCallback(() => {
+    if (!capabilitiesScope || state.connState !== "connected" || !state.wrapperOnline) return;
+    setCapabilitiesLoading(true);
+    const requested = requestSkillCatalog(capabilitiesScope, true);
+    if (!requested && !skillCatalogRequestsRef.current?.hasPendingRead(capabilitiesScope.key, false)
+        && !skillCatalogRequestsRef.current?.hasPendingMutation(capabilitiesScope.key)) {
+      setCapabilitiesLoading(false);
+    }
+  }, [capabilitiesScope, requestSkillCatalog, state.connState, state.wrapperOnline]);
+  const openExtensions = (kind: EngineCapabilityKind | "all") => {
+    setCapabilitiesKind(kind);
+    setCapabilitiesOpen(true);
+  };
+
+  // An open Extensions sheet follows the visible authorization scope. Switching
   // device, engine, space, or cwd must fetch that scope instead of retaining a
   // report from the previously visible session.
   useEffect(() => {
-    if (!capabilitiesOpen || !authed || state.connState !== "connected"
-        || !state.wrapperOnline) return;
-    setCapabilitiesLoading(true);
-    requestSkillCatalog({
-      key: focusedSkillCatalogKey,
-      engine: focusedEngine,
-      space,
-      cwd: capabilityCwd,
-      skillsOnly: false,
-    }, true);
-  }, [
-    authed,
-    capabilitiesOpen,
-    capabilityCwd,
-    focusedEngine,
-    focusedSkillCatalogKey,
-    requestSkillCatalog,
-    space,
-    state.connState,
-    state.wrapperOnline,
-  ]);
+    if (capabilitiesOpen && authed) refreshCapabilities();
+  }, [authed, capabilitiesOpen, refreshCapabilities]);
 
   // Keep a long-lived tab bounded without evicting anything that can still be
   // acted on. ACK callbacks run the same prune when an outbox target becomes
@@ -2462,10 +4235,12 @@ export default function App() {
         sid, rt.turns, live, revision,
         wsRef.current?.generationFor(sid),
         rt.control,
+        rt.historyHeadKnown && !rt.hasMore && !rt.historyInvalidated,
       );
     });
   }, [
     focusedSid, rt.turns, rt.ccSessionId, rt.historyRevision, rt.control,
+    rt.historyHeadKnown, rt.hasMore, rt.historyInvalidated,
     state.historyRecovery,
   ]);
 
@@ -2493,7 +4268,8 @@ export default function App() {
           && cacheEpoch === (historyCacheEpochRef.current.get(sid) ?? 0)
           && !historyInvalidationsRef.current.has(sid)
           && cached && Array.isArray(cached.turns)
-          && (cached.turns.length || cached.control);
+          && (cached.turns.length || cached.control
+            || cached.historyAtStart === true);
       if (valid && cached) {
         dispatch({
           type: "hydrate_cache", sid,
@@ -2503,6 +4279,7 @@ export default function App() {
           revision: cached.revision,
           generation: cached.generation ?? cached.control?.generation,
           control: cached.control,
+          historyAtStart: cached.historyAtStart === true,
         });
       }
     });
@@ -2516,12 +4293,36 @@ export default function App() {
     };
   }, [focusedSid, requestHistory, state.connState]);
 
-  // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Shift+B => open latest turn's diff
+  // An unfocused "/" focuses the composer; a second press types normally.
+  // Cmd/Ctrl+B => toggle sidebar; Cmd/Ctrl+Shift+B => open latest turn's diff.
   useEffect(() => {
     if (!authed) return;
+    const hasOtherOverlay = (owner: Element | null) => [...document.querySelectorAll<HTMLElement>(
+      '[role="dialog"], [aria-modal="true"], dialog[open], [role="menu"]',
+    )].some(node => node !== owner && !node.closest("[inert]") && node.getClientRects().length);
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229 || e.repeat) return;
+      if (e.key === "/" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        // Only centered BTW owns this shortcut; a docked chat leaves it to main.
+        const panel = document.querySelector('.btw-panel[aria-modal="true"]');
+        if (e.composedPath().some((target) => target instanceof HTMLElement
+              && (target.matches("input, textarea, select, [role=textbox]")
+                || target.isContentEditable))
+            || hasOtherOverlay(panel)) return;
+        const input = (panel ?? document).querySelector<HTMLTextAreaElement>(
+          `textarea[${panel ? "data-btw-composer" : "data-chat-composer"}]:not(:disabled):not([readonly])`);
+        if (input) {
+          e.preventDefault();
+          input.focus({ preventScroll: true });
+        }
+        return;
+      }
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
       const k = e.key.toLowerCase();
+      // Let a nested picker/confirmation finish before moving its owner panel.
+      if ((k === "e" || k === "k") && e.shiftKey
+          && hasOtherOverlay(document.querySelector('.btw-panel[aria-modal="true"]')
+            ?? document.querySelector('.right-panel-frame[aria-modal="true"]'))) return;
       if (k === "b" && e.shiftKey) {           // diff (shared right slot)
         e.preventDefault();
         const latest = shortcutRef.current;
@@ -2531,21 +4332,35 @@ export default function App() {
         e.preventDefault();
         setSidebarOpen((v) => !v);
       } else if (k === "k" && e.shiftKey) {      // /btw side panel (shared right slot)
+        if (!shortcutRef.current.btwAvailable) return;
         e.preventDefault();
         const latest = shortcutRef.current;
-        if (latest.btwSid && latest.rightView === "btw") latest.closeBtw();
+        if (document.querySelector('.btw-panel[aria-modal="true"]')
+            || (btwPanelVisibleRef.current && latest.rightView === "btw")) {
+          latest.collapseBtw();
+        }
         else latest.openBtw();
+      } else if (k === "e" && e.shiftKey) {
+        if (!shortcutRef.current.btwAvailable) return;
+        e.preventDefault();
+        shortcutRef.current.toggleCenteredBtw();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed]);
+  }, [authed, setSidebarOpen]);
+
+  const setPerm = useCallback((perm: string) => {
+    if (focusedEngine === "dsh" && focusedSid) wsRef.current?.sendDshControl(focusedSid, "permission", perm);
+    else wsRef.current?.sendSetPerm(perm);
+  }, [focusedEngine, focusedSid]);
 
   // Shift+Tab follows each engine's real mode control: Claude cycles permission
   // modes; Codex toggles collaboration mode without touching approvalPolicy.
   useEffect(() => {
     if (!authed) return;
     const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || stateRef.current.newChat) return;
       if (e.key === "Tab" && e.shiftKey) {
         e.preventDefault();
         if ((rt.control && sessionControlLocksInput(rt.control))
@@ -2555,7 +4370,10 @@ export default function App() {
             rt.collaborationMode === "plan" ? "default" : "plan");
           return;
         }
-        const modes = permsFor(focusedEngine).map((p) => p.id);
+        const modes = focusedEngine === "dsh"
+          ? (rt.dsh?.permissions ?? []).filter(p => p.value !== "custom").map(p => p.value)
+          : permsFor(focusedEngine).map((p) => p.id);
+        if (!modes.length) return;
         const current = modes.indexOf(rt.perm);
         setPerm(modes[current < 0 ? 0 : (current + 1) % modes.length]);
       }
@@ -2563,17 +4381,18 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
-    rt.external, focusedEngine]);
+    rt.external, rt.dsh?.permissions, focusedEngine, setPerm]);
 
-  const loadHistoryTurnDetail = useCallback((
+  const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
-    autoLoad = true,
+    autoLoad = false,
+    includeBrowseProjection = true,
   ): boolean => {
     const current = stateRef.current;
     const sid = current.focusedSid;
     const runtime = sid ? current.runtimes[sid] : null;
     if (!sid || !runtime?.historyRevision) return false;
-    const browse = current.historyBrowse?.sid === sid
+    const browse = includeBrowseProjection && current.historyBrowse?.sid === sid
       ? current.historyBrowse : null;
     const displayed = (browse?.turns ?? runtime.turns).find(
       (turn) => turn.id === displayTurnId
@@ -2630,6 +4449,44 @@ export default function App() {
     }
     return true;
   }, [focusedEngine, historyPageScopeFor, space]);
+  const loadHistoryTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+    autoLoad = false,
+  ) => requestHistoryTurnDetail(
+    displayTurnId, before, autoLoad, true), [requestHistoryTurnDetail]);
+  const loadRuntimeTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+    autoLoad = false,
+  ) => requestHistoryTurnDetail(
+    displayTurnId, before, autoLoad, false), [requestHistoryTurnDetail]);
+  useEffect(() => {
+    const current = stateRef.current;
+    const sid = current.focusedSid;
+    const runtime = sid ? current.runtimes[sid] : null;
+    if (!sid || !runtime || current.newChat
+        || current.historyBrowse?.sid === sid
+        || current.connState !== "connected" || !current.wrapperOnline
+        || !runtime.syncReady || !runtime.historyHeadKnown
+        || runtime.historyInvalidated || !runtime.historyRevision) return;
+    const request = nextActiveDetailRequest(
+      runtime.turns,
+      runtime.historyNewestId,
+      runtime.state !== "idle" || runtime.mirroredRunning,
+    );
+    if (!request) return;
+    // One newest page establishes the immutable source snapshot. Older pages
+    // stay behind the existing explicit pagination controls while live tail
+    // frames continue merging independently into the same turn.
+    loadRuntimeTurnDetail(request.turnId, request.before, false);
+  }, [
+    loadRuntimeTurnDetail,
+    state.connState,
+    state.focusedSid,
+    state.historyBrowse,
+    state.newChat,
+    state.runtimes,
+    state.wrapperOnline,
+  ]);
   useEffect(() => {
     const current = stateRef.current;
     const sid = current.focusedSid;
@@ -2664,44 +4521,97 @@ export default function App() {
   // that the replacement wrapper has finished restoring resident sessions.
   useEffect(() => {
     if (!authed || !focusedSid || state.newChat
+        || focusedSession?.tag === "archived"
         || state.connState !== "connected" || !state.wrapperOnline) return;
-    if (stateRef.current.runtimes[focusedSid]?.contextRequestId) return;
-    const requestId = wsRef.current?.sendGetContext();
-    if (requestId) {
-      dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
+    const contextRuntime = stateRef.current.runtimes[focusedSid];
+    const deferred = contextRuntime?.contextRefreshDeferred === true;
+    if (!contextRuntime?.contextRequestId
+        && (!deferred || focusedEngine === "claude" && contextRuntime?.state === "idle")) {
+      // A resumed Claude child has no capacity cache until its first native
+      // summary. The Wrapper selects its safe local read, including while busy.
+      sendContextRequestTo(focusedSid, deferred || focusedEngine === "claude"
+        && (contextRuntime?.contextReport?.max_tokens ?? 0) <= 0);
     }
+    // Both engines receive usage during a long turn. Poll cached totals; Claude
+    // only needs a native summary again if its generation's capacity is absent.
+    if (focusedEngine !== "codex" && focusedEngine !== "claude") return;
+    const timer = window.setInterval(() => {
+      const runtime = stateRef.current.runtimes[focusedSid];
+      if (document.visibilityState === "visible"
+          && runtime?.state === "running") {
+        sendContextRequestTo(focusedSid, focusedEngine === "claude"
+          && !runtime.contextRefreshDeferred
+          && (runtime.contextReport?.max_tokens ?? 0) <= 0);
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
   }, [
     authed,
+    focusedEngine,
+    focusedSession?.tag,
     focusedSid,
+    sendContextRequestTo,
     state.connState,
     state.newChat,
     state.wrapperOnline,
   ]);
 
   const refreshStatus = useCallback(() => {
-    if (!focusedSid || focusedEngine !== "codex") return;
-    if (stateRef.current.runtimes[focusedSid]?.statusRequestId) return;
+    if (!focusedSid || focusedEngine === "dsh") return;
+    const current = stateRef.current;
+    if (current.sessions.find(
+      (session) => session.session_id === focusedSid)?.tag === "archived") return;
+    if (current.runtimes[focusedSid]?.statusRequestId) return;
     const requestId = wsRef.current?.sendGetStatus();
     if (requestId) {
       dispatch({ type: "begin_status_request", sid: focusedSid, requestId });
     }
+  }, [focusedSid, focusedEngine]);
+  const consumeResetCredit = useCallback((creditId?: string | null) => {
+    if (!focusedSid || focusedEngine !== "codex") return false;
+    const current = stateRef.current;
+    const runtime = current.runtimes[focusedSid];
+    const session = current.sessions.find(
+      (candidate) => candidate.session_id === focusedSid);
+    if (
+      current.newChat
+      || session?.tag === "archived"
+      || !runtime
+      || runtime.state !== "idle"
+      || runtime.statusRequestId
+      || runtime.statusError
+      || current.connState !== "connected"
+      || !current.wrapperOnline
+    ) return false;
+    const requestId = wsRef.current?.sendConsumeRateLimitResetCredit(
+      focusedSid, creditId) ?? null;
+    if (requestId) {
+      dispatch({
+        type: "begin_status_request",
+        sid: focusedSid,
+        requestId,
+      });
+    }
+    return requestId !== null;
   }, [focusedEngine, focusedSid]);
   useEffect(() => {
-    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
-        || rt.state !== "idle"
+    if (!authed || !focusedSid || state.newChat
+        || archivedBrowse
+        || (focusedEngine === "codex" && rt.state !== "idle")
         || state.connState !== "connected" || !state.wrapperOnline) return;
-    if (stateRef.current.runtimes[focusedSid]?.statusRequestId) return;
     refreshStatus();
-  }, [
-    authed,
-    focusedEngine,
-    focusedSid,
-    refreshStatus,
-    rt.state,
-    state.connState,
-    state.newChat,
-    state.wrapperOnline,
-  ]);
+    if (focusedEngine !== "claude") return;
+    // Account reads do not use the chat reader. The Wrapper coalesces requests
+    // across sessions/tabs; background pages need no periodic refresh.
+    const refreshVisible = () => {
+      if (document.visibilityState === "visible") refreshStatus();
+    };
+    const timer = window.setInterval(refreshVisible, 60_000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [authed, focusedSid, focusedEngine, state.newChat, archivedBrowse,
+    state.connState, state.wrapperOnline, refreshStatus, rt.state]);
 
   useEffect(() => {
     const artifact = state.artifact;
@@ -2741,16 +4651,22 @@ export default function App() {
   }
 
   if (!authed) {
-    return <LoginForm onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} />;
+    return <Suspense fallback={<div className="login" aria-busy="true">正在加载登录页面…</div>}><LoginForm
+      onLogin={() => { dispatch({ type: "reset" }); setAuthed(true); }} theme={theme} onToggleTheme={toggleTheme} /></Suspense>;
   }
 
+  const runtimeIsReadOnly = (sid: string): boolean => {
+    const runtime = stateRef.current.runtimes[sid];
+    return runtime?.control
+      ? sessionControlLocksInput(runtime.control) : !!runtime?.external;
+  };
   const sendDeferredQuery = (
     sid: string,
     query: PendingQuery,
     delivery: "queue" | "replace",
   ): boolean => {
     const ws = wsRef.current;
-    if (!ws) return false;
+    if (!ws || runtimeIsReadOnly(sid)) return false;
     const currentState = stateRef.current;
     const unconfirmed = collectUnconfirmedQueries(
       currentState.runtimes,
@@ -2832,7 +4748,7 @@ export default function App() {
 
   const updateQueuedQuery = (prompt: string): boolean => {
     const current = queuedQueryEditor;
-    if (!current || current.saving) return false;
+    if (!current || current.saving || runtimeIsReadOnly(current.sid)) return false;
     if (current.state === "failed") {
       dispatch({
         type: "update_failed_deferred",
@@ -2917,7 +4833,16 @@ export default function App() {
     const hasDeferred = !!(
       currentRuntime?.queue.length || currentRuntime?.pendingSend
     );
-    if (awaitingAcceptance || hasDeferred) {
+    // `state` is the wrapper's authoritative turn state and it is broadcast to
+    // every connected client. When another device (phone/desktop) is holding the
+    // turn, `state` is not "idle" here even though THIS browser has no pending
+    // query of its own. Sending `immediate` in that case is rejected with
+    // ERR_BUSY and the message lands in "undelivered", which is why users had to
+    // open a brand-new session to keep talking. Queueing instead lets the wrapper
+    // run it the moment the active turn finishes, so both devices can talk.
+    const remoteTurnActive = currentRuntime?.state === "running"
+      || currentRuntime?.mirroredRunning === true;
+    if (awaitingAcceptance || hasDeferred || remoteTurnActive) {
       const sendMode = currentRuntime?.sendMode ?? "steer";
       const delivery = awaitingAcceptance && sendMode !== "queue"
         ? "replace" : "queue";
@@ -2959,7 +4884,7 @@ export default function App() {
     prompt: string, images?: QueryImg[], files?: QueryFile[],
   ): boolean => {
     const ws = wsRef.current;
-    if (!ws || !focusedSid || focusedEngine !== "codex") return false;
+    if (!ws || !focusedSid || runtimeIsReadOnly(focusedSid)) return false;
     const runtime = stateRef.current.runtimes[focusedSid];
     if (ws.pendingQueryFor(focusedSid) || runtime?.acceptancePending) {
       return false;
@@ -2975,14 +4900,36 @@ export default function App() {
       files,
       ts: Date.now(),
     });
-    if (stateRef.current.historyBrowse?.sid === focusedSid) {
-      dispatch({ type: "return_to_latest", sid: focusedSid });
-    }
     return true;
+  };
+  const replyAsyncQuestion = (
+    sid: string, prompt: string,
+    whenIdle: (text: string) => boolean, whenRunning: (text: string) => boolean,
+  ): Promise<QueryAcceptanceResult> | null => {
+    const current = stateRef.current;
+    const ws = wsRef.current;
+    const runtime = current.runtimes[sid];
+    // The outbox latch updates synchronously, before React can disable sibling
+    // cards. A second answer must not enter the composer's replace-query path.
+    if (!ws || current.connState !== "connected" || !current.wrapperOnline
+        || !runtime || ws.pendingQueryFor(sid) || runtime.acceptancePending
+        || (runtime.state === "idle" && (runtime.queue.length || runtime.pendingSend))
+        || (runtime.control
+          ? sessionControlLocksInput(runtime.control) : runtime.external)) return null;
+    const sent = runtime.state === "running" ? whenRunning(prompt)
+      : runtime.state === "idle" ? whenIdle(prompt) : false;
+    if (!sent) return null;
+    const messageId = ws.pendingQueryFor(sid);
+    return messageId ? ws.queryReceiptFor(sid, messageId) : null;
   };
   const loadOlderHistoryPage = (
     anchorTurnId?: string,
-  ): boolean | { accepted: true; viewId: string } => {
+  ): boolean | {
+    accepted: true;
+    viewId: string;
+    scopeKey: string;
+    generation: string | null;
+  } => {
     const current = stateRef.current;
     const sid = current.focusedSid;
     const runtime = sid ? current.runtimes[sid] : null;
@@ -3044,7 +4991,12 @@ export default function App() {
         sourcePageKey: basePageKey,
         anchorTurnId: anchorTurnId ?? null,
       });
-    return accepted ? { accepted: true, viewId } : false;
+    return accepted ? {
+      accepted: true,
+      viewId,
+      scopeKey,
+      generation: browseGeneration,
+    } : false;
   };
   const loadNewerHistoryPage = (anchorTurnId?: string): boolean => {
     const browse = stateRef.current.historyBrowse;
@@ -3061,6 +5013,14 @@ export default function App() {
       pageKey: browse.newerPageKey,
       anchorTurnId: anchorTurnId ?? null,
     };
+    const latestPageKey = `${HISTORY_LATEST_PAGE_KEY}:${frozen.viewId}`;
+    // The synthetic latest page is written to IndexedDB asynchronously. A
+    // quick down-swipe can reach it before that write completes; its stable
+    // page key is already sufficient to return to the authoritative live tail.
+    if (cachedLatestRequiresLiveRuntime(browse, null, latestPageKey)) {
+      dispatch({ type: "return_to_latest", sid: frozen.sid });
+      return true;
+    }
     void (async () => {
       const page = await historyPageCacheRef.current.getPage(
         scope, frozen.pageKey);
@@ -3069,17 +5029,12 @@ export default function App() {
       if (currentState.focusedSid !== frozen.sid
           || !current
           || !acceptsCachedNewerPage(current, frozen)) return;
-      if (page?.isLatest && current.latestDirty) {
-        dispatch({
-          type: "history_browse_newer_settled",
-          sid: frozen.sid,
-          scopeKey: frozen.scopeKey,
-          revision: frozen.revision,
-          generation: frozen.generation,
-          viewId: frozen.viewId,
-          windowEpoch: frozen.windowEpoch,
-          pageKey: frozen.pageKey,
-        });
+      if (cachedLatestRequiresLiveRuntime(current, page, latestPageKey)) {
+        // loadNewerHistoryPage is accepted only from a real downward gesture.
+        // The cached latest page became stale while Claude was still writing,
+        // so honor that gesture by returning to the authoritative live tail—the
+        // same destination as the explicit bottom button.
+        dispatch({ type: "return_to_latest", sid: frozen.sid });
         return;
       }
       if (!page) {
@@ -3142,12 +5097,19 @@ export default function App() {
   // to route or trigger this message.
   const sendFirstMessage = (prompt: string, images?: QueryImg[], files?: QueryFile[],
                             collaborationMode?: CollaborationModeName,
-                            permissionMode?: CodexPermissionMode,
+                            permissionMode?: PermissionMode,
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
-                            serviceTier?: CodexServiceTier): boolean => {
-    if (!wsRef.current || !state.newChat) return false;
-    const { cwd, cwdSource, model, effort } = state.newChat;
+                            serviceTier?: CodexServiceTier, dshPermission?: string): boolean => {
+    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
+        || newChatClaudeProfileMissing
+        || restoringSurfaceScope === activeScopeKey) {
+      return false;
+    }
+    const {
+      cwd, cwdSource, model, effort,
+      autoCompactMode, autoCompactThresholdTokens,
+    } = state.newChat;
     // Null is meaningful: let the local CLI/app-server use its configured defaults.
     // Only explicit user choices cross the wire; otherwise a stale fallback catalog
     // could silently override the machine's real model or reasoning configuration.
@@ -3158,7 +5120,7 @@ export default function App() {
       engine === "codex" ? collaborationMode : undefined,
       engine === "codex"
         ? (space === "work" ? "never" : permissionMode)
-        : undefined,
+        : space === "code" ? permissionMode : undefined,
       engine === "codex" && space === "code"
         ? permissionProfile
         : undefined,
@@ -3166,7 +5128,15 @@ export default function App() {
         ? webSearch
         : undefined,
       engine === "codex" ? serviceTier : undefined,
-      space, space === "work" ? workProjectId : undefined);
+      space, space === "work" ? activeWorkProjectId : undefined,
+      engine === "codex" ? newChatCodexProfileId : undefined,
+      engine === "claude" ? {
+        mode: autoCompactMode,
+        thresholdTokens: autoCompactThresholdTokens,
+      } : undefined,
+      engine === "claude" ? newChatClaudeProfileId : undefined,
+      engine === "dsh" ? newChatDshPreset ?? undefined : undefined,
+      engine === "dsh" ? dshPermission : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -3182,17 +5152,17 @@ export default function App() {
     }
     return queued;
   };
-  const pickNewChatModel = (model: string | null) => {
+  const pickNewChatModel = (model: string | null, modelSource?: "command") => {
     const current = state.newChat;
     if (!current) return;
     const compatibleEffort = compatibleNewChatEffort(
       engine,
       model,
       current.effort,
-      state.catalog,
+      newChatCatalog,
       newChatDefaults.model,
     );
-    dispatch({ type: "set_new_chat_model", model });
+    dispatch({ type: "set_new_chat_model", model, modelSource });
     if (compatibleEffort !== current.effort) {
       dispatch({
         type: "set_new_chat_effort",
@@ -3204,26 +5174,58 @@ export default function App() {
     if (!state.newChat) return;
     dispatch({ type: "set_new_chat_effort", effort });
   };
+  const pickNewChatAutoCompact = (selection: AutoCompactSelection) => {
+    if (!state.newChat || engine !== "claude") return;
+    dispatch({
+      type: "set_new_chat_auto_compact",
+      mode: selection.mode,
+      thresholdTokens: selection.thresholdTokens,
+    });
+  };
+  const pickNewChatCodexProfile = (profileId: string) => {
+    if (engine !== "codex") return;
+    setNewChatPermissionCatalog(null);
+    dispatch({
+      type: "set_new_chat_codex_profile",
+      scopeKey: activeScopeKey,
+      profileId,
+    });
+  };
+  const pickNewChatClaudeProfile = (profileId: string) => {
+    if (engine !== "claude") return;
+    dispatch({
+      type: "set_new_chat_claude_profile",
+      scopeKey: activeScopeKey,
+      profileId,
+    });
+  };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
     wsRef.current?.sendSetModel(model);
   };
   const setEffort = (effort: string) => {
-    wsRef.current?.sendSetEffort(effort);
+    if (focusedEngine === "dsh" && focusedSid) wsRef.current?.sendDshControl(focusedSid, "effort", effort);
+    else wsRef.current?.sendSetEffort(effort);
   };
+  const setAutoCompact = (selection: AutoCompactSelection): boolean => (
+    wsRef.current?.sendSetAutoCompact(
+      selection.mode, selection.thresholdTokens) ?? false
+  );
   // Codex Fast mode is persisted by app-server per thread. The runtime's Fast
   // event owns the chip state; here we only forward the requested transition.
   const setServiceTier = (tier: string) => {
     wsRef.current?.sendSetServiceTier(tier);
   };
-  const setPerm = (perm: string) => {
-    wsRef.current?.sendSetPerm(perm);
-  };
   const getPermissionProfiles = () => {
     wsRef.current?.sendGetPermissionProfiles();
   };
   const setPermissionProfile = (profile: string) => {
-    wsRef.current?.sendSetPermissionProfile(profile);
+    const commandId = wsRef.current?.sendSetPermissionProfile(profile);
+    if (commandId && focusedSid) {
+      setPermissionProfileRequests((current) => ({
+        ...current, [JSON.stringify([machineId, space, focusedEngine, focusedSid])]: commandId,
+      }));
+    }
   };
   const setWebSearch = (mode: CodexWebSearchMode) => {
     wsRef.current?.sendSetWebSearch(mode);
@@ -3231,24 +5233,58 @@ export default function App() {
   const setCollaborationMode = (mode: CollaborationModeName) => {
     wsRef.current?.sendSetCollaborationMode(mode);
   };
-  const setGoalUi = (patch: Partial<{ revealed: boolean; open: boolean }>) => {
-    if (!focusedSid) return;
-    setGoalUiBySid((current) => {
-      const previous = current[focusedSid] ?? { revealed: false, open: false };
-      return { ...current, [focusedSid]: { ...previous, ...patch } };
+  const setGoalUi = (patch: Partial<{
+    revealed: boolean;
+    open: boolean;
+    loading: boolean;
+  }>) => {
+    if (!focusedGoalScopeKey) return;
+    setGoalUiByScope((current) => {
+      const previous = current[focusedGoalScopeKey] ?? {
+        revealed: false,
+        open: false,
+        loading: false,
+      };
+      return {
+        ...current,
+        [focusedGoalScopeKey]: { ...previous, ...patch },
+      };
     });
   };
+  const rememberFocusedGoalUi = () => {
+    if (!focusedGoalScopeKey) return;
+    persistGoalUiPreferences(rememberGoalUi(
+      goalUiPreferencesRef.current,
+      focusedGoalScopeKey,
+    ));
+  };
+  const requestFocusedGoal = () => {
+    if (!focusedSid || !focusedGoalScopeKey || archivedBrowse) return null;
+    const requestId = wsRef.current?.sendGetGoalTo(focusedSid) ?? null;
+    if (requestId) {
+      goalRequestScopeByIdRef.current.set(requestId, {
+        scopeKey: focusedGoalScopeKey,
+        sid: focusedSid,
+      });
+    }
+    return requestId;
+  };
   const runGoal = (args: string) => {
-    if (!focusedSid) return;
-    const command = parseGoalCommand(args, focusedEngine);
-    if (command.kind === "clear") {
-      wsRef.current?.sendClearGoal();
-      setGoalUi({ revealed: false, open: false });
+    if (!focusedSid || !focusedGoalScopeKey || archivedBrowse) return;
+    if (focusedEngine === "dsh") {
+      setGoalUi({ revealed: true, open: true, loading: false });
       return;
     }
-    setGoalUi({ revealed: true, open: true });
+    const command = parseGoalCommand(args, focusedEngine);
+    rememberFocusedGoalUi();
+    if (command.kind === "clear") {
+      wsRef.current?.sendClearGoal();
+      setGoalUi({ revealed: false, open: false, loading: false });
+      return;
+    }
+    setGoalUi({ revealed: true, open: true, loading: command.kind === "show" });
     if (command.kind === "show") {
-      wsRef.current?.sendGetGoal();
+      requestFocusedGoal();
     } else if (command.kind === "resume") {
       // Codex resumes the existing condition by changing only its status.
       if (focusedEngine === "codex") {
@@ -3259,24 +5295,30 @@ export default function App() {
     }
   };
   const openStatus = () => {
-    if (!focusedSid) return;
+    if (!focusedSid || archivedBrowse) return;
     setStatusOpenSid(focusedSid);
     refreshStatus();
   };
   const openUsageActivity = () => {
-    if (engine !== "codex") return;
+    if (engine !== "codex" || archivedBrowse) return;
     setUsageActivityOpen(true);
     refreshStatus();
   };
   const requestContext = () => {
-    if (!focusedSid) return;
-    const requestId = wsRef.current?.sendGetContext();
-    if (requestId) {
-      dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
-    }
+    if (!focusedSid || archivedBrowseRef.current === focusedSid) return;
+    const runtime = stateRef.current.runtimes[focusedSid];
+    if (runtime?.contextRequestId
+        || contextRequestLaunchesRef.current.has(focusedSid)) return;
+    // The Wrapper knows whether this Claude handle supports a live local
+    // summary. Let it choose, rather than suppress every running read here.
+    // Closing and reopening is an explicit retry even if a previous busy
+    // response exhausted its automatic finalizer catch-up attempts.
+    contextDeferredRetryAttemptsRef.current.delete(focusedSid);
+    sendContextRequestTo(focusedSid, true);
   };
   const forkFromTurn = (forkPointId: string) => {
     if (!focusedSid
+        || archivedBrowseRef.current === focusedSid
         || pendingSessionForkRef.current || pendingWorktreeForkRef.current) return;
     const requestId = wsRef.current?.sendForkSession(
       focusedSid, forkPointId) ?? null;
@@ -3346,6 +5388,8 @@ export default function App() {
   };
   const getDiff = (file: string) => {
     if (!confirmArtifactDiscard()) return;
+    setSessionArtifacts(null);
+    closeViewer();
     const requestId = wsRef.current?.sendGetDiff(file, theme) ?? null;
     if (!requestId) return;
     setRightView("diff");
@@ -3353,23 +5397,45 @@ export default function App() {
   };
   const openTurnDiff = (files: string[], diff: string) => {
     if (!diff || !confirmArtifactDiscard()) return;
+    closeViewer();
     setRightView("diff");
     dispatch({ type: "set_artifact", artifact: {
       file: files.length === 1 ? files[0] : `本轮改动 · ${files.length} 个文件`,
       sid: focusedSid,
       kind: "gitdiff",
-      sections: parseGitDiff(diff),
+      sections: parseGitDiff(diff).filter((section) => files.includes(section.file)),
     } });
+  };
+  const openArchivedDiff = (turnId: string, revision: string, file: string) => {
+    if (!confirmArtifactDiscard()) return;
+    const requestId = wsRef.current?.sendGetDiff(file, theme, turnId, revision, focusedEngine) ?? null;
+    if (!requestId) return;
+    setSessionArtifacts(null);
+    closeViewer();
+    setRightView("diff");
+    dispatch({ type: "open_artifact_loading", file, sid: focusedSid, requestId });
+  };
+  const loadTurnFilePage: LoadTurnFilePage = (turnId, revision, offset, signal) => {
+    if (!focusedSid) return Promise.reject(new Error("请先选择会话。"));
+    return turnFileRequestsRef.current.request({
+      sid: focusedSid, engine: focusedEngine, turnId, revision, offset,
+    }, () => wsRef.current?.sendGetTurnFileChanges(
+      focusedSid, focusedEngine, turnId, revision, offset) ?? null, signal);
   };
   const previewFileForSid = (
     targetSid: string | null,
     file: string,
     line?: number,
-  ) => {
-    if (!targetSid) return;
-    if (!confirmArtifactDiscard()) return;
+    fromBrowser = false,
+  ): boolean => {
+    if (!targetSid) return false;
+    if (!confirmArtifactDiscard()) return false;
+    if (targetSid === activeBtwSid) setCenteredBtw(false);
+    if (!fromBrowser) { setFileBrowser(null); setSessionArtifacts(null); }
+    closeViewer();
     const requestId = uuid();
-    if (!wsRef.current?.sendGetFilePreview(file, requestId, targetSid)) return;
+    if (!wsRef.current?.sendGetFilePreview(
+      file, requestId, targetSid)) return false;
     setRightView("diff");
     dispatch({
       type: "open_file_loading",
@@ -3379,14 +5445,63 @@ export default function App() {
       kind: isMarkdownPath(file) ? "md" : "file",
       line,
     });
+    return true;
   };
   const previewFile = (file: string, line?: number) =>
     previewFileForSid(focusedSid, file, line);
   const previewBtwFile = (file: string, line?: number) =>
     previewFileForSid(activeBtwSid, file, line);
+
+  const openAgentDetail = (runId: string, title?: string) => {
+    if (focusedEngine === "dsh" && focusedSid && !runId.startsWith("dsh@")) {
+      setDshPanel({sid: focusedSid, scope: activeScopeKey, selection: {kind: runId.startsWith("dsh-job-") ? "jobs" : "subagents"}}); return;
+    }
+    if (!focusedSid || space !== "code"
+        || !rt.historyRevision) return;
+    setSessionArtifacts(null);
+    closeViewer();
+    const agent = rt.backgroundProcesses.find((block) => block.item_id === runId)
+      ?? rt.turns.flatMap((turn) => turn.blocks).find((block) =>
+        block.kind === "process" && block.item_id === runId);
+    setAgentPanel({ sid: focusedSid, revision: rt.historyRevision,
+      runId, title: title || "协作代理", engine: focusedEngine,
+      status: agent?.kind === "process" ? agent.status : undefined });
+  };
+  const previewAgentFile = (file: string, line?: number) => {
+    if (previewFileForSid(focusedSid, file, line)) setAgentPanel(null);
+  };
+
   const previewArtifactFile = (file: string, line?: number) =>
     previewFileForSid(state.artifact?.sid ?? focusedSid, file, line);
   const previewMarkdown = (file: string) => previewFile(file);
+  const openFiles = (path = ".") => {
+    if (!focusedSid || !confirmArtifactDiscard()) return;
+    setSessionArtifacts(null);
+    closeViewer();
+    setAgentPanel(null);
+    dispatch({ type: "clear_artifact" });
+    setFileBrowser({ sid: focusedSid, machineId, engine, space,
+      path, preview: false, id: uuid() });
+  };
+  const openSessionArtifacts = (sid = visibleParentSid) => {
+    if (!sid || !visibleParentSid || !confirmArtifactDiscard()) return;
+    closeViewer();
+    setCenteredBtw(false);
+    setAgentPanel(null);
+    setFileBrowser(null);
+    dispatch({ type: "clear_artifact" });
+    setSessionArtifacts({ parentSid: visibleParentSid, sid, machineId,
+      engine: focusedEngine, space, selected: null, id: uuid() });
+  };
+  const selectSessionArtifact = (entry: SessionArtifactInfo) => {
+    if (!sessionArtifacts || !confirmArtifactDiscard()) return;
+    const requestId = uuid();
+    if (!wsRef.current?.sendGetSessionArtifactPreview(sessionArtifacts.sid,
+      sessionArtifacts.engine, sessionArtifacts.space, entry.id, requestId)) return;
+    setSessionArtifacts({ ...sessionArtifacts, selected: entry });
+    dispatch({ type: "open_file_loading", file: entry.path, sid: sessionArtifacts.sid,
+      requestId, kind: isMarkdownPath(entry.path) ? "md" : "file" });
+  };
   const loadPreviewAsset = (file: string, previewId: string): boolean => {
     const targetSid = state.artifact?.sid ?? focusedSid;
     if (!targetSid) return false;
@@ -3447,15 +5562,11 @@ export default function App() {
     dispatch({ type: "start_file_save", requestId, content });
     return requestId;
   };
-  // Each /btw stays pinned to its parent session. Navigation hides it without
-  // destroying the fork; returning to that parent restores it. Other sessions
-  // can open their own independent side conversations.
-  const openBtw = () => {
-    if (!confirmArtifactDiscard()) return;
-    setRightView("btw");
+  // Each side chat stays pinned to its parent. Panel visibility is a pure view
+  // concern; only closeBtw sends the destructive native-fork teardown.
+  const createBtw = () => {
     const parentSid = visibleParentSid;
-    if (!parentSid || activeBtw
-        || pendingBtwByParentRef.current.has(parentSid)) return;
+    if (!btwPanelKey || !parentSid || pendingBtwByParentRef.current.has(parentSid)) return;
     const requestId = wsRef.current?.sendOpenBtw(parentSid) ?? null;
     if (!requestId) {
       setBtwOpeningFor(parentSid, false);
@@ -3470,19 +5581,73 @@ export default function App() {
       requestParents.delete(oldest);
     }
     setBtwOpeningFor(parentSid, true);
+    setBtwFocusScope(panelScope("btw"));
   };
-  const sendBtw = (prompt: string): boolean => {
+  const showCenteredBtw = () => {
+    if (!btwPanelKey) return;
+    btwChatViewRef.current?.prepareLayoutChange();
+    setCenteredBtw(true);
+    setBtwFocusScope(btwScope);
+    if (!activeBtwGroup && !btwOpening) createBtw();
+  };
+  const dismissCenteredBtw = () => {
+    btwChatViewRef.current?.prepareLayoutChange();
+    setCenteredBtw(false);
+  };
+  const toggleCenteredBtw = () => {
+    if (btwExpanded) dismissCenteredBtw();
+    else showCenteredBtw();
+  };
+  const openBtw = (expanded = false) => {
+    if (expanded) { showCenteredBtw(); return; }
+    if (!btwPanelKey || !confirmArtifactDiscard()) return;
+    setCenteredBtw(false);
+    setSessionArtifacts(null);
+    setDshPanel(null);
+    closeViewer();
+    setAgentPanel(null);
+    setFileBrowser(null);
+    setRightView("btw");
+    setBtwFocusScope(btwScope);
+    setBtwPanelScopes(current => setBtwPanelScope(current, btwPanelKey, true));
+    if (!activeBtwGroup && !btwOpening) createBtw();
+  };
+  const collapseBtw = () => {
+    if (btwExpanded) { dismissCenteredBtw(); return; }
+    if (btwPanelKey) setBtwPanelScopes(
+      current => setBtwPanelScope(current, btwPanelKey, false));
+  };
+  const dockBtw = () => {
+    if (!confirmArtifactDiscard()) return;
+    openBtw();
+    dismissCenteredBtw();
+  };
+  const dockPanel = () => setExpandedPanel(null);
+  const togglePanelExpanded = () => {
+    if (panelExpanded) dockPanel();
+    else if (rightPanelKey) setExpandedPanel({ scope: rightPanelKey });
+  };
+  const selectBtw = (sid: string) => {
+    const parentSid = visibleParentSid;
+    if (!parentSid) return;
+    dispatch({ type: "select_btw", parentSid, btwSid: sid });
+    setBtwFocusScope(panelScope("btw"));
+  };
+  const sendBtw = (
+    prompt: string, images?: QueryImg[], files?: QueryFile[], steer = false,
+  ): boolean => {
     const sid = activeBtwSid;
     const ws = wsRef.current;
-    if (!sid || !ws) return false;
+    if (!sid || !ws || runtimeIsReadOnly(sid)) return false;
     const runtime = stateRef.current.runtimes[sid];
     const awaitingAcceptance = !!(
       ws.pendingQueryFor(sid) || runtime?.acceptancePending
     );
-    if (awaitingAcceptance || runtime?.queue.length || runtime?.pendingSend) {
+    if (steer && awaitingAcceptance) return false;
+    const query = { prompt, images, files };
+    if (!steer && (awaitingAcceptance || runtime?.queue.length || runtime?.pendingSend)) {
       const delivery = awaitingAcceptance && activeBtwSendMode !== "queue"
         ? "replace" : "queue";
-      const query = { prompt };
       const currentState = stateRef.current;
       const unconfirmed = collectUnconfirmedQueries(
         currentState.runtimes,
@@ -3497,33 +5662,35 @@ export default function App() {
       return sendDeferredQuery(sid, query, delivery);
     }
     const msg_id = uuid();
-    if (!ws.sendQueryTo(sid, prompt, msg_id)) return false;
+    const accepted = steer
+      ? ws.sendSteerTo(sid, prompt, msg_id, images, files)
+      : ws.sendQueryTo(sid, prompt, msg_id, images, files);
+    if (!accepted) return false;
     dispatch({
-      type: "query_sent", sid, prompt, msg_id, ts: Date.now(),
+      type: steer ? "steer_sent" : "query_sent", sid, ...query, msg_id, ts: Date.now(),
     });
     return true;
   };
-  const steerBtw = (prompt: string): boolean => {
-    const sid = activeBtwSid;
-    const ws = wsRef.current;
-    if (!sid || !ws || activeBtw?.engine !== "codex") return false;
-    const runtime = stateRef.current.runtimes[sid];
-    if (ws.pendingQueryFor(sid) || runtime?.acceptancePending) return false;
-    const msg_id = uuid();
-    if (!ws.sendSteerTo(sid, prompt, msg_id)) return false;
-    dispatch({
-      type: "steer_sent", sid, prompt, msg_id, ts: Date.now(),
-    });
-    return true;
-  };
+  const steerBtw = (prompt: string, images?: QueryImg[], files?: QueryFile[]): boolean =>
+    sendBtw(prompt, images, files, true);
   const interruptBtw = (sid: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendInterruptTo(sid);
   };
   const setBtwModel = (sid: string, model: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendSetModelTo(sid, model);
   };
   const setBtwEffort = (sid: string, effort: string) => {
+    if (runtimeIsReadOnly(sid)) return;
     wsRef.current?.sendSetEffortTo(sid, effort);
+  };
+  const setBtwAutoCompact = (
+    sid: string, selection: AutoCompactSelection,
+  ): boolean => {
+    if (runtimeIsReadOnly(sid)) return false;
+    return wsRef.current?.sendSetAutoCompactTo(
+      sid, selection.mode, selection.thresholdTokens) ?? false;
   };
   const setBtwSendMode = (
     sid: string, mode: SendMode,
@@ -3532,42 +5699,49 @@ export default function App() {
       current[sid] === mode ? current : { ...current, [sid]: mode }
     ));
   };
-  const closeBtw = () => {
+  const closeBtw = (btwSid = activeBtwSid) => {
     const parentSid = visibleParentSid;
-    if (!parentSid) return;
-    const pendingRequestId = pendingBtwByParentRef.current.get(parentSid);
-    pendingBtwByParentRef.current.delete(parentSid);
-    activeBtwByParentRef.current.delete(parentSid);
-    setBtwOpeningFor(parentSid, false);
-    if (pendingRequestId) {
-      // Keep the request -> parent tombstone. A late success is classified as
-      // stale and its newly-created fork is closed immediately.
-      btwRequestParentsRef.current.set(pendingRequestId, parentSid);
-    }
-    if (activeBtw) {
-      btwDraftsRef.current.delete(activeBtwDraftKey);
-      setBtwSendModeBySid((current) => {
-        if (!(activeBtw.sid in current)) return current;
-        const next = { ...current };
-        delete next[activeBtw.sid];
-        return next;
-      });
-      setCompletionReceipts((receipts) => acknowledgeCompletion(
-        receipts, parentSid, { btwSid: activeBtw.sid }));
-      wsRef.current?.sendCloseBtw(activeBtw.sid);
-      dispatch({ type: "clear_btw", parentSid });
-    }
+    if (!parentSid || !btwSid) return;
+    const target = stateRef.current.runtimes[btwSid];
+    const hasActiveWork = !!target && (
+      target.state !== "idle" || target.mirroredRunning
+      || !!target.acceptancePending || !!target.pendingSend
+      || target.queue.length > 0
+    );
+    if (activeBtwGroup?.chats.find(chat => chat.sid === btwSid)?.engine !== "dsh" && hasActiveWork && !window.confirm(
+      "这个侧边对话仍在工作或有排队消息，确定关闭并丢弃吗？")) return;
+    if (!wsRef.current?.sendCloseBtw(btwSid)) return;
+    const tracked = activeBtwByParentRef.current.get(parentSid);
+    if (tracked?.sid === btwSid) activeBtwByParentRef.current.delete(parentSid);
+    btwDraftsRef.current.delete(composerDraftKey(
+      machineId, space,
+      (activeBtwGroup?.chats.find((chat) => chat.sid === btwSid)?.engine ?? focusedEngine),
+      `btw:${btwSid}`,
+    ));
+    setBtwSendModeBySid((current) => {
+      if (!(btwSid in current)) return current;
+      const next = { ...current };
+      delete next[btwSid];
+      return next;
+    });
+    setCompletionReceipts((receipts) => acknowledgeCompletion(
+      receipts, parentSid, { btwSid }));
+    dispatch({ type: "clear_btw", parentSid, btwSid });
   };
   // Header tab switch between the two right-slot views (opening the target lazily).
-  const switchRight = (v: "diff" | "btw") => {
+  const switchRight = (v: RightPanelView) => {
+    if (fileBrowser && !confirmArtifactDiscard()) return;
+    setFileBrowser(null);
     if (v === "diff") {
       setRightView("diff");
       if (!state.artifact) getDiff("");
-    } else openBtw();
+    } else {
+      openBtw();
+    }
   };
   shortcutRef.current = {
-    artifact: state.artifact, btwSid: activeBtwSid, rightView,
-    getDiff, openBtw, closeBtw,
+    artifact: state.artifact, btwSid: activeBtwSid, btwAvailable: !!btwPanelKey, rightView,
+    getDiff, openBtw, collapseBtw, toggleCenteredBtw,
   };
   const logout = async () => {
     try {
@@ -3575,6 +5749,10 @@ export default function App() {
         method: "POST", credentials: "same-origin", cache: "no-store",
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      // Relay revocation is authoritative; a provider outage must not block
+      // logout. The native shell retains a failed invalidation for next login.
+      if (hasHarmonyPush()) void disableRemotePush();
+      try { localStorage.removeItem(MANUAL_UNREAD_STORAGE); } catch { /* Private browsing. */ }
       await import("./cache").then((module) => module.clearCache());
       await historyPageCacheRef.current.clear();
       wsRef.current?.stop();
@@ -3584,13 +5762,13 @@ export default function App() {
       pendingSessionForkRef.current = null;
       pendingWorktreeForkRef.current = null;
       pendingSessionMigrationRef.current = null;
+      clearForkFocusLease(false);
       setMigrateSession(null);
       setMigrateCreating(false);
       setMigrateError(null);
       sessionActivityPendingRef.current.clear();
       activeBtwByParentRef.current.clear();
       btwRequestParentsRef.current.clear();
-      discardedBtwSidsRef.current.clear();
       historyInvalidationsRef.current.clear();
       historyInvalidationGenerationsRef.current.clear();
       historyCacheEpochRef.current.clear();
@@ -3599,6 +5777,8 @@ export default function App() {
       historyPageScopesRef.current.clear();
       composerDraftsRef.current.clear();
       btwDraftsRef.current.clear();
+      questionDraftsRef.current.clear();
+      setCenteredBtwScopes([]);
       setBtwSendModeBySid({});
       setCreateError(null);
       setForkingPointId(null);
@@ -3608,30 +5788,50 @@ export default function App() {
       setBtwOpeningByParentSid({});
       setCompletionReceipts({});
       dispatch({ type: "reset" });
+      setRestoringSurfaceScope(null);
       setAuthed(false);
     } catch {
       dispatch({ type: "command_error", detail: "退出失败：服务暂不可用，请稍后重试" });
     }
   };
   const updateNotificationMode = async (mode: NotificationMode): Promise<boolean> => {
-    if (mode !== "off") {
-      if (typeof Notification === "undefined") {
-        dispatch({ type: "command_error", detail: "当前浏览器不支持系统通知。" });
-        return false;
+    changingNotificationModeRef.current = true;
+    const scopeChanged = () => notificationScopeRef.current.machineId !== machineId
+      || notificationScopeRef.current.authed !== authed;
+    try {
+      if (hasHarmonyPush()) {
+        if (mode !== "off" && !await requestHarmonyPermission()) return false;
+        if (scopeChanged()) return false;
+        const target = mode === "off" ? null : { machineId, mode };
+        const result = await pushCoordinatorRef.current?.setTarget(target, true);
+        if (scopeChanged()) return false;
+        if (mode === "off" ? !!harmonyPushSnapshot().error
+          : result?.bound?.mode !== mode || result?.bound?.machineId !== machineId
+            || !!harmonyPushSnapshot().error) return false;
+        if (mode !== "off") confirmHarmonyPermission();
+      } else if (mode !== "off") {
+        if (typeof Notification === "undefined") {
+          dispatch({ type: "command_error", detail: "当前浏览器不支持系统通知。" });
+          return false;
+        }
+        const permission = Notification.permission === "granted"
+          ? "granted" : await Notification.requestPermission();
+        if (permission !== "granted") {
+          dispatch({ type: "command_error", detail: "通知权限未开启，设置没有更改。" });
+          return false;
+        }
       }
-      const permission = Notification.permission === "granted"
-        ? "granted" : await Notification.requestPermission();
-      if (permission !== "granted") {
-        dispatch({ type: "command_error", detail: "通知权限未开启，设置没有更改。" });
-        return false;
-      }
+      writeNotificationMode(localStorage, mode);
+      setNotificationMode(mode);
+      return true;
+    } finally {
+      changingNotificationModeRef.current = false;
+      if (scopeChanged()) recheckNotificationBinding();
     }
-    writeNotificationMode(localStorage, mode);
-    setNotificationMode(mode);
-    return true;
   };
   const activeDevice = remoteDevices.find(
     (device) => device.machine_id === machineId);
+  const versionNotice = deviceVersionNotice(activeDevice?.compatibility);
   const activeDeviceOnline = state.connState === "connected" && state.wrapperOnline;
   // A native client can advance the transcript without a wrapper-owned turn.
   // Present that mirrored activity as running in every status surface while
@@ -3642,12 +5842,48 @@ export default function App() {
   const effectiveState = mergeSessionActivityState(
     focusedSessionState, rt.state, rt.mirroredRunning,
   ) ?? rt.state;
+  const dshConnectionError = focusedEngine === "dsh" && !state.newChat
+    && rt.dsh?.connected === false ? rt.dsh.error ?? null : null;
+  const focusedDshPresetId = space === "code" && focusedEngine === "dsh" && !state.newChat
+    ? rt.dsh?.agent_preset : null;
+  const focusedDshPresetName = focusedDshPresetId
+    ? state.dshPresets?.find(preset => preset.id === focusedDshPresetId)?.name ?? focusedDshPresetId
+    : null;
+  // Fail closed when a migrated cache contains colliding display aliases. A
+  // session-level running bit alone must never animate the wrong historical
+  // row, another account, or a read-only browse projection.
+  const runtimeActiveOwnerId = displayActiveTurnOwnerId(
+    rt.liveOwner?.turnId, rt.acceptancePending);
+  const displayActiveOwnerId = historyView.recovering
+    ? historyView.activeOwnerId : runtimeActiveOwnerId;
+  const runtimeHasActiveTurn = rt.state !== "idle" || rt.mirroredRunning
+    || !!rt.acceptancePending;
+  const activeTurnCandidates = activeTurnCandidateIds(
+    historyView.turns,
+    displayActiveOwnerId,
+    !historyView.browsing && runtimeHasActiveTurn
+      && (!historyView.recovering || !!historyView.activeOwnerId),
+  );
+  const activeTurnId = activeTurnCandidates.length === 1
+    ? activeTurnCandidates[0] : null;
+  const ambiguousActiveTurnIds = activeTurnCandidates.length > 1
+    ? activeTurnCandidates : [];
 
   return (
-    <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + (dshOpen ? " dsh-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
-      <SessionsSidebar
+    <ViewerPagesProvider scope={visibleParentSid && authed
+      ? { machineId, sid: visibleParentSid, space, engine } : null} onOpen={openViewerPage}>
+    <RemoteViewerContext.Provider value={visibleParentSid ? openViewerLink : null}>
+    <SidebarShell controller={sidebar} className={visibleRightPanel !== null && !panelExpanded && !(visibleRightPanel === "btw" && btwExpanded) ? "panel-open" : ""}>
+      <SidebarState controller={sidebar}>{sidebarOpen => <Suspense fallback={null}><SessionsSidebar
         open={sidebarOpen}
+        onOpenChange={setSidebarOpen}
+        engine={engine}
         space={space}
+        profileScopeKey={activeScopeKey}
+        claudeProfiles={state.claudeProfiles}
+        defaultClaudeProfileId={state.defaultClaudeProfileId}
+        codexProfiles={state.codexProfiles}
+        defaultCodexProfileId={state.defaultCodexProfileId}
         onSpaceChange={switchSpace}
         sessions={state.sessions}
         liveStates={Object.fromEntries(state.sessions.map((session) => {
@@ -3660,14 +5896,24 @@ export default function App() {
         }))}
         completionBadges={completionBadges}
         activeSessionId={focusedSid}
+        machineId={machineId}
+        readDsh={engine === "dsh" ? dshApi.read : undefined}
+        onDshSearch={(sid, query) => {
+          if (!focusedSid && !state.sessions.length) return;
+          setDshPanel({ sid: focusedSid ?? state.sessions[0].session_id, scope: activeScopeKey,
+            selection: { kind: "conversation", target: sid, query } });
+          if (isMobile()) setSidebarOpen(false);
+        }}
         onSelect={(id) => {
-          if (!confirmArtifactDiscard()) return;
+          if (!confirmArtifactDiscard()) return false;
           cancelPendingNotificationTarget();
           const selected = state.sessions.find((s) => s.session_id === id);
-          if (selected) focusListedSession(selected);
+          if (!selected) return false;
+          focusListedSession(selected);
+          return true;
         }}
-        onNew={() => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit" }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={(profileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", claudeProfileId: engine === "claude" ? profileId ?? newChatClaudeProfileId : null, codexProfileId: engine === "codex" ? profileId ?? newChatCodexProfileId : null }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); setRestoringSurfaceScope(null); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", claudeProfileId: newChatClaudeProfileId, codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -3693,18 +5939,26 @@ export default function App() {
           const target = deleted
             ? sessionCommandTarget(deleted, engine, space)
             : { engine, space };
+          if (forkFocusLeaseRef.current?.childSessionId === id) {
+            clearForkFocusLease(false);
+          }
           composerDraftsRef.current.delete(composerDraftKey(
             machineId, target.space, target.engine, id,
           ));
           invalidateHistoryPageScopes(id);
           if (focusedSid === id) clearHistoryDetailRequests();
-          if (focusedSid === id) dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default" });
-          wsRef.current?.sendDeleteSession(id, engine, space);
+          if (focusedSid === id) dispatch({
+            type: "enter_new_chat", cwd: "~", cwdSource: "default",
+            claudeProfileId: newChatClaudeProfileId,
+            codexProfileId: newChatCodexProfileId,
+          });
+          wsRef.current?.sendDeleteSession(
+            id, target.engine, target.space);
         }}
         onForkWorktree={openForkWorktree}
         onMigrate={openSessionMigration}
-      />
-      <DirPicker
+      /></Suspense>}</SidebarState>
+      {dirPickerOpen && <Suspense fallback={null}><DirPicker
         open={dirPickerOpen}
         path={state.dirPicker?.path ?? null}
         parent={state.dirPicker?.parent ?? null}
@@ -3713,8 +5967,8 @@ export default function App() {
         onBrowse={(p) => wsRef.current?.sendListDir(p) ?? null}
         onConfirm={(cwd) => { if (state.newChat) dispatch({ type: "set_new_chat_cwd", cwd, cwdSource: "explicit" }); setDirPickerOpen(false); }}
         onClose={() => setDirPickerOpen(false)}
-      />
-      <DirPicker
+      /></Suspense>}
+      {migrateSession !== null && <Suspense fallback={null}><DirPicker
         key={`migration-${migrateSession?.session_id ?? "closed"}-${migrateSession?.cwd ?? "unset"}`}
         open={migrateSession !== null}
         path={state.dirPicker?.path ?? null}
@@ -3730,22 +5984,48 @@ export default function App() {
         onBrowse={(p) => wsRef.current?.sendListDir(p) ?? null}
         onConfirm={submitSessionMigration}
         onClose={closeSessionMigration}
-      />
+      /></Suspense>}
       <section className={`pane ${space}-pane`}>
-        <header className={`c-head ${space}-head`}>
+        <header className={`c-head ${space}-head${focusedDshPresetName ? " has-dsh-mode" : ""}`}>
           <div className="titlewrap">
             <div className="ttl">
-              <button className="surface-head-title" onClick={() => { if (!dshOpen) setSidebarOpen(true); }}
-                disabled={dshOpen}>
-                <span className="surface-head-mark"><Icon name={dshOpen ? "term" : space === "work" ? "work" : "code"} size={18} /></span>
-                {dshOpen ? <span>DeepSeek</span> : <span>{space === "work" ? "Work" : "Code"}</span>}
-              </button>
+              <SidebarState controller={sidebar}>{sidebarOpen => <SidebarToggle className="surface-head-title" open={sidebarOpen} onOpenChange={setSidebarOpen}>
+                <span className="surface-head-mark"><Icon name={space === "work" ? "work" : "code"} size={18} /></span>
+                <span>{space === "work" ? "Work" : "Code"}</span>
+              </SidebarToggle>}</SidebarState>
+              {focusedDshPresetName && <span className="dsh-session-mode"
+                title={focusedDshPresetName} aria-label={`当前会话模式：${focusedDshPresetName}`}>
+                {focusedDshPresetName}
+              </span>}
+              {focusedWorkProfile && (
+                <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
+                  title={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}
+                  aria-label={`${focusedEngine === "codex" ? "Codex" : "Claude"} 账号：${focusedWorkProfile.fullLabel}`}>
+                  <i className="profile-tone" />
+                  {focusedWorkProfile.name}
+                </span>
+              )}
             </div>
-            <div className="sub">{dshOpen ? "Harness 桌面版" : <>{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</>}</div>
+            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${shortSessionId(focusedEngine, focusedNativeSessionId)}` : "connected"}</div>
           </div>
-          {!dshOpen && <span className={`hstat ${effectiveState}`}><span className="sd" />
-            <span className="hstat-label">{effectiveState}</span></span>}
-          {!dshOpen && space === "code" && focusedSid && !state.newChat && (
+          <button className={`rooms-entry${roomsOpen ? " is-on" : ""}`}
+            onClick={() => {
+              const next = !roomsOpen;
+              setRoomsOpen(next);
+              if (next) wsRef.current?.sendListRooms();
+              // A room member picks its own model, so the catalog has to be loaded
+              // for the engines a room can host rather than only for the open chat.
+              if (next) {
+                wsRef.current?.sendGetModels("claude");
+                wsRef.current?.sendGetModels("codex");
+              }
+            }}
+            aria-label="协作房间" title="协作房间">
+            协作
+          </button>          <span className={`hstat ${dshConnectionError ? "reconnecting" : effectiveState}`}><span className="sd" />
+            <span className="hstat-label">{dshConnectionError ? "同步中" : effectiveState}</span></span>
+          {space === "code" && focusedSid && !state.newChat
+              && !archivedBrowse && focusedEngine !== "dsh" && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -3760,66 +6040,198 @@ export default function App() {
             <Icon name="devices" size={18} />
             <span>{activeDevice?.label ?? machineId}</span><i />
           </button>
-          <EngineSwitcher selected={dshOpen ? "dsh" : engine} onSelect={selectEngineSurface} />
-          <HeaderMenu
+          {import.meta.env.VITE_DSH_DESKTOP_PANEL === "1" && engine === "dsh" && <button className="engine-toggle"
+            aria-pressed={desktopDshOpen} onClick={() => {
+              setDesktopDshMounted(true); setDesktopDshOpen(open => !open);
+            }}>桌面面板</button>}
+          <EngineSelector engine={engine} onChange={toggleEngine} />
+          <Suspense fallback={<span className="iconbtn" aria-hidden="true"><Icon name="dots" /></span>}><HeaderMenu
             engine={engine}
-            theme={theme}
+            appearance={appearance}
+            boldText={boldText} onBoldText={setBoldText}
             notificationMode={notificationMode}
             notificationBinding={pushBinding.state}
-            notificationAvailable={typeof Notification !== "undefined"}
+            notificationAvailable={harmonyPush.available || typeof Notification !== "undefined"}
+            notificationNative={harmonyPush.available}
+            notificationError={harmonyPush.error}
             onNotificationMode={updateNotificationMode}
+            onOpenDshTools={engine === "dsh" && focusedSid ? () => setDshPanel({ sid: focusedSid, scope: activeScopeKey, selection: { kind: "subagents" } }) : undefined}
             onOpenUsageActivity={openUsageActivity}
-            onToggleTheme={toggleTheme}
+            onOpenBtw={btwPanelKey && !archivedBrowse ? () => openBtw() : undefined}
+            onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
+            onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
+            onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
             onLogout={() => void logout()}
-          />
+          /></Suspense>
         </header>
+        {desktopDshMounted && <Suspense fallback={null}>
+          <DesktopDshPanel visible={desktopDshOpen && engine === "dsh"} />
+        </Suspense>}
+        {roomsOpen && (
+          <div className="rooms-overlay">
+            <button type="button" className="rooms-overlay-close"
+              onClick={() => setRoomsOpen(false)} aria-label="关闭协作">
+              ✕
+            </button>
+            <Suspense fallback={null}>
+            <RoomsView
+              rooms={rooms}
+              activeRoomId={activeRoomId}
+              defaultCwd={state.newChat?.cwd || ""}
+              onSelectRoom={(roomId) => {
+                setActiveRoomId(roomId);
+                wsRef.current?.sendGetRoom(roomId);
+              }}
+              onCreateRoom={(name, cwd, members) => wsRef.current?.sendCreateRoom(name, cwd, members)}
+              onPostMessage={(roomId, text) => wsRef.current?.sendPostRoomMessage(roomId, text)}
+              onSteer={(roomId, memberId, text) => wsRef.current?.sendSteerRoomMember(roomId, memberId, text)}
+              onCancel={(roomId, memberId) => wsRef.current?.sendCancelRoomMember(roomId, memberId)}
+              onRenameRoom={(roomId, name) => wsRef.current?.sendRenameRoom(roomId, name)}
+              onDeleteRoom={(roomId) => wsRef.current?.sendDeleteRoom(roomId)}
+              onUpdateMembers={(roomId, members) => wsRef.current?.sendUpdateRoomMembers(roomId, members)}
+              onChangeCwd={(roomId, cwd) => wsRef.current?.sendUpdateRoomCwd(roomId, cwd)}
+              dshSessions={roomDshSessions}
+              catalog={state.catalog}
+              onApprovePlan={(roomId, member) => wsRef.current?.sendApproveRoomPlan(roomId, member)}
+              onDiscardPlan={(roomId) => wsRef.current?.sendDiscardRoomPlan(roomId)}
+              onSetFlow={(roomId, on) => wsRef.current?.sendSetRoomFlow(roomId, on)}
+              onOpenSession={(member) => {
+                if (!member.session_id) return;
+                setRoomsOpen(false);
+                setSpace("code");
+                wsRef.current?.sendSwitchSession(
+                  member.session_id,
+                  member.engine as "claude" | "codex" | "dsh",
+                  "code",
+                );
+              }}
+              onRefresh={() => wsRef.current?.sendListRooms()}
+            />
+            </Suspense>
+          </div>
+        )}
 
-        {dshMounted && <DshPanel visible={dshOpen} />}
-        <div className="cc-engine-content" hidden={dshOpen}>
+        {versionNotice && <div className="notice-bar attention version-notice" role="status">
+          <span className="notice-icon" aria-hidden="true"><Icon name="info" size={16} /></span>
+          <span className="notice-copy">{versionNotice}</span>
+        </div>}
         <ReconnectBanner banner={state.banner}
           replaying={rt.replaying || historyView.recovering}
           truncated={rt.truncated}
           busy={state.connState !== "connected" || !state.wrapperOnline
             || rt.replaying || historyView.recovering}
           onDismiss={dismissBanner} />
+        {focusedEngine === "dsh" && <Suspense fallback={null}><DshConnectionNotice
+          key={`${activeScopeKey}:${focusedSid}`} error={dshConnectionError} /></Suspense>}
         <NoticeStack notices={rt.notices}
           onDismiss={(noticeId) => {
             if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
           }} />
 
-        {state.newChat ? (
-          <NewChatView cwd={state.newChat.cwd}
-            controlScopeKey={sessionScopeKey(machineId, engine, space)}
+        {restoringSurfaceScope === activeScopeKey ? (
+          <div className="empty" role="status" aria-live="polite">
+            <span className="spinner" aria-hidden="true" />
+            <span className="loading-tx">正在恢复会话</span>
+          </div>
+        ) : state.newChat ? (
+          <Suspense fallback={null}><NewChatView cwd={state.newChat.cwd}
+            editPrompt={editPrompt} onEditConsumed={() => setEditPrompt(null)}
+            dshPresets={state.dshPresets} dshPermissions={state.dshPermissions}
+            dshError={state.dshError}
+            dshPreset={newChatDshPreset}
+            onPickDshPreset={value => setDshPresetSelection({ scope: activeScopeKey, value })}
+            controlScopeKey={`${activeScopeKey}\u0000${newChatProfileId ?? "__default__"}`}
             space={space}
             createError={createError}
             autoFocus={newChatAutoFocus}
             engine={engine}
-            catalog={state.catalog}
+            catalog={newChatCatalog}
+            skills={space === "code" && skillCatalogFresh(skillCatalogs[newChatSkillCatalogKey])
+              ? skillCatalogs[newChatSkillCatalogKey]?.items : undefined}
+            dshCommands={skillCatalogs[newChatSkillCatalogKey]?.dshCommands}
+            skillsOnline={state.connState === "connected" && state.wrapperOnline}
+            skillsError={!!skillCatalogErrors[newChatSkillCatalogKey]}
+            onOpenExtensions={openExtensions}
+            onRequestSkills={() => {
+              if (!state.newChat || space !== "code" || state.connState !== "connected"
+                  || !state.wrapperOnline) return;
+              const requested = requestSkillCatalog({
+                key: newChatSkillCatalogKey, dshPreset: newChatDshPreset,
+                engine, space, cwd: state.newChat.cwd, skillsOnly: true,
+                claudeProfileId: newChatClaudeProfileId,
+                codexProfileId: newChatCodexProfileId,
+              }, true);
+              if (requested || skillCatalogRequestsRef.current?.hasPendingRead(newChatSkillCatalogKey, true)) {
+                clearSkillCatalogError(newChatSkillCatalogKey);
+              } else {
+                setSkillCatalogErrors(current => ({ ...current, [newChatSkillCatalogKey]: true }));
+              }
+            }}
+            onRequestModels={() => wsRef.current?.sendGetModels(
+              engine, engine === "claude" && space === "code" ? state.newChat?.cwd : undefined,
+              newChatCodexProfileId, newChatClaudeProfileId)}
             model={state.newChat.model}
             effort={state.newChat.effort}
+            autoCompact={{
+              mode: state.newChat.autoCompactMode,
+              thresholdTokens: state.newChat.autoCompactThresholdTokens,
+            }}
             defaultModel={newChatDefaults.model}
             defaultEffort={newChatDefaults.effort}
-            workDashboard={workDashboards[engine] ?? null}
-            selectedProjectId={workProjectId}
+            claudeProfiles={state.claudeProfiles}
+            defaultClaudeProfileId={state.defaultClaudeProfileId}
+            claudeProfileId={newChatClaudeProfileId}
+            codexProfiles={state.codexProfiles}
+            defaultCodexProfileId={state.defaultCodexProfileId}
+            codexProfileId={newChatCodexProfileId}
+            workDashboard={activeWorkDashboard}
+            selectedProjectId={activeWorkProjectId}
             onSelectProject={setWorkProjectId}
             onManageWork={() => setWorkManagerOpen(true)}
             onPickCwd={() => setDirPickerOpen(true)}
             onPickModel={pickNewChatModel}
             onPickEffort={pickNewChatEffort}
+            onPickAutoCompact={pickNewChatAutoCompact}
+            onPickClaudeProfile={pickNewChatClaudeProfile}
+            onPickCodexProfile={pickNewChatCodexProfile}
             permissionProfiles={
               newChatPermissionCatalog?.machineId === machineId
                 && newChatPermissionCatalog.cwd === state.newChat.cwd
+                && newChatPermissionCatalog.codexProfileId
+                  === newChatCodexProfileId
                 ? newChatPermissionCatalog.profiles
                 : null
             }
             onGetPermissionProfiles={(cwd) => {
-              wsRef.current?.sendGetPermissionProfiles(cwd);
+              wsRef.current?.sendGetPermissionProfiles(
+                cwd, newChatCodexProfileId);
             }}
-            onSend={sendFirstMessage} />
+            onSend={sendFirstMessage} /></Suspense>
         ) : (
           <>
-            <ChatView sid={focusedSid} turns={historyView.turns}
-              loading={!!rt.loading}
+            <ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
+              sid={focusedSid} turns={historyView.turns}
+              sessionLink={(nativeId) => {
+                const session = findMessageSession(nativeId);
+                return { title: relatedSessionTitle(session, nativeId), available: !!session };
+              }}
+              onOpenSession={space === "code" ? (nativeId) => {
+                const session = findMessageSession(nativeId);
+                if (!session || !confirmArtifactDiscard()) return;
+                cancelPendingNotificationTarget();
+                const targetEngine = session.engine === "codex" ? "codex" : "claude";
+                if (targetEngine !== engine) {
+                  // Select the exact linked session, not the other engine's
+                  // remembered/latest chat. Use the normal navigation path.
+                  prepareSurfaceSwitch(targetEngine, "code", true);
+                  engineRef.current = targetEngine;
+                  spaceRef.current = "code";
+                  setEngine(targetEngine);
+                  setSpace("code");
+                }
+                focusListedSession(session);
+              } : undefined}
+              loading={!!rt.loading || historyView.recovering}
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={historyView.hasMore}
@@ -3840,9 +6252,26 @@ export default function App() {
                 ? undefined : loadHistoryTurnDetail}
               onEdit={historyView.recovering
                 ? undefined : (prompt) => setEditPrompt(prompt)}
+              asyncReplyMode={rt.state === "running" ? "steer"
+                : rt.state === "idle" ? "query" : undefined}
+              pendingReplyId={rt.acceptancePending}
+              onReplyAsyncQuestion={focusedEngine !== "codex"
+                || historyView.recovering || !state.wrapperOnline
+                || state.connState !== "connected"
+                || focusedSession?.tag === "archived"
+                || (rt.control ? sessionControlLocksInput(rt.control) : rt.external)
+                || rt.acceptancePending || (rt.state !== "idle" && rt.state !== "running")
+                ? undefined : (prompt) => {
+                  const current = stateRef.current;
+                  if (!focusedSid || current.focusedSid !== focusedSid
+                      || previousMachineRef.current !== machineId) return null;
+                  return replyAsyncQuestion(focusedSid, prompt, sendQuery, sendSteer);
+                }}
               onGetDiff={historyView.recovering ? undefined : getDiff}
               onOpenTurnDiff={historyView.recovering
                 ? undefined : openTurnDiff}
+              onOpenArchivedDiff={historyView.recovering ? undefined : openArchivedDiff}
+              onLoadFilePage={historyView.recovering ? undefined : loadTurnFilePage}
               onPreviewMarkdown={historyView.recovering
                 ? undefined : previewMarkdown}
               onOpenFile={historyView.recovering ? undefined : previewFile}
@@ -3861,29 +6290,137 @@ export default function App() {
               onLoadHistoryImage={historyView.recovering
                 ? undefined : loadHistoryImage}
               onTextSelectionGuardChange={updateTextSelectionGuard}
-              onFork={!historyView.recovering && space === "code"
+              externalPlanProgress={planProgress ? {
+                turnId: planProgress.turnId,
+                itemId: planProgress.block.item_id,
+              } : null}
+              turnUsage={rt.turnUsage}
+              activeTurnId={activeTurnId}
+              ambiguousActiveTurnIds={ambiguousActiveTurnIds}
+              onOpenAgent={space === "code"
+                ? openAgentDetail : undefined}
+              onFork={!historyView.recovering && !archivedBrowse
+                  && space === "code"
                 ? forkFromTurn : undefined} />
 
-            <GoalPanel engine={engine} goal={rt.goal}
-              revealed={!!goalUi?.revealed} open={!!goalUi?.open}
-              onOpen={() => { wsRef.current?.sendGetGoal(); setGoalUi({ revealed: true, open: true }); }}
-              onClose={() => setGoalUi({ open: false })}
-              onDismiss={() => setGoalUi({ revealed: false, open: false })}
-              onSave={(objective, status, budget) => {
-                wsRef.current?.sendSetGoal(objective, status, engine === "codex" ? budget : null);
-                setGoalUi({ revealed: true, open: false });
-              }}
-              onClear={() => {
-                wsRef.current?.sendClearGoal();
-                setGoalUi({ revealed: false, open: false });
-              }} />
+            <Suspense fallback={((!archivedBrowse
+                && ((goalUi?.revealed && !completedGoalRetired)
+                  || goalUi?.open)) || planProgress)
+              ? <span className="goal-suspense" role="status"
+                  aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
+              : null}>
+              {focusedEngine === "dsh" && !archivedBrowse && <DshGoalPanel key={focusedGoalScopeKey}
+                goal={rt.dsh?.goal ?? null} open={!!goalUi?.open}
+                disabled={!state.wrapperOnline || !rt.dsh?.connected || !rt.dsh.commands.some(c => c.name === "goal")}
+                onOpen={() => setGoalUi({ open: true })} onClose={() => setGoalUi({ open: false })}
+                onAction={action => dshApi.goal(focusedSid!, action)} />}
+              {focusedEngine !== "dsh" && <GoalPanel engine={focusedEngine} goal={rt.goal}
+                revealed={!archivedBrowse && !!goalUi?.revealed}
+                open={!archivedBrowse && !!goalUi?.open}
+                key={focusedGoalScopeKey}
+                loading={!!goalUi?.loading}
+                completedGoalRetired={completedGoalRetired}
+                plan={planProgress}
+                onLoadPlanDetail={planProgress?.needsDetail
+                    && !planProgress.detailLoading && !historyView.recovering
+                  ? () => {
+                      if (planProgressSource === "history") {
+                        loadHistoryTurnDetail(planProgress.turnId);
+                      } else {
+                        loadRuntimeTurnDetail(planProgress.turnId);
+                      }
+                    }
+                  : undefined}
+                onOpen={() => {
+                  rememberFocusedGoalUi();
+                  requestFocusedGoal();
+                  setGoalUi({ revealed: true, open: true, loading: !rt.goal });
+                }}
+                onClose={() => setGoalUi({ open: false })}
+                onDismiss={() => {
+                  if (focusedSid && rt.goalId) {
+                    wsRef.current?.sendDismissGoalTo(
+                      focusedSid, rt.goalId);
+                  }
+                  if (focusedGoalScopeKey) {
+                    persistGoalUiPreferences(dismissGoalUi(
+                      goalUiPreferencesRef.current,
+                      focusedGoalScopeKey,
+                      rt.goal,
+                    ));
+                  }
+                  setGoalUi({ revealed: false, open: false, loading: false });
+                }}
+                disabled={!state.wrapperOnline || state.connState !== "connected"}
+                onStatus={async status => (await getGoalApi()).save(focusedSid!, null, status, null)}
+                onSave={async (objective, status, budget) => {
+                  rememberFocusedGoalUi();
+                  await (await getGoalApi()).save(focusedSid!, objective,
+                    focusedEngine === "claude" ? "active" : status,
+                    focusedEngine === "codex" ? budget : null);
+                }}
+                onClear={async () => {
+                  rememberFocusedGoalUi();
+                  await (await getGoalApi()).clear(focusedSid!);
+                }} />}
+            </Suspense>
+
+            {rt.pendingQuestion && !activeBtwQuestionVisible && (
+              <Suspense fallback={<div className="scrim show" role="dialog"
+                aria-label="正在加载操作确认" aria-busy="true" />}>
+              <QuestionSheet
+                key={JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id])}
+                draft={{ key: JSON.stringify([focusedComposerDraftKey, rt.pendingQuestion.ask_id]),
+                  store: questionDraftsRef.current }}
+                engine={focusedEngine}
+                header={rt.pendingQuestion.header}
+                question={rt.pendingQuestion.question}
+                options={rt.pendingQuestion.options}
+                allowText={rt.pendingQuestion.allow_text}
+                secret={rt.pendingQuestion.secret}
+                multiSelect={rt.pendingQuestion.multi_select}
+                questions={rt.pendingQuestion.questions}
+                onAnswers={(answers) => {
+                  const question = rt.pendingQuestion;
+                  if (!focusedSid || !question) return false;
+                  return wsRef.current?.sendAnswerQuestion(
+                    focusedSid, question.ask_id, undefined, answers) ?? false;
+                }}
+                onAnswer={(answer) => {
+                  const question = rt.pendingQuestion;
+                  if (!focusedSid || !question) return false;
+                  if (!wsRef.current?.sendAnswerQuestion(
+                    focusedSid, question.ask_id, answer)) return false;
+                  dispatch({
+                    type: "answer_question",
+                    sid: focusedSid,
+                    ask_id: question.ask_id,
+                  });
+                  return true;
+                }}
+              />
+              </Suspense>
+            )}
 
             <Composer
+          dsh={rt.dsh}
+          dshSid={focusedSid ?? undefined}
+          readDsh={dshApi.read}
+          dshCommandResult={rt.dshCommandResult}
+          onDshCommand={(value, images, files) => focusedSid ? wsRef.current?.sendDshControl(focusedSid, "command", value, images, files) ?? null : null}
           draftKey={focusedComposerDraftKey}
           draftStore={composerDraftsRef.current}
+          backgroundTasks={rt.backgroundProcesses.length > 0
+            ? <Suspense fallback={null}>
+                <BackgroundTaskControl key={focusedComposerDraftKey}
+                  processes={rt.backgroundProcesses}
+                  onOpenFile={historyView.recovering ? undefined : previewFile}
+                  onOpenAgent={space === "code" ? openAgentDetail : undefined} />
+              </Suspense> : null}
           surface={space}
           state={rt.state}
-          catalog={state.catalog}
+          catalog={focusedCatalog}
+          onRequestModels={requestFocusedModels}
           connState={state.connState}
           wrapperOnline={state.wrapperOnline}
           sendMode={rt.sendMode}
@@ -3899,17 +6436,21 @@ export default function App() {
           replaceQueueCapacity={replaceQueueCapacity}
           model={rt.model}
           effort={rt.effort}
+          autoCompact={rt.autoCompact}
           perm={rt.perm}
           permissionProfile={rt.permissionProfile}
+          permissionProfilePending={!!permissionProfileRequests[
+            JSON.stringify([machineId, space, focusedEngine, focusedSid])]}
           permissionProfiles={rt.permissionProfiles}
           webSearch={rt.webSearch}
           collaborationMode={rt.collaborationMode}
-          fast={rt.fast}
+          serviceTier={rt.serviceTier}
           control={rt.control}
           external={rt.external}
           takeoverPending={rt.takeoverPending}
           takeoverMessage={rt.takeoverMessage}
           engine={focusedEngine}
+          archived={focusedSession?.tag === "archived"}
           editPrompt={editPrompt}
           onEditConsumed={() => setEditPrompt(null)}
           onSendQuery={sendQuery}
@@ -3929,6 +6470,7 @@ export default function App() {
           }}
           onSetModel={setModel}
           onSetEffort={setEffort}
+          onSetAutoCompact={setAutoCompact}
           onSetServiceTier={setServiceTier}
           onSetPerm={setPerm}
           onGetPermissionProfiles={getPermissionProfiles}
@@ -3939,11 +6481,17 @@ export default function App() {
             type: "enter_new_chat",
             cwd: space === "work" ? "~" : (currentCwd || "~"),
             cwdSource: space === "work" || !currentCwd ? "default" : "inherited",
+            claudeProfileId: focusedClaudeProfileId ?? newChatClaudeProfileId,
+            codexProfileId: focusedCodexProfileId ?? newChatCodexProfileId,
           })}
           onContext={requestContext}
-          onOpenBtw={openBtw}
+          onOpenBtw={btwPanelKey ? openBtw : undefined}
           onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
+          onOpenFiles={openFiles}
+          codexContext={rt.codexContext}
+          onSetCodexContext={focusedSid && space === "code" && focusedEngine === "codex"
+            ? (maxTokens) => wsRef.current?.sendCodexContext(focusedSid, maxTokens) ?? false : undefined}
           onGoal={runGoal}
           onStatus={openStatus}
           onRefreshUsage={refreshStatus}
@@ -3951,20 +6499,11 @@ export default function App() {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
           }}
           onCompact={() => {
-            if (focusedSid) wsRef.current?.sendCompactSession(focusedSid);
+            if (focusedSid) {
+              wsRef.current?.sendCompactSession(focusedSid, focusedEngine);
+            }
           }}
-          onOpenExtensions={(kind) => {
-            setCapabilitiesKind(kind);
-            setCapabilitiesOpen(true);
-            setCapabilitiesLoading(true);
-            requestSkillCatalog({
-              key: focusedSkillCatalogKey,
-              engine: focusedEngine,
-              space,
-              cwd: capabilityCwd,
-              skillsOnly: false,
-            }, true);
-          }}
+          onOpenExtensions={openExtensions}
           skills={skillCatalogs[focusedSkillCatalogKey]?.items}
           onRequestSkills={() => {
             requestSkillCatalog({
@@ -3973,6 +6512,9 @@ export default function App() {
               space,
               cwd: capabilityCwd,
               skillsOnly: true,
+              claudeProfileId: focusedClaudeProfileId,
+              codexProfileId: focusedCodexProfileId,
+              sid: focusedSid,
             });
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
@@ -3983,27 +6525,162 @@ export default function App() {
             setWorkArtifactsOpen(true);
           }}
           contextReport={rt.contextReport}
-          contextError={rt.contextError}
+          contextExactReport={rt.contextExactReport}
           statusReport={rt.statusReport}
+          rateLimits={rt.rateLimits}
           statusError={rt.statusError}
           statusLoading={rt.statusRequestId !== null}
         />
           </>
         )}
         {/* context usage now lives in the composer's ring popover (see Composer) */}
-        </div>
       </section>
-      {/* Shared right slot: diff and /btw take turns; header tabs switch. */}
+      {/* Share the layout's selection: retained hidden chats reserve no space. */}
+      <RightPanelPresentation.Provider value={{ expanded: panelExpanded, covered: btwExpanded, layer: 0, chat: false,
+        onOpenChat: toggleCenteredBtw, onExpand: togglePanelExpanded, onDock: dockPanel, onDismiss: togglePanelExpanded }}>
+      {visibleRightPanel === "dsh" && dshPanel && <Suspense fallback={null}>
+        <DshPanel key={`${dshPanel.sid}:${dshPanel.selection.target ?? ""}:${dshPanel.selection.query ?? ""}`}
+          onOpenAgent={(run, title) => { setDshPanel(null); openAgentDetail(run, title); }}
+          onCompose={(prompt, preset) => {
+            if (preset) {
+              if (!confirmArtifactDiscard()) return;
+              clearForkFocusLease(false); cancelPendingNotificationTarget();
+              pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null);
+              setNewChatAutoFocus(true); setRestoringSurfaceScope(null);
+              wsRef.current?.setFocusedSid(null);
+              setDshPresetSelection({ scope: activeScopeKey, value: preset });
+              dispatch({ type: "enter_new_chat", cwd: currentCwd, cwdSource: "explicit" });
+            }
+            setEditPrompt(prompt); setDshPanel(null);
+          }}
+          sid={dshPanel.sid} selection={dshPanel.selection} api={dshApi}
+          state={state.runtimes[dshPanel.sid]?.dsh} onClose={() => setDshPanel(null)}
+          onOpenFile={(path, sid, line) => {
+            if (previewFileForSid(sid ?? dshPanel.sid, path, line)) setDshPanel(null);
+          }} onOpenSession={sid => {
+            const selected = state.sessions.find(session => session.session_id === sid);
+            if (selected && confirmArtifactDiscard()) { focusListedSession(selected); setDshPanel(null); }
+          }} />
+      </Suspense>}
       {(() => {
-        const btwShowing = !!activeBtw || btwOpening;
-        const view = rightView === "btw" && btwShowing ? "btw"
-          : state.artifact ? "diff" : btwShowing ? "btw" : null;
-        if (view === "btw")
-          return <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
-            engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
-            active="btw" hasArtifact={!!state.artifact} artifactKind={state.artifact?.kind} onTab={switchRight}
-            catalog={state.catalog}
+        if (visibleRightPanel === "artifacts" && sessionArtifacts) {
+          const owner = sessionArtifacts;
+          const close = () => {
+            if (!confirmArtifactDiscard()) return;
+            setSessionArtifacts(null);
+            dispatch({ type: "clear_artifact" });
+          };
+          return <Suspense fallback={<div className="artifact-panel" role="status">加载 Artifacts…</div>}>
+            <SessionArtifactsPanel key={owner.id} sid={owner.sid} engine={owner.engine} space={owner.space}
+              ws={wsRef.current} revision={`${state.connState}:${state.runtimes[owner.sid]?.state}:${state.runtimes[owner.sid]?.turns.length}`}
+              onListen={listenArtifacts} selected={owner.selected} onSelect={selectSessionArtifact}
+              onClose={close} onBack={() => {
+                if (!confirmArtifactDiscard()) return;
+                setSessionArtifacts({ ...owner, selected: null });
+                dispatch({ type: "clear_artifact" });
+              }} preview={{ artifact: state.artifact, theme,
+                onRefresh: (path, line) => {
+                  previewFileForSid(owner.sid, path, line, true);
+                },
+                onOpenFile: (path, line) => { previewFileForSid(owner.sid, path, line, true); },
+                onLoadPreviewAsset: loadPreviewAsset, onAuthorizePreview: authorizePreview,
+                onSaveMarkdown: saveMarkdown, onDirtyChange: setArtifactDirty, onClose: close }} />
+          </Suspense>;
+        }
+        if (visibleRightPanel === "files" && fileBrowser) {
+          const closeFiles = () => {
+            if (!confirmArtifactDiscard()) return;
+            setFileBrowser(null);
+            dispatch({ type: "clear_artifact" });
+          };
+          return <Suspense fallback={<div className="artifact-panel" role="status">加载目录…</div>}>
+            <SessionFilesPanel key={fileBrowser.id} showingPreview={fileBrowser.preview}
+              browser={{ sid: fileBrowser.sid, initialPath: fileBrowser.path, ws: wsRef.current,
+                hidden: fileBrowser.preview, onListen: listenFiles, onClose: closeFiles,
+                onOpenFile: (path) => {
+                  if (previewFileForSid(fileBrowser.sid, path, undefined, true))
+                    setFileBrowser({ ...fileBrowser, preview: true });
+                } }}
+              onBack={() => {
+                if (!confirmArtifactDiscard()) return;
+                dispatch({ type: "clear_artifact" });
+                setFileBrowser({ ...fileBrowser, preview: false });
+              }}
+              preview={{ artifact: state.artifact, theme,
+                onRefresh: (path, line) => { previewFileForSid(fileBrowser.sid, path, line, true); },
+                onOpenFile: (path, line) => { previewFileForSid(fileBrowser.sid, path, line, true); },
+                onLoadPreviewAsset: loadPreviewAsset, onAuthorizePreview: authorizePreview,
+                onSaveMarkdown: saveMarkdown, onDirtyChange: setArtifactDirty, onClose: closeFiles }} />
+          </Suspense>;
+        }
+        if (visibleRightPanel === "viewer" && visibleParentSid && viewerKey) {
+          return <Suspense fallback={<div className="artifact-panel empty" role="status"><p>加载预览…</p></div>}>
+            <RemoteViewerPanel key={`${viewerKey}:${viewerUrl?.key === viewerKey ? viewerUrl.openId : ""}`}
+              scope={{ machineId, sid: visibleParentSid, space, engine }}
+              selection={viewerSelections[viewerKey] ?? null}
+              requestedUrl={viewerUrl?.key === viewerKey ? viewerUrl.href : undefined}
+              devices={remoteDevices} onSelect={selectViewer} onClose={closeViewer} />
+          </Suspense>;
+        }
+        if (visibleRightPanel === "agent" && agentPanel) {
+          return <Suspense fallback={null}>
+            <AgentDetailController dshApi={agentPanel.engine === "dsh" ? dshApi : undefined}
+              key={`${agentPanel.sid}:${agentPanel.revision}:${agentPanel.runId}`}
+              selection={{ ...agentPanel, revision: rt.historyRevision || agentPanel.revision }} ws={wsRef.current}
+              onListen={setAgentDetailListener}
+              onClose={() => setAgentPanel(null)}
+              onOpenFile={previewAgentFile} />
+          </Suspense>;
+        }
+        if (visibleRightPanel === "diff" && state.artifact)
+          return <Suspense fallback={
+            <div className="artifact-panel empty" role="status">
+              <div className="spinner" aria-hidden="true" />
+              <p className="loading-tx">加载预览…</p>
+            </div>
+          }>
+            <ArtifactPanel artifact={state.artifact} active="diff"
+              hasBtw={!!activeBtwGroup}
+              theme={theme}
+              onTab={switchRight} onRefresh={previewArtifactFile}
+              onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
+              onAuthorizePreview={authorizePreview}
+              onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
+              onClose={() => dispatch({ type: "clear_artifact" })} />
+          </Suspense>;
+        return null;
+      })()}
+      </RightPanelPresentation.Provider>
+      <RightPanelPresentation.Provider value={{ expanded: btwExpanded, covered: false, layer: 1, chat: true,
+        onOpenChat: toggleCenteredBtw, onExpand: showCenteredBtw, onDock: dockBtw, onDismiss: dismissCenteredBtw }}>
+        {btwRendered && (<Suspense fallback={null}>
+            <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
+            engine={activeBtw?.engine ?? focusedEngine} opening={btwOpening}
+            focusRequested={btwFocusScope === btwScope}
+            onFocusConsumed={consumeBtwFocus}
+            chats={(activeBtwGroup?.chats ?? []).map((chat, index) => {
+              const runtime = state.runtimes[chat.sid];
+              const prompt = (runtime?.btwReplayView?.turns ?? runtime?.turns)?.find(
+                (turn) => turn.prompt.trim().length > 0)?.prompt.trim();
+              return {
+                ...chat,
+                title: prompt ? prompt.slice(0, 36) : `侧聊 ${index + 1}`,
+                state: runtime?.state ?? "idle",
+                needsAnswer: !!runtime?.pendingQuestion,
+              };
+            })}
+            active="btw" hasArtifact={!!state.artifact && !btwExpanded}
+            chatViewRef={btwChatViewRef}
+            artifactKind={state.artifact?.kind}
+            onTab={switchRight}
+            onOpenArtifacts={activeBtwSid ? () => openSessionArtifacts(activeBtwSid) : undefined}
+            onNew={createBtw}
+            onSelect={selectBtw}
+            onCloseChat={closeBtw}
+            catalog={focusedCatalog}
+            onRequestModels={requestFocusedModels}
             draftKey={activeBtwDraftKey} draftStore={btwDraftsRef.current}
+            questionDrafts={questionDraftsRef.current}
             sendMode={activeBtwSendMode}
             unconfirmedQueued={unconfirmedQueued}
             unconfirmedReplaceable={btwUnconfirmedReplaceable}
@@ -4011,6 +6688,13 @@ export default function App() {
             replaceQueueCapacity={btwReplaceQueueCapacity}
             onSend={sendBtw}
             onSteer={steerBtw}
+            onReplyAsyncQuestion={state.connState !== "connected" || !state.wrapperOnline
+              ? undefined : (prompt) => {
+                if (!activeBtwSid || stateRef.current.newChat
+                    || stateRef.current.focusedSid !== visibleParentSid
+                    || previousMachineRef.current !== machineId) return null;
+                return replyAsyncQuestion(activeBtwSid, prompt, sendBtw, steerBtw);
+              }}
             onInterrupt={() => {
               if (activeBtwSid) interruptBtw(activeBtwSid);
             }}
@@ -4037,23 +6721,35 @@ export default function App() {
             onSetEffort={(effort) => {
               if (activeBtwSid) setBtwEffort(activeBtwSid, effort);
             }}
-            onOpenFile={previewBtwFile} onClose={closeBtw}
+            onSetServiceTier={(tier) => {
+              if (!activeBtwSid || activeBtw?.engine !== "codex"
+                  || runtimeIsReadOnly(activeBtwSid)) return false;
+              return wsRef.current?.sendSetServiceTier(tier, activeBtwSid) ?? false;
+            }}
+            onSetAutoCompact={(selection) => activeBtwSid
+              ? setBtwAutoCompact(activeBtwSid, selection) : false}
+            onOpenFile={previewBtwFile} onCollapse={collapseBtw}
             imageAssets={btwInlineImageAssets}
             onLoadImage={loadBtwMessageImage}
             onAuthorizeImage={authorizeMessageImage}
+            onAnswerQuestion={(askId, answer, answers) => {
+              if (!activeBtwSid) return false;
+              if (!wsRef.current?.sendAnswerQuestion(
+                activeBtwSid, askId, answer, answers)) return false;
+              if (answers) return true; // Batch remains visible until authoritative close.
+              dispatch({
+                type: "answer_question",
+                sid: activeBtwSid,
+                ask_id: askId,
+              });
+              return true;
+            }}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
-            }} />;
-        if (view === "diff" && state.artifact)
-          return <ArtifactPanel artifact={state.artifact} active="diff" hasBtw={!!activeBtw}
-            onTab={switchRight} onRefresh={previewArtifactFile}
-            onOpenFile={previewArtifactFile} onLoadPreviewAsset={loadPreviewAsset}
-            onAuthorizePreview={authorizePreview}
-            onSaveMarkdown={saveMarkdown} onDirtyChange={setArtifactDirty}
-            onClose={() => dispatch({ type: "clear_artifact" })} />;
-        return null;
-      })()}
-      <QueuedQueryDialog
+            }} />
+          </Suspense>)}
+      </RightPanelPresentation.Provider>
+      {queuedQueryEditor && <Suspense fallback={null}><QueuedQueryDialog
         key={queuedQueryEditor
           ? `${queuedQueryEditor.sid}:${queuedQueryEditor.msgId}`
           : "closed"}
@@ -4062,140 +6758,140 @@ export default function App() {
           if (!queuedQueryEditor?.saving) setQueuedQueryEditor(null);
         }}
         onSave={updateQueuedQuery}
-        onRetry={retryQueuedQuery} />
-      {rt.pendingQuestion && (
-        <QuestionSheet
-          key={rt.pendingQuestion.ask_id}
-          header={rt.pendingQuestion.header}
-          question={rt.pendingQuestion.question}
-          options={rt.pendingQuestion.options}
-          allowText={rt.pendingQuestion.allow_text}
-          secret={rt.pendingQuestion.secret}
-          multiSelect={rt.pendingQuestion.multi_select}
-          onAnswer={(answer) => {
-            const question = rt.pendingQuestion;
-            if (!focusedSid || !question) return;
-            if (!wsRef.current?.sendAnswerQuestion(
-              focusedSid, question.ask_id, answer)) return;
-            dispatch({
-              type: "answer_question",
-              sid: focusedSid,
-              ask_id: question.ask_id,
-            });
-          }}
+        onRetry={retryQueuedQuery} /></Suspense>}
+      {shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)
+        && <Suspense fallback={null}>
+          <StatusSheet open report={rt.statusReport}
+            notices={rt.notices}
+            error={rt.statusError}
+            resetCreditLoading={rt.statusRequestId !== null}
+            resetCreditResult={rt.resetCreditResult}
+            resetCreditDisabled={
+              rt.state !== "idle"
+              || rt.statusRequestId !== null
+              || !!rt.statusError
+              || state.connState !== "connected"
+              || !state.wrapperOnline
+            }
+            onClose={() => setStatusOpenSid(null)}
+            onRefresh={openStatus}
+            onConsumeResetCredit={consumeResetCredit}
+            onDismissNotice={(noticeId) => {
+              if (focusedSid) dispatch({
+                type: "dismiss_notice", sid: focusedSid, noticeId,
+              });
+            }} />
+        </Suspense>}
+      {usageActivityOpen && engine === "codex" && <Suspense fallback={null}>
+        <UsageActivitySheet
+          open
+          report={rt.statusReport}
+          error={rt.statusError}
+          loading={rt.statusRequestId !== null}
+          hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
+          onClose={() => setUsageActivityOpen(false)}
+          onRefresh={refreshStatus}
         />
-      )}
-      <StatusSheet open={shouldOpenCodexStatus(statusOpenSid, focusedSid, focusedEngine)} report={rt.statusReport}
-        notices={rt.notices}
-        error={rt.statusError}
-        onClose={() => setStatusOpenSid(null)}
-        onRefresh={openStatus}
-        onDismissNotice={(noticeId) => {
-          if (focusedSid) dispatch({ type: "dismiss_notice", sid: focusedSid, noticeId });
-        }} />
-      <UsageActivitySheet
-        open={usageActivityOpen && engine === "codex"}
-        report={rt.statusReport}
-        error={rt.statusError}
-        loading={rt.statusRequestId !== null}
-        hasSession={!!focusedSid && focusedEngine === "codex" && !state.newChat}
-        onClose={() => setUsageActivityOpen(false)}
-        onRefresh={refreshStatus}
-      />
-      <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
-        creating={forkWorktreeCreating} error={forkWorktreeError}
-        onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
-      <WorkDashboardSheet open={workManagerOpen && space === "work"}
-        dashboard={workDashboards[engine] ?? null}
-        selectedProjectId={workProjectId}
+      </Suspense>}
+      {forkWorktreeSession !== null && <Suspense fallback={null}>
+        <ForkWorktreeSheet open session={forkWorktreeSession}
+          creating={forkWorktreeCreating} error={forkWorktreeError}
+          onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
+      </Suspense>}
+      {space === "work" && <Suspense fallback={null}><WorkDashboardSheet
+        key={sessionScopeKey(machineId, engine, "work")}
+        open={workManagerOpen && space === "work"}
+        scopeKey={sessionScopeKey(machineId, engine, "work")}
+        dashboard={activeWorkDashboard}
+        claudeProfiles={state.claudeProfiles}
+        defaultClaudeProfileId={state.defaultClaudeProfileId}
+        claudeProfileId={state.newChat
+          ? newChatClaudeProfileId : focusedClaudeProfileId}
+        codexProfiles={state.codexProfiles}
+        defaultCodexProfileId={state.defaultCodexProfileId}
+        codexProfileId={state.newChat
+          ? newChatCodexProfileId : focusedCodexProfileId}
+        selectedProjectId={activeWorkProjectId}
         onSelectProject={setWorkProjectId}
         onClose={() => setWorkManagerOpen(false)}
         onCreateProject={(name, description) => !!wsRef.current?.sendCreateWorkProject(engine, name, description)}
         onDeleteProject={(projectId) => !!wsRef.current?.sendDeleteWorkProject(engine, projectId)}
         onAddSource={(projectId, kind, title, uri, file) => !!wsRef.current?.sendAddWorkSource(engine, projectId, kind, title, uri, file)}
         onDeleteSource={(sourceId) => !!wsRef.current?.sendDeleteWorkSource(engine, sourceId)}
-        onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId) => !!wsRef.current?.sendCreateWorkSchedule(engine, title, prompt, nextRunAt, repeatSeconds, projectId)}
+        onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId,
+          profileId) => !!wsRef.current?.sendCreateWorkSchedule(
+          engine, title, prompt, nextRunAt, repeatSeconds, projectId,
+          engine === "codex" ? profileId : undefined,
+          engine === "claude" ? profileId : undefined)}
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
-        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
-      <WorkArtifactsSheet open={workArtifactsOpen && space === "work"
-          && !state.newChat && currentWorkArtifacts.length > 0}
-        artifacts={currentWorkArtifacts}
-        onOpen={(path) => { setWorkArtifactsOpen(false); previewFile(path); }}
-        onClose={() => setWorkArtifactsOpen(false)} />
-      <CapabilitiesSheet open={capabilitiesOpen}
-        engine={focusedEngine}
+        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} /></Suspense>}
+      {workArtifactsOpen && space === "work" && !state.newChat
+        && currentWorkArtifacts.length > 0 && <Suspense fallback={null}>
+          <WorkArtifactsSheet open artifacts={currentWorkArtifacts}
+            onOpen={(path) => {
+              setWorkArtifactsOpen(false);
+              previewFile(path);
+            }}
+            onClose={() => setWorkArtifactsOpen(false)} />
+        </Suspense>}
+      <Suspense fallback={null}>
+      <CapabilitiesSheet key={capabilitiesScope?.key ?? "unavailable"}
+        open={capabilitiesOpen && capabilitiesScope !== null}
+        engine={capabilitiesScope?.engine ?? engine}
         activeKind={capabilitiesKind}
         readOnly={space === "work"}
-        report={capabilitiesByScope[focusedSkillCatalogKey] ?? null}
+        report={capabilitiesScope ? capabilitiesByScope[capabilitiesScope.key] ?? null : null}
         loading={capabilitiesLoading}
         onKindChange={setCapabilitiesKind}
-        onRefresh={() => {
-          setCapabilitiesLoading(true);
-          requestSkillCatalog({
-            key: focusedSkillCatalogKey,
-            engine: focusedEngine,
-            space,
-            cwd: capabilityCwd,
-            skillsOnly: false,
-          }, true);
-        }}
+        onRefresh={refreshCapabilities}
         onManagePlugin={(item, action) => {
+          if (!capabilitiesScope || space === "work") return;
           const verb = action === "install" ? "安装" : "卸载";
-          if (!window.confirm(`${verb}插件「${item.name}」将修改本机 ${focusedEngine === "codex" ? "Codex" : "Claude"} 配置，确定继续吗？`)) return;
+          if (!window.confirm(`${verb}插件「${item.name}」将修改本机 ${capabilitiesScope.engine === "codex" ? "Codex" : "Claude"} 配置，确定继续吗？`)) return;
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEnginePlugin(
-            focusedEngine, space, action, item.id,
-            capabilityCwd);
-          trackCapabilityMutation(requestId, {
-            key: focusedSkillCatalogKey, engine: focusedEngine, space,
-            cwd: capabilityCwd, skillsOnly: false,
-          });
+            capabilitiesScope.engine, space, action, item.id,
+            capabilitiesScope.cwd, capabilitiesScope.codexProfileId, capabilitiesScope.claudeProfileId);
+          trackCapabilityMutation(requestId, capabilitiesScope);
         }}
         onManageSkill={(item: EngineCapabilityItem, action) => {
+          if (!capabilitiesScope || space === "work") return;
           const labels = { enable: "启用", disable: "停用", remove: "删除" } as const;
           if (!window.confirm(`${labels[action]} Skill「${item.name}」？${action === "remove" ? "删除会移动到本机可恢复回收目录。" : ""}`)) return;
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineSkill(
-            focusedEngine, space, action, { skillId: item.id },
-            capabilityCwd);
-          trackCapabilityMutation(requestId, {
-            key: focusedSkillCatalogKey, engine: focusedEngine, space,
-            cwd: capabilityCwd, skillsOnly: false,
-          });
+            capabilitiesScope.engine, space, action, { skillId: item.id },
+            capabilitiesScope.cwd, capabilitiesScope.codexProfileId, capabilitiesScope.claudeProfileId);
+          trackCapabilityMutation(requestId, capabilitiesScope);
         }}
         onCreateSkill={(draft: SkillDraft) => {
+          if (!capabilitiesScope || space === "work") return;
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineSkill(
-            focusedEngine, space, "create", draft,
-            capabilityCwd);
-          trackCapabilityMutation(requestId, {
-            key: focusedSkillCatalogKey, engine: focusedEngine, space,
-            cwd: capabilityCwd, skillsOnly: false,
-          });
+            capabilitiesScope.engine, space, "create", draft,
+            capabilitiesScope.cwd, capabilitiesScope.codexProfileId, capabilitiesScope.claudeProfileId);
+          trackCapabilityMutation(requestId, capabilitiesScope);
         }}
         onRemoveHook={(item: EngineCapabilityItem) => {
+          if (!capabilitiesScope || space === "work") return;
           if (!window.confirm(`删除 Hook「${item.name}」？配置文件中的其他内容会原样保留。`)) return;
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineHook(
-            focusedEngine, space, "remove", { hookId: item.id },
-            capabilityCwd);
-          trackCapabilityMutation(requestId, {
-            key: focusedSkillCatalogKey, engine: focusedEngine, space,
-            cwd: capabilityCwd, skillsOnly: false,
-          });
+            capabilitiesScope.engine, space, "remove", { hookId: item.id },
+            capabilitiesScope.cwd, capabilitiesScope.codexProfileId, capabilitiesScope.claudeProfileId);
+          trackCapabilityMutation(requestId, capabilitiesScope);
         }}
         onCreateHook={(draft: HookDraft) => {
+          if (!capabilitiesScope || space === "work") return;
           setCapabilitiesLoading(true);
           const requestId = wsRef.current?.sendManageEngineHook(
-            focusedEngine, space, "create", draft,
-            capabilityCwd);
-          trackCapabilityMutation(requestId, {
-            key: focusedSkillCatalogKey, engine: focusedEngine, space,
-            cwd: capabilityCwd, skillsOnly: false,
-          });
+            capabilitiesScope.engine, space, "create", draft,
+            capabilitiesScope.cwd, capabilitiesScope.codexProfileId, capabilitiesScope.claudeProfileId);
+          trackCapabilityMutation(requestId, capabilitiesScope);
         }}
         onClose={() => setCapabilitiesOpen(false)} />
+      </Suspense>
       <DeviceSheet open={deviceSheetOpen}
         currentId={machineId}
         devices={remoteDevices}
@@ -4210,6 +6906,8 @@ export default function App() {
           setDeviceSheetOpen(false);
         }}
         onClose={() => setDeviceSheetOpen(false)} />
-    </div>
+    </SidebarShell>
+    </RemoteViewerContext.Provider>
+    </ViewerPagesProvider>
   );
 }

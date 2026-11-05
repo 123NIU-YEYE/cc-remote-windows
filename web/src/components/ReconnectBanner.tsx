@@ -29,8 +29,11 @@ export function ReconnectBanner({
   const text = parts.join(" · ");
   if (!text) return null;
   return (
-    <div className="banner show" role="status" aria-live="polite">
-      {busy && <span className="sp" aria-hidden="true" />}
+    <div className={`banner show ${busy ? "info" : "attention"}`} role="status" aria-live="polite">
+      <span className="notice-icon" aria-hidden="true">
+        {busy && <span className="sp" aria-hidden="true" />}
+        {!busy && <Icon name="warning" size={16} />}
+      </span>
       <span className="banner-copy">{text}</span>
       {banner && <button type="button" className="banner-dismiss"
         onClick={() => onDismiss(banner)} aria-label="关闭提示" title="关闭提示">

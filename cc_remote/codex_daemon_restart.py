@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -28,12 +29,12 @@ from cc_remote.wrapper.os_compat import fchmod
 _SCHEMA_VERSION = 2
 _FILENAME = "codex-daemon-restart.json"
 _MAX_STATE_BYTES = 4096
-_LOG_FILENAME = "codex-daemon-restart.log"
 _DEFAULT_SYNC_TIMEOUT = 60.0
 _DEFAULT_WORKER_TIMEOUT = 60.0
 _DEFAULT_DRAIN_GRACE = 2.0
 _OUTCOME_GRACE = 5.0
 _FAILED_STATE_RETENTION = 15.0
+_PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 RestartPhase = Literal["restarting", "ready", "failed"]
 
 
@@ -71,14 +72,38 @@ def restart_state_is_stale(
     return current >= state.deadline_at
 
 
-def restart_state_path(state_dir: str | Path | None = None) -> Path:
+def restart_state_path(
+    state_dir: str | Path | None = None,
+    *,
+    profile_id: Optional[str] = None,
+) -> Path:
     root = (
         Path(state_dir)
         if state_dir is not None
         else Path(os.environ.get(
             "CC_REMOTE_STATE_DIR", str(Path.home() / ".cc-remote")))
     )
-    return root.expanduser() / _FILENAME
+    if profile_id is None:
+        filename = _FILENAME
+    else:
+        if not isinstance(profile_id, str) or not _PROFILE_ID.fullmatch(
+            profile_id
+        ):
+            raise ValueError("invalid Codex profile id")
+        filename = f"codex-daemon-restart-{profile_id}.json"
+    return root.expanduser() / filename
+
+
+def _codex_home_value(value: str | Path | None) -> Optional[str]:
+    if value is None:
+        return None
+    raw = os.fspath(value)
+    if not raw or "\x00" in raw:
+        raise ValueError("invalid CODEX_HOME")
+    resolved = Path(raw).expanduser()
+    if not resolved.is_absolute():
+        raise ValueError("CODEX_HOME must be absolute")
+    return str(resolved.resolve(strict=False))
 
 
 def read_restart_state(path: str | Path) -> Optional[CodexDaemonRestartState]:
@@ -239,7 +264,14 @@ def _run_official_restart(
     codex_bin: str,
     *,
     timeout: Optional[float],
+    codex_home: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    kwargs = {}
+    selected_home = _codex_home_value(codex_home)
+    if selected_home is not None:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = selected_home
+        kwargs["env"] = env
     return subprocess.run(
         [codex_bin, "app-server", "daemon", "restart"],
         text=True,
@@ -249,12 +281,15 @@ def _run_official_restart(
             else max(1.0, float(timeout))
         ),
         check=False,
+        **kwargs,
     )
 
 
 def restart_managed_daemon(
     *,
     codex_bin: Optional[str] = None,
+    codex_home: str | Path | None = None,
+    profile_id: Optional[str] = None,
     state_dir: str | Path | None = None,
     timeout: Optional[float] = _DEFAULT_SYNC_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
@@ -265,7 +300,7 @@ def restart_managed_daemon(
         else max(1.0, float(timeout))
     )
     epoch = uuid4().hex
-    path = restart_state_path(state_dir)
+    path = restart_state_path(state_dir, profile_id=profile_id)
     deadline_at = time.time() + restart_outcome_timeout(
         restart_timeout, drain_grace=0.0)
     with _exclusive_lock(_state_lock_path(path)):
@@ -280,6 +315,7 @@ def restart_managed_daemon(
             result = _run_official_restart(
                 _codex_binary(codex_bin),
                 timeout=restart_timeout,
+                codex_home=codex_home,
             )
     except BaseException:
         _publish_if_current(path, epoch=epoch, phase="failed")
@@ -296,6 +332,8 @@ def _scheduled_worker(
     *,
     epoch: str,
     codex_bin: Optional[str],
+    codex_home: str | Path | None = None,
+    profile_id: Optional[str] = None,
     state_dir: str | Path | None,
     timeout: Optional[float],
     drain_grace: float = _DEFAULT_DRAIN_GRACE,
@@ -314,7 +352,7 @@ def _scheduled_worker(
         if timeout is None or timeout <= 0
         else max(1.0, float(timeout))
     )
-    path = restart_state_path(state_dir)
+    path = restart_state_path(state_dir, profile_id=profile_id)
     with _exclusive_lock(_worker_lock_path(path)):
         current = read_restart_state(path)
         if (
@@ -342,6 +380,7 @@ def _scheduled_worker(
             result = _run_official_restart(
                 _codex_binary(codex_bin),
                 timeout=restart_timeout,
+                codex_home=codex_home,
             )
         except BaseException:
             _publish_if_current(path, epoch=epoch, phase="failed")
@@ -361,6 +400,8 @@ def _scheduled_worker(
 def schedule_managed_daemon_restart(
     *,
     codex_bin: Optional[str] = None,
+    codex_home: str | Path | None = None,
+    profile_id: Optional[str] = None,
     state_dir: str | Path | None = None,
     timeout: Optional[float] = _DEFAULT_WORKER_TIMEOUT,
 ) -> str:
@@ -377,7 +418,7 @@ def schedule_managed_daemon_restart(
         else max(1.0, float(timeout))
     )
     epoch = uuid4().hex
-    path = restart_state_path(state_dir)
+    path = restart_state_path(state_dir, profile_id=profile_id)
     deadline_at = time.time() + restart_outcome_timeout(
         worker_timeout,
         drain_grace=_DEFAULT_DRAIN_GRACE,
@@ -403,10 +444,15 @@ def schedule_managed_daemon_restart(
     ]
     if codex_bin:
         argv.extend(("--codex-bin", codex_bin))
+    selected_home = _codex_home_value(codex_home)
+    if selected_home is not None:
+        argv.extend(("--codex-home", selected_home))
+    if profile_id is not None:
+        argv.extend(("--profile-id", profile_id))
     if state_dir is not None:
         argv.extend(("--state-dir", str(state_dir)))
 
-    log_path = path.with_name(_LOG_FILENAME)
+    log_path = path.with_suffix(".log")
     log_fd = os.open(
         log_path,
         os.O_WRONLY | os.O_CREAT | os.O_APPEND,
@@ -446,6 +492,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     mode.add_argument("--worker", metavar="EPOCH", help=argparse.SUPPRESS)
     parser.add_argument("--codex-bin")
+    parser.add_argument("--codex-home")
+    parser.add_argument("--profile-id")
     parser.add_argument("--state-dir")
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--drain-grace", type=float)
@@ -459,6 +507,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return _scheduled_worker(
                 epoch=args.worker,
                 codex_bin=args.codex_bin,
+                codex_home=args.codex_home,
+                profile_id=args.profile_id,
                 state_dir=args.state_dir,
                 timeout=(
                     _DEFAULT_WORKER_TIMEOUT
@@ -481,6 +531,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         try:
             schedule_managed_daemon_restart(
                 codex_bin=args.codex_bin,
+                codex_home=args.codex_home,
+                profile_id=args.profile_id,
                 state_dir=args.state_dir,
                 timeout=(
                     _DEFAULT_WORKER_TIMEOUT
@@ -498,6 +550,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         result = restart_managed_daemon(
             codex_bin=args.codex_bin,
+            codex_home=args.codex_home,
+            profile_id=args.profile_id,
             state_dir=args.state_dir,
             timeout=(
                 _DEFAULT_SYNC_TIMEOUT

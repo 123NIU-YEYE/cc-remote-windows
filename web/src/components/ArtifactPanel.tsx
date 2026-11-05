@@ -1,6 +1,7 @@
-import { isValidElement, useCallback, useEffect, useMemo, useRef, useState,
+import { PanelFrame, PanelExpandButton } from "./RightPanelPresentation";
+import { lazy, Suspense, isValidElement, useCallback, useEffect, useMemo, useRef, useState,
   type ComponentPropsWithoutRef, type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+  type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import type {
   Artifact,
@@ -8,30 +9,32 @@ import type {
   PreviewAuthorizationState,
 } from "../reducer";
 import { Icon } from "../icons";
-import { PanelTabs } from "./PanelTabs";
+import { LocalFileLink, WebLink } from "./LinkPreview";
+import { PanelTabs, type RightPanelView } from "./PanelTabs";
 import { GIT_DIFF_PAGE_LINES, pageGitDiff, type GitDiffSection } from "../diff";
 import { classifyPreviewTarget } from "../preview-path";
 import { parseLocalFileTarget } from "../file-link";
 import {
   buildInteractiveSandboxDocument,
-  buildSandboxDocument,
+  type HtmlPreviewTheme,
 } from "../html-preview";
-import { clampPanelWidth } from "../responsive-layout";
 import { isMermaidFenceClass } from "../mermaid";
 import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import {
   isMathFenceClass,
-  normalizeMathDelimiters,
   STREAMING_REMARK_PLUGINS,
   useMarkdownMathPlugins,
 } from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
+import { PanelResizer } from "./PanelResizer";
+import { PdfArtifactPreview } from "./PdfArtifactPreview";
+import { AudioArtifactPreview } from "./AudioArtifactPreview";
+import { previewImageDimension, rehypePreviewHtml } from "../markdown-preview-html";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
 const SOURCE_PAGE_LINES = 500;
-const PANEL_WIDTH_KEY = "cc_remote_artifact_panel_width";
 const URL_ATTRIBUTES = new Set(["src", "href", "xlink:href", "poster", "action", "formaction"]);
 const UNSAFE_CSS = /(?:url\s*\(|@import|expression\s*\()/i;
 
@@ -71,11 +74,16 @@ function MarkdownPreviewCode({
   return <code className={className}>{children}</code>;
 }
 
-function HtmlArtifactPreview({ content }: { content: string }) {
-  const [document, setDocument] = useState<string | null>(null);
+const ArtifactDownload = lazy(() => import("./ArtifactDownload"));
+const SpreadsheetPreview = lazy(() => import("./SpreadsheetPreview"));
+
+function HtmlArtifactPreview({ content, theme }: {
+  content: string;
+  theme?: HtmlPreviewTheme;
+}) {
   const [interactiveDocument, setInteractiveDocument] =
     useState<string | null>(null);
-  const [interactive, setInteractive] = useState(false);
+  const [frameRevision, setFrameRevision] = useState(0);
   const interactiveFrameRef = useRef<HTMLIFrameElement>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -83,33 +91,6 @@ function HtmlArtifactPreview({ content }: { content: string }) {
     let cancelled = false;
     const prepare = async () => {
       try {
-        const { default: DOMPurify } = await import("dompurify");
-        const clean = DOMPurify.sanitize(content, {
-          WHOLE_DOCUMENT: true,
-          FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
-          FORBID_ATTR: ["srcset", "action", "formaction"],
-        });
-        const parsed = new DOMParser().parseFromString(clean, "text/html");
-        for (const element of parsed.documentElement.querySelectorAll("*")) {
-          for (const attribute of Array.from(element.attributes)) {
-            const name = attribute.name.toLowerCase();
-            const value = attribute.value.trim();
-            if (name.startsWith("on")) {
-              element.removeAttribute(attribute.name);
-            } else if (URL_ATTRIBUTES.has(name)) {
-              const allowedAnchor = name === "href" && value.startsWith("#");
-              const allowedImage = name === "src"
-                && /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/i.test(value);
-              if (!allowedAnchor && !allowedImage) element.removeAttribute(attribute.name);
-            } else if (name === "style" && UNSAFE_CSS.test(value)) {
-              element.removeAttribute(attribute.name);
-            }
-          }
-        }
-        for (const style of parsed.documentElement.querySelectorAll("style")) {
-          if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
-        }
-
         const runnable = new DOMParser().parseFromString(content, "text/html");
         for (const element of Array.from(runnable.querySelectorAll(
           "iframe,object,embed,form,base,link,meta[http-equiv],script[src]",
@@ -140,26 +121,22 @@ function HtmlArtifactPreview({ content }: { content: string }) {
           if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
         }
         if (cancelled) return;
-        setDocument(buildSandboxDocument(
-          parsed.body.innerHTML,
-          parsed.head.innerHTML,
-        ));
         setInteractiveDocument(buildInteractiveSandboxDocument(
           runnable.body.innerHTML,
           runnable.head.innerHTML,
+          theme,
         ));
-        setInteractive(false);
+        setFrameRevision(value => value + 1);
         setError(null);
       } catch {
         if (cancelled) return;
-        setDocument(null);
         setInteractiveDocument(null);
         setError("HTML 安全处理失败");
       }
     };
     void prepare();
     return () => { cancelled = true; };
-  }, [content]);
+  }, [content, theme]);
 
   const loadInteractiveDocument = useCallback(() => {
     if (!interactiveDocument) return;
@@ -170,32 +147,23 @@ function HtmlArtifactPreview({ content }: { content: string }) {
   }, [interactiveDocument]);
 
   if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
-  if (!document) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
+  if (!interactiveDocument) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
   return <div className="artifact-html-stage">
-    <div className="artifact-html-controls">
-      <span>外部资源已禁用</span>
-      <button type="button" onClick={() => setInteractive((value) => !value)}>
-        {interactive ? "停止交互预览" : "运行交互预览"}
-      </button>
-    </div>
-    {interactive
-      ? <iframe ref={interactiveFrameRef} className="artifact-html-preview"
+    <iframe key={frameRevision} ref={interactiveFrameRef} className="artifact-html-preview"
           title="HTML 交互预览" sandbox="allow-scripts"
           referrerPolicy="no-referrer" src="/html-preview-runner.html"
           onLoad={loadInteractiveDocument} />
-      : <iframe className="artifact-html-preview" title="HTML 静态预览"
-          sandbox="" referrerPolicy="no-referrer" srcDoc={document} />}
   </div>;
 }
 
-function BinaryArtifactPreview({ data, mediaType, kind, title }: {
+function ImageArtifactPreview({ data, mediaType, title }: {
   data?: string;
   mediaType?: string;
-  kind: "image" | "pdf";
   title: string;
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
   const svg = useSanitizedSvgUrl(data, mediaType);
 
   useEffect(() => {
@@ -227,12 +195,15 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
 
   const resolvedUrl = mediaType === "image/svg+xml" ? svg.url : objectUrl;
   const resolvedError = mediaType === "image/svg+xml" ? svg.error : error;
-  if (resolvedError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError}</div>;
+  // A cached decode can fail before passive effects run. Associate the error
+  // with its URL so a source-change effect cannot clear that new failure.
+  const decodeError = resolvedUrl && failedUrl === resolvedUrl
+    ? "图片无法解码或格式不受支持" : null;
+  if (resolvedError || decodeError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError || decodeError}</div>;
   if (!resolvedUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
-  if (kind === "image") {
-    return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title} /></div>;
-  }
-  return <iframe className="artifact-pdf-preview" src={resolvedUrl} title={`${title} PDF 预览`} />;
+  return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title}
+    onLoad={() => setFailedUrl(current => current === resolvedUrl ? null : current)}
+    onError={() => setFailedUrl(resolvedUrl)} /></div>;
 }
 
 function SourceFile({ content, targetLine, artifactKey }: {
@@ -283,12 +254,14 @@ function SourceFile({ content, targetLine, artifactKey }: {
   </>;
 }
 
-function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
+function PreviewImage({ markdownPath, src, alt, title, width, height, asset, requestAsset,
   onAuthorizePreview }: {
   markdownPath: string;
   src: string;
   alt?: string;
   title?: string;
+  width?: string | number;
+  height?: string | number;
   asset?: PreviewAssetState;
   requestAsset: (path: string) => boolean;
   onAuthorizePreview?: (
@@ -315,6 +288,7 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
 
   if (target.kind === "external") {
     return <img src={target.value} alt={alt || ""} title={title}
+      width={width} height={height}
       loading="lazy" referrerPolicy="no-referrer" />;
   }
   if (target.kind !== "local") {
@@ -336,7 +310,7 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
     return <img src={asset.mediaType === "image/svg+xml"
       ? svg.url!
       : `data:${asset.mediaType};base64,${asset.data}`}
-      alt={alt || ""} title={title} loading="lazy" />;
+      alt={alt || ""} title={title} width={width} height={height} loading="lazy" />;
   }
   if (asset?.error) {
     return <span className="preview-image-error" title={asset.error}>图片不可用：{alt || src}</span>;
@@ -349,11 +323,12 @@ function PreviewImage({ markdownPath, src, alt, title, asset, requestAsset,
 
 export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
-  onSaveMarkdown, onDirtyChange }: {
+  onSaveMarkdown, onDirtyChange, theme, displayName }: {
+  displayName?: string;
   artifact: Artifact;
-  active: "diff" | "btw";
+  active: RightPanelView;
   hasBtw: boolean;
-  onTab: (v: "diff" | "btw") => void;
+  onTab: (v: RightPanelView) => void;
   onClose: () => void;
   onRefresh?: (path: string, line?: number) => void;
   onOpenFile?: (path: string, line?: number) => void;
@@ -365,14 +340,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onSaveMarkdown?: (path: string, content: string, expectedSize: number,
     expectedMtimeNs: string, expectedRevision: string) => string | null;
   onDirtyChange?: (dirty: boolean) => void;
+  theme?: HtmlPreviewTheme;
 }) {
-  const panelRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
-  const resizeRef = useRef<{
-    pointerId: number;
-    startX: number;
-    startWidth: number;
-  } | null>(null);
   const artifactKey = `${artifact.sid || ""}:${artifact.file}:${artifact.requestId || ""}`;
   const [pageState, setPageState] = useState({ key: artifactKey, page: 0 });
   const [modeState, setModeState] = useState<{ key: string; mode: "preview" | "source" }>({
@@ -404,10 +374,13 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     draft: artifact.content || "",
     baseline: artifact.content || "",
   };
-  const mathPlugins = useMarkdownMathPlugins(
+  const math = useMarkdownMathPlugins(
     editor.draft,
     artifact.kind === "md" && mode === "preview",
   );
+  const markdownRehypePlugins = useMemo(() => [
+    rehypePreviewHtml, ...(math.plugins?.rehypePlugins ?? []),
+  ], [math.plugins?.rehypePlugins]);
   const dirty = artifact.kind === "md" && editor.draft !== editor.baseline;
   const sections = artifact.kind === "gitdiff"
     ? (artifact.sections || EMPTY_GIT_DIFF_SECTIONS) : EMPTY_GIT_DIFF_SECTIONS;
@@ -478,7 +451,7 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     onClose();
   }, [confirmDiscard, onClose, onDirtyChange]);
 
-  const switchPanelTab = useCallback((next: "diff" | "btw") => {
+  const switchPanelTab = useCallback((next: RightPanelView) => {
     if (next !== active && !confirmDiscard()) return;
     if (next !== active) onDirtyChange?.(false);
     onTab(next);
@@ -489,64 +462,6 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         || event.key.toLowerCase() !== "s") return;
     event.preventDefault();
     saveDraft();
-  };
-
-  const applyPanelWidth = useCallback((requestedWidth: number, persist = false) => {
-    const width = clampPanelWidth(requestedWidth, window.innerWidth);
-    document.documentElement.style.setProperty("--panel-w", `${width}px`);
-    if (persist) localStorage.setItem(PANEL_WIDTH_KEY, String(width));
-    return width;
-  }, []);
-
-  useEffect(() => {
-    if (!window.matchMedia("(min-width: 981px)").matches) return;
-    const saved = Number.parseFloat(localStorage.getItem(PANEL_WIDTH_KEY) || "");
-    if (Number.isFinite(saved)) applyPanelWidth(saved);
-    const fitPanel = () => {
-      if (!window.matchMedia("(min-width: 981px)").matches) return;
-      const current = panelRef.current?.getBoundingClientRect().width;
-      if (current) applyPanelWidth(current);
-    };
-    window.addEventListener("resize", fitPanel);
-    return () => {
-      window.removeEventListener("resize", fitPanel);
-      document.documentElement.classList.remove("panel-resizing");
-    };
-  }, [applyPanelWidth]);
-
-  const startResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (!window.matchMedia("(min-width: 981px)").matches || !panelRef.current) return;
-    resizeRef.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startWidth: panelRef.current.getBoundingClientRect().width,
-    };
-    event.currentTarget.setPointerCapture(event.pointerId);
-    document.documentElement.classList.add("panel-resizing");
-    event.preventDefault();
-  };
-  const moveResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const resize = resizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    applyPanelWidth(resize.startWidth + resize.startX - event.clientX);
-  };
-  const finishResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const resize = resizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    resizeRef.current = null;
-    document.documentElement.classList.remove("panel-resizing");
-    const width = panelRef.current?.getBoundingClientRect().width;
-    if (width) applyPanelWidth(width, true);
-  };
-  const resizeWithKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    const width = panelRef.current?.getBoundingClientRect().width;
-    if (!width) return;
-    applyPanelWidth(width + (event.key === "ArrowLeft" ? 24 : -24), true);
-    event.preventDefault();
   };
 
   const sendNextAsset = useCallback(() => {
@@ -587,29 +502,27 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   const markdownComponents = useMemo<Components>(() => ({
     pre: MarkdownPreviewPre,
     code: MarkdownPreviewCode,
-    img: ({ src, alt, title }) => {
+    img: ({ src, alt, title, width, height }) => {
       const source = typeof src === "string" ? src : "";
       const target = classifyPreviewTarget(artifact.file, source);
       const asset = target.kind === "local" ? artifact.assets?.[target.value] : undefined;
       return <PreviewImage markdownPath={artifact.file} src={source} alt={alt}
-        title={title} asset={asset} requestAsset={requestAsset}
+        title={title} width={previewImageDimension(width)} height={previewImageDimension(height)}
+        asset={asset} requestAsset={requestAsset}
         onAuthorizePreview={onAuthorizePreview} />;
     },
-    a: ({ href, children, title }) => {
+    a: ({ href, children, title, id }) => {
       const target = classifyPreviewTarget(artifact.file, href || "");
       if (target.kind === "external") {
-        return <a href={target.value} target="_blank" rel="noopener noreferrer"
-          title={title}>{children}</a>;
+        return <WebLink href={target.value} title={title} id={id}>{children}</WebLink>;
       }
-      if (target.kind === "anchor") return <a href={target.value} title={title}>{children}</a>;
+      if (target.kind === "anchor") return <a href={target.value} title={title} id={id}>{children}</a>;
       if (target.kind === "local" && onOpenFile) {
         const source = parseLocalFileTarget(href || "");
-        return <a href="#" title={target.value} onClick={(event) => {
-          event.preventDefault();
-          onOpenFile(target.value, source?.line);
-        }}>{children}</a>;
+        return <LocalFileLink id={id} location={source?.line ? `${target.value}:${source.line}` : target.value}
+          onOpen={() => onOpenFile(target.value, source?.line)}>{children}</LocalFileLink>;
       }
-      return <span className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
+      return <span id={id} className="preview-link-disabled" title="该相对链接不会离开当前工作目录">{children}</span>;
     },
   }), [
     artifact.assets,
@@ -619,26 +532,25 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
     requestAsset,
   ]);
 
-  const title = artifact.file.split("/").pop()
-    || (["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "文件预览" : "改动");
-  const renderedArtifact = ["image", "pdf"].includes(artifact.kind)
+  const title = displayName || artifact.file.split("/").pop()
+    || (["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) ? "文件预览" : "改动");
+  const mermaidFile = artifact.kind === "file" && /\.(?:mmd|mermaid)$/i.test(artifact.file);
+  const renderedArtifact = ["image", "pdf", "audio"].includes(artifact.kind)
     || (artifact.kind === "html" && mode === "preview");
 
   return (
-    <div className="artifact-panel" ref={panelRef} data-lock-horizontal-swipe="true"
+    <PanelFrame className="artifact-panel" label={artifact.kind === "gitdiff" ? "改动" : "文件预览"}
       onKeyDown={handlePanelKeyDown}>
-      <button type="button" className="panel-resizer"
-        aria-label="调整文件面板宽度" title="左右拖动调整面板宽度"
-        onPointerDown={startResize} onPointerMove={moveResize}
-        onPointerUp={finishResize} onPointerCancel={finishResize}
-        onKeyDown={resizeWithKeyboard} />
+      <PanelResizer ariaLabel="调整文件面板宽度" />
       <div className="artifact-head">
-        {hasBtw ? <PanelTabs active={active} artifactKind={artifact.kind} onTab={switchPanelTab} />
+        {hasBtw ? <PanelTabs active={active}
+            artifactKind={artifact.kind} hasArtifact hasBtw={hasBtw}
+            onTab={switchPanelTab} />
           : <span className="artifact-title">{title}</span>}
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
-        {["md", "html"].includes(artifact.kind) && !loading && !artifact.error && <div
+        {(["md", "html"].includes(artifact.kind) || mermaidFile) && !loading && !artifact.error && <div
           className="preview-modes" role="group"
-          aria-label={`${artifact.kind === "html" ? "HTML" : "Markdown"} 显示模式`}>
+          aria-label={`${mermaidFile ? "Mermaid" : artifact.kind === "html" ? "HTML" : "Markdown"} 显示模式`}>
           <button className={mode === "preview" ? "on" : ""}
             onClick={() => setModeState({ key: artifactKey, mode: "preview" })}>预览</button>
           <button className={mode === "source" ? "on" : ""}
@@ -658,22 +570,32 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         </button>}
         {artifact.kind === "md" && artifact.saveStatus === "saved" && !dirty
           && <span className="markdown-save-state ok">已保存</span>}
+        {!loading && !artifact.error && !artifact.authorization && !artifact.truncated
+          && ["md", "file", "html", "image", "pdf"].includes(artifact.kind)
+          && (artifact.data != null || artifact.content != null) && <Suspense fallback={null}>
+            <ArtifactDownload id={artifactKey} file={displayName || artifact.file} data={artifact.data}
+              content={artifact.content} converted={artifact.convertedFrom} />
+          </Suspense>}
         {artifact.convertedFrom && <span className="artifact-converted"
           title="由 nono 本机沙箱临时转换，VPS 不保存文件">
           {artifact.convertedFrom.toUpperCase()} → PDF
         </span>}
-        {["md", "file", "html", "image", "pdf"].includes(artifact.kind) && <button className="iconbtn"
+        {["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) && <button className="iconbtn"
           onClick={() => onRefresh?.(artifact.file, artifact.line)}
           aria-label="刷新文件" title="重新读取文件"><Icon name="refresh" size={17} /></button>}
+        <PanelExpandButton label={artifact.kind === "gitdiff" ? "改动" : "文件预览"} />
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
-      <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}`}>
+      <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}${
+        artifact.kind === "md" && mode === "source"
+          ? " source-artifact-body" : ""
+      }`}>
         {artifact.authorization ? (
           <PreviewAuthorizationPrompt
             authorization={artifact.authorization}
             onDecision={onAuthorizePreview} />
         ) : loading ? (
-          <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file", "html", "image", "pdf"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
+          <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
         ) : artifact.error ? (
           <div className="preview-error"><Icon name="read" size={18} />{artifact.error}</div>
         ) : artifact.kind === "gitdiff" ? (
@@ -723,18 +645,24 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         ) : artifact.kind === "html" ? (
           mode === "source"
             ? <SourceFile content={artifact.content || ""} artifactKey={artifactKey} />
-            : <HtmlArtifactPreview content={artifact.content || ""} />
+            : <HtmlArtifactPreview content={artifact.content || ""} theme={theme} />
+        ) : artifact.kind === "spreadsheet" ? (
+          <Suspense fallback={<div className="diff-empty">读取表格…</div>}><SpreadsheetPreview key={artifactKey} content={artifact.content || ""} data={artifact.data} title={title} /></Suspense>
         ) : artifact.kind === "image" ? (
-          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
-            kind="image" title={title} />
+          <ImageArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
+            title={title} />
         ) : artifact.kind === "pdf" ? (
-          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
-            kind="pdf" title={title} />
+          <PdfArtifactPreview data={artifact.data} title={title} />
+        ) : artifact.kind === "audio" ? (
+          <AudioArtifactPreview key={artifactKey} data={artifact.data}
+            mediaType={artifact.mediaType} title={title} size={artifact.size} />
         ) : artifact.kind === "file" ? (
           <>
             {artifact.truncated && <div className="preview-truncated">文件共 {artifact.size?.toLocaleString()} 字节，仅预览前 512 KiB。</div>}
-            <SourceFile content={artifact.content || ""} targetLine={artifact.line}
-              artifactKey={artifactKey} />
+            {mermaidFile && mode === "preview" && !artifact.truncated
+              ? <MermaidBlock source={artifact.content || ""} />
+              : <SourceFile content={artifact.content || ""} targetLine={artifact.line}
+                  artifactKey={artifactKey} />}
           </>
         ) : artifact.kind === "md" ? (
           <>
@@ -754,15 +682,14 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
                   })} />
               : <div className="prose markdown-preview"><ReactMarkdown
                   remarkPlugins={
-                    mathPlugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
-                  rehypePlugins={mathPlugins?.rehypePlugins}
+                    math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+                  rehypePlugins={markdownRehypePlugins}
                   components={markdownComponents}>
-                  {mathPlugins
-                    ? normalizeMathDelimiters(editor.draft) : editor.draft}
+                  {math.normalizedSource}
                 </ReactMarkdown></div>}
           </>
         ) : null}
       </div>
-    </div>
+    </PanelFrame>
   );
 }

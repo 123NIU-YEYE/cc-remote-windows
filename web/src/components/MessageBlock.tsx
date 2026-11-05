@@ -1,8 +1,13 @@
-import { createContext, isValidElement, useContext, useEffect, useMemo, useRef,
-  useState, useSyncExternalStore, type ComponentPropsWithoutRef,
+import { createContext, isValidElement, memo, useContext, useEffect,
+  useMemo, useRef, useState, useSyncExternalStore,
+  type ComponentPropsWithoutRef,
   type ReactNode } from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
+import { LocalFileLink, WebLink } from "./LinkPreview";
+import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
 import { parseLocalFileTarget } from "../file-link";
+import { RemoteViewerContext } from "../remote-viewer-context";
+import { ViewerPagesContext } from "../viewer-pages-context";
+import { isLocalViewerUrl } from "../remote-viewer";
 import { Icon } from "../icons";
 import {
   classifyMessageImageTarget,
@@ -15,13 +20,20 @@ import type { PreviewAuthorizationState } from "../reducer";
 import { isMermaidFenceClass } from "../mermaid";
 import {
   isMathFenceClass,
-  normalizeMathDelimiters,
   STREAMING_REMARK_PLUGINS,
   useMarkdownMathPlugins,
 } from "../markdown-math";
 import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
+import { useMarkdownExtras } from "../use-markdown-extras";
+import { rehypeMessageBreaks } from "../markdown-breaks";
+
+// Keep the parser behind its own memo boundary. MessageBlock still receives
+// fresh callbacks/assets through context, but an unchanged displayed string
+// must not run the Markdown pipeline on each raw delta, scroll or drawer update.
+// Context consumers inside the cached tree continue to update independently.
+const MessageMarkdown = memo(ReactMarkdown);
 
 const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
   "git-stage": "Git 变更已暂存",
@@ -34,9 +46,47 @@ const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
 
 type MessagePart =
   | { kind: "markdown"; text: string }
-  | { kind: "directive"; name: string; label: string };
+  | { kind: "directive"; name: string; label: string }
+  | { kind: "visualization"; path: string; title: string };
 
-function splitCodexDirectives(text: string): MessagePart[] {
+const CODEX_VISUALIZATION_PREFIX = "visualize";
+const CODEX_VISUALIZATION_SUFFIX = "";
+const MAX_VISUALIZATION_PATH_CHARS = 4096;
+const MAX_VISUALIZATION_TITLE_CHARS = 240;
+
+function parseCodexVisualization(line: string): MessagePart | null {
+  const value = line.trim();
+  if (!value.startsWith(CODEX_VISUALIZATION_PREFIX)
+      || !value.endsWith(CODEX_VISUALIZATION_SUFFIX)) return null;
+  const encoded = value.slice(
+    CODEX_VISUALIZATION_PREFIX.length,
+    -CODEX_VISUALIZATION_SUFFIX.length,
+  );
+  let payload: unknown;
+  try {
+    payload = JSON.parse(encoded);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  if (typeof record.path !== "string"
+      || record.path.length > MAX_VISUALIZATION_PATH_CHARS) return null;
+  const target = parseLocalFileTarget(record.path);
+  if (!target || !/\.html?$/i.test(target.path)) return null;
+  const filename = target.path.replace(/\\/g, "/").split("/").pop()
+    ?.replace(/\.html?$/i, "") || "可视化";
+  const suppliedTitle = typeof record.title === "string"
+    ? record.title.trim().slice(0, MAX_VISUALIZATION_TITLE_CHARS)
+    : "";
+  return {
+    kind: "visualization",
+    path: target.path,
+    title: suppliedTitle || filename,
+  };
+}
+
+function splitCodexRichContent(text: string): MessagePart[] {
   const parts: MessagePart[] = [];
   let markdown = "";
   let fence: "`" | "~" | null = null;
@@ -51,6 +101,12 @@ function splitCodexDirectives(text: string): MessagePart[] {
     const suffix = index < lines.length - 1 ? "\n" : "";
     const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
     if (!fence) {
+      const visualization = parseCodexVisualization(line);
+      if (visualization) {
+        flushMarkdown();
+        parts.push(visualization);
+        return;
+      }
       const directive = line.match(
         /^::(git-stage|git-commit|git-create-branch|git-push|git-create-pr|created-thread)\{[^\n]*\}\s*$/,
       );
@@ -74,6 +130,28 @@ function splitCodexDirectives(text: string): MessagePart[] {
   });
   flushMarkdown();
   return parts;
+}
+
+function CodexVisualizationCard({ path, title, onOpenFile }: {
+  path: string;
+  title: string;
+  onOpenFile?: (path: string, line?: number) => void;
+}) {
+  const available = !!onOpenFile;
+  return <button type="button" className="codex-visualization-card"
+    disabled={!available} data-visualization="html"
+    title={available ? "在 Remote 中打开可视化" : "当前无法读取可视化文件"}
+    onClick={() => onOpenFile?.(path)}>
+    <span className="codex-visualization-icon"><Icon name="read" size={17} /></span>
+    <span className="codex-visualization-copy">
+      <strong>{title}</strong>
+      <span>HTML 可视化</span>
+    </span>
+    <span className="codex-visualization-open">
+      {available ? "打开" : "不可用"}
+      <Icon name="chevron-right" size={15} />
+    </span>
+  </button>;
 }
 
 function nodeText(node: ReactNode): string {
@@ -367,19 +445,36 @@ function MarkdownImage({ src, alt, title }: ComponentPropsWithoutRef<"img">) {
     onPreviewImage={onPreviewImage} />;
 }
 
+// Keep local file anchors until MarkdownLink turns them into preview buttons.
+// Images and all other schemes retain react-markdown's default URL policy.
+const messageUrlTransform: UrlTransform = (url, key, node) => {
+  if (key === "href" && node.tagName === "a"
+      && /^file:\/\//i.test(url) && parseLocalFileTarget(url)) return url;
+  return defaultUrlTransform(url);
+};
+
 function MarkdownLink({
   href = "", children, title,
 }: ComponentPropsWithoutRef<"a">) {
   const { onOpenFile } = useContext(MessageMarkdownContext);
+  const openViewer = useContext(RemoteViewerContext);
+  const openPage = useContext(ViewerPagesContext)?.openLink;
   const file = parseLocalFileTarget(href);
   if (file && onOpenFile) {
     const location = file.line ? `${file.path}:${file.line}` : file.path;
-    return <button type="button" className="message-file-link"
-      title={`在 Remote 中打开 ${location}`}
-      onClick={() => onOpenFile(file.path, file.line)}>{children}</button>;
+    return <LocalFileLink location={location}
+      onOpen={() => onOpenFile(file.path, file.line)}>{children}</LocalFileLink>;
+  }
+  if (/^https?:\/\//i.test(href) && !isLocalViewerUrl(href)) {
+    return <WebLink href={href} title={title}>{children}</WebLink>;
   }
   if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) {
     return <a href={href} target="_blank" rel="noopener noreferrer"
+      onClick={isLocalViewerUrl(href) ? (event) => {
+        if (event.defaultPrevented || event.button !== 0
+            || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (openPage?.(href) || openViewer?.(href)) event.preventDefault();
+      } : undefined}
       title={title}>{children}</a>;
   }
   if (href.startsWith("#")) return <a href={href} title={title}>{children}</a>;
@@ -460,6 +555,9 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
 
   useEffect(() => () => {
     if (timer.current) clearTimeout(timer.current);
+    // StrictMode reconnects effects on mount; a canceled timer must not keep
+    // subsequent text updates waiting for a callback that will never run.
+    timer.current = null;
   }, []);
 
   const markdownContext = useMemo<MessageMarkdownContextValue>(() => ({
@@ -473,26 +571,41 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
     onOpenFile,
     onPreviewImage,
   ]);
-  const mathPlugins = useMarkdownMathPlugins(shown, done);
-  const parts = useMemo(() => splitCodexDirectives(
-    mathPlugins ? normalizeMathDelimiters(shown) : shown,
-  ), [mathPlugins, shown]);
+  const math = useMarkdownMathPlugins(shown, true);
+  const extras = useMarkdownExtras(shown);
+  const remarkPlugins = useMemo(() => [
+    ...(math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS),
+    ...(extras.citation ? [extras.citation] : []),
+  ], [extras.citation, math.plugins?.remarkPlugins]);
+  const rehypePlugins = useMemo(() => [
+    ...(extras.details ? [extras.details] : []),
+    rehypeMessageBreaks,
+    ...(math.plugins?.rehypePlugins ?? []),
+  ], [extras.details, math.plugins?.rehypePlugins]);
+  const parts = useMemo(
+    () => splitCodexRichContent(math.normalizedSource),
+    [math.normalizedSource],
+  );
 
   if (!shown) return null;
   return (
     <MessageMarkdownContext.Provider value={markdownContext}>
       <div className="prose">
-        {parts.map((part, index) => part.kind === "markdown"
-          ? <ReactMarkdown key={`markdown-${index}`}
-              remarkPlugins={
-                mathPlugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
-              rehypePlugins={mathPlugins?.rehypePlugins}
-              components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>
-          : <div key={`directive-${index}`} className="codex-directive-status"
+        {parts.map((part, index) => {
+          if (part.kind === "markdown") return <MessageMarkdown key={`markdown-${index}`}
+              remarkPlugins={remarkPlugins}
+              rehypePlugins={rehypePlugins}
+              urlTransform={messageUrlTransform}
+              components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</MessageMarkdown>;
+          if (part.kind === "visualization") return <CodexVisualizationCard
+            key={`visualization-${index}`} path={part.path} title={part.title}
+            onOpenFile={onOpenFile} />;
+          return <div key={`directive-${index}`} className="codex-directive-status"
               data-directive={part.name}>
               <Icon name="verify" size={14} />
               <span>{part.label}</span>
-            </div>)}
+            </div>;
+        })}
         {!done && <span className="cursor" />}
       </div>
     </MessageMarkdownContext.Provider>
