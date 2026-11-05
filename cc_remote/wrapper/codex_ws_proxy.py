@@ -2,9 +2,9 @@
 
 ``CodexHandle`` already owns the WebSocket handshake, framing, validation and
 JSON-RPC lifecycle. Unix can reach the shared daemon through the official
-``codex app-server proxy`` command; Windows has no daemon/socket lifecycle, so
-this tiny process provides the equivalent byte pipe to a loopback ``ws://``
-listener without adding another WebSocket implementation to the handle.
+``codex app-server proxy`` command, which current Windows CLIs support too.
+This compatibility process supplies a byte pipe only when an explicit legacy
+loopback ``ws://`` listener is selected.
 """
 from __future__ import annotations
 

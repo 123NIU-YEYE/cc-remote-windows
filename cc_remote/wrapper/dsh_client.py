@@ -28,6 +28,7 @@ from cc_remote.log import logger
 from cc_remote.wrapper.os_compat import private_file_ok
 
 TESTED_DSH_VERSION = "0.2.1-rc.2"
+SUPPORTED_DSH_VERSIONS = frozenset({TESTED_DSH_VERSION, "0.2.1-rc.5"})
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 # A follow snapshot is reconciled through bounded HTTP history reads before
 # consuming its live tail. Reasoning/tool chunks can burst while those complete;
@@ -480,8 +481,10 @@ class DshClient:
 
     async def draft_catalog(self, cwd, preset=None):
         value = await self.read_route("/api/cc-remote.catalog", {"cwd": cwd, **({"preset": preset} if preset else {})})
-        if not isinstance(value, dict) or value.get("contract") != 2 or value.get("version") != TESTED_DSH_VERSION:
-            raise DshError("metadata_required", "请加载 DSH 0.2.1-rc.2 对应的 cc-remote 元数据插件。")
+        if (not isinstance(value, dict) or value.get("contract") != 2
+                or not isinstance(value.get("version"), str)
+                or value["version"] not in SUPPORTED_DSH_VERSIONS):
+            raise DshError("metadata_required", "请加载已验证 DSH 版本对应的 cc-remote 元数据插件。")
         return value
 
     async def metadata(self, sid: str, *, query=None):
@@ -490,9 +493,10 @@ class DshClient:
             params["query"] = query
         value = await self.read_route("/api/cc-remote.metadata", params)
         if (not isinstance(value, dict) or value.get("contract") != 2
-                or value.get("version") != TESTED_DSH_VERSION
+                or not isinstance(value.get("version"), str)
+                or value["version"] not in SUPPORTED_DSH_VERSIONS
                 or value.get("sessionId") != native_session_id(sid)):
-            raise DshError("metadata_required", "请加载与 DSH 0.2.1-rc.2 对应的 cc-remote 元数据插件。")
+            raise DshError("metadata_required", "请加载已验证 DSH 版本对应的 cc-remote 元数据插件。")
         return value
 
     async def read_route(self, route: str, params: dict):

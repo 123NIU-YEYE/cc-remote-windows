@@ -27,7 +27,7 @@
      ▼
 本机 Wrapper（Windows）
      ├── DSH 桌面版    http://127.0.0.1:<端口>?token=<43字符>
-     ├── Codex CLI     app-server --stdio
+     ├── Codex CLI     官方共享 daemon ← 官方终端 / 可选桌面入口
      └── Claude Code   stream-json 子进程
 ```
 
@@ -75,9 +75,9 @@ CODEX_BIN=C:\...\@openai\codex\...\bin\codex.exe
 CLAUDE_BIN=C:\...\@anthropic-ai\claude-code\bin\claude.exe
 
 # ── Codex 共享守护进程 ───────────────────────────────
-# 保留私有 stdio；需要共享时改为 auto 并设置下面的回环端点
-CC_REMOTE_CODEX_DAEMON=off
-# CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:8766
+# 官方终端与 Wrapper 共用原生 daemon；不设置旧的独立 WS 端点
+CC_REMOTE_CODEX_DAEMON=auto
+# CODEX_APP_SERVER_WS_URL=
 
 # ── DSH 桌面版配对文件（可选，配了才启用 DSH 引擎）───
 CC_REMOTE_DSH_CONNECTION_FILE=C:\Users\<你>\.config\cc-remote\dsh-connection.json
@@ -110,9 +110,10 @@ CC_REMOTE_DSH_CONNECTION_FILE=C:\Users\<你>\.config\cc-remote\dsh-connection.js
 Wrapper 的中继连接使用 `HTTPS_PROXY` / `HTTP_PROXY`，并遵守 `NO_PROXY`；
 回环连接保持直连。需要代理时在本机配置中设置，模型链路仍由各引擎配置决定。
 
-Windows 上若需要 Codex 共享控制，设置 `CC_REMOTE_CODEX_DAEMON=auto` 和
-根路径的回环 `CODEX_APP_SERVER_WS_URL`。同一个端点只用于默认账号，
-其他账号保留独立边界；`off` 继续使用私有 stdio。协议 v81 必须在 Web、relay 和 wrapper 同步使用。
+Windows 上使用 `CC_REMOTE_CODEX_DAEMON=auto`，并保持
+`CODEX_APP_SERVER_WS_URL` 为空。Wrapper 与普通 `codex resume <会话ID>`
+通过官方 `app-server proxy` 连接同一个账号的原生 daemon。显式 `off` 仍是私有
+stdio，不能视为实时共享；Work 继续使用独立控制面。
 
 DSH 已集成原生会话与工具面板；配置了同源 `/dsh/` 代理时，可在构建时设置 `VITE_DSH_DESKTOP_PANEL=1`，使用顶部的
 “桌面面板”入口。旧的桌面代理与隧道维护脚本仍位于 `scripts/`。
@@ -153,26 +154,41 @@ DSH 桌面版的 API 只绑回环，且 **launch token 每次启动新生成、�
 
 ### 3.2 Codex
 
-- `CODEX_BIN` 指向**真实可执行文件**（不是 `.cmd` 包装器）。
-- `CC_REMOTE_CODEX_DAEMON=off`：共享 daemon 走 Unix socket，Windows 上不可用；`off` 让 Wrapper 走 stdio 回退，功能等价。
-- 一个 thread **同时只能有一个写入者**。若同一会话在官方 Codex App 里开着，cc-remote 会得到
-  `already has an active writer`，只能看不能写 —— 关掉那一边即可。
+- `CODEX_BIN` 指向现有官方 CLI 的真实可执行文件。
+- 使用 `CC_REMOTE_CODEX_DAEMON=auto`，不设置旧的独立 WebSocket 端点。
+  Windows 已验证官方原生 daemon；本次链路验收使用 CLI/后台 `0.166.0`。
+- 在本机运行 `codex app-server daemon version`，确认 `status=running`、
+  CLI/后台版本一致及账号目录一致，再用普通 `codex resume <会话ID>` 恢复网页会话。
+  后台自动更新后若 CLI 落后，应通过原安装渠道对齐 CLI；不要结束活跃任务来重启后台。
+- 可选桌面入口：正常结束现有 App 任务并退出 App 后，运行
+  `scripts/start-codex-shared-app.ps1`。它从已安装的官方 App 包定位程序，
+  只对新 App 进程设置共享连接，不修改程序、全局环境或默认账号。
+  本地桥接只把字节转发到同一原生 daemon，不另起一个私有 app-server。
+- 已运行的私有 App/CLI 不会自动迁移。桌面环境变量属于版本相关的内部行为，
+  桥接握手通过不能替代 App 本身的连接验收；升级 App 后应重新验证。
+
+### 网页与本地会话的边界
+
+| 引擎 | 同一会话与记录 | 控制方式 |
+|---|---|---|
+| Codex Code | 相同原生 thread ID、相同账号 daemon 和 rollout | 网页与普通官方终端共享控制；桌面 App 需从共享入口启动并单独验收 |
+| Claude Code | 相同原生 UUID、原 cwd 与 transcript，续接时不创建副本 | 官方终端持有会话时网页只读镜像；终端退出或用户明确接管后，网页恢复同一 UUID |
+| DSH | 网页 `dsh@<原生ID>` 对应桌面服务同一条会话日志 | 通过同一个桌面 Host 的官方控制 API 操作，不创建平行的模型会话 |
+
+Claude 的单写入者保护不会因为“同步记录”而关闭。在原 cwd 使用
+`claude --resume <UUID>` 续接；不要用 fork 或另一个 cwd 冒充同一会话。
+这与官方 claude.ai Remote Control 是不同的集成，cc-remote 不代理其登录服务。
+
+DSH 已验证 `0.2.1-rc.2` 与 `0.2.1-rc.5` 的 v4 日志和 metadata contract 2。
+桌面端重启或更新后，先运行 `scripts/pair-desktop.ps1`；端点改变时应等任务结束后
+重启 Wrapper，使新连接生效，不要停止桌面 Agent 来清除状态。
 
 ### 3.3 Claude Code
 
-两个前提：
-
-1. **`claude-agent-sdk` 必须是 `0.2.157`**。仓库对它做严格相等校验，版本不符会在 preflight 直接拒绝整个引擎。
-   PyPI 上 `0.2.157` 只有源码包，便携版 Python 构建不了（缺 hatchling 后端）。
-   解法是直接从 sdist 里取出纯 Python 包目录复制进 `.pydeps`：
-
-   ```powershell
-   python -m pip download --no-deps --no-binary :all: claude-agent-sdk==0.2.157 -d .dl
-   # 解包 .dl/*.tar.gz，把 src/claude_agent_sdk/ 整个目录复制到 .pydeps/claude_agent_sdk/
-   ```
-
-2. **`mcp==1.28.1`**。更新的 `mcp` 移除了 `Server.list_tools`，启动时会
-   `AttributeError: 'Server' object has no attribute 'list_tools'`。
+使用已登录的日常官方 `claude`，并通过 `requirements-wrapper.txt` 在 `.venv`
+中安装固定的 `claude-agent-sdk==0.2.157` 及其依赖。启动时会校验 SDK 的精确补丁
+版本和 Claude Code `>=2.1.263`；不要用手工复制包目录替代依赖安装，也不要换用
+SDK 自带 CLI。`CLAUDE_BIN` 只在真实 CLI 不位于默认位置时设置为绝对路径。
 
 **关于网关**：Claude Code 读 `~/.claude/settings.json` 里的 `env`，其**优先级高于**父进程环境变量：
 
@@ -404,7 +420,7 @@ cloudflared tunnel --url http://127.0.0.1:8765
 |---|---|
 | **Viewer（文件预览）** | Windows 上未移植。依赖 Unix socket 与目录 `dir_fd` 语义，需单独实现。日志会持续出现 `Viewer channel unavailable`，**不影响对话** |
 | **Claude PTY broker** | 仅 Unix（`experimental_claude_broker`，默认关闭） |
-| **Codex 共享 daemon** | 仅 Unix；Windows 用 stdio 回退（`CC_REMOTE_CODEX_DAEMON=off`） |
+| **Codex 共享 daemon** | Windows/Linux/macOS 均走已验证的官方 native daemon/proxy；显式 `off` 才使用私有 stdio |
 | **自建网关 + 代理** | 若你的 Claude 网关需要走代理才通，需改 `child_env.py` 的代理策略 |
 | **UAC / 服务安装** | 非管理员账户下无法安装 Clash 服务或开启 TUN |
 | **协作：DSH 成员** | 不能从目录新建会话，必须绑定已存在的 `dsh@<id>`（见 §4.7） |

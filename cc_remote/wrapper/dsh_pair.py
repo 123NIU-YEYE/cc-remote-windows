@@ -56,7 +56,7 @@ async def validate(connection: DshConnection) -> None:
         await client.draft_catalog(str(Path.cwd()))
         if (not isinstance(roster, dict) or not isinstance(roster.get("presets"), list)
                 or not isinstance(catalog, dict) or not isinstance(catalog.get("groups"), list)):
-            raise DshError("unsupported", "DSH 未提供 0.2.1-rc.2 的模型与 Preset 接口。")
+            raise DshError("unsupported", "DSH 未提供已验证的模型与 Preset 接口。")
     finally:
         await client.close()
 
