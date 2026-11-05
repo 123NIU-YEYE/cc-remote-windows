@@ -1,508 +1,253 @@
-# cc-remote
+# cc-remote-windows
 
-**Use Claude Code and Codex on your machine from your phone, browser or terminal.**
+**Continue local Claude Code, Codex and DeepSeek Harness sessions from your phone or browser.**
 
-Self-hosted · Multiple sessions and devices · Live tool activity · Code / Work · Web / PWA / TUI
+[中文](README.md) · Product version: v4.0.29 · protocol v81
 
-**Product version: v4.0.29** · Wire protocol v81
+Native session identity · Multiple devices and sessions · Live tools · Collaboration rooms · Web / PWA / TUI
 
-[中文](README.md) · [Release install (recommended)](#install-and-upgrade) · [Engine comparison](#engines-and-features) · [Try from source](#quick-start) ·
-[Terminal workspace](#terminal-workspace) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
+This branch combines Windows support, DSH desktop integration and collaboration rooms. Model authentication, tool execution and native history stay on the device. cc-remote provides remote control, history projections and the interface.
 
-cc-remote brings your local agent's sessions, tool activity, files and controls to
-remote clients. Start a task on your computer, check progress from your phone,
-answer a question or steer the task, then return to the same conversation.
-Model authentication, provider configuration and tool execution remain with the
-local engine. cc-remote does not proxy model APIs.
+[Windows quick start](#windows-quick-start) · [Shared sessions](#how-web-and-local-clients-share-a-session) · [Engine setup](#engine-setup) · [Deployment](#deployment-and-upgrades) · [Troubleshooting](#troubleshooting) · [Development](#development-and-validation)
 
-**We recommend the latest stable Release for regular use.** Follow the
-[Release installation guide](docs/installation_en.md#release-install) for your first setup,
-then run `cc-remote update` from an independent terminal or SSH connection to upgrade
-to the latest stable version. Installation and updates use prebuilt artifacts;
-you do not need to clone the repository, run CI or build the frontend.
-
-This README describes the current source tree. For a published package, read the
-documentation at its tag: the same product version does not guarantee the same
-features or wire protocol across different commits.
-
-![Claude sessions and the multi-session workspace](assets/readme-claude-multisession.jpg)
+![Interface example: multiple sessions and tool activity](assets/readme-claude-multisession.jpg)
 
 ## What you can do
 
-- **Handle several tasks at once.** Group sessions by directory, search, pin,
-  rename and leave them running in the background. Switching views does not stop
-  a task. History is paged, with tool details loaded when expanded.
-- **Follow the work.** Read streaming replies, engine-provided reasoning
-  summaries, plans, tool calls, command output, file changes and approvals.
-  Claude and Codex support steering or queueing while busy. Steering adds
-  instructions to the current task without interrupting running tools.
-- **Manage longer tasks.** `/goal` exposes each engine's native progress, budget
-  and controls. Claude and Codex also offer temporary `/btw` side conversations
-  while the main task continues.
-- **Read files directly.** File and directory links in messages connect to
-  `/open` and the preview panel: source, Markdown, images, HTML, PDF, audio and XLSX.
-- **Connect machines and accounts.** Pair, switch and revoke devices in Device
-  Center. Built-in Claude/Codex multi-account support lets you use OAuth accounts
-  and third-party API gateway accounts in one interface.
-- **Customize appearance.** More settings → Appearance adjusts accent, background,
-  text and fonts. Each engine’s light/dark styles are saved separately in the
-  current browser; reset restores only the visible style.
-- **Work from a phone.** Compact engine menus, light/dark themes, image zoom, PWA
-  installation and optional background notifications. Notifications default to
-  generic status; showing a session name requires an explicit opt-in.
-- **Continue in a terminal.** The full-screen TUI supports Claude/Codex Code and
-  Work, sharing Web sessions, running state and queues. Use Vim-style controls,
-  a searchable session tree, tabs and tool details. [Install and run](#terminal-workspace).
+- Continue tasks remotely, inspect replies and tools, answer native questions and approvals, then return to the official client.
+- Organize, search, pin and switch sessions across devices without stopping background work.
+- Read the device's transcript, rollout or DSH log, with paged history and on-demand process details.
+- Use native models, reasoning, plans, Goals, steering, queues, subagents and extensions where supported.
+- Dispatch with `@member` in collaboration rooms, quote results, hand off messages and open members' full sessions.
+- Use the Claude/Codex Code and Work terminal workspace. Press `Space e` for the session tree; see the [TUI guide](docs/tui.md).
 
-### Code and Work
+Controls depend on the device's native engine, account and version. DSH currently supports Code; Claude/Codex Work uses separate projects and control planes.
 
-**Code** operates in your chosen project directory for development, debugging and
-other agent tasks. Both engines support it.
+## How Web and local clients share a session
 
-**Work** is a separate Claude/Codex workspace for documents, spreadsheets,
-presentations and research. It includes private projects, file/link/note sources,
-work templates, artifacts, and one-shot, daily or weekly schedules. Each work
-item has its own directory; add material through attachments or the project
-library. Work sessions and material are separate from Code.
+Sharing preserves one engine's conversation across Web and official local clients. Each engine retains its own log format and session IDs.
 
-## Engines and features
-
-This development branch adds **DSH 0.2.1-rc.2**, using the current Code chat UI
-and a separate white/blue default palette. It supports native commands, Skills,
-questions and approvals, steering/queueing, Goals, subagents, jobs and artifact
-previews. See [DSH integration](docs/dsh-integration.md) for pairing, verification
-and capability boundaries. DSH retains model authentication; connecting does
-not automatically upgrade or migrate existing DSH data.
-
-This table describes **capabilities connected in cc-remote**. Models, permissions
-and extensions still depend on the native installation on the selected device.
-
-| Capability | Claude Code | Codex |
+| Engine | Shared identity and history | Control |
 |---|---|---|
-| Connection | Daily Claude CLI + Agent SDK | Official app-server, shared daemon |
-| Code / Work | Both | Both |
-| Full-screen terminal TUI | Supported | Supported |
-| Models and reasoning | Native models and supported levels | Native models, reasoning effort, service tier |
-| Plan | Native Plan mode | Native Plan collaboration mode |
-| Goal | Completion condition, check count, latest feedback, token usage and elapsed time | Objective, optional token budget, pause/resume, complete and clear |
-| `/btw` side conversation | Supported | Supported |
-| Archive and delete | Archive, restore, delete | Archive, restore, delete |
-| Fork sessions | Supported | Supported, including a separate worktree |
-| Engine-specific tools | Hook management, native questions and tool approvals | Review, idle-session directory migration, status and account limits |
-| Extensions | Skills, plugins, MCP, Hooks and supported management | Skills, plugins, Apps, MCP; read-only Hooks |
+| Claude Code | Same UUID, original cwd and transcript | A native terminal owns its transcript; Web mirrors read-only until it exits or the user explicitly hands over control |
+| Codex Code | Same thread ID, account home, official daemon and rollout | Wrapper and ordinary CLI use the same daemon; App sharing uses a separate launcher and actual connection verification |
+| DSH | Web `dsh@<native-ID>` maps to the desktop Host's session | Official local control API; DSH owns execution and storage |
 
-### Goal budgets are separate from context capacity
+Open **会话信息与本地续接** (session information and local continuation) to inspect the full ID, original cwd, device, account and control state. On mobile, use More settings. Applicable continuation commands are shown there.
 
-`/goal` opens the current engine's goal dialog, with controls matching native capabilities:
+Resume Claude with `claude --resume <UUID>` in its original cwd, or Codex with `codex resume <thread-ID>`. Select the matching native session in the paired DSH desktop. Uncertain ownership remains read-only; do not terminate unknown processes to unlock it.
 
-- **Claude** uses a completion condition and native check feedback. It shows
-  usage and elapsed time, without a Codex-style token-budget input.
-- **Codex** can set a cumulative token budget for a goal or leave it unlimited.
-  That budget does not increase the context window.
+## Architecture and data
 
-## Common operations
+```text
+Phone / browser / PWA
+        | HTTPS + Cookie / WebSocket
+        v
+Relay + Web (VPS with Caddy, or a tunnel)
+        | /ws; Wrapper authenticates with a Bearer credential
+        v
+Local Wrapper
+        +-- Claude Code: daily official CLI + pinned Agent SDK
+        +-- Codex: official app-server daemon / proxy
+        +-- DSH: paired loopback control API
 
-Type `/` in the composer to see commands available for the current engine.
+Local engine -- its own authentication and settings --> model service
+```
 
-| Entry | Purpose |
+Relay forwards device-scoped traffic and does not proxy model APIs. Native logs stay local; browser projections and the SQLite history index are rebuildable. Preserve login, device authorization and Push state when moving the corresponding service.
+
+## Windows quick start
+
+This path connects to an **existing Relay**. Otherwise, start with [Deployment and upgrades](#deployment-and-upgrades).
+
+### 1. Prepare dependencies
+
+| Dependency | Requirement |
 |---|---|
-| `/model` | Choose a model and reasoning level |
-| `/goal` | Open the current engine's goal dialog |
-| `/plan` | Enter planning; exit with `/normal` |
-| `/btw [question]` | Start a temporary side conversation based on the current Claude/Codex session |
-| `/open [path]` | Browse directories; also available from More → Session files |
-| `/preview <path>` | Open a file preview |
-| `/diff` | Inspect current project Git changes |
-| `/context` | Inspect context usage; the small composer gauge opens it too |
-| `/autocompact` | Claude/Codex session context settings, with the semantics below |
-| `/status` | Codex thread, configuration, usage and account limits |
-| `/skills` | Inspect engine Skills; Claude/Codex also have `/extensions` and related catalogs |
+| Python | Standard or uv-managed Python 3.13 recommended; deployment runtime pinned in [python-version.txt](deploy/python-version.txt) |
+| Git | Fetch the source |
+| Node.js | Node 24 when building Web; see [.nvmrc](.nvmrc). Wrapper-only devices do not need a Web build |
+| Claude Code | Signed-in daily official CLI, version `>=2.1.263` |
+| Codex | Signed-in official CLI, aligned with the daemon; verified baseline `0.166.0` |
+| DSH, optional | Desktop `0.2.1-rc.2` / `0.2.1-rc.5`, paired below |
 
-On desktop, **Enter sends and Shift+Enter inserts a newline** by default. Assistant
-question dialogs use the same keys; **Esc** dismisses the dialog while leaving
-the question unanswered. Confirming an IME composition does not submit it.
-
-Side conversations, file previews, diffs, session files, agent details and remote
-previews have a header button to expand into a centered view or dock on the right.
-
-Native Codex agents and MCP background tasks appear above the composer in the
-background task control. Click an agent to inspect its activity. Refreshing or
-reconnecting restores ongoing work; finishing the main response does not clear
-an agent that is still running.
-
-**More → Artifacts** lists uploads and delivered file links for the current session;
-side chats have their own Artifacts entry. Discovery also recognizes
-code-formatted local paths and filenames in a list or
-table introduced by an explicit directory. It does not crawl directories or
-automatically treat tool-read files as deliverables.
-Tables may omit or mix leading/trailing pipes and use an explicitly labeled
-filename/path column; code-formatted source
-filenames or identifiers in description columns are not treated as deliverables.
-Opening a file replaces the list with
-its preview; Back returns to the list. New uploads have durable private copies,
-while delivered files reference their original paths. Older sessions are indexed
-one history page at a time; previously deleted temporary uploads cannot be recovered.
-Private attachment copies are capped at 256 MiB / 512 files per session and
-2 GiB / 4096 files per Wrapper state directory, with 256 MiB of disk space reserved.
-At a limit, new copies are skipped and logged; existing attachments are preserved
-and sending continues. Later previews depend on files still available in native history.
-Deleting a session releases its copies; archiving does not. Delivered originals
-are never counted against these limits or deleted by this cleanup.
-The existing session file browser continues to browse directories independently.
-
-**⌘/Ctrl+Shift+K** opens or collapses side chat. **⌘/Ctrl+Shift+E** only toggles
-centered side chat, above any open or expanded file preview. Files keep their
-own expand/dock buttons and retain their layout and unsaved edits underneath.
-Pressing it again, clicking outside, or pressing **Esc** restores the previous
-state: hidden if opened directly, docked if expanded from the right panel.
-Layout changes preserve conversations, drafts, file edits and preview pages,
-and leave running tasks active.
-Use the paperclip to add attachments; images, files and pasted-text
-cards appear above the input of the corresponding chat.
-
-### Context and automatic compaction
-
-In **Codex Code**, `/autocompact 300k` sets the session's maximum usable context
-to **300,000 tokens**. Automatic compaction targets roughly **95%** of that
-capacity, subject to the effective threshold shown in the popover and Codex's
-native limits. The gauge uses native compaction estimates rather than treating
-last-request usage as the compaction trigger. A temporary read failure keeps the
-last valid reading for the same session and model, without repeated loading notices.
-
-A setting saved while busy may remain pending until the thread is idle and other
-clients release it. `/autocompact default` restores native defaults. This Codex
-override does not apply to Work or temporary side conversations. Restore defaults
-before switching to a model with a smaller context window.
-
-**Claude** keeps native automatic compaction by default, with an explicit automatic
-or `100K–1M` session-window choice available. Lowering it first verifies a native
-compact boundary. Reading context creates no model turn.
-
-## Files and previews
-
-Code's `/open` starts in the session directory and supports parent directories,
-absolute paths and `~`. Regular files readable by the Wrapper's OS user can be
-viewed even when another user owns them. External files are read-only by default;
-Work stays within its own workspace. Directory reads are paged and non-recursive.
-Symlinks and special files are not opened.
-
-| File | Preview and limits |
-|---|---|
-| Source, text, Markdown | Line navigation and rendered previews; Markdown successfully written by this session supports conflict-safe editing |
-| Images, PDF | Direct previews; images support a lightbox and zoom |
-| Audio | Playback, seeking, speed and download; up to 8 MiB, with codec support determined by the browser |
-| XLSX | Worksheet tabs and saved cell values on macOS/Linux without Office. No formula evaluation or external-link execution. Size, row/column and total-cell bounds apply; truncation is indicated and the original can be downloaded |
-| DOC/DOCX/ODT/RTF, XLS/ODS, PPT/PPTX/ODP | Temporary PDF conversion with LibreOffice + bubblewrap on a Linux Wrapper; unavailable without that conversion environment |
-| HTML | Sanitized, scriptless file preview; use [Remote Viewer](docs/remote-viewer.md) for interactive multi-file static pages |
-
-Parsing/conversion happens on the Wrapper host or in the browser. Files return to
-the requester through an authenticated connection. The relay does not persist
-originals or previews. Viewer defaults to the main site origin without another
-preview domain; it does not proxy arbitrary private-network services.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  browser["Phone / browser"] <-->|HTTPS / WSS| relay["Relay + static Web client"]
-  terminal["Terminal TUI"] <-->|WSS| relay
-  subgraph device["Your machine"]
-    wrapper["Wrapper"] <--> engine["Claude SDK / Codex app-server"]
-  end
-  relay <-->|WebSocket| wrapper
-  engine -->|Native config and login| model["Model service"]
+```powershell
+git clone https://github.com/123NIU-YEYE/cc-remote-windows.git
+Set-Location cc-remote-windows
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-wrapper.lock
+Copy-Item .env.example .env
 ```
 
-Wrapper connects outbound to Relay; the device needs no public inbound port.
-Relay handles the control connection while the native engine connects directly
-to its model service. The two connections are configured independently.
+Preserve an existing `.env`. Use the repository's `.venv`; the old portable-Python `.pydeps` layout is not the current installation path.
 
-<a id="quick-start-local-one-machine-5-min"></a>
+### 2. Configure and enroll the device
 
-## Quick start
-
-For regular use, start with [Release installation and one-command updates](#install-and-upgrade).
-The steps below are for source development and local evaluation: run Relay, Wrapper
-and the web client on the agent's machine. Source
-development/builds use **Python 3.13 and Node 24**, matching CI and [`.nvmrc`](.nvmrc).
-
-Prepare at least one working engine:
-
-- **Claude:** daily Claude Code `>= 2.1.263`, normally at `~/.local/bin/claude`.
-  Wrapper launches that CLI; the Python Agent SDK is pinned to `0.2.157`.
-- **Codex:** an authenticated official CLI. Shared control requires both
-  `codex app-server daemon --help` and `codex app-server proxy --help`.
-
-### 1. Install dependencies and build
-
-```bash
-git clone https://github.com/muggle-stack/cc-remote.git
-cd cc-remote
-# For development-branch features, check out that branch before installing/building.
-python3.13 -m venv .venv
-.venv/bin/python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
-# Use Node 24 for the following commands.
-npm --prefix web ci
-npm --prefix web run build
-```
-
-### 2. Configure local access
-
-Copy the template only for a first setup. Edit an existing `.env` in place to
-preserve its secrets.
-
-```bash
-install -m 600 .env.example .env
-openssl rand -hex 32   # Generate SESSION_SECRET.
-openssl rand -hex 32   # Generate a separate WRAPPER_TOKEN.
-```
-
-Set actual values in `.env`; angle-bracket values below are placeholders:
+Edit `.env` as UTF-8 without BOM. For **Device Center pairing**, use this example and replace CLI paths with real absolute paths:
 
 ```ini
-LOGIN_PASSWORD=<strong web login password>
-SESSION_SECRET=<first random value>
-WRAPPER_TOKEN=<second random value>
-PUBLIC_ORIGIN=http://127.0.0.1:8765
-RELAY_URL=ws://127.0.0.1:8765/ws
-WEB_STATIC_DIR=web/dist
-CC_CWD=/absolute/path/to/project
-CLAUDE_BIN=
+# Empty values use private paired-device configuration
+RELAY_URL=
+WRAPPER_TOKEN=
+CC_REMOTE_MACHINE_ID=
+
+CLAUDE_BIN=C:/path/to/claude.exe
+CODEX_BIN=C:/path/to/codex.exe
+CC_REMOTE_CODEX_DAEMON=auto
+
+# Optional existing default project directory
+# CC_CWD=C:/projects/workspace
 ```
 
-An empty `CLAUDE_BIN` selects the default path; an override must be an absolute
-path.
-The local `.env` is for development; production credential storage is covered in
-[Installation](docs/installation_en.md).
+Enable device enrollment in the Relay's Device Center, obtain a one-time code, then run:
 
-### 3. Start
-
-Open two terminals in the repository directory and run separately:
-
-```bash
-# Terminal 1
-.venv/bin/python -m cc_remote.relay
+```powershell
+.\.venv\Scripts\python.exe -m cc_remote.device pair https://relay.example.com XXXXX-XXXXX-XXXXX-XXXXX --name "Windows PC"
 ```
 
-```bash
-# Terminal 2
-.venv/bin/python -m cc_remote.wrapper
+Pairing saves credentials in a private user-home file. Nonempty environment values take precedence: remove stale `RELAY_URL`, `WRAPPER_TOKEN` and `CC_REMOTE_MACHINE_ID` overrides from the launch environment too.
+
+Existing manual installations can keep those values explicit. `RELAY_URL` must end in `/ws`; the machine ID and credential must match Relay authorization. Keep codes, tokens and real deployment configuration out of Git.
+
+### 3. Start and verify
+
+```powershell
+.\scripts\run-wrapper.ps1
+# Alternatively, open start-cc-remote.cmd
 ```
 
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765) and sign in with the configured
-password. Check that the device is online, then select an engine and session.
-This address is local to the computer. For phone access, use the public deployment
-below or configure a restricted LAN/Tailscale entry point.
+The launcher checks `.venv` and `.env`. A private `.runtime/active-wrapper.json` selects a frozen release when present; otherwise it runs the checkout. It also attempts to refresh stale DSH pairing.
 
-<a id="one-command-github-release-install-recommended-for-production"></a>
-<a id="production-deploy-public-vps-relay--wrapper-on-your-machine"></a>
+Select the device and engine in Web. Verify native identity, cwd, control state and history. A healthy `/healthz` endpoint or model catalog alone does not establish session acceptance.
 
-## Install and upgrade
+## Engine setup
 
-**For your first deployment, use the [latest stable GitHub Release](https://github.com/muggle-stack/cc-remote/releases/latest).**
-Follow the [Release installation guide](docs/installation_en.md#release-install) to install
-Relay on your VPS and Wrapper on each device. Installers register the `cc-remote`
-management command automatically. Subsequent updates need no manual package download;
-run this from an independent terminal or SSH connection:
+### Claude Code
 
-```bash
-cc-remote update --check   # Check versions only
-cc-remote update           # Install the latest stable Release; no latest argument needed
+Set `CLAUDE_BIN` to the daily official CLI's real absolute path. Wrapper uses locked `claude-agent-sdk==0.2.157` and checks SDK and CLI versions at startup.
+
+Model accounts and endpoints use native settings. The current SDK child policy clears inherited proxy variables; changing Wrapper's `HTTPS_PROXY` alone does not change that model route. If a model service requires a proxy, inspect [child_env.py](cc_remote/wrapper/child_env.py) and native configuration first.
+
+Keep single-writer protection while a terminal owns the transcript. A fork, copied log or different cwd is not a continuation of the same conversation.
+
+### Codex and Codex App
+
+Use `CC_REMOTE_CODEX_DAEMON=auto` for CLI and Wrapper to share the account's official daemon. Explicit `off` uses private stdio and does not establish sharing. An existing controlled loopback WebSocket setup may set `CODEX_APP_SERVER_WS_URL`; non-loopback endpoints are rejected.
+
+```powershell
+codex app-server daemon version
+codex resume <thread-ID>
 ```
 
-Each device checks its paired VPS first, updating Relay + Web when necessary.
-An already-current compatible Relay is skipped. Use
-`cc-remote update --relay-ssh operator@relay-host` to bind an existing SSH admin
-entry for the first remote server upgrade. Update other devices individually.
-Installation uses prebuilt artifacts; it does not run CI, pytest or a frontend
-build on users' machines. The Electron application is updated separately.
+Verify the daemon, account home and CLI version. Align versions through the original installation channel after updates, preserving active tasks.
 
-v4.0.10 adds automatic retention: after acceptance, keep the active
-version, one complete previous rollback set and all live runtime dependencies;
-remove proven older generations. Linux Wrappers can also use an existing Supervisor
-with the same updater, preserving their root, account and HOME; see
-[Supervisor installation/adoption](docs/installation_en.md#linux-supervisor-installation-and-adoption).
-These features ship in **v4.0.10**, including when an older updater downloads the
-new installer. Unresolved dependencies defer cleanup and preserve older files.
-See [subsequent updates](docs/installation_en.md#subsequent-updates) for command
-locations, older installations, roles and coordinated protocol upgrades.
+For App sharing, finish active work, exit normally, then use the separate launcher:
 
-| Scenario | Guide |
+```powershell
+.\scripts\start-codex-shared-app.ps1
+.\scripts\start-codex-shared-app.ps1 -Action check
+```
+
+Only `verified` establishes an actual shared App connection. The launcher preserves the official application and default account, and never forces an existing App to exit. Recheck after updates; see [Windows App acceptance](docs/codex-desktop-windows.md).
+
+### DSH desktop pairing
+
+Load both extensions in the desktop profile's patch configuration, using real checkout or active-release paths:
+
+```yaml
+- insert:
+    - id: cc-remote-desktop-url
+      name: C:/path/to/cc-remote-windows/integrations/dsh/cc-remote-desktop-url.mjs
+    - id: cc-remote-metadata
+      name: C:/path/to/cc-remote-windows/integrations/dsh/cc-remote.mjs
+```
+
+The default patch is `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`; locate it through native settings for a custom `DSH_HOME` or profile. Finish active work, restart DSH normally, then pair:
+
+```powershell
+.\scripts\pair-desktop.ps1
+```
+
+The extension exports private state; pairing checks the process and native contract before saving control credentials. After port or credential rotation, finish work before re-pairing and restarting Wrapper. Preserve the desktop Agent's lifecycle.
+
+Never paste tokens, connection files or token-bearing login URLs into Git, chat or browser parameters. See [DSH integration](docs/dsh-integration.md) for native capabilities and versions.
+
+## Collaboration rooms
+
+A room binds a directory and members. Dispatch with `@member`, `@all` or `@全体`; quote results, hand off a message, select models and open full sessions.
+
+**Each member has a separate native session.** Bounded recent context and explicit quotes transfer information. The current room adapter requires an existing `dsh@<native-ID>` for DSH members; ordinary DSH chat can still create sessions.
+
+Defaults are six recent messages and a 6000-character budget, configured with `CC_REMOTE_ROOM_CONTEXT_DEPTH` and `CC_REMOTE_ROOM_CONTEXT_BUDGET`. Inspect tools in members' full sessions. Automatic adviser/executor workflows are not implemented. See the [design](docs/collaboration-rooms.md) and [roadmap](docs/collaboration-rooms-optimization.md).
+
+## Deployment and upgrades
+
+Follow [deploy/README.md](deploy/README.md) and the [installation guide](docs/installation_en.md). Windows Wrapper uses the source launcher above. Follow the relevant guide for Linux/macOS or published upstream packages, checking that the selected artifact includes this branch's features.
+
+Linux releases live under `/opt/cc-remote/releases/`, activated atomically through `/opt/cc-remote/current`. Create release-local environments instead of copying a venv that references an old interpreter. Preserve external configuration, private state and a complete rollback set.
+
+Relay, Web and every Wrapper must use one tested source snapshot or coordinated artifacts. Equal product versions do not guarantee equal features. Protocol changes require coordinated upgrades across all three tiers.
+
+```text
+Check protocol/build -> stage every target -> drain tasks and queues
+-> snapshot state -> activate atomically -> verify public and native session paths
+```
+
+VPS + Caddy supports a fixed HTTPS entry point. Quick tunnels suit temporary checks but may change address after restart. Manage domains, origins and credentials through the deployment guide. Browser Origin must match `PUBLIC_ORIGIN` exactly.
+
+## Troubleshooting
+
+Separate the **control link** (browser ↔ Relay ↔ Wrapper) from the **model link** (engine ↔ model service). The launcher writes to its terminal; file logs depend on the actual service or launcher.
+
+| Symptom | Check |
 |---|---|
-| Regular use and production deployments (recommended) | [Release packages](docs/installation_en.md#release-install): choose the latest stable version, then use `cc-remote update`; Linux Relay and macOS/glibc Linux Wrappers have x86_64 / arm64 packages |
-| Development, debugging or testing unreleased features | [Source deployment](docs/installation_en.md#source-install): use one tested snapshot |
-| Containers or an existing reverse proxy | [Deployment reference](deploy/README.md#container-deploy-docker-and-the-nginx-alternative) |
+| `4406 protocol upgrade required` | Compare Relay `/healthz`, Web build and Wrapper protocol; upgrade all three together |
+| WebSocket 401/403 | Check login, device authorization and exact Origin; sign in again after Relay restart. Tokens never belong in URLs |
+| Immediate socket closure | Inspect close reasons and protocol validation; custom clients must not send undefined fields |
+| `Connection dropped` / `ECONNRESET` | Identify the link. If native clients also fail, check model host, port, direct/proxy route and `NO_PROXY` |
+| Read-only / unknown ownership | Preserve tasks; check process visibility, private-file ACLs and dependencies. Incomplete checks keep protection active |
+| `already has an active writer` | Check ID, account, cwd and clients; finish work and exit normally or explicitly hand over control |
+| Configuration appears ineffective | Check BOM, environment overrides, active frozen source and paired-device settings |
+| Missing or duplicated history | Verify native ID, original cwd, account and source logs before projection/SQLite errors; preserve originals |
+| Stale DSH pairing | Check the process and extensions; finish work before re-pairing and restarting Wrapper |
 
-The production Relay keeps immutable versions under `/opt/cc-remote/releases/`
-and switches `/opt/cc-remote/current` atomically. Preserve external configuration
-and private-state snapshots before upgrading. Relay, Web and every Wrapper must
-come from one source snapshot or coordinated artifact set. Mismatched protocols
-cannot connect.
+History reads do not create model turns. Run live acceptance separately and inspect native receipts before repeating a mutation with an unknown outcome.
 
-[deploy/README.md](deploy/README.md) owns the release procedure, rollback and
-acceptance checks. AI-assisted deployment uses the repository's
-[deployment skill](.agents/skills/cc-remote-deploy/SKILL.md). Verify that each Codex
-account's daily CLI and Wrapper use the same official daemon. Attaching an
-installed Codex App is a separate optional step, with distinct
-[macOS](docs/codex-desktop-launcher.md) and [Linux](docs/codex-desktop-linux.md)
-procedures, independent of core deployment success.
+## Boundaries and security
 
-## Configuration and native clients
+- Windows private-file checks use real ownership and DACLs. Codex checks process generations, file identity and write access; incomplete inspection remains read-only.
+- The independent Windows Viewer resource channel has not passed complete platform acceptance. It is separate from ordinary previews and can be disabled with `CC_REMOTE_VIEWER_CHANNEL=off`; see [Viewer boundaries](docs/remote-viewer.md).
+- DSH currently has no Work, session deletion, worktree migration or rollback adapter. Controls reflect native capabilities.
+- Keep `.env`, device/pairing files, account homes and `.runtime` out of Git. Browsers use cookies; Wrappers use Bearer credentials at upgrade. Authorization is scoped by `machine_id`.
+- Use HTTPS/WSS publicly. Explicit plain HTTP exposes passwords, cookies and session traffic and requires separate configuration.
 
-- **Claude:** sessions owned by native CLI/Desktop/Agent View are mirrored
-  read-only until the user explicitly takes over. The official `claude` command
-  remains unchanged.
-- **Codex Code:** coordinates through the official shared daemon. A private stdio
-  fallback lacks the same bidirectional sharing and does not satisfy shared-control
-  deployment acceptance. Work uses private processes.
+## Development and validation
 
-See [Configuration, accounts and data](docs/configuration_en.md) for account
-directories, proxies, device policy, notifications and environment variables.
-Claude/Codex can mix official OAuth accounts with third-party API gateway accounts
-supported by the native CLI. First sign in or configure API access in each account's
-native directory, then [register its profile](docs/configuration_en.md#multiple-accounts)
-to select and use it in cc-remote. Configuration, authentication, sessions and
-extensions remain separate for each account; credentials stay on the local machine
-and are never sent to the web client or relay. Without registered profiles,
-cc-remote continues using the existing default account.
+Use Python 3.13, Node 24 and dependency locks. Install the complete development environment:
 
-<a id="security-please-read"></a>
+```powershell
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements.lock
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+npm --prefix web ci
+.\.venv\Scripts\python.exe -m pytest
+npm --prefix web run build
+npm --prefix web run test:reliability
+npm --prefix web run lint
+```
 
-## Security and data
+The complete gate, including Ruff, ShellCheck and Bash checks, is in [AGENTS.md](AGENTS.md#commit-and-pr-gate). GitHub CI builds Web and runs Windows/Linux pytest for PRs and `main` / `master` pushes. Unit tests do not call models; [live probes](scripts/live/) run separately and may spend tokens.
 
-**Treat anyone who can sign in and use Code as holding remote agent/shell access
-to the Wrapper machine.** Code defaults are permissive. Work's private-directory
-policy is not a replacement for separate OS users, containers or virtual machines.
-
-- Use HTTPS/WSS publicly and keep credentials outside source/release directories.
-  Linux production services use root-only environment files; the macOS installer
-  uses the current user's private configuration.
-- Web login uses an HttpOnly, SameSite=Strict cookie with exact WebSocket Origin
-  checks. Wrapper credentials travel in request headers; device authorization is
-  scoped by `machine_id`.
-- Session sources and Work data remain on the device; browsers cache history
-  projections. Relay forwards conversation traffic without persisting chats or
-  artifacts. Control metadata such as device registrations and Push subscriptions
-  is persisted.
-- Browsing history and reading context do not request model inference. Messages,
-  side conversations and native goal continuation still use the model account's
-  allowance or billing.
+The verified baseline on 2026-11-05, `dec6bbb`, passed 5685 Windows tests and 6710 Linux tests, with 594 and 14 platform skips. Checks covered all three native histories, App shared transport, public live replies, reconnects and desktop/mobile session information. This records tested scope and does not replace acceptance of a new deployment.
 
 ## Documentation
 
-| Guide | Contents |
+| Topic | Guide |
 |---|---|
-| [Installation and upgrades](docs/installation_en.md) | Release packages, source, pairing, network access |
-| [Configuration, accounts and data](docs/configuration_en.md) | Profiles, environment variables, authentication, queues and history |
-| [Deployment procedure](deploy/README.md) | Immutable releases, rollback, shared control and acceptance |
-| [Remote Viewer](docs/remote-viewer.md) | Interactive static pages, Bridge/Isolated modes |
-| Codex App: [macOS](docs/codex-desktop-launcher.md) / [Linux](docs/codex-desktop-linux.md) | Optional App, daily CLI and Wrapper on one daemon |
-| [Codex App tools](docs/codex-app-tools.md) | Optional App-control MCP |
-| [Generic async task MCP](docs/async-tasks.md) | Run scripts/external agents in the background and return results to the originating Codex thread |
-| [Cross-session messaging MCP](docs/session-messages.md) | Unified Claude/Codex delivery alongside native Codex App messages, source labels and receipts |
-| [Timed messages](docs/timed-messages.md) | Scheduled queue receipts, message tags and countdown UI |
-| [Terminal workspace](docs/tui.md) | TUI setup, connections, Vim controls, session tree, previews and terminal limits |
-| [Changelog](CHANGELOG.md) | Version changes and migrations |
-
-<a id="terminal-workspace"></a>
-
-## Terminal workspace (preview)
-
-The built-in Python/Textual full-screen TUI supports **Claude/Codex Code and
-Work** through the same Relay and Wrapper as Web. Sessions, running state and
-queues share the control link. Closing the TUI leaves running tasks and accepted
-queued messages intact; native clients' session ownership rules still apply.
-
-After installing the source dependencies above, add the optional terminal packages:
-
-```bash
-.venv/bin/python -m pip install -r requirements-tui.txt
-# Offline preview; no server connection or model calls.
-./scripts/cc-remote-tui --demo
-# Connect to your Relay; replace the example domain and enter the password when prompted.
-./scripts/cc-remote-tui --engine codex --url wss://cc.example.com/ws
-```
-
-Use `--engine claude` for Claude or `--space work` for Work. Append a session ID
-to open it directly, or use `--machine <id>` to select an authorized device.
-The TUI, Relay and Wrapper must use the same source/protocol version. See the
-[terminal workspace guide](docs/tui.md) for authentication, local automatic
-login and a launcher that works from any directory.
-
-| Action | Default keys |
-|---|---|
-| Session directory tree and search | `Space e` in Normal mode, then `/` to search |
-| Switch open sessions | `H` / `L` in Normal mode; `Space ,` searches tabs |
-| Focus transcript / draft | `Ctrl+k` / `Ctrl+j` |
-| Type and send | `i` enters Insert; `Esc` returns to Normal; Normal `Enter` sends |
-| Queue / stop the current turn | `Ctrl+e` / `Ctrl+x` |
-| Current shortcut help | `Space h` |
-
-Vim selection, copy and quote, on-demand thinking/tool/process details, elapsed
-time, Goal / Plan, usage and queue editing are available. Active status text
-sweeps from left to right and stops on completion or interruption; set
-`TEXTUAL_ANIMATIONS=none` to disable animation. Markdown previews work in the
-terminal; images depend on its graphics protocol, and other content offers a
-Web handoff. Use `--line-mode` for the original line-oriented client.
-
-## Development
-
-Use Node 24 for the web client and the repository's Python dependency locks.
-Common tests that do not call a live model:
-
-```bash
-.venv/bin/python -m pip install -r requirements-dev.txt
-.venv/bin/python -m pytest
-npm --prefix web run test:reliability
-npm --prefix web run lint
-npm --prefix web run build
-```
-
-Maintainers run the complete local gate before submitting a PR; see
-[AGENTS.md](AGENTS.md#commit-and-pr-gate). Other contributors may submit a PR
-with a description of the checks performed and any validation gaps. PRs and
-pushes to `master` automatically run the **Web build and pytest**; releases
-reuse these checks. Playwright is not part of CI or the required local PR gate.
-Its tests remain available for diagnostics when requested. For PR acceptance,
-maintainers check out the requested revision and verify the changed behavior
-in the running application.
-[Live probes](scripts/live/) run separately; live model probes may spend tokens
-and are not default unit tests.
-Use `npm --prefix web run dev` for the UI dev server, or the built Relay-served
-web client for same-origin integration.
-
-## FAQ
-
-- **Why can I list a file but not preview it?** Previews also require a regular
-  file, a supported format and size, and OS read permission. XLSX needs no Office;
-  other Office formats need the Linux conversion sandbox.
-- **Does restarting Wrapper lose history?** Persisted history remains. Live-tail
-  replay and ordinary pending messages are bounded in-memory state and are not
-  guaranteed across a Wrapper restart. Work schedules have separate durable records.
-- **What happens when Relay restarts or moves?** Browsers reconnect and sign in
-  again; device-local sessions remain. Moving Relay also requires migrating or
-  recreating device authorization, Push and other control configuration, not just
-  changing its address.
-- **Does phone access need an inbound port on my computer?** No. Wrapper connects
-  outbound; the public entry point is on the Relay host.
-
-<details>
-<summary>More interface screenshots</summary>
-
-These show Claude/Codex interface examples. Menus vary by engine and version.
-
-![Sessions grouped by directory](assets/readme-multi-session.jpg)
-
-![Claude tool calls and activity](assets/readme-claude-session.jpg)
-
-![Engine and working-directory selection](assets/readme-new-session.jpg)
-
-![Codex collapsible activity timeline](assets/readme-process-timeline.jpg)
-
-![Model and session controls](assets/readme-model-controls.jpg)
-
-</details>
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+| Installation, upgrades, rollback and acceptance | [Installation](docs/installation_en.md) · [Deployment contract](deploy/README.md) |
+| Windows Codex App | [Shared launcher and acceptance](docs/codex-desktop-windows.md) |
+| DSH native capabilities | [Integration](docs/dsh-integration.md) |
+| Terminal workspace | [TUI English](docs/tui.md) · [中文](docs/tui_zh.md) |
+| Collaboration | [Design](docs/collaboration-rooms.md) · [Roadmap](docs/collaboration-rooms-optimization.md) |
+| Independent Claude session service | [Lifecycle and migration](docs/claude-session-service.md) |
+| Upstream reference | [README.upstream.md](README.upstream.md) |
+| Changes and license text | [CHANGELOG.md](CHANGELOG.md) · [LICENSE](LICENSE) |
