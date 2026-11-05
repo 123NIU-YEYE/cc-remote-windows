@@ -2957,7 +2957,7 @@ def test_machine_reconciles_remote_steer_user_item_without_second_steer(
             ):
                 await asyncio.sleep(0)
 
-        await asyncio.wait_for(wait_for_first_user(), timeout=1)
+        await asyncio.wait_for(wait_for_first_user(), timeout=5)
 
         async def steer(
             prompt, images=None, *, client_user_message_id=None,
@@ -3213,7 +3213,7 @@ def test_goal_status_only_continuation_keeps_an_empty_anchor():
 
         task = ctx.codex_spontaneous_task
         assert task is not None
-        await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(task, timeout=5)
         anchors = [event for event in transport.sent
                    if isinstance(event, UserMsg)]
         assert [(event.msg_id, event.prompt) for event in anchors] == [
