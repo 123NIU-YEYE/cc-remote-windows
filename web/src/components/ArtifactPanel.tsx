@@ -206,6 +206,55 @@ function ImageArtifactPreview({ data, mediaType, title }: {
     onError={() => setFailedUrl(resolvedUrl)} /></div>;
 }
 
+function VideoArtifactPreview({ data, mediaType, title }: {
+  data?: string;
+  mediaType?: string;
+  title: string;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!data || !mediaType) {
+      setObjectUrl(null);
+      setError("预览数据不完整");
+      return;
+    }
+    try {
+      const binary = window.atob(data);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      const url = URL.createObjectURL(new Blob([bytes], { type: mediaType }));
+      setObjectUrl(url);
+      setError(null);
+      return () => URL.revokeObjectURL(url);
+    } catch {
+      setObjectUrl(null);
+      setError("预览数据损坏");
+    }
+  }, [data, mediaType]);
+
+  const decodeError = objectUrl && failedUrl === objectUrl
+    ? "视频无法解码或容器不受此浏览器支持" : null;
+  if (error || decodeError) {
+    return <div className="preview-error"><Icon name="read" size={18} />{error || decodeError}</div>;
+  }
+  if (!objectUrl) {
+    return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备视频…</div>;
+  }
+  return (
+    <div className="artifact-video-stage">
+      <video src={objectUrl} controls playsInline preload="metadata"
+        aria-label={title}
+        onLoadedData={() => setFailedUrl(current => current === objectUrl ? null : current)}
+        onError={() => setFailedUrl(objectUrl)} />
+    </div>
+  );
+}
+
 function SourceFile({ content, targetLine, artifactKey }: {
   content: string;
   targetLine?: number;
@@ -533,9 +582,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   ]);
 
   const title = displayName || artifact.file.split("/").pop()
-    || (["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) ? "文件预览" : "改动");
+    || (["md", "file", "html", "image", "pdf", "audio", "video", "spreadsheet"].includes(artifact.kind) ? "文件预览" : "改动");
   const mermaidFile = artifact.kind === "file" && /\.(?:mmd|mermaid)$/i.test(artifact.file);
-  const renderedArtifact = ["image", "pdf", "audio"].includes(artifact.kind)
+  const renderedArtifact = ["image", "pdf", "audio", "video"].includes(artifact.kind)
     || (artifact.kind === "html" && mode === "preview");
 
   return (
@@ -656,6 +705,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         ) : artifact.kind === "audio" ? (
           <AudioArtifactPreview key={artifactKey} data={artifact.data}
             mediaType={artifact.mediaType} title={title} size={artifact.size} />
+        ) : artifact.kind === "video" ? (
+          <VideoArtifactPreview key={artifactKey} data={artifact.data}
+            mediaType={artifact.mediaType} title={title} />
         ) : artifact.kind === "file" ? (
           <>
             {artifact.truncated && <div className="preview-truncated">文件共 {artifact.size?.toLocaleString()} 字节，仅预览前 512 KiB。</div>}

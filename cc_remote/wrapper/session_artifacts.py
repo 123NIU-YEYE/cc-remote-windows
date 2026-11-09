@@ -260,6 +260,8 @@ def artifact_kind(name: str) -> str:
     ext = Path(name).suffix.lower()
     if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif"}:
         return "image"
+    if ext in {".mp4", ".m4v", ".mov", ".webm", ".ogv"}:
+        return "video"
     if ext in {".md", ".txt", ".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".csv"}:
         return "document"
     return "file"

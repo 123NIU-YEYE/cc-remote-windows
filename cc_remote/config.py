@@ -206,13 +206,16 @@ class RelayConfig:
     # disconnected; individual deltas are never shed because that would make a
     # partial answer look complete.
     client_queue_cap: int = field(default_factory=lambda: _int("CLIENT_QUEUE_CAP", 4096))
+    # Must stay >= ws_max_size_bytes: one queued frame can be a whole preview
+    # asset. 32 MiB covers a 20 MiB artifact after base64 inflation.
     client_queue_bytes: int = field(
-        default_factory=lambda: _int("CLIENT_QUEUE_BYTES", 16 * 1024 * 1024)
+        default_factory=lambda: _int("CLIENT_QUEUE_BYTES", 32 * 1024 * 1024)
     )
     # Maximum decoded WebSocket text frame accepted by the relay. Attachment
     # commands are validated more tightly by the wrapper after transport.
+    # 32 MiB carries a 20 MiB artifact (base64 is 4/3 of raw).
     ws_max_size_bytes: int = field(
-        default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 16 * 1024 * 1024)
+        default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 32 * 1024 * 1024)
     )
     # Login gate: web clients POST /api/login with this password and receive a
     # short-lived HMAC session in an HttpOnly cookie.
@@ -348,7 +351,8 @@ class WrapperConfig:
     cc_cwd: str = field(default_factory=lambda: _env("CC_CWD", os.getcwd()))
     resume_session_id: str = field(default_factory=lambda: _env("CC_RESUME_SESSION_ID", ""))
     ring_max_events: int = field(default_factory=lambda: _int("RING_MAX_EVENTS", 10000))
-    ring_max_bytes: int = field(default_factory=lambda: _int("RING_MAX_BYTES", 24 * 1024 * 1024))
+    # Must stay >= ws_max_size_bytes: a single preview frame lives in the ring.
+    ring_max_bytes: int = field(default_factory=lambda: _int("RING_MAX_BYTES", 32 * 1024 * 1024))
     tool_result_max: int = field(default_factory=lambda: _int("TOOL_RESULT_MAX", 65536))
     history_source_max_bytes: int = field(
         default_factory=lambda: _int("HISTORY_SOURCE_MAX_BYTES", 64 * 1024 * 1024)
@@ -368,7 +372,7 @@ class WrapperConfig:
     transport_send_bytes: int = field(
         default_factory=lambda: _int("WRAPPER_SEND_QUEUE_BYTES", 32 * 1024 * 1024)
     )
-    ws_max_size_bytes: int = field(default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 16 * 1024 * 1024))
+    ws_max_size_bytes: int = field(default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 32 * 1024 * 1024))
     # Consumer-facing per-turn queue. CodexHandle derives a separate bounded
     # burst window from this value so app-server stdout never waits on relay I/O.
     turn_reader_queue_cap: int = field(

@@ -443,7 +443,7 @@ export interface DeleteWorkPlugin extends Base { type: "delete_work_plugin"; eng
 export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: Engine; project_id?: string | null; claude_profile_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
 export interface DeleteWorkSchedule extends Base { type: "delete_work_schedule"; engine?: Engine; schedule_id: string }
 export interface GetWorkArtifacts extends Base { type: "get_work_artifacts"; engine?: Engine; session_id: string }
-export interface WorkArtifactInfo { path: string; size: number; modified_at: number; kind: "document" | "spreadsheet" | "presentation" | "image" | "pdf" | "file"; previewable: boolean }
+export interface WorkArtifactInfo { path: string; size: number; modified_at: number; kind: "document" | "spreadsheet" | "presentation" | "image" | "video" | "pdf" | "file"; previewable: boolean }
 export interface WorkArtifacts extends Base { type: "work_artifacts"; engine: Engine; session_id: string; artifacts: WorkArtifactInfo[] }
 export interface WorkProjectInfo { project_id: string; name: string; description: string; created_at: number; updated_at: number }
 export interface WorkSourceInfo { source_id: string; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; created_at: number }
@@ -497,7 +497,7 @@ export interface GetDiff extends Base { type: "get_diff"; file: string; theme?: 
 export interface DiffReport extends Base { type: "diff_report"; file: string; diff: string; request_id?: string }
 export interface SessionArtifactInfo {
   id: string; name: string; path: string; source: "upload" | "delivered";
-  kind: "image" | "document" | "file"; created_at: number; size: number; available: boolean;
+  kind: "image" | "video" | "document" | "file"; created_at: number; size: number; available: boolean;
 }
 export interface GetSessionArtifacts extends Base {
   type: "get_session_artifacts"; engine: Engine; space?: Space; request_id: string;
@@ -513,13 +513,13 @@ export interface SessionArtifacts extends Base {
   next_before?: number | null; has_more: boolean; history_before?: string | null; history_more: boolean; error?: string | null;
 }
 export interface GetFilePreview extends Base { type: "get_file_preview"; path: string; request_id: string }
-export interface FilePreview extends Base { type: "file_preview"; directory?: boolean; path: string; request_id: string; format: "markdown" | "text" | "html" | "image" | "pdf" | "audio" | "spreadsheet"; content: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/svg+xml" | "application/pdf" | "audio/wav" | "audio/mpeg" | "audio/mp4" | "audio/aac" | "audio/flac" | "audio/ogg" | "audio/webm" | null; data?: string | null; converted_from?: string | null; size: number; truncated: boolean; mtime_ns: string; revision?: string | null; writable?: boolean; error?: string | null }
+export interface FilePreview extends Base { type: "file_preview"; directory?: boolean; path: string; request_id: string; format: "markdown" | "text" | "html" | "image" | "pdf" | "audio" | "video" | "spreadsheet"; content: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/svg+xml" | "application/pdf" | "audio/wav" | "audio/mpeg" | "audio/mp4" | "audio/aac" | "audio/flac" | "audio/ogg" | "audio/webm" | "video/mp4" | "video/webm" | "video/quicktime" | "video/x-m4v" | "video/ogg" | null; data?: string | null; converted_from?: string | null; size: number; truncated: boolean; mtime_ns: string; revision?: string | null; writable?: boolean; error?: string | null }
 export interface SaveMarkdown extends Base { type: "save_markdown"; path: string; request_id: string; content: string; expected_size: number; expected_mtime_ns: string; expected_revision: string }
 export interface FileSaveResult extends Base { type: "file_save_result"; path: string; request_id: string; status: "saved" | "conflict" | "error"; size: number; mtime_ns: string; revision?: string | null; error?: string | null }
 export interface GetPreviewAsset extends Base { type: "get_preview_asset"; path: string; preview_id: string; request_id: string }
-export interface PreviewAsset extends Base { type: "preview_asset"; path: string; preview_id: string; request_id: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/svg+xml" | null; data?: string | null; error?: string | null }
+export interface PreviewAsset extends Base { type: "preview_asset"; path: string; preview_id: string; request_id: string; media_type?: "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/avif" | "image/svg+xml" | "video/mp4" | "video/webm" | "video/quicktime" | "video/x-m4v" | "video/ogg" | null; data?: string | null; error?: string | null }
 export type PreviewAuthorizationOperation = "file_preview" | "preview_asset";
-export interface PreviewAuthorizationRequired extends Base { type: "preview_authorization_required"; authorization_id: string; request_id: string; operation: PreviewAuthorizationOperation; path: string; resolved_path: string; format: "markdown" | "text" | "html" | "image" | "pdf" | "audio" | "spreadsheet"; preview_id?: string | null }
+export interface PreviewAuthorizationRequired extends Base { type: "preview_authorization_required"; authorization_id: string; request_id: string; operation: PreviewAuthorizationOperation; path: string; resolved_path: string; format: "markdown" | "text" | "html" | "image" | "pdf" | "audio" | "video" | "spreadsheet"; preview_id?: string | null }
 export interface AuthorizePreview extends Base { type: "authorize_preview"; authorization_id: string; request_id: string; decision: "allow" | "deny" }
 export interface PreviewAuthorizationResult extends Base { type: "preview_authorization_result"; authorization_id: string; request_id: string; operation?: PreviewAuthorizationOperation | null; path?: string | null; status: "granted" | "denied" | "expired" | "changed" | "error"; preview_id?: string | null; error?: string | null }
 // On-demand bulk history: fetched once when a session is opened (like a web

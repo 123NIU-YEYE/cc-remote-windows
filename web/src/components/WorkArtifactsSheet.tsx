@@ -13,6 +13,7 @@ const LABELS: Record<WorkArtifactInfo["kind"], string> = {
   spreadsheet: "表格",
   presentation: "演示",
   image: "图片",
+  video: "视频",
   pdf: "PDF",
   file: "文件",
 };
