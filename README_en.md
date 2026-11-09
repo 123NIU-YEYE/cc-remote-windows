@@ -195,6 +195,16 @@ Check protocol/build -> stage every target -> drain tasks and queues
 
 VPS + Caddy supports a fixed HTTPS entry point. Quick tunnels suit temporary checks but may change address after restart. Manage domains, origins and credentials through the deployment guide. Browser Origin must match `PUBLIC_ORIGIN` exactly.
 
+## Change your sign-in password
+
+1. Sign in and open **更多设置 → 修改密码** (More settings → Change password).
+2. Enter your current password, then enter and confirm a new password of 12 to 256 characters. Select **保存新密码** (Save new password).
+3. Sign in with the new password. The change revokes the account's old browser sessions. After signing in again, the same browser retains its session for the configured lifetime.
+
+The relay saves a salted password hash in its device authorization database. The change takes effect immediately and survives restarts. In multi-user installations, each account can change its own password.
+
+If you forget your current password, use administrator SSH access to set a different value for `LOGIN_PASSWORD` in the relay service configuration, or for the account's `password` in `LOGIN_USERS_JSON`. Restart the relay to replace the account's Web password override with the new configured password. See the [deployment guide](deploy/README.md) for the configuration path and service instructions.
+
 ## Troubleshooting
 
 Separate the **control link** (browser ↔ Relay ↔ Wrapper) from the **model link** (engine ↔ model service). The launcher writes to its terminal; file logs depend on the actual service or launcher.
