@@ -36209,6 +36209,25 @@ class WrapperMachine:
             dirs.sort(key=lambda item: item["name"])
         except PermissionError:
             pass
+        # Surface every other volume at whatever level the picker is opened.
+        # A root-only drive list still left the user stranded in their home
+        # directory (the picker opens there) with no way to reach D: without
+        # walking up twice first. These are absolute paths, which
+        # list_dir/browse_files already accept. On POSIX the other candidates
+        # simply fail isdir(), so this is a no-op there.
+        present = {entry["path"].casefold() for entry in dirs}
+        for code in range(ord("A"), ord("Z") + 1):
+            drive = f"{chr(code)}:\\"
+            if drive.casefold() == base.casefold():
+                continue
+            if drive.casefold() in present:
+                continue
+            try:
+                if os.path.isdir(drive):
+                    dirs.append({"name": drive, "path": drive})
+            except OSError:
+                continue
+        dirs.sort(key=lambda item: item["name"])
         return base, parent, dirs
 
     @staticmethod
