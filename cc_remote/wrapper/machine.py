@@ -26462,7 +26462,8 @@ class WrapperMachine:
         """
         if len(data) < 12:
             return False
-        if data[:4] == b"RIFF" and data[8:12] == b"WEBM":
+        # WebM is a Matroska profile: an EBML header, not a RIFF chunk.
+        if data[:4] == b"\x1a\x45\xdf\xa3":
             return True
         if data[:4] == b"OggS":
             return True
@@ -26582,7 +26583,9 @@ class WrapperMachine:
                     or converted.is_symlink()):
                 raise ValueError("Office 转换结果无效")
             if converted_stat.st_size > ARTIFACT_PREVIEW_MAX_BYTES:
-                raise ValueError("转换后的 PDF 超过 8 MiB 预览限制")
+                raise ValueError(
+                    "转换后的 PDF 超过 "
+                    f"{ARTIFACT_PREVIEW_MAX_BYTES // (1024 * 1024)} MiB 预览限制")
             preview = converted.read_bytes()
             cls._validate_rendered_preview("application/pdf", preview)
             return {

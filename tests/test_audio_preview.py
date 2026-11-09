@@ -36,7 +36,15 @@ CONTAINERS = {
 }
 
 
-@pytest.mark.parametrize("suffix,media_type", AUDIO_PREVIEW_MEDIA_TYPES.items())
+# .webm also holds video, so the preview routes it to <video> (see
+# tests/test_video_preview.py); every other audio suffix stays on the audio path.
+AUDIO_ONLY_MEDIA_TYPES = {
+    suffix: media_type for suffix, media_type in AUDIO_PREVIEW_MEDIA_TYPES.items()
+    if suffix not in WrapperMachine.VIDEO_PREVIEW_MEDIA_TYPES
+}
+
+
+@pytest.mark.parametrize("suffix,media_type", AUDIO_ONLY_MEDIA_TYPES.items())
 def test_audio_preview_identifies_container_and_preserves_bytes(tmp_path, suffix, media_type):
     path = tmp_path / ("sample" + suffix.upper())
     path.write_bytes(CONTAINERS[media_type])
@@ -48,7 +56,7 @@ def test_audio_preview_identifies_container_and_preserves_bytes(tmp_path, suffix
     assert list(tmp_path.iterdir()) == [path]
 
 
-@pytest.mark.parametrize("suffix", AUDIO_PREVIEW_MEDIA_TYPES)
+@pytest.mark.parametrize("suffix", AUDIO_ONLY_MEDIA_TYPES)
 def test_audio_preview_rejects_non_audio_bytes(tmp_path, suffix):
     (tmp_path / ("fake" + suffix)).write_bytes(b"<html>not audio</html>")
     with pytest.raises(ValueError, match="音频格式不匹配"):
@@ -63,7 +71,8 @@ def test_audio_preview_rejects_video_riff_and_does_not_truncate(tmp_path):
     with path.open("wb") as stream:
         stream.write(wav_bytes())
         stream.truncate(ARTIFACT_PREVIEW_MAX_BYTES + 1)
-    with pytest.raises(ValueError, match="8 MiB"):
+    with pytest.raises(
+            ValueError, match=f"{ARTIFACT_PREVIEW_MAX_BYTES // (1024 * 1024)} MiB"):
         WrapperMachine._read_file_preview(str(tmp_path), path.name)
 
 
