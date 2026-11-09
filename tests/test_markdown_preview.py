@@ -1729,7 +1729,8 @@ def test_preview_asset_is_type_limited_and_bounded(tmp_path):
         machine._read_preview_asset(str(tmp_path), "invalid.svg")
     with pytest.raises(ValueError, match="格式不匹配"):
         machine._read_preview_asset(str(tmp_path), "fake.gif")
-    with pytest.raises(ValueError, match="4 MiB"):
+    with pytest.raises(
+            ValueError, match=f"{PREVIEW_ASSET_MAX_BYTES // (1024 * 1024)} MiB"):
         machine._read_preview_asset(str(tmp_path), "large.webp")
 
 
