@@ -29,6 +29,7 @@ interface Props {
   onOpenArtifacts?: () => void;
   onOpenFiles?: () => void;
   onOpenSessionInfo?: (trigger: HTMLButtonElement) => void;
+  onChangePassword?: (trigger: HTMLButtonElement | null) => void;
   onLogout: () => void;
 }
 
@@ -61,6 +62,7 @@ export function HeaderMenu({
   onOpenSessionInfo,
   onOpenArtifacts,
   onOpenDshTools,
+  onChangePassword,
   onLogout,
 }: Props) {
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -245,6 +247,13 @@ export function HeaderMenu({
                   <span><b>加粗字体</b><small>整页文字加粗，更易阅读</small></span>
                   <span className="header-menu-switch" aria-hidden="true" />
                 </button>
+                {onChangePassword && <button type="button" className="header-menu-item" onClick={() => {
+                  close();
+                  onChangePassword(triggerRef.current);
+                }}>
+                  <Icon name="lock" size={18} />
+                  <span><b>修改密码</b><small>使用当前密码设置新密码</small></span>
+                </button>}
                 <button type="button" className="header-menu-item danger"
                   onClick={onLogout}>
                   <Icon name="logout" size={18} />

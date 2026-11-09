@@ -8,6 +8,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Optional
 
 from cc_remote.config import (
@@ -72,16 +73,19 @@ def authenticate_login(
     username: str,
     password: str,
     cfg: RelayConfig,
+    *,
+    verify: Callable[[str | None, str, str], bool] | None = None,
 ) -> tuple[str | None, tuple[str, ...]] | None:
     """Validate legacy or configured user credentials in constant-time."""
     users = parse_login_users(cfg.login_users_json)
     if not users:
-        if verify_password(password, cfg.login_password):
+        valid = verify(None, password, cfg.login_password) if verify else verify_password(password, cfg.login_password)
+        if valid:
             return None, ("*",)
         return None
     record = users.get(username)
     expected = record[0] if record is not None else ("\x00" * 12)
-    valid = verify_password(password, expected)
+    valid = verify(username, password, expected) if verify and record is not None else verify_password(password, expected)
     if record is None or not valid:
         return None
     return username, record[1]

@@ -672,6 +672,58 @@ def test_logout_revokes_session_and_closes_all_of_its_websockets():
     assert second_close == expected
 
 
+def test_password_change_revokes_sessions_persists_and_allows_config_reset(tmp_path):
+    cfg = _cfg(device_db_path=str(tmp_path / "devices.sqlite3"))
+    endpoint = "/api/change-password"
+    origin = {"Origin": cfg.public_origin}
+    payload = {"current_password": cfg.login_password, "new_password": "different secure password"}
+    with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
+        assert client.post(endpoint, headers=origin, json=payload).status_code == 401
+        other = _login(client, cfg)
+        _login(client, cfg)
+        assert client.post(endpoint, json=payload).status_code == 403
+        assert client.post(endpoint, headers={"Origin": "https://other.example"}, json=payload).status_code == 403
+        assert client.post(endpoint, headers=origin, json={**payload, "current_password": "wrong"}).status_code == 403
+        assert client.post(endpoint, headers=origin, json={**payload, "new_password": "short"}).status_code == 400
+        headers = {"cookie": _cookie_header(other), **origin}
+        with client.websocket_connect(_ws_url(cfg.public_origin), headers=headers) as ws:
+            assert client.post(endpoint, headers=origin, json=payload).status_code == 200
+            assert ws.receive()["code"] == server.SESSION_REVOKED_CLOSE_CODE
+        assert client.get("/api/session").status_code == 401
+        assert client.get("/api/session", headers=headers).status_code == 401
+
+    server._login_limiter.reset()
+    with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
+        assert client.post("/api/login", json={"password": cfg.login_password}).status_code == 401
+        assert client.post("/api/login", json={"password": payload["new_password"]}).status_code == 200
+
+    reset = _cfg(device_db_path=cfg.device_db_path, login_password="operator reset password")
+    with TestClient(create_app(reset), base_url=cfg.public_origin) as client:
+        assert client.post("/api/login", json={"password": payload["new_password"]}).status_code == 401
+        _login(client, reset)
+
+
+def test_password_change_is_bound_to_the_authenticated_account():
+    cfg = _cfg(login_users_json=json.dumps({
+        "alice": {"password": "alice original password", "machines": ["machine-a"]},
+        "bob": {"password": "bob original password", "machines": ["machine-b"]},
+    }))
+    with TestClient(create_app(cfg), base_url=cfg.public_origin) as client:
+        bob = client.post("/api/login", json={"username": "bob", "password": "bob original password"})
+        assert bob.status_code == 200
+        assert client.post("/api/login", json={"username": "alice", "password": "alice original password"}).status_code == 200
+        response = client.post("/api/change-password", headers={"Origin": cfg.public_origin}, json={
+            "username": "bob", "current_password": "alice original password", "new_password": "alice changed password",
+        })
+        assert response.status_code == 200
+        assert client.get("/api/session", headers={"cookie": _cookie_header(bob)}).json()["username"] == "bob"
+        assert client.post("/api/login", json={"username": "bob", "password": "alice changed password"}).status_code == 401
+        login = client.post("/api/login", json={"username": "alice", "password": "alice changed password"})
+        assert login.status_code == 200
+        claims = session_token_claims(login.cookies[SESSION_COOKIE_NAME].strip('"'), cfg.session_secret)
+        assert claims is not None and claims.machines == ("machine-a",)
+
+
 def test_relay_restart_invalidates_old_registry_session():
     cfg = _cfg()
     with TestClient(create_app(cfg), base_url=cfg.public_origin) as first_relay:

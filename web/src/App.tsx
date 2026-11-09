@@ -326,6 +326,7 @@ const AgentDetailController = lazy(() => import("./components/AgentDetailControl
 const DesktopDshPanel = lazy(() => import("./components/DesktopDshPanel").then(m => ({ default: m.DesktopDshPanel })));
 const DshPanel = lazy(() => import("./components/DshPanel"));
 const SessionContinuationSheet = lazy(() => import("./components/SessionContinuationSheet"));
+const PasswordChangeSheet = lazy(() => import("./components/PasswordChangeSheet"));
 const DshConnectionNotice = lazy(() => import("./components/DshCommandFeedback").then(m => ({ default: m.DshConnectionNotice })));
 const SessionsSidebar = lazy(() => import("./components/SessionsSidebar").then(
   ({ SessionsSidebar: Sidebar }) => ({ default: Sidebar }),
@@ -560,6 +561,8 @@ export default function App() {
   const [desktopDshMounted, setDesktopDshMounted] = useState(false);
   const [desktopDshOpen, setDesktopDshOpen] = useState(false);
   const [continuationOpen, setContinuationOpen] = useState(false);
+  const [passwordChangeOpen, setPasswordChangeOpen] = useState(false);
+  const passwordChangeTrigger = useRef<HTMLButtonElement | null>(null);
   const continuationTrigger = useRef<HTMLButtonElement>(null);
   const [dshPanel, setDshPanel] = useState<{ sid: string; scope: string; selection: DshPanelSelection } | null>(null);
   const [permissionProfileRequests, setPermissionProfileRequests] =
@@ -3921,6 +3924,7 @@ export default function App() {
         },
         onAuthFail: () => {
           if (!acceptsLifecycle()) return;
+          setPasswordChangeOpen(false);
           turnFileRequestsRef.current.clear();
           setAuthReady(false);
           clearLegacyAuthMarkers(localStorage);
@@ -5751,19 +5755,24 @@ export default function App() {
     artifact: state.artifact, btwSid: activeBtwSid, btwAvailable: !!btwPanelKey, rightView,
     getDiff, openBtw, collapseBtw, toggleCenteredBtw,
   };
-  const logout = async () => {
+  const logout = async ({ sessionRevoked = false } = {}) => {
     try {
-      const response = await fetch("/api/logout", {
-        method: "POST", credentials: "same-origin", cache: "no-store",
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!sessionRevoked) {
+        const response = await fetch("/api/logout", {
+          method: "POST", credentials: "same-origin", cache: "no-store",
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      }
+      setPasswordChangeOpen(false);
       // Relay revocation is authoritative; a provider outage must not block
       // logout. The native shell retains a failed invalidation for next login.
       if (hasHarmonyPush()) void disableRemotePush();
       try { localStorage.removeItem(MANUAL_UNREAD_STORAGE); } catch { /* Private browsing. */ }
-      await import("./cache").then((module) => module.clearCache());
-      await historyPageCacheRef.current.clear();
       wsRef.current?.stop();
+      await Promise.allSettled([
+        import("./cache").then((module) => module.clearCache()),
+        historyPageCacheRef.current.clear(),
+      ]);
       pendingCreateRef.current = null;
       createRequestsRef.current.clear();
       pendingBtwByParentRef.current.clear();
@@ -6080,9 +6089,17 @@ export default function App() {
             onOpenViewer={visibleParentSid ? () => openViewer() : undefined}
             onOpenArtifacts={visibleParentSid && state.wrapperOnline ? () => openSessionArtifacts() : undefined}
             onOpenFiles={visibleParentSid && !archivedBrowse && state.wrapperOnline ? () => openFiles() : undefined}
+            onChangePassword={(trigger) => {
+              passwordChangeTrigger.current = trigger;
+              setPasswordChangeOpen(true);
+            }}
             onLogout={() => void logout()}
           /></Suspense>
         </header>
+        {passwordChangeOpen && <Suspense fallback={null}>
+          <PasswordChangeSheet trigger={passwordChangeTrigger} onClose={() => setPasswordChangeOpen(false)}
+            onChanged={() => void logout({ sessionRevoked: true })} />
+        </Suspense>}
         {continuationOpen && space === "code" && <Suspense fallback={null}>
           <SessionContinuationSheet key={`${machineId}:${focusedSid}`} engine={focusedEngine}
             sessionId={focusedNativeSessionId ?? null} cwd={focusedSession?.cwd || currentCwd || null}

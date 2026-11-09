@@ -38,6 +38,7 @@ from cc_remote.relay.auth import (
     make_session_token, session_token_claims, wrapper_machine_scope,
 )
 from cc_remote.relay.devices import DeviceStore
+from cc_remote.relay.passwords import PasswordStore
 from cc_remote.relay.harmony_push import (
     HarmonyPushDispatcher, HarmonyPushStore, HarmonySubscription, HuaweiPushSender,
     TOKEN_RE as HARMONY_TOKEN_RE,
@@ -176,6 +177,7 @@ _pair_limiter = LoginRateLimiter(max_per_ip=30)
 @dataclass
 class _SessionEntry:
     expires_at: int
+    subject: str | None = None
     revoked: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -197,7 +199,7 @@ class SessionRegistry:
             self._prune_locked(time.time())
             if claims.jti in self._entries or len(self._entries) >= self.cap:
                 return False
-            self._entries[claims.jti] = _SessionEntry(claims.expires_at)
+            self._entries[claims.jti] = _SessionEntry(claims.expires_at, claims.subject)
             return True
 
     async def active(self, claims: SessionClaims) -> bool:
@@ -224,6 +226,14 @@ class SessionRegistry:
                 return False
             entry.revoked.set()
             return True
+
+    def revoke_subject(self, subject: str | None) -> None:
+        # Registry operations run on the relay event loop and never suspend
+        # while mutating entries. Keep revocation adjacent to the durable write.
+        for jti, entry in list(self._entries.items()):
+            if entry.subject == subject:
+                del self._entries[jti]
+                entry.revoked.set()
 
 
 class _BodyTooLarge(ValueError):
@@ -586,6 +596,8 @@ def create_app(
     link_previews = LinkPreviewService()
     link_preview_limiter = LoginRateLimiter(max_per_ip=120)
     devices = device_store or DeviceStore(cfg.device_db_path)
+    passwords = PasswordStore(devices.path, cfg)
+    password_lock = asyncio.Lock()
     push_store: PushSubscriptionStore | None = None
     push_dispatcher: PushDispatcher | None = None
     if cfg.push_vapid_public_key:
@@ -818,14 +830,16 @@ def create_app(
                 return JSONResponse({"error": "subscription_limit"}, status_code=429)
         return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
-    @app.post("/api/login")
-    async def login(req: Request) -> JSONResponse:
-        if not _request_origin_allowed(req, cfg):
+    async def password_request(req: Request, *, change: bool = False) -> JSONResponse:
+        if not _request_origin_allowed(req, cfg, allow_missing=not change):
             return JSONResponse(
                 {"error": "origin_rejected"},
                 status_code=403,
                 headers={"Cache-Control": "no-store"},
             )
+        current = await _active_claims(req, cfg, sessions) if change else None
+        if change and current is None:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
         ip = _request_ip(req)
         if _rate_limited(ip):
             return JSONResponse(
@@ -855,25 +869,59 @@ def create_app(
                     status_code=408,
                     headers={"Cache-Control": "no-store"},
                 )
-        except _BodyTooLarge:
-            return JSONResponse(
-                {"error": "too_large"},
-                status_code=413,
-                headers={"Cache-Control": "no-store"},
-            )
-        except Exception:
-            return JSONResponse(
-                {"error": "bad_request"},
-                status_code=400,
-                headers={"Cache-Control": "no-store"},
-            )
+            except _BodyTooLarge:
+                return JSONResponse(
+                    {"error": "too_large"},
+                    status_code=413,
+                    headers={"Cache-Control": "no-store"},
+                )
+            except Exception:
+                return JSONResponse(
+                    {"error": "bad_request"},
+                    status_code=400,
+                    headers={"Cache-Control": "no-store"},
+                )
+            async with password_lock:
+                try:
+                    return await apply_password_request(req, body if isinstance(body, dict) else {}, current, ip)
+                except sqlite3.Error:
+                    log.warning("password storage unavailable")
+                    return JSONResponse({"error": "password_storage_unavailable"}, status_code=503,
+                                        headers={"Cache-Control": "no-store"})
         finally:
             login_slots.release()
-        candidate = body.get("password", "") if isinstance(body, dict) else ""
+
+    async def apply_password_request(req: Request, body: dict, current: SessionClaims | None,
+                                     ip: str) -> JSONResponse:
+        candidate = body.get("current_password" if current else "password", "")
         password = candidate if isinstance(candidate, str) else ""
-        username_value = body.get("username", "") if isinstance(body, dict) else ""
-        username = username_value if isinstance(username_value, str) else ""
-        access = authenticate_login(username, password, cfg)
+        username_value = body.get("username", "")
+        username = (current.subject or "") if current else (username_value if isinstance(username_value, str) else "")
+        if current is not None and not await sessions.active(current):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            password.encode("utf-8")
+            username.encode("utf-8")
+        except UnicodeError:
+            return JSONResponse({"error": "bad_request"}, status_code=400)
+        access = await asyncio.to_thread(authenticate_login, username, password, cfg, verify=passwords.verify)
+        if current is not None:
+            if access is None or access[0] != current.subject:
+                return JSONResponse({"error": "invalid_current_password"}, status_code=403)
+            new_password = body.get("new_password")
+            if (not isinstance(new_password, str) or not 12 <= len(new_password) <= 256
+                    or not new_password.strip() or new_password == password
+                    or any(0xD800 <= ord(char) <= 0xDFFF for char in new_password)):
+                return JSONResponse({"error": "invalid_new_password"}, status_code=400)
+            prepared = await asyncio.to_thread(passwords.prepare, current.subject, new_password)
+            if not await sessions.active(current):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            passwords.save(current.subject, *prepared)
+            sessions.revoke_subject(current.subject)
+            log.info("browser password changed", ip=ip)
+            response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
+            clear_session_cookie(req, response)
+            return response
         if access is None:
             log.warning("login failed", ip=ip)
             return JSONResponse({"error": "invalid"}, status_code=401)
@@ -903,6 +951,14 @@ def create_app(
             samesite="strict",
         )
         return response
+
+    @app.post("/api/login")
+    async def login(req: Request) -> JSONResponse:
+        return await password_request(req)
+
+    @app.post("/api/change-password")
+    async def change_password(req: Request) -> JSONResponse:
+        return await password_request(req, change=True)
 
     @app.post("/api/link-preview")
     async def link_preview(req: Request):
@@ -943,6 +999,15 @@ def create_app(
             headers={"Cache-Control": "no-store"},
         )
 
+    def clear_session_cookie(req: Request, response: JSONResponse) -> None:
+        response.delete_cookie(
+            main_cookie_name(cfg, req),
+            path="/",
+            secure=_request_cookie_secure(req),
+            httponly=True,
+            samesite="strict",
+        )
+
     @app.post("/api/logout")
     async def logout(req: Request) -> JSONResponse:
         if not _request_origin_allowed(req, cfg):
@@ -960,13 +1025,7 @@ def create_app(
                 await harmony_store.remove_session(claims.jti)
             await sessions.revoke(claims.jti)
         response = JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
-        response.delete_cookie(
-            main_cookie_name(cfg, req),
-            path="/",
-            secure=_request_cookie_secure(req),
-            httponly=True,
-            samesite="strict",
-        )
+        clear_session_cookie(req, response)
         return response
 
     @app.get("/api/devices")
