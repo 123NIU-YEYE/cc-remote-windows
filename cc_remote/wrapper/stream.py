@@ -2635,7 +2635,10 @@ def transcript_timestamps(
         source_path = path or transcript_path(session_id)
         if not source_path:
             return out
-        with open(source_path) as f:
+        # Claude writes UTF-8. A Windows service locale (cp936) would otherwise
+        # fail on the first non-ASCII record and leave every entry unmapped;
+        # uuid/timestamp are ASCII, so a damaged byte must not drop later rows.
+        with open(source_path, encoding="utf-8", errors="replace") as f:
             for line in _bounded_jsonl_lines(f):
                 try:
                     d = json.loads(line)
