@@ -116,9 +116,14 @@ ASK_OPTION_MIN_COUNT = 2
 ASK_OPTION_MAX_COUNT = 5
 ASK_QUESTION_MAX_COUNT = 4
 FILE_PREVIEW_MAX_BYTES = 512 * 1024
-PREVIEW_ASSET_MAX_BYTES = 4 * 1024 * 1024
+# Inline markdown assets (images referenced by an open preview). Raised from
+# 4 MiB so a 4K screenshot still loads; base64 inflates by 4/3, which stays
+# well inside the 32 MiB WebSocket frame budget.
+PREVIEW_ASSET_MAX_BYTES = 12 * 1024 * 1024
 MAX_ENCODED_PREVIEW_ASSET_CHARS = ((PREVIEW_ASSET_MAX_BYTES + 2) // 3) * 4
-ARTIFACT_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+# Files opened from the artifacts panel. 20 MiB covers ordinary short videos
+# and large renders; base64 lands at ~26.7 MiB, still under one 32 MiB frame.
+ARTIFACT_PREVIEW_MAX_BYTES = 20 * 1024 * 1024
 MAX_ENCODED_ARTIFACT_PREVIEW_CHARS = ((ARTIFACT_PREVIEW_MAX_BYTES + 2) // 3) * 4
 
 
@@ -1861,7 +1866,7 @@ class WorkArtifactInfo(BaseModel):
     path: PreviewPath
     size: int = Field(ge=0)
     modified_at: float = Field(ge=0)
-    kind: Literal["document", "spreadsheet", "presentation", "image", "pdf", "file"]
+    kind: Literal["document", "spreadsheet", "presentation", "image", "video", "pdf", "file"]
     previewable: bool = False
 
 
@@ -2764,7 +2769,7 @@ class SessionArtifactInfo(BaseModel):
     name: str = Field(max_length=1024)
     path: PreviewPath
     source: Literal["upload", "delivered"]
-    kind: Literal["image", "document", "file"]
+    kind: Literal["image", "video", "document", "file"]
     created_at: float = Field(ge=0)
     size: int = Field(ge=0)
     available: bool
@@ -2799,13 +2804,14 @@ class FilePreview(_Base):
     directory: bool = False
     path: PreviewPath
     request_id: WireId
-    format: Literal["markdown", "text", "html", "image", "pdf", "audio", "spreadsheet"] = "text"
+    format: Literal["markdown", "text", "html", "image", "pdf", "audio", "video", "spreadsheet"] = "text"
     content: PreviewContent = ""
     media_type: Optional[Literal[
         "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
         "image/svg+xml", "application/pdf",
         "audio/wav", "audio/mpeg", "audio/mp4", "audio/aac", "audio/flac",
         "audio/ogg", "audio/webm",
+        "video/mp4", "video/webm", "video/quicktime", "video/x-m4v", "video/ogg",
     ]] = None
     data: Optional[ArtifactPreviewData] = None
     converted_from: Optional[str] = Field(default=None, max_length=16)
@@ -2861,6 +2867,7 @@ class PreviewAsset(_Base):
     media_type: Optional[Literal[
         "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
         "image/svg+xml",
+        "video/mp4", "video/webm", "video/quicktime", "video/x-m4v", "video/ogg",
     ]] = None
     data: Optional[PreviewAssetData] = None
     error: Optional[str] = Field(default=None, max_length=512)
@@ -2876,7 +2883,7 @@ class PreviewAuthorizationRequired(_Base):
     operation: Literal["file_preview", "preview_asset"]
     path: PreviewPath
     resolved_path: PreviewPath
-    format: Literal["markdown", "text", "html", "image", "pdf", "audio", "spreadsheet"] = "text"
+    format: Literal["markdown", "text", "html", "image", "pdf", "audio", "video", "spreadsheet"] = "text"
     preview_id: Optional[WireId] = None
 
 

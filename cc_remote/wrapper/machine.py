@@ -2038,9 +2038,20 @@ class WrapperMachine:
         ".avif": "image/avif",
         ".svg": "image/svg+xml",
     }
+    # Video rendered by the browser's own <video> element. The wrapper only
+    # verifies the container's cheap magic bytes and ships the bytes; decoding
+    # stays in the client, exactly like the audio path.
+    VIDEO_PREVIEW_MEDIA_TYPES = {
+        ".mp4": "video/mp4",
+        ".m4v": "video/x-m4v",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+        ".ogv": "video/ogg",
+    }
     ARTIFACT_PREVIEW_MEDIA_TYPES = {
         **PREVIEW_ASSET_MEDIA_TYPES,
         **AUDIO_PREVIEW_MEDIA_TYPES,
+        **VIDEO_PREVIEW_MEDIA_TYPES,
         ".pdf": "application/pdf",
     }
     SAFE_RETRY_COMMANDS = frozenset({
@@ -26421,6 +26432,10 @@ class WrapperMachine:
         if media_type.startswith("audio/"):
             validate_audio_preview(media_type, data)
             return
+        if media_type.startswith("video/"):
+            if not WrapperMachine._looks_like_video(data):
+                raise ValueError("文件内容与预览格式不匹配")
+            return
         if media_type == "image/svg+xml":
             WrapperMachine._validate_svg_preview(data)
             return
@@ -26436,6 +26451,26 @@ class WrapperMachine:
         }.get(media_type, False)
         if not valid:
             raise ValueError("文件内容与预览格式不匹配")
+
+    @staticmethod
+    def _looks_like_video(data: bytes) -> bool:
+        """Cheap container sniff for the video formats we advertise.
+
+        Only the bytes that identify the container are checked; the browser's
+        <video> element does the real decoding, so an expensive parse here
+        would buy nothing.
+        """
+        if len(data) < 12:
+            return False
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBM":
+            return True
+        if data[:4] == b"OggS":
+            return True
+        # ISO base media (mp4 / m4v / mov): a box header, then 'ftyp'.
+        if data[4:8] == b"ftyp":
+            return True
+        # Some QuickTime exports open with a bare media box instead.
+        return data[4:8] in {b"moov", b"mdat", b"wide", b"free"}
 
     @staticmethod
     def _validate_svg_preview(data: bytes) -> None:
@@ -26816,6 +26851,11 @@ class WrapperMachine:
             return "pdf"
         if suffix in cls.PREVIEW_ASSET_MEDIA_TYPES:
             return "image"
+        # Video is checked before audio because .webm is a container that can
+        # hold either. A <video> element plays an audio-only webm just as well,
+        # so preferring video never loses playback.
+        if suffix in cls.VIDEO_PREVIEW_MEDIA_TYPES:
+            return "video"
         if suffix in AUDIO_PREVIEW_MEDIA_TYPES:
             return "audio"
         return "text"
