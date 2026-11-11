@@ -15,11 +15,11 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import urlsplit
 from urllib.request import getproxies_environment, proxy_bypass_environment
 
-from websockets.asyncio.client import connect
+from websockets.asyncio.client import ClientConnection, connect
 
 from cc_remote import __version__
 from cc_remote.log import logger
-from cc_remote.protocol import ProtocolError, deserialize, serialize
+from cc_remote.protocol import Error, Ping, Pong, ProtocolError, deserialize, serialize
 
 log = logger("cc_remote.wrapper.transport")
 
@@ -28,6 +28,26 @@ log = logger("cc_remote.wrapper.transport")
 # otherwise a latency spike tears the connection down and the UI stalls.
 _DEFAULT_PING_INTERVAL = 30.0
 _DEFAULT_PING_TIMEOUT = 90.0
+_APPLICATION_PING_INTERVAL = 20.0
+_APPLICATION_PING_TIMEOUT = 60.0
+
+
+class RelayClientConnection(ClientConnection):
+    """Handle an HTTP proxy losing TLS before connection_made (websockets 16).
+
+    start_tls can report connection_lost before websockets initializes its
+    receive assembler. Preserve the original handshake failure and resolve the
+    close waiter instead of raising AttributeError in the event-loop callback.
+    """
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        if hasattr(self, "recv_messages"):
+            super().connection_lost(exc)
+            return
+        self.protocol.receive_eof()
+        self.set_recv_exc(exc)
+        if not self.connection_lost_waiter.done():
+            self.connection_lost_waiter.set_result(None)
 
 
 def _ws_ping_interval() -> float | None:
@@ -125,6 +145,10 @@ class WrapperTransport:
         self._generation = 0
         self._stop = False
         self._task: Optional[asyncio.Task] = None
+        self._announcement_task: Optional[asyncio.Task] = None
+        self._announcement_socket = None
+        self._heartbeat_n = 0
+        self._heartbeat_ack: Optional[asyncio.Event] = None
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run())
@@ -142,6 +166,14 @@ class WrapperTransport:
                 pass
 
     async def send(self, msg) -> None:
+        if (asyncio.current_task() is self._announcement_task
+                and self._announcement_socket is not None):
+            # The relay requires Hello as the first frame. A running Claude
+            # turn can emit while a replacement socket is being announced;
+            # keep those live frames in replay until Hello crosses the socket.
+            await self._announcement_socket.send(serialize(msg))
+            self._connected = True
+            return
         if not self._connected:
             return  # dropped; ring buffer + client replay covers it
         raw = serialize(msg)
@@ -166,6 +198,9 @@ class WrapperTransport:
             try:
                 headers = {"Authorization": f"Bearer {self.token}", "X-CC-Remote-Version": __version__}
                 kw: dict = {
+                    "create_connection": RelayClientConnection,
+                    "open_timeout": 15,
+                    "close_timeout": 5,
                     "additional_headers": headers,
                     "max_size": self.max_size,
                     # Select only the operator's explicit HTTP proxy variables.
@@ -192,20 +227,40 @@ class WrapperTransport:
                     kw["proxy"] = proxies.get("https") or proxies.get("http") or None
                 async with connect(self.url, **kw) as ws:
                     log.info("connected to relay", url=self.url)
-                    backoff = 1.0
+                    connected_at = asyncio.get_running_loop().time()
                     self._generation += 1
-                    self._connected = True
-                    if self.on_connected:
-                        try:
-                            await self.on_connected()
-                        except Exception:
-                            log.exception("on_connected callback failed")
+                    self._connected = self.on_connected is None
                     sender = asyncio.create_task(
                         self._sender(ws, self._generation))
                     receiver = asyncio.create_task(self._receiver(ws))
+                    announcer = None
+                    heartbeat = None
                     try:
+                        # Announcing can fill the bounded queue. Its consumer
+                        # must already be running, including during reconnect.
+                        if self.on_connected:
+                            self._announcement_socket = ws
+                            announcer = asyncio.create_task(self.on_connected())
+                            self._announcement_task = announcer
+                            await asyncio.wait(
+                                {announcer, sender, receiver},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if announcer.done():
+                                announcer.result()
+                                self._connected = True
+                            # A socket can die while announcement is blocked on
+                            # queue pressure. Reap that producer on this same
+                            # generation instead of waiting forever for room.
+                            else:
+                                announcer.cancel()
+                        if self._connected:
+                            heartbeat = asyncio.create_task(self._keepalive(ws))
+                        workers = {sender, receiver}
+                        if heartbeat is not None:
+                            workers.add(heartbeat)
                         _, pending = await asyncio.wait(
-                            {sender, receiver}, return_when=asyncio.FIRST_COMPLETED,
+                            workers, return_when=asyncio.FIRST_COMPLETED,
                         )
                         for task in pending:
                             task.cancel()
@@ -213,7 +268,7 @@ class WrapperTransport:
                         # captures the real failure instead of emitting an
                         # unhandled-task warning later.
                         results = await asyncio.gather(
-                            sender, receiver, return_exceptions=True)
+                            *workers, return_exceptions=True)
                         for result in results:
                             if (isinstance(result, BaseException)
                                     and not isinstance(
@@ -221,23 +276,38 @@ class WrapperTransport:
                                 raise result
                     finally:
                         self._connected = False
+                        self._announcement_socket = None
+                        self._announcement_task = None
+                        self._heartbeat_ack = None
+                        # An accepted HTTP upgrade can still be rejected by the
+                        # relay's Hello gate. Don't reset retry pacing on every
+                        # such rejection while an old socket is being reaped.
+                        if (asyncio.get_running_loop().time() - connected_at
+                                >= _APPLICATION_PING_INTERVAL):
+                            backoff = 1.0
                         self._generation += 1
                         # Parent cancellation (WrapperTransport.stop) can land
                         # while wait() is pending. Child tasks are not cancelled
                         # automatically, so reap them explicitly before leaving
                         # this socket generation.
-                        for task in (sender, receiver):
+                        tasks = [sender, receiver]
+                        if announcer is not None:
+                            tasks.append(announcer)
+                        if heartbeat is not None:
+                            tasks.append(heartbeat)
+                        for task in tasks:
                             if not task.done():
                                 task.cancel()
-                        await asyncio.gather(
-                            sender, receiver, return_exceptions=True)
+                        await asyncio.gather(*tasks, return_exceptions=True)
             except Exception as e:
                 self._connected = False
-                log.warning("relay connection lost, reconnecting", error=str(e), backoff=backoff)
+                log.warning("relay connection lost, reconnecting",
+                            error=str(e) or type(e).__name__,
+                            error_type=type(e).__name__, backoff=backoff)
             await self._drain_send_queue()
             if not self._stop:
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                backoff = min(backoff * 2, 5.0)
 
     async def _drain_send_queue(self) -> None:
         dropped = await self._send_q.drain()
@@ -254,12 +324,39 @@ class WrapperTransport:
                 continue
             await ws.send(raw)
 
+    async def _keepalive(self, ws) -> None:
+        """Exercise the application path through HTTP proxies and tunnels.
+
+        Native WebSocket pings don't prove that the relay's routing loop can
+        receive frames. This exchange stays out of session queues and replay.
+        Its deadline includes a blocked socket write as well as the reply.
+        """
+        while True:
+            await asyncio.sleep(_APPLICATION_PING_INTERVAL)
+            self._heartbeat_n = (self._heartbeat_n + 1) % 2_147_483_648
+            ack = asyncio.Event()
+            self._heartbeat_ack = ack
+            try:
+                async with asyncio.timeout(_APPLICATION_PING_TIMEOUT):
+                    await ws.send(serialize(Ping(n=self._heartbeat_n)))
+                    await ack.wait()
+            finally:
+                if self._heartbeat_ack is ack:
+                    self._heartbeat_ack = None
+
     async def _receiver(self, ws) -> None:
         async for raw in ws:
             try:
                 cmd = deserialize(raw)
             except ProtocolError as e:
                 log.warning("dropping malformed frame from relay", error=str(e))
+                continue
+            if isinstance(cmd, Pong):
+                if self._heartbeat_ack is not None and cmd.n == self._heartbeat_n:
+                    self._heartbeat_ack.set()
+                continue
+            if isinstance(cmd, Error) and not cmd.sid:
+                log.warning("relay rejected wrapper frame", code=cmd.code)
                 continue
             try:
                 await self._inbox.put(cmd, len(raw.encode("utf-8")))
