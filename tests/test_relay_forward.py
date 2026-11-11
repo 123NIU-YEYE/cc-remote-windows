@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from cc_remote.protocol import (
-    Delta, Hello, Query, TurnEnd, TurnNotificationContext, TurnResult, serialize,
+    Delta, Hello, Ping, Query, TurnEnd, TurnNotificationContext, TurnResult, serialize,
 )
 from cc_remote.relay.forward import ClientConn, SlowClientError
 from cc_remote.relay import pairing
@@ -35,6 +35,36 @@ class ScriptedWs(FakeWs):
     def __init__(self):
         super().__init__()
         self.block.set()
+
+
+def test_heartbeat_stays_local_scoped_and_responsive_without_wrapper():
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+        first_ws, other_ws = ScriptedWs(), ScriptedWs()
+        first = ClientConn(first_ws, 4, "tab", 4096)
+        other = ClientConn(other_ws, 4, "tab", 4096)
+        first.start()
+        other.start()
+        hub._ensure_clients_for("device-a")["tab"] = first
+        hub._ensure_clients_for("device-b")["tab"] = other
+        try:
+            # A wrapper write may be blocked; heartbeat must bypass its lock.
+            async with hub._wrapper_send_lock_for("device-a"):
+                assert await asyncio.wait_for(hub._forward_client_msg(
+                    first, "tab", Ping(n=71), "device-a"), 0.2)
+            await asyncio.sleep(0)
+            assert [json.loads(raw)["n"] for raw in first_ws.sent] == [71]
+            assert other_ws.sent == []
+            assert not await hub._forward_client_msg(first, "tab", Ping(n=72), "device-b")
+            hub._ensure_clients_for("device-a")["tab"] = other
+            assert not await hub._forward_client_msg(first, "tab", Ping(n=73), "device-a")
+            await asyncio.sleep(0)
+            assert len(first_ws.sent) == 1
+        finally:
+            await first.stop()
+            await other.stop()
+
+    asyncio.run(run())
 
 
 def test_client_queue_is_bounded_by_items_and_bytes():

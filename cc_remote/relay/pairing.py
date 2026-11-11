@@ -27,7 +27,7 @@ from cc_remote import __version__
 from cc_remote.config import RelayConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, ProtocolError, WrapperDisconnected, WrapperReconnected,
+    Error, Ping, Pong, ProtocolError, WrapperDisconnected, WrapperReconnected,
     PROTOCOL_VERSION, deserialize, is_client_message, serialize,
     ERR_BUSY, ERR_WRAPPER_OFFLINE, ERR_WRAPPER_ALREADY_CONNECTED, ERR_PROTOCOL,
 )
@@ -46,6 +46,7 @@ PROTOCOL_ERROR_CLOSE_REASON = "invalid protocol frame"
 MAX_NAMED_WRAPPERS = 256
 WRAPPER_LIMIT_CLOSE_CODE = 1013
 WRAPPER_LIMIT_CLOSE_REASON = "wrapper capacity reached"
+WRAPPER_HEARTBEAT_IDLE_TIMEOUT = 90.0
 
 
 WrapperEventHook = Callable[[str, object], Awaitable[None]]
@@ -197,10 +198,28 @@ class RelayHub:
         authorize_machine: WrapperAuthorizer | None = None,
     ) -> None:
         announced = False
+        heartbeat_seen = False
         machine_id: str | None = None
         try:
             while True:
-                raw = await ws.receive_text()
+                if heartbeat_seen:
+                    try:
+                        raw = await asyncio.wait_for(
+                            ws.receive_text(), WRAPPER_HEARTBEAT_IDLE_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        # Only peers which have opted into application pings
+                        # have this deadline; legacy idle Wrappers stay valid.
+                        log.warning("wrapper application heartbeat expired",
+                                    machine_id=machine_id)
+                        await self._wrapper_gone(machine_id, ws)
+                        try:
+                            await asyncio.wait_for(ws.close(
+                                code=1011, reason="wrapper heartbeat timeout"), 5.0)
+                        except (asyncio.TimeoutError, Exception):
+                            pass
+                        return
+                else:
+                    raw = await ws.receive_text()
                 try:
                     msg = deserialize(raw)
                 except ProtocolError as e:
@@ -323,9 +342,17 @@ class RelayHub:
                     self.remember_wrapper_version(machine_id, PROTOCOL_VERSION,
                                                   getattr(ws, "headers", {}).get("x-cc-remote-version"))
                 assert machine_id is not None
+                if isinstance(msg, Ping):
+                    heartbeat_seen = True
+                    # Reply on this exact authenticated socket. Never fan a
+                    # Wrapper's transport heartbeat out to browser clients.
+                    async with self._wrapper_send_lock_for(machine_id):
+                        await ws.send_text(serialize(Pong(n=msg.n)))
+                    continue
                 await self._on_wrapper_msg(msg, machine_id)
-        except WebSocketDisconnect:
-            pass
+        except WebSocketDisconnect as exc:
+            log.info("wrapper socket closed", machine_id=machine_id,
+                     code=exc.code)
         except Exception:
             log.exception("wrapper loop error")
         finally:
@@ -553,6 +580,18 @@ class RelayHub:
         machine_id: str = "default",
     ) -> bool:
         """Forward iff ``conn`` still owns client_id at the send linearization point."""
+        if msg.type == "ping":
+            # Browser transport liveness is independent of model/session
+            # recovery. Do not queue heartbeats behind a stalled wrapper write
+            # or broadcast another browser's Pong through the focused session.
+            async with self._lock:
+                if self._clients_for(machine_id).get(client_id) is not conn:
+                    return False
+            try:
+                await conn.send(Pong(n=msg.n))
+            except (SlowClientError, ConnectionError):
+                return False
+            return True
         async with self._wrapper_send_lock_for(machine_id):
             async with self._lock:
                 current = self._clients_for(machine_id).get(client_id) is conn

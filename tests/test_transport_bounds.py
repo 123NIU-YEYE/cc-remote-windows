@@ -260,3 +260,81 @@ def test_transport_stop_reaps_socket_sender_and_receiver(monkeypatch):
         assert transport._connected is False
 
     asyncio.run(run())
+
+
+def test_proxy_tls_failure_before_connection_made_preserves_error():
+    from websockets.client import ClientProtocol
+    from websockets.uri import parse_uri
+
+    from cc_remote.wrapper.transport import RelayClientConnection
+
+    async def run():
+        connection = RelayClientConnection(ClientProtocol(parse_uri("wss://relay.example/ws")))
+        error = ConnectionResetError("proxy TLS reset")
+        # HTTP CONNECT succeeded, but start_tls failed before connection_made.
+        assert not hasattr(connection, "recv_messages")
+        connection.connection_lost(error)
+        assert connection.recv_exc is error
+        assert connection.connection_lost_waiter.done()
+        assert connection.protocol.handshake_exc is not None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fail_send", [False, True])
+def test_announcement_drains_bounded_queue_and_disconnect_reaps_producer(monkeypatch, fail_send):
+    import cc_remote.wrapper.transport as transport_module
+
+    async def run():
+        announced, cancelled, exited = (asyncio.Event() for _ in range(3))
+        sent = []
+
+        class Socket:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+            async def send(self, raw):
+                if fail_send:
+                    raise ConnectionError("socket died during announcement")
+                sent.append(raw)
+
+        class Connection:
+            async def __aenter__(self):
+                return Socket()
+
+            async def __aexit__(self, *_args):
+                transport._stop = True
+                exited.set()
+
+        monkeypatch.setattr(transport_module, "connect", lambda *_args, **_kwargs: Connection())
+        transport = WrapperTransport("ws://127.0.0.1:8765/ws", "secret", send_cap=1)
+
+        async def announce():
+            try:
+                for n in range(10):
+                    await transport.send(Ping(n=n))
+                announced.set()
+            finally:
+                cancelled.set()
+
+        transport.on_connected = announce
+        await transport.start()
+        try:
+            if fail_send:
+                await asyncio.wait_for(exited.wait(), 1)
+                assert not announced.is_set()
+            else:
+                await asyncio.wait_for(announced.wait(), 1)
+                # Wait for the final queued frame too.
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                assert len(sent) == 10
+        finally:
+            await asyncio.wait_for(transport.stop(), 1)
+        assert cancelled.is_set()
+        assert exited.is_set()
+
+    asyncio.run(run())
