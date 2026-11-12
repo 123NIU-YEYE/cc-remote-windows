@@ -83,7 +83,7 @@ class RingBuffer:
             frames: list = [ReplayStart(from_seq=head, to_seq=tail,
                                         truncated=truncated, rebuild=True,
                                         generation=generation)]
-            frames.extend(m for _, m in self._buf)
+            frames.extend(self._compact_current_turn_suffix(list(self._buf)))
             frames.append(ReplayEnd(turn_usage=self.latest_turn_usage(), to_seq=tail, truncated=truncated))
             return frames
 
@@ -110,7 +110,7 @@ class RingBuffer:
             frames: list = [ReplayStart(from_seq=from_seq, to_seq=to_seq,
                                         truncated=truncated, rebuild=True,
                                         generation=generation)]
-            frames.extend(m for _, m in have)
+            frames.extend(self._compact_current_turn_suffix(have))
             frames.append(ReplayEnd(turn_usage=self.latest_turn_usage(), to_seq=to_seq, truncated=truncated))
             return frames
 
@@ -129,8 +129,7 @@ class RingBuffer:
         to_seq = self.tail_seq
         frames = [ReplayStart(from_seq=from_seq, to_seq=to_seq,
                               truncated=truncated, generation=generation)]
-        for _, m in have:
-            frames.append(m)
+        frames.extend(self._compact_current_turn_suffix(have))
         frames.append(ReplayEnd(turn_usage=self.latest_turn_usage(), to_seq=to_seq, truncated=truncated))
         return frames
 
@@ -209,6 +208,7 @@ class RingBuffer:
             message.sid,
             message.to,
             message.route_id,
+            getattr(message, "replace", False),
         )
 
     @classmethod
@@ -247,7 +247,7 @@ class RingBuffer:
             run_key = None
 
         for seq, message in retained:
-            if not isinstance(message, Delta):
+            if not isinstance(message, Delta) or getattr(message, "replace", False):
                 flush()
                 compacted.append(message)
                 continue
@@ -339,7 +339,7 @@ class RingBuffer:
             from_seq=have[0][0], to_seq=self.tail_seq, truncated=truncated,
             generation=generation,
         )]
-        frames.extend(message for _, message in have)
+        frames.extend(self._compact_current_turn_suffix(have))
         frames.append(ReplayEnd(turn_usage=self.latest_turn_usage(), to_seq=self.tail_seq, truncated=truncated))
         return frames
 
