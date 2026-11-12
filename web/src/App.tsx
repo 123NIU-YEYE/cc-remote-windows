@@ -18,6 +18,7 @@ import {
   useState,
 } from "react";
 import { RelayWs, sessionScopeKey, type EventOwnership } from "./ws";
+import { streamingMediaKind } from "./media-path";
 import type { QueryAcceptanceResult } from "./outbox";
 import { RemoteViewerContext, useRemoteViewerLinks } from "./remote-viewer-context";
 import { ViewerPagesProvider } from "./components/ViewerPagesProvider";
@@ -5446,6 +5447,15 @@ export default function App() {
     if (!fromBrowser) { setFileBrowser(null); setSessionArtifacts(null); }
     closeViewer();
     const requestId = uuid();
+    const mediaKind = streamingMediaKind(file);
+    if (mediaKind) {
+      setRightView("diff");
+      dispatch({ type: "set_artifact", artifact: {
+        file, sid: targetSid, kind: mediaKind, writable: false,
+        mediaSource: { machineId, sid: targetSid, path: file, engine: focusedEngine, space },
+      } });
+      return true;
+    }
     if (!wsRef.current?.sendGetFilePreview(
       file, requestId, targetSid)) return false;
     setRightView("diff");
@@ -5507,6 +5517,11 @@ export default function App() {
   };
   const selectSessionArtifact = (entry: SessionArtifactInfo) => {
     if (!sessionArtifacts || !confirmArtifactDiscard()) return;
+    if (streamingMediaKind(entry.path)) {
+      if (previewFileForSid(sessionArtifacts.sid, entry.path, undefined, true))
+        setSessionArtifacts({ ...sessionArtifacts, selected: entry });
+      return;
+    }
     const requestId = uuid();
     if (!wsRef.current?.sendGetSessionArtifactPreview(sessionArtifacts.sid,
       sessionArtifacts.engine, sessionArtifacts.space, entry.id, requestId)) return;
@@ -6622,7 +6637,7 @@ export default function App() {
                 if (!confirmArtifactDiscard()) return;
                 setSessionArtifacts({ ...owner, selected: null });
                 dispatch({ type: "clear_artifact" });
-              }} preview={{ artifact: state.artifact, theme,
+              }} preview={{ artifact: state.artifact, theme, machineId, mediaScope: { engine: owner.engine, space: owner.space },
                 onRefresh: (path, line) => {
                   previewFileForSid(owner.sid, path, line, true);
                 },
@@ -6650,7 +6665,7 @@ export default function App() {
                 dispatch({ type: "clear_artifact" });
                 setFileBrowser({ ...fileBrowser, preview: false });
               }}
-              preview={{ artifact: state.artifact, theme,
+              preview={{ artifact: state.artifact, theme, machineId, mediaScope: { engine, space },
                 onRefresh: (path, line) => { previewFileForSid(fileBrowser.sid, path, line, true); },
                 onOpenFile: (path, line) => { previewFileForSid(fileBrowser.sid, path, line, true); },
                 onLoadPreviewAsset: loadPreviewAsset, onAuthorizePreview: authorizePreview,
@@ -6683,7 +6698,7 @@ export default function App() {
               <p className="loading-tx">加载预览…</p>
             </div>
           }>
-            <ArtifactPanel artifact={state.artifact} active="diff"
+            <ArtifactPanel artifact={state.artifact} active="diff" machineId={machineId} mediaScope={{ engine: focusedEngine, space }}
               hasBtw={!!activeBtwGroup}
               theme={theme}
               onTab={switchRight} onRefresh={previewArtifactFile}

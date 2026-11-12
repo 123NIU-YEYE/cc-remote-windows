@@ -1,3 +1,5 @@
+import { parseLocalFileTarget } from "./file-link.ts";
+
 export type PreviewTarget =
   | { kind: "local"; value: string }
   | { kind: "external"; value: string }
@@ -5,15 +7,19 @@ export type PreviewTarget =
   | { kind: "blocked"; value: "" };
 
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+const DRIVE_PATH = /^[A-Za-z]:[\\/]/;
 
 function resolveLocalPath(markdownPath: string, target: string): string | null {
   const normalizedTarget = target.replace(/\\/g, "/");
-  const targetAbsolute = normalizedTarget.startsWith("/");
-  const baseAbsolute = markdownPath.replace(/\\/g, "/").startsWith("/");
+  const base = markdownPath.replace(/\\/g, "/");
+  const drive = DRIVE_PATH.exec(normalizedTarget)?.[0].slice(0, 2)
+    ?? DRIVE_PATH.exec(base)?.[0].slice(0, 2);
+  const targetAbsolute = normalizedTarget.startsWith("/") || DRIVE_PATH.test(normalizedTarget);
+  const baseAbsolute = base.startsWith("/") || DRIVE_PATH.test(base);
   const parts = targetAbsolute
-    ? normalizedTarget.split("/")
+    ? normalizedTarget.replace(/^[A-Za-z]:/, "").split("/")
     : [
-        ...markdownPath.replace(/\\/g, "/").split("/").slice(0, -1),
+        ...base.replace(/^[A-Za-z]:/, "").split("/").slice(0, -1),
         ...normalizedTarget.split("/"),
       ];
   const resolved: string[] = [];
@@ -35,6 +41,7 @@ function resolveLocalPath(markdownPath: string, target: string): string | null {
     resolved.push(part);
   }
   if (!resolved.length) return null;
+  if (drive) return `${drive}/${resolved.join("/")}`;
   return targetAbsolute || baseAbsolute
     ? `/${resolved.join("/")}`
     : resolved.join("/");
@@ -44,11 +51,17 @@ function resolveLocalPath(markdownPath: string, target: string): string | null {
  * HTML URL. Paths outside cwd remain local targets and are subject to the
  * wrapper's exact-file read capability flow. */
 export function classifyPreviewTarget(markdownPath: string, rawTarget: string): PreviewTarget {
-  const target = rawTarget.trim();
+  let target = rawTarget.trim();
   if (!target || target.length > 4096) return { kind: "blocked", value: "" };
   if (target.startsWith("#")) return { kind: "anchor", value: target };
   if (/^https?:/i.test(target)) return { kind: "external", value: target };
-  if (target.startsWith("//") || SCHEME.test(target)) {
+  if (/^file:\/\//i.test(target)) {
+    const file = parseLocalFileTarget(target);
+    if (!file) return { kind: "blocked", value: "" };
+    target = file.path;
+  }
+  if (target.startsWith("//") || target.startsWith("\\\\")
+      || (SCHEME.test(target) && !DRIVE_PATH.test(target))) {
     return { kind: "blocked", value: "" };
   }
 

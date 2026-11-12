@@ -25,6 +25,7 @@ from cc_remote.viewer import (
     CHUNK_SIZE, ID_RE, MAX_FILE_BYTES, MAX_REQUESTS, MAX_SITES, PULL_WINDOW, REQUEST_ID_RE,
     SCRIPT_ORIGINS, clean_path,
 )
+from cc_remote.media import MAX_MEDIA_BYTES
 
 COOKIE = "__Host-cc_remote_viewer"
 PREFIX = "/__cc_viewer/"
@@ -136,6 +137,7 @@ class PendingRead:
     expected: int = 0
     received: int = 0
     head: bool = False
+    max_bytes: int = MAX_FILE_BYTES
 
 
 class ViewerPeer:
@@ -149,6 +151,7 @@ class ViewerPeer:
         self.lock = asyncio.Lock()
         self.closed = False
         self.session_pages = False
+        self.media = False
         self.metadata_pending: dict[str, asyncio.Future] = {}
 
     def publication(self, site_id: str):
@@ -195,7 +198,8 @@ class ViewerPeer:
         async with self.lock:
             await asyncio.wait_for(self.ws.send_json(message), timeout=10)
 
-    async def read(self, site: PublicSite, path: str, method: str, headers: dict):
+    async def read(self, site: PublicSite | None, path: str, method: str, headers: dict,
+                   *, media_id: str | None = None, owner: str | None = None):
         if self.closed:
             raise ViewerError(503, "device_offline")
         if self.waiting_reads >= MAX_REQUESTS * 8:
@@ -213,12 +217,14 @@ class ViewerPeer:
             self.read_slots.release()
             raise ViewerError(503, "device_offline")
         request_id = secrets.token_hex(16)
-        pending = PendingRead(head=method == "HEAD")
+        pending = PendingRead(head=method == "HEAD",
+                              max_bytes=MAX_MEDIA_BYTES if media_id else MAX_FILE_BYTES)
         self.pending[request_id] = pending
         try:
+            target = ({"media_id": media_id, "owner": owner} if media_id else
+                      {"site_id": site.id, "revision": site.revision, "path": path})
             await self.send({"type": "request", "request_id": request_id,
-                             "site_id": site.id, "revision": site.revision,
-                             "path": path, "method": method, "headers": headers})
+                             **target, "method": method, "headers": headers})
             status, response_headers = await asyncio.wait_for(pending.metadata, 15)
             return request_id, status, response_headers
         except BaseException:
@@ -326,7 +332,7 @@ class ViewerPeer:
                                 for key, value in headers.items())):
                         raise ValueError("invalid resource metadata")
                     size = int(headers.get("content-length", "0"))
-                    if not 0 <= size <= MAX_FILE_BYTES:
+                    if not 0 <= size <= pending.max_bytes:
                         raise ValueError("invalid resource size")
                     if status in {200, 206} and not {"content-length", "content-type"} <= headers.keys():
                         raise ValueError("incomplete resource metadata")
@@ -454,6 +460,7 @@ class ViewerRelay:
                 raise ValueError("Viewer channel already connected or full")
             peer = ViewerPeer(ws, parse_catalog(hello.get("sites")))
             peer.session_pages = hello.get("session_pages") is True
+            peer.media = hello.get("media") is True
             self.peers[machine_id] = peer
             async def check_credential():
                 while True:

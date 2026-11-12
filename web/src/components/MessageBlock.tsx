@@ -4,7 +4,7 @@ import { createContext, isValidElement, memo, useContext, useEffect,
   type ReactNode } from "react";
 import { LocalFileLink, WebLink } from "./LinkPreview";
 import ReactMarkdown, { defaultUrlTransform, type Components, type UrlTransform } from "react-markdown";
-import { parseLocalFileTarget } from "../file-link";
+import { parseInlineFileTarget, parseLocalFileTarget } from "../file-link";
 import { RemoteViewerContext } from "../remote-viewer-context";
 import { ViewerPagesContext } from "../viewer-pages-context";
 import { isLocalViewerUrl } from "../remote-viewer";
@@ -449,7 +449,9 @@ function MarkdownImage({ src, alt, title }: ComponentPropsWithoutRef<"img">) {
 // Images and all other schemes retain react-markdown's default URL policy.
 const messageUrlTransform: UrlTransform = (url, key, node) => {
   if (key === "href" && node.tagName === "a"
-      && /^file:\/\//i.test(url) && parseLocalFileTarget(url)) return url;
+      && parseLocalFileTarget(url)) return url;
+  if (key === "src" && node.tagName === "img"
+      && classifyMessageImageTarget(url).kind === "local") return url;
   return defaultUrlTransform(url);
 };
 
@@ -501,12 +503,17 @@ function MarkdownPre({ children }: ComponentPropsWithoutRef<"pre">) {
 function MarkdownCode({
   className, children,
 }: ComponentPropsWithoutRef<"code">) {
-  const { done } = useContext(MessageMarkdownContext);
+  const { done, onOpenFile } = useContext(MessageMarkdownContext);
   if (done && isMathFenceClass(className)) {
     return <code className={className}>{children}</code>;
   }
   if (done && isMermaidFenceClass(className)) {
     return <MermaidBlock source={nodeText(children).replace(/\n$/, "")} />;
+  }
+  const target = !className ? parseInlineFileTarget(nodeText(children)) : null;
+  if (target && onOpenFile) {
+    return <LocalFileLink location={target.path}
+      onOpen={() => onOpenFile(target.path, target.line)}><code>{children}</code></LocalFileLink>;
   }
   return <code className={className}>{children}</code>;
 }

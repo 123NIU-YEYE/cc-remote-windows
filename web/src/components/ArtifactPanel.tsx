@@ -30,6 +30,8 @@ import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 import { PanelResizer } from "./PanelResizer";
 import { PdfArtifactPreview } from "./PdfArtifactPreview";
 import { AudioArtifactPreview } from "./AudioArtifactPreview";
+import LocalMediaPreview, { MediaDownloadButton } from "./LocalMediaPreview";
+import { parentFilePath } from "../media-path";
 import { previewImageDimension, rehypePreviewHtml } from "../markdown-preview-html";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
@@ -372,7 +374,9 @@ function PreviewImage({ markdownPath, src, alt, title, width, height, asset, req
 
 export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
   onRefresh, onOpenFile, onLoadPreviewAsset, onAuthorizePreview,
-  onSaveMarkdown, onDirtyChange, theme, displayName }: {
+  onSaveMarkdown, onDirtyChange, theme, displayName, machineId, mediaScope }: {
+  machineId?: string;
+  mediaScope?: { engine: "claude" | "codex" | "dsh"; space: "code" | "work" };
   displayName?: string;
   artifact: Artifact;
   active: RightPanelView;
@@ -619,17 +623,22 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         </button>}
         {artifact.kind === "md" && artifact.saveStatus === "saved" && !dirty
           && <span className="markdown-save-state ok">已保存</span>}
-        {!loading && !artifact.error && !artifact.authorization && !artifact.truncated
-          && ["md", "file", "html", "image", "pdf"].includes(artifact.kind)
+        {machineId && artifact.sid && !artifact.authorization && artifact.kind !== "gitdiff"
+          ? <MediaDownloadButton source={{ machineId, sid: artifact.sid, path: artifact.file, ...mediaScope }} />
+          : !loading && !artifact.error && !artifact.authorization && !artifact.truncated
+          && ["md", "file", "html", "image", "pdf", "audio", "video", "spreadsheet"].includes(artifact.kind)
           && (artifact.data != null || artifact.content != null) && <Suspense fallback={null}>
             <ArtifactDownload id={artifactKey} file={displayName || artifact.file} data={artifact.data}
               content={artifact.content} converted={artifact.convertedFrom} />
           </Suspense>}
+        {onOpenFile && artifact.kind !== "gitdiff" && <button className="iconbtn"
+          title="打开所在文件夹" aria-label="打开所在文件夹"
+          onClick={() => onOpenFile(parentFilePath(artifact.file))}><Icon name="folder-open" size={17} /></button>}
         {artifact.convertedFrom && <span className="artifact-converted"
           title="由 nono 本机沙箱临时转换，VPS 不保存文件">
           {artifact.convertedFrom.toUpperCase()} → PDF
         </span>}
-        {["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) && <button className="iconbtn"
+        {["md", "file", "html", "image", "pdf", "audio", "video", "spreadsheet"].includes(artifact.kind) && <button className="iconbtn"
           onClick={() => onRefresh?.(artifact.file, artifact.line)}
           aria-label="刷新文件" title="重新读取文件"><Icon name="refresh" size={17} /></button>}
         <PanelExpandButton label={artifact.kind === "gitdiff" ? "改动" : "文件预览"} />
@@ -647,6 +656,9 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
           <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> {["md", "file", "html", "image", "pdf", "audio", "spreadsheet"].includes(artifact.kind) ? "正在读取文件…" : "正在读取 diff…"}</div>
         ) : artifact.error ? (
           <div className="preview-error"><Icon name="read" size={18} />{artifact.error}</div>
+        ) : artifact.mediaSource && (artifact.kind === "video" || artifact.kind === "audio") ? (
+          <LocalMediaPreview key={`${artifact.mediaSource.machineId}:${artifact.sid}:${artifact.file}`}
+            source={artifact.mediaSource} kind={artifact.kind} title={artifact.file} />
         ) : artifact.kind === "gitdiff" ? (
           empty ? (
             <div className="diff-empty">没有未提交的改动。</div>

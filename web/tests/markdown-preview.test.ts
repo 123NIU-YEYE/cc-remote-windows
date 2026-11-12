@@ -6,7 +6,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
-import { parseLocalFileTarget } from "../src/file-link.ts";
+import { parseInlineFileTarget, parseLocalFileTarget } from "../src/file-link.ts";
+import { parentFilePath, streamingMediaKind } from "../src/media-path.ts";
 import {
   parseCodexFileCitationDirective,
   remarkCodexFileCitations,
@@ -92,7 +93,20 @@ assert.deepEqual(classifyPreviewTarget(
   "/tmp/report.md", "./images/chart.png"), {
   kind: "local", value: "/tmp/images/chart.png",
 });
-assert.equal(classifyPreviewTarget("README.md", "file:///etc/passwd").kind, "blocked");
+assert.deepEqual(classifyPreviewTarget("README.md", "file:///etc/passwd"), { kind: "local", value: "/etc/passwd" });
+assert.deepEqual(classifyPreviewTarget("C:/项目/README.md", "../图片/样例.png"), { kind: "local", value: "C:/图片/样例.png" });
+assert.deepEqual(classifyPreviewTarget("C:/项目/README.md", "D:/素材/样例.png"), { kind: "local", value: "D:/素材/样例.png" });
+assert.deepEqual(classifyPreviewTarget("C:/项目/README.md", "file:///D:/素材/样例.png"), { kind: "local", value: "D:/素材/样例.png" });
+assert.equal(classifyPreviewTarget("C:/README.md", "../../escape.png").kind, "blocked");
+assert.deepEqual(parseInlineFileTarget("D:/素材/clip.mp4"), { path: "D:/素材/clip.mp4", line: undefined, column: undefined });
+assert.equal(parseInlineFileTarget("const x = 1\n"), null);
+assert.equal(parseInlineFileTarget("https://example.com/file.mp4"), null);
+assert.equal(parseLocalFileTarget("file://server/share/file.png"), null);
+assert.deepEqual(parseLocalFileTarget("file:///D:/my%20files/photo.png"), { path: "D:/my files/photo.png", line: undefined, column: undefined });
+assert.equal(streamingMediaKind("D:/素材/clip.MP4"), "video");
+assert.equal(streamingMediaKind("D:\\素材\\voice.wav"), "audio");
+assert.equal(parentFilePath("D:\\素材\\clip.mp4"), "D:/素材");
+assert.equal(parentFilePath("D:/clip.mp4"), "D:/");
 assert.equal(classifyPreviewTarget(
   "README.md", `${"图".repeat(1400)}.png`).kind, "blocked");
 assert.equal(classifyPreviewTarget("README.md", "//example.com/a.png").kind, "blocked");
@@ -572,6 +586,12 @@ try {
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const windowsFileLinks = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "[打开文件](<D:/素材/clip.mp4>) · `D:/素材/clip.mp4`", done: true,
+    onOpenFile: () => {},
+  }));
+  assert.equal((windowsFileLinks.match(/class="message-file-link"/g) ?? []).length, 2,
+    "both Markdown links and inline drive paths open the authenticated file preview");
   const { preloadMarkdownExtras } = await harness.ssrLoadModule(
     "/src/use-markdown-extras.ts");
   // Bare breaks work on the first render, before lazy disclosure parsers load.
@@ -1457,9 +1477,11 @@ $$`,
   const fileUrlImage = renderToStaticMarkup(createElement(MessageBlock, {
     text: "![image](file:///tmp/clip.png)", done: true, onLoadImage: () => true,
   }));
-  assert.match(fileUrlImage, /message-image-error/);
-  assert.doesNotMatch(fileUrlImage, /<img|message-image-loading/,
-    "the link exception must not change the existing image URL policy");
+  assert.match(fileUrlImage, /message-image-loading/);
+  assert.doesNotMatch(fileUrlImage, /<img[^>]*src="file:/,
+    "file URLs load through authenticated assets instead of browser-local navigation");
+  assert.doesNotMatch(fileUrlImage, /<img[^>]*src="(?:file:|[A-Za-z]:)/,
+    "a local path must never become an HTML image URL");
 
   const source = Array.from({ length: 740 }, (_, index) => `line ${index + 1}`).join("\n");
   const sourceMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {

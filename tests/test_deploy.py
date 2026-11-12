@@ -1171,7 +1171,7 @@ def test_caddy_blob_policy_is_limited_to_image_and_audio_previews(template):
         if (parts := directive.strip().split())
     }
     assert "blob:" in directives["img-src"]
-    assert directives["media-src"] == ["blob:"]
+    assert directives["media-src"] == ["'self'", "blob:"]
     assert all(
         "blob:" not in sources
         for name, sources in directives.items()

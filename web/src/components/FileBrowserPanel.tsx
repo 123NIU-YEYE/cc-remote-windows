@@ -17,6 +17,7 @@ export function FileBrowserPanel({ sid, initialPath, ws, hidden, onListen,
   const [showHidden, setShowHidden] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const pending = useRef<{ id: string; append: boolean; target: string } | null>(null);
   const timeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const openFile = useRef(onOpenFile);
@@ -70,7 +71,8 @@ export function FileBrowserPanel({ sid, initialPath, ws, hidden, onListen,
     <PanelResizer ariaLabel="调整文件面板宽度" />
     <div className="artifact-head">
       <Icon name="folder-open" size={18} /><strong>会话文件</strong>
-      <span className="artifact-path" title={visibleListing?.path}>{visibleListing?.path}</span>
+      <span className="artifact-path" title={visibleListing?.path === "::drives::" ? "此电脑" : visibleListing?.path}>
+        {visibleListing?.path === "::drives::" ? "此电脑" : visibleListing?.path}</span>
       <button className="iconbtn" title="刷新目录" aria-label="刷新目录"
         onClick={() => browse(listing?.path ?? path, showHidden)}><Icon name="refresh" size={17} /></button>
       <PanelExpandButton label="会话文件" />
@@ -79,14 +81,22 @@ export function FileBrowserPanel({ sid, initialPath, ws, hidden, onListen,
     <form className="workspace-path" onSubmit={(event) => {
       event.preventDefault(); browse(path, showHidden);
     }}>
-      <input aria-label="文件或目录路径" value={path} onChange={(event) => setPath(event.target.value)}
-        spellCheck={false} placeholder="输入文件或目录路径" />
+      <input aria-label="文件或目录路径" value={path === "::drives::" ? "" : path} onChange={(event) => setPath(event.target.value)}
+        spellCheck={false} placeholder={path === "::drives::" ? "此电脑 · 选择磁盘或输入路径" : "输入文件或目录路径"} />
       <button type="submit" disabled={loading}>打开</button>
     </form>
     <div className="workspace-options">
       <button disabled={!listing?.parent || loading} onClick={() => browse(listing!.parent!, showHidden)}>
         <Icon name="chevron-left" size={15} />上级目录
       </button>
+      {listing && (/^[A-Za-z]:[\\/]/.test(listing.root) || listing.path === "::drives::")
+        && <button disabled={loading} onClick={() => browse("::drives::", showHidden)}>磁盘</button>}
+      <button disabled={!listing || listing.path === "::drives::"} onClick={() => {
+        if (!navigator.clipboard) { setError("请从上方地址栏选择并复制路径"); return; }
+        void navigator.clipboard.writeText(listing!.path).then(() => {
+          setCopied(true); setTimeout(() => setCopied(false), 1800);
+        }).catch(() => setError("请从上方地址栏选择并复制路径"));
+      }}>{copied ? "已复制" : "复制路径"}</button>
       <label><input type="checkbox" checked={showHidden} onChange={(event) => {
         setShowHidden(event.target.checked);
         browse(listing?.path ?? path, event.target.checked);

@@ -56,6 +56,7 @@ const PATHS: Record<string, string> = {
   stop: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
   pause: '<path d="M8 5v14M16 5v14"/>',
   'arrow-right': '<path d="M5 12h14m-5-5 5 5-5 5"/>',
+  download: '<path d="M12 3v12m-5-5 5 5 5-5M4 16v4h16v-4"/>',
   bolt: '<path d="M13 2L4 14h7l-1 8 9-12h-7l1-8z"/>',
   queue: '<path d="M4 7h16M4 12h16M4 17h10"/>',
   term: '<path d="M5 8l4 4-4 4M12 16h7"/>',
