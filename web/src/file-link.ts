@@ -26,6 +26,9 @@ export function parseLocalFileTarget(rawHref: string): LocalFileTarget | null {
       const url = new URL(value);
       if (url.hostname && url.hostname !== "localhost") return null;
       value = `${url.pathname}${url.hash}`;
+      // file:///C:/... is a drive path on the resource machine, regardless of
+      // the operating system running the browser.
+      if (/^\/[A-Za-z]:[\\/]/.test(value)) value = value.slice(1);
     } catch {
       return null;
     }
@@ -60,6 +63,15 @@ export function parseLocalFileTarget(rawHref: string): LocalFileTarget | null {
   } catch {
     return null;
   }
-  if (!value || value.includes("\0")) return null;
+  if (/^\/[A-Za-z]:[\\/]/.test(value)) value = value.slice(1);
+  if (!value || Array.from(value).some(char => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)
+      || value.startsWith("\\\\") || new TextEncoder().encode(value).length > 4096) return null;
   return { path: value, line, column };
+}
+
+/** Explicit paths inside prose/code are actions; ordinary code stays code. */
+export function parseInlineFileTarget(text: string): LocalFileTarget | null {
+  if (text !== text.trim() || /[\r\n]/.test(text) || text.length > 4096) return null;
+  if (!/^(?:[A-Za-z]:[\\/]|file:\/\/|\/|~[\\/]|\.{1,2}[\\/])/.test(text)) return null;
+  return parseLocalFileTarget(text);
 }

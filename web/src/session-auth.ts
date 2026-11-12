@@ -17,6 +17,25 @@ export type SessionFetch = (
 const SESSION_CHECK_TIMEOUT_MS = 5_000;
 const LEGACY_AUTH_KEYS = ["cc_remote_session", "cc_remote_authenticated"] as const;
 
+/** Bound the complete operation, including a stalled response body. */
+export async function withRequestDeadline<T>(
+  run: (signal: AbortSignal) => Promise<T>, timeoutMs: number,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("request timed out"));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([run(controller.signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /**
  * HttpOnly cookies are deliberately opaque to JavaScript.  Probe the relay's
  * session endpoint so both page startup and an opaque WebSocket handshake

@@ -58,7 +58,18 @@ def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path
     assert file["kind"] == "file" and file["path"] == str(outside)
     assert "content" not in file  # File content still uses the preview authorization flow.
     top = browse_workspace(str(root), os.path.abspath(os.sep), confine_to_cwd=False)
-    assert top["parent"] is None
+    assert top["parent"] == ("::drives::" if os.name == "nt" else None)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows drive inventory")
+def test_code_drive_picker_is_bounded_and_work_cannot_use_it(tmp_path):
+    result = browse_workspace(str(tmp_path), "::drives::", confine_to_cwd=False)
+    assert result["path"] == "::drives::"
+    assert all(entry["kind"] == "directory" and len(entry["path"]) <= 4
+               for entry in result["entries"])
+    assert result["parent"] is None
+    with pytest.raises(ValueError):
+        browse_workspace(str(tmp_path), "::drives::", confine_to_cwd=True)
 
 
 def test_code_external_browsing_still_rejects_symlinks_and_special_files(tmp_path):

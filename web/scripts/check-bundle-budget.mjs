@@ -68,7 +68,8 @@ const MAX_INITIAL_BYTES = 966 * 1024;
 // The history reader and link UI load on demand; other caps stay unchanged.
 // DSH engine routing/defaults and native return-receipt boundaries add <1 KiB
 // gzip. Management panels and xterm stay lazy; retain entry/raw/request caps.
-const MAX_INITIAL_GZIP_BYTES = 291 * 1024;
+// Native media path actions and original-file controls add <1 KiB gzip.
+const MAX_INITIAL_GZIP_BYTES = 292 * 1024;
 const MAX_INITIAL_JS_FILES = 4;
 
 const html = readFileSync(resolve(DIST, "index.html"), "utf8");

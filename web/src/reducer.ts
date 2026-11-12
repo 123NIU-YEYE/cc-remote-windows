@@ -176,6 +176,8 @@ export interface PreviewAuthorizationState {
 }
 
 export interface Artifact {
+  mediaSource?: { machineId: string; sid: string; path: string;
+    engine?: "claude" | "codex" | "dsh"; space?: "code" | "work" };
   file: string;
   kind: "diff" | "md" | "file" | "gitdiff" | "html" | "image" | "pdf" | "audio" | "video" | "spreadsheet";
   sid?: string | null;

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import stat
+import sys
 
 MAX_DIRECTORY_ENTRIES = 20_000
 
@@ -15,6 +16,13 @@ def browse_workspace(
     confine_to_cwd: bool = True,
 ) -> dict:
     start = os.path.realpath(cwd)
+    if path == "::drives::":
+        if confine_to_cwd or sys.platform != "win32":
+            raise ValueError("当前会话不允许浏览其他磁盘")
+        return {"root": "::drives::", "path": "::drives::", "kind": "directory",
+                "parent": None, "entries": [
+                    {"name": drive, "path": drive, "kind": "directory"}
+                    for drive in os.listdrives()], "revision": "drives", "next_offset": None}
     candidate = os.path.abspath(os.path.join(start, os.path.expanduser(path or ".")))
     root = start if confine_to_cwd else Path(candidate).anchor
     if os.path.commonpath([root, candidate]) != root:
@@ -56,7 +64,8 @@ def browse_workspace(
             entry["kind"] != "directory", entry["name"].casefold(), entry["name"]))
         return {
             "root": root, "path": candidate, "kind": "directory",
-            "parent": os.path.dirname(candidate) if candidate != root else None,
+            "parent": (os.path.dirname(candidate) if candidate != root else
+                       "::drives::" if sys.platform == "win32" and not confine_to_cwd else None),
             "entries": entries[offset:offset + limit],
             "revision": current_revision,
             "next_offset": offset + limit if offset + limit < len(entries) else None,

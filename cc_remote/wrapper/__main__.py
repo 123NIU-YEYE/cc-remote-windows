@@ -12,6 +12,7 @@ from cc_remote.wrapper.codex_launch_barrier import serve as serve_launch_barrier
 from cc_remote.viewer import registry_path
 from cc_remote.viewer_home import HomePages
 from cc_remote.wrapper.viewer_transport import ViewerTransport
+from cc_remote.wrapper.media_files import MediaFiles
 
 log = logger("cc_remote.wrapper")
 
@@ -40,10 +41,11 @@ async def run_wrapper() -> None:
         send_bytes=cfg.transport_send_bytes,
     )
     machine = WrapperMachine(cfg, transport)
+    media = MediaFiles(machine)
     viewers = asyncio.create_task(ViewerTransport(
         cfg.relay_url, cfg.wrapper_token, cfg.machine_id, registry_path(),
         session_pages=machine.viewer_pages,
-        home_pages=HomePages(cfg.state_dir / "viewer-home-pages.json")).run())
+        home_pages=HomePages(cfg.state_dir / "viewer-home-pages.json"), media=media).run())
     try:
         # The installer verifies Work schemas independently of optional Codex
         # readiness. A slow daemon probe must not look like a failed migration.
@@ -59,6 +61,7 @@ async def run_wrapper() -> None:
     finally:
         viewers.cancel()
         await asyncio.gather(viewers, return_exceptions=True)
+        media.close()
 
 
 if __name__ == "__main__":

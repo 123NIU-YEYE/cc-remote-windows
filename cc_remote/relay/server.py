@@ -660,6 +660,13 @@ def create_app(
         lambda req: _request_origin_allowed(req, cfg),
     )
     app.state.viewers = viewers
+    from cc_remote.relay.media import MediaRelay
+    app.state.media = MediaRelay(
+        app, viewers, lambda req: _active_claims(req, cfg, sessions), sessions.active,
+        lambda claims, machine: _claims_allow_machine(claims, machine, devices),
+        lambda req: _request_origin_allowed(req, cfg),
+        lambda claims: _btw_owner_id(claims, cfg.session_secret), _read_json_limited,
+    )
 
     @app.middleware("http")
     async def static_shell_cache_policy(req: Request, call_next):

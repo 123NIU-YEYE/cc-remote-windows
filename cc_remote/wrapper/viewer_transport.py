@@ -22,7 +22,7 @@ log = logger("cc_remote.wrapper.viewer")
 
 class ViewerTransport:
     def __init__(self, url: str, token: str, machine_id: str, registry: Path,
-                 session_pages=None, home_pages=None):
+                 session_pages=None, home_pages=None, media=None):
         parts = urlsplit(url)
         self.url = urlunsplit((parts.scheme, parts.netloc, "/ws/viewer", "", ""))
         self.token = token
@@ -30,8 +30,12 @@ class ViewerTransport:
         self.registry = registry
         self.session_pages = session_pages
         self.home_pages = home_pages
+        self.media = media
+        self.static_enabled = True
 
     def resource_sites(self):
+        if not self.static_enabled:
+            return {}
         manual = load_sites(self.registry)
         return {**(self.home_pages.sites() if self.home_pages else {}), **manual}
 
@@ -42,20 +46,29 @@ class ViewerTransport:
         # a doomed WebSocket once a minute. Allow it to be switched off.
         if os.environ.get("CC_REMOTE_VIEWER_CHANNEL", "").strip().lower() in {
                 "off", "0", "false", "no", "disabled"}:
-            log.info("viewer channel disabled by CC_REMOTE_VIEWER_CHANNEL")
-            return
+            self.static_enabled = False
+            if self.media is None:
+                log.info("viewer channel disabled by CC_REMOTE_VIEWER_CHANNEL")
+                return
         backoff = 1
         while True:
             try:
-                sites = await asyncio.to_thread(load_sites, self.registry)
-                if not sites and self.session_pages is None:
+                sites = await asyncio.to_thread(self.resource_sites)
+                if not sites and self.session_pages is None and self.media is None:
                     await asyncio.sleep(5)
                     continue
                 options = {"additional_headers": {"Authorization": f"Bearer {self.token}"},
                            "max_size": 64 * 1024, "max_queue": 4,
                            "compression": None}
-                if urlsplit(self.url).hostname in {"localhost", "127.0.0.1", "::1"}:
-                    options["proxy"] = None
+                from urllib.request import getproxies_environment, proxy_bypass_environment
+                from cc_remote.wrapper.transport import RelayClientConnection
+                proxies = getproxies_environment()
+                target = urlsplit(self.url)
+                options.update(create_connection=RelayClientConnection, open_timeout=15,
+                               close_timeout=5, ping_interval=30, ping_timeout=90)
+                options["proxy"] = (None if target.hostname in {"localhost", "127.0.0.1", "::1"}
+                                    or proxy_bypass_environment(target.netloc, proxies)
+                                    else proxies.get("https") or proxies.get("http") or None)
                 async with connect(self.url, **options) as ws:
                     backoff = 1
                     await self.serve(ws, sites)
@@ -82,7 +95,7 @@ class ViewerTransport:
             previous = None
             try:
                 while True:
-                    current = await asyncio.to_thread(load_sites, self.registry)
+                    current = await asyncio.to_thread(self.resource_sites)
                     public = [site.public() for site in current.values()]
                     if public != previous:
                         await send({"type": "catalog", "sites": public})
@@ -98,7 +111,19 @@ class ViewerTransport:
                 action, payload = message.get("action"), message.get("payload")
                 if not isinstance(payload, dict):
                     raise ValueError("invalid metadata")
-                if action == "locate":
+                if action == "media_open" and self.media is not None:
+                    try:
+                        result = await self.media.create(payload)
+                    except (ValueError, PermissionError) as exc:
+                        result = {"error": str(exc)[:512]}
+                    except OSError:
+                        result = {"error": "无法读取文件，请确认文件存在且有访问权限"}
+                elif action == "media_close" and self.media is not None:
+                    self.media.release(payload.get("id"), payload.get("owner"))
+                    result = {"ok": True}
+                elif not self.static_enabled:
+                    raise ValueError("static Viewer disabled")
+                elif action == "locate":
                     paths = payload.get("paths")
                     if (set(payload) != {"paths"} or not isinstance(paths, list)
                             or len(paths) > 16 or any(not isinstance(p, str) or len(p) > 4096 for p in paths)):
@@ -140,10 +165,16 @@ class ViewerTransport:
             stream = None
             began = False
             try:
-                sites = await asyncio.to_thread(self.resource_sites)
-                site = sites.get(message.get("site_id"))
-                if site is None or message.get("revision") != site.revision:
-                    raise PermissionError("publication changed")
+                media_id = message.get("media_id")
+                site = None
+                if media_id is not None:
+                    if self.media is None:
+                        raise PermissionError("media unavailable")
+                else:
+                    sites = await asyncio.to_thread(self.resource_sites)
+                    site = sites.get(message.get("site_id"))
+                    if site is None or message.get("revision") != site.revision:
+                        raise PermissionError("publication changed")
                 if message.get("method") not in {"GET", "HEAD"}:
                     raise PermissionError("read only")
                 headers = message.get("headers", {})
@@ -153,7 +184,8 @@ class ViewerTransport:
                                for k, v in headers.items())):
                     raise ValueError("invalid headers")
                 opening = asyncio.create_task(asyncio.to_thread(
-                    open_resource, site, message.get("path", "")))
+                    self.media.open, media_id, message.get("owner")) if media_id is not None else
+                    asyncio.to_thread(open_resource, site, message.get("path", "")))
                 try:
                     stream, info, mime = await asyncio.shield(opening)
                 except asyncio.CancelledError:
@@ -175,9 +207,13 @@ class ViewerTransport:
                 while True:
                     await asyncio.wait_for(ready.get(), timeout=45)
                     # Removal / configuration change revokes even an ongoing download.
-                    current = (await asyncio.to_thread(self.resource_sites)).get(site.id)
-                    if current is None or current.revision != site.revision:
-                        raise PermissionError("publication revoked")
+                    if media_id is not None:
+                        check, _, _ = self.media.open(media_id, message.get("owner"))
+                        check.close()
+                    else:
+                        current = (await asyncio.to_thread(self.resource_sites)).get(site.id)
+                        if current is None or current.revision != site.revision:
+                            raise PermissionError("publication revoked")
                     def read_chunk():
                         import os
                         now = os.fstat(stream.fileno())
@@ -204,7 +240,8 @@ class ViewerTransport:
 
         await send({"type": "hello", "v": PROTOCOL_VERSION,
                     "machine_id": self.machine_id,
-                    "session_pages": self.session_pages is not None,
+                    "session_pages": self.static_enabled and self.session_pages is not None,
+                    "media": self.media is not None,
                     "sites": [site.public() for site in initial_sites.values()]})
         catalog_task = asyncio.create_task(catalog())
         try:
@@ -264,3 +301,5 @@ class ViewerTransport:
             for task in tasks.values():
                 task.cancel()
             await asyncio.gather(catalog_task, *tasks.values(), return_exceptions=True)
+            if self.media is not None:
+                self.media.close()

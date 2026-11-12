@@ -957,6 +957,14 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .artifact-image-stage img{ display:block; max-width:100%; max-height:100%; object-fit:contain; border-radius:8px; box-shadow:var(--shadow-sm); }
 .artifact-video-stage{ display:grid; width:100%; min-width:0; height:100%; place-items:center; overflow:auto; padding:16px; }
 .artifact-video-stage video{ display:block; max-width:100%; max-height:100%; object-fit:contain; border-radius:8px; box-shadow:var(--shadow-sm); background:#000; }
+.media-file-info{ display:block; max-width:100%; overflow-wrap:anywhere; color:var(--dim); font-size:12px; text-align:center; }
+.media-download-control{ position:relative; display:inline-flex; align-items:center; }
+.media-action-error{ position:absolute; top:100%; right:0; z-index:2; width:max-content; max-width:240px; padding:8px; border:1px solid var(--border); border-radius:8px; color:var(--danger); background:var(--surface); font-size:12px; }
+.media-error{ flex-direction:column; align-items:flex-start; gap:12px; }
+.media-error>div{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+.artifact-audio-stage:has(.media-file-info){ flex-direction:column; align-items:center; gap:16px; }
+.artifact-audio-stage audio{ width:100%; max-width:640px; }
+.message-file-link code{ overflow-wrap:anywhere; white-space:normal; }
 .artifact-audio-stage{ display:flex; width:100%; min-width:0; min-height:0; align-items:flex-start; justify-content:center; overflow:auto; padding:clamp(16px,4vw,32px); }
 .artifact-audio-card{ width:100%; max-width:520px; min-width:0; padding:20px; border:1px solid var(--border); border-radius:16px; background:var(--surface); box-shadow:var(--shadow-sm); }
 .artifact-audio-heading{ display:flex; align-items:center; gap:12px; margin-bottom:20px; min-width:0; }
