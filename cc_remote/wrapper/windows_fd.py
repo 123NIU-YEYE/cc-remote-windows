@@ -118,6 +118,7 @@ def install() -> None:
         return
     native_open, native_fsync = os.open, os.fsync
     native_stat, native_lstat, native_scandir = os.stat, os.lstat, os.scandir
+    native_listdir = os.listdir
     native_mkdir, native_unlink, native_replace, native_rename = os.mkdir, os.unlink, os.replace, os.rename
     os.O_NOFOLLOW = NOFOLLOW
     os.O_DIRECTORY = DIRECTORY
@@ -176,6 +177,7 @@ def install() -> None:
     os.open, os.fsync = binary_open, fsync
     os.stat, os.lstat = relative_stat, lstat
     os.scandir = lambda path=".": _directory_entries(path) if isinstance(path, int) else native_scandir(path)
+    os.listdir = lambda path=".": [entry.name for entry in _directory_entries(path)] if isinstance(path, int) else native_listdir(path)
     os.mkdir, os.unlink, os.replace, os.rename = mkdir, unlink, replace, rename
 
 

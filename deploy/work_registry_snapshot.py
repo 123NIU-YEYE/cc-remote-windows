@@ -375,7 +375,7 @@ def _backup_checkpoints(state_dir: Path, snapshot: Path) -> dict[str, Any]:
             finally:
                 os.close(fd)
         elif stat.S_ISREG(info.st_mode):
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=parent_fd)
             with os.fdopen(fd, "rb") as stream:
                 opened = os.fstat(fd)
                 if (opened.st_dev, opened.st_ino, opened.st_size) != (

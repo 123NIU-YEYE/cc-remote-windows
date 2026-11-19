@@ -26,6 +26,9 @@ def test_windows_snapshot_restores_private_state_and_database(tmp_path):
             connection.close()
     state = tmp_path / "state"
     private_directory(state)
+    checkpoints = state / "codex-checkpoints"
+    private_directory(checkpoints)
+    (checkpoints / "native-checkpoint.json").write_text('{"original":true}')
     controls = state / "claude-session-controls.json"
     with os.fdopen(create_private_file(controls), "w", encoding="utf-8") as stream:
         json.dump({"session": "before"}, stream)
@@ -38,6 +41,7 @@ def test_windows_snapshot_restores_private_state_and_database(tmp_path):
     restore_snapshot(destination)
     assert json.loads(controls.read_text())["session"] == "before"
     assert owned_path(controls, private=True)
+    assert json.loads((checkpoints / "native-checkpoint.json").read_text()) == {"original": True}
     for root in roots.values():
         connection = sqlite3.connect(root / "registry.sqlite3")
         try:
