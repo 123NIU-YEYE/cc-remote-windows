@@ -232,7 +232,7 @@ def _check_database(db: sqlite3.Connection, *, label: str) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    descriptor = os.open(path, os.O_RDWR if sys.platform == "win32" else os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
@@ -255,6 +255,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _private_mode(path: Path, info: os.stat_result) -> int:
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        if not owned_path(path, private=True):
+            raise WorkRegistrySnapshotError(f"wrapper state must have a private DACL: {path}")
+        return 0o600
+    return stat.S_IMODE(info.st_mode)
+
+
 def _backup_database(source: Path, destination: Path) -> dict[str, Any]:
     info = source.lstat()
     if not stat.S_ISREG(info.st_mode):
@@ -274,7 +283,7 @@ def _backup_database(source: Path, destination: Path) -> dict[str, Any]:
     _fsync_file(destination)
     return {
         "exists": True,
-        "mode": stat.S_IMODE(info.st_mode),
+        "mode": _private_mode(source, info) if sys.platform == "win32" else stat.S_IMODE(info.st_mode),
         "uid": info.st_uid,
         "gid": info.st_gid,
         "sha256": _sha256(destination),
@@ -284,13 +293,13 @@ def _backup_database(source: Path, destination: Path) -> dict[str, Any]:
 def _backup_private_file(
     source: Path, destination: Path, *, max_bytes: int,
 ) -> dict[str, Any]:
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(source, flags)
     try:
         info = os.fstat(descriptor)
         if (
             not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) & ~0o700
+            or _private_mode(source, info) & ~0o700
             or info.st_size > max_bytes
         ):
             raise WorkRegistrySnapshotError(
@@ -318,7 +327,7 @@ def _backup_private_file(
     destination.chmod(0o600)
     return {
         "exists": True,
-        "mode": stat.S_IMODE(info.st_mode),
+        "mode": _private_mode(source, info),
         "uid": info.st_uid,
         "gid": info.st_gid,
         "sha256": _sha256(destination),
@@ -478,7 +487,7 @@ def _restore_checkpoints(
 
 
 def _checkpoint_permissions(path: Path, member: tarfile.TarInfo) -> None:
-    if os.geteuid() == 0:
+    if sys.platform != "win32" and os.geteuid() == 0:
         os.chown(path, member.uid, member.gid)
     path.chmod(member.mode)
 
@@ -516,7 +525,11 @@ def create_snapshot(
                 f"snapshot destination is not empty: {destination}"
             )
     else:
-        destination.mkdir(mode=0o700, parents=True)
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(destination)
+        else:
+            destination.mkdir(mode=0o700, parents=True)
     destination.chmod(0o700)
 
     manifest: dict[str, Any] = {
@@ -567,7 +580,7 @@ def create_snapshot(
             else:
                 if filename == "claude-plans.sqlite3":
                     info = state_path.lstat()
-                    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & ~0o700
+                    if (not stat.S_ISREG(info.st_mode) or _private_mode(state_path, info) & ~0o700
                             or info.st_size > max_bytes):
                         raise WorkRegistrySnapshotError("Claude plans must be a private bounded database")
                     state_entry.update(_backup_database(state_path, destination / filename))
@@ -762,7 +775,7 @@ def _restore_private_file(
             stream.flush()
             os.fsync(stream.fileno())
         temporary.chmod(entry["mode"])
-        if os.geteuid() == 0:
+        if sys.platform != "win32" and os.geteuid() == 0:
             os.chown(temporary, entry["uid"], entry["gid"])
         _fsync_file(temporary)
         if destination.exists() or destination.is_symlink():
@@ -826,7 +839,7 @@ def _restore_database(backup: Path, database: Path, entry: dict[str, Any]) -> No
         if not all(isinstance(value, int) for value in (mode, uid, gid)):
             raise WorkRegistrySnapshotError("snapshot file metadata is invalid")
         temporary.chmod(mode)
-        if os.geteuid() == 0:
+        if sys.platform != "win32" and os.geteuid() == 0:
             os.chown(temporary, uid, gid)
         _fsync_file(temporary)
         _unlink_database_file(Path(f"{database}-wal"))
