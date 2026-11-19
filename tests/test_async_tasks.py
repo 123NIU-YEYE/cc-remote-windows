@@ -903,7 +903,7 @@ def test_production_socket_transport_uses_only_owned_existing_daemon(monkeypatch
         with tempfile.TemporaryDirectory(prefix="crt-wire-", dir="/tmp") as folder:
             store = TaskStore(Path(folder))
             socket = store.home / "app-server-control/app-server-control.sock"
-            socket.parent.mkdir()
+            socket.parent.mkdir(mode=0o700)
             protected = store.home / "p"
             protected.mkdir(mode=0o700)
             monkeypatch.setattr(codex_daemon, "_protected_socket_directory", lambda uid: protected)
