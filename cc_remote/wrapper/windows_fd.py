@@ -9,6 +9,14 @@ NOFOLLOW = 1 << 28
 DIRECTORY = 1 << 29
 
 
+def _native_path(path):
+    if isinstance(path, int):
+        return path
+    from cc_remote.wrapper.os_compat import _win32_long_path
+    value = os.fsdecode(path)
+    return _win32_long_path(value) if len(os.path.abspath(value)) >= 248 else path
+
+
 def open_descriptor(path, flags: int, mode: int = 0o600, *, dir_fd=None) -> int:
     import ctypes
     import msvcrt
@@ -43,8 +51,9 @@ def open_descriptor(path, flags: int, mode: int = 0o600, *, dir_fd=None) -> int:
             handle = _relative_handle(path, dir_fd, access, disposition, flags)
         else:
             from cc_remote.windows_privacy import _private_attributes
+            from cc_remote.wrapper.os_compat import _win32_long_path
             security = (_private_attributes() if flags & os.O_CREAT and not mode & 0o077 else None)
-            handle = win32file.CreateFile(os.fsdecode(path), access, 7, security,
+            handle = win32file.CreateFile(_win32_long_path(os.fsdecode(path)), access, 7, security,
                                           disposition, attributes, None)
         info = win32file.GetFileInformationByHandle(handle)
         if flags & NOFOLLOW and info[0] & c.FILE_ATTRIBUTE_REPARSE_POINT:
@@ -128,7 +137,7 @@ def install() -> None:
             flags |= DIRECTORY | NOFOLLOW
         if dir_fd is not None or flags & (NOFOLLOW | DIRECTORY) or flags & os.O_CREAT and not mode & 0o077:
             return open_descriptor(path, flags, mode, dir_fd=dir_fd)
-        return native_open(path, flags | os.O_BINARY, mode)
+        return native_open(_native_path(path), flags | os.O_BINARY, mode)
 
     def fsync(fd):
         # Only directory handles have no Windows fsync equivalent. Never swallow
@@ -138,7 +147,7 @@ def install() -> None:
 
     def relative_stat(path, *, dir_fd=None, follow_symlinks=True):
         if dir_fd is None:
-            return native_stat(path, follow_symlinks=follow_symlinks)
+            return native_stat(_native_path(path), follow_symlinks=follow_symlinks)
         handle = _relative_handle(path, dir_fd, 0x80000000, 3, NOFOLLOW, directory=None)
         import msvcrt
         descriptor = msvcrt.open_osfhandle(handle.Detach(), os.O_RDONLY | os.O_BINARY)
@@ -148,36 +157,36 @@ def install() -> None:
             os.close(descriptor)
 
     def lstat(path, *, dir_fd=None):
-        return relative_stat(path, dir_fd=dir_fd, follow_symlinks=False) if dir_fd is not None else native_lstat(path)
+        return relative_stat(path, dir_fd=dir_fd, follow_symlinks=False) if dir_fd is not None else native_lstat(_native_path(path))
 
     def mkdir(path, mode=0o777, *, dir_fd=None):
         if dir_fd is None:
-            return native_mkdir(path, mode)
+            return native_mkdir(_native_path(path), mode)
         handle = _relative_handle(path, dir_fd, 0x80000000, 1, DIRECTORY, directory=True)
         handle.Close()
 
     def unlink(path, *, dir_fd=None):
         if dir_fd is None:
-            return native_unlink(path)
+            return native_unlink(_native_path(path))
         _relative_mutation(path, dir_fd, delete=True)
 
     def replace(source, target, *, src_dir_fd=None, dst_dir_fd=None):
         if src_dir_fd is None and dst_dir_fd is None:
-            return native_replace(source, target)
+            return native_replace(_native_path(source), _native_path(target))
         if src_dir_fd is None or dst_dir_fd is None:
             raise NotImplementedError("Both Windows rename directory handles are required")
         _relative_mutation(source, src_dir_fd, target=target, target_fd=dst_dir_fd)
 
     def rename(source, target, *, src_dir_fd=None, dst_dir_fd=None):
         if src_dir_fd is None and dst_dir_fd is None:
-            return native_rename(source, target)
+            return native_rename(_native_path(source), _native_path(target))
         raise NotImplementedError("Descriptor-relative non-replacing rename is not supported")
 
     binary_open._cc_remote_windows = True
     os.open, os.fsync = binary_open, fsync
     os.stat, os.lstat = relative_stat, lstat
-    os.scandir = lambda path=".": _directory_entries(path) if isinstance(path, int) else native_scandir(path)
-    os.listdir = lambda path=".": [entry.name for entry in _directory_entries(path)] if isinstance(path, int) else native_listdir(path)
+    os.scandir = lambda path=".": _directory_entries(path) if isinstance(path, int) else native_scandir(_native_path(path))
+    os.listdir = lambda path=".": [entry.name for entry in _directory_entries(path)] if isinstance(path, int) else native_listdir(_native_path(path))
     os.mkdir, os.unlink, os.replace, os.rename = mkdir, unlink, replace, rename
 
 

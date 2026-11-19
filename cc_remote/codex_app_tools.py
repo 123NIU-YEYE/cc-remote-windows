@@ -210,7 +210,7 @@ def _pipe_from_open_logs(pid: int, bundle_id: str) -> Path | None:
         inspected += 1
         if inspected > 8:
             return None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
         try:
             info = os.fstat(fd)
             if (

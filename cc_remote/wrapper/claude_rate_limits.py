@@ -72,7 +72,7 @@ def read_cached_claude_plan(
             return None
         # Only a regular file in this account's layout is useful. In
         # particular, don't follow a metadata symlink to another profile.
-        fd = os.open(root / ".claude.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(root / ".claude.json", os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_NATIVE_ACCOUNT_FILE_BYTES:

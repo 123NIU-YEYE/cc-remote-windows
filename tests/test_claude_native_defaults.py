@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -43,10 +44,25 @@ def test_model_save_does_not_replace_invalid_native_settings(tmp_path, content):
 def test_model_save_refuses_symlink(tmp_path):
     outside = tmp_path / "outside.json"
     outside.write_text('{}')
-    (tmp_path / "settings.json").symlink_to(outside)
+    try:
+        (tmp_path / "settings.json").symlink_to(outside)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Creating symlinks requires Windows developer mode or privilege")
+        raise
     with pytest.raises(OSError):
         claude_settings.save_model_default(tmp_path, "claude-sonnet-5")
     assert outside.read_text() == '{}'
+
+
+def test_native_settings_without_nonblocking_flag(tmp_path, monkeypatch):
+    monkeypatch.delattr(os, "O_NONBLOCK", raising=False)
+    path = tmp_path / "settings.json"
+    path.write_text('{"switchModelsOnFlag":true,"unrelated":"preserved"}')
+    assert claude_settings.automatic_model_fallback(tmp_path)
+    claude_settings.save_model_default(tmp_path, "claude-sonnet-5")
+    assert json.loads(path.read_text()) == {
+        "switchModelsOnFlag": True, "unrelated": "preserved", "model": "claude-sonnet-5"}
 
 
 def test_model_save_remerges_concurrent_native_change(tmp_path, monkeypatch):

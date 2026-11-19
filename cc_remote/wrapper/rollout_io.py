@@ -103,7 +103,7 @@ def _decoded_path(path: str, *, follow_symlinks=True) -> str:
 
 def _native_open(path, mode, *, follow_symlinks=True, **kwargs):
     if not follow_symlinks:
-        kwargs["opener"] = lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+        kwargs["opener"] = lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     return open(path, mode, **kwargs)
 
 

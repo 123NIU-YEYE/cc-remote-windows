@@ -8,6 +8,23 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows native handles")
 
 
+def test_private_descriptor_supports_long_paths(tmp_path):
+    root = tmp_path / ("a" * 100) / ("b" * 100)
+    root.mkdir(parents=True)
+    path = root / ("c" * 100)
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    try:
+        os.write(descriptor, b"long path")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        assert os.read(descriptor, 100) == b"long path"
+    finally:
+        os.close(descriptor)
+
+
 def test_relative_read_stays_on_renamed_directory(tmp_path):
     root = tmp_path / "root"
     root.mkdir()

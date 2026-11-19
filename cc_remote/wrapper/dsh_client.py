@@ -120,7 +120,7 @@ class DshConnection:
     @classmethod
     def load(cls, path: Path) -> DshConnection:
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
             with os.fdopen(fd, "rb") as stream:
                 info = os.fstat(stream.fileno())
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()

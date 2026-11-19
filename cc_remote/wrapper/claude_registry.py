@@ -86,7 +86,7 @@ def registered_session(
     try:
         if path.parent.is_symlink():
             return False, None
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return True, None
     except OSError:

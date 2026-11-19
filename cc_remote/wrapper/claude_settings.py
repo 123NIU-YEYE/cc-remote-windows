@@ -22,7 +22,7 @@ _MAX_BYTES = 1024 * 1024
 
 def _read(path: Path) -> tuple[bytes | None, os.stat_result | None]:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return None, None
     with os.fdopen(fd, "rb") as stream:
@@ -115,7 +115,7 @@ def automatic_model_fallback(config_root: str | Path) -> bool:
     # Native user settings may be a dotfile-manager symlink. Reading that
     # preference does not require the stricter identity checks used for writes.
     try:
-        fd = os.open(Path(config_root).expanduser() / "settings.json", os.O_RDONLY | os.O_NONBLOCK)
+        fd = os.open(Path(config_root).expanduser() / "settings.json", os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_BYTES:
