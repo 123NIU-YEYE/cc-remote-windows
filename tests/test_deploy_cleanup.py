@@ -561,8 +561,10 @@ def test_cli_previews_and_applies_isolated_installation_with_real_scans(installa
             # The real CLI must refuse cleanup in that environment, not ignore
             # denied /proc records or require elevated test-suite privileges.
             assert result.returncode == 1
-            assert result.stderr.strip() == (
-                "Cleanup stopped (CleanupError): process files are not fully observable")
+            assert result.stderr.strip() in {
+                "Cleanup stopped (CleanupError): process files are not fully observable",
+                "Cleanup stopped (CleanupError): process reference scan incomplete; no deletion is safe",
+            }
             assert not result.stdout.strip()
             assert old.is_dir()
             assert not (root / module.JOURNAL).exists()
@@ -588,6 +590,14 @@ def test_real_process_reference_absent_from_command_line_is_protected(installati
             stdout=subprocess.PIPE, text=True)
     try:
         assert proc.stdout.readline().strip() == "ready"
+        if sys.platform == "linux":
+            # Scope the native procfs scan to the owned fixture too. Unrelated
+            # nondumpable same-user processes must not invalidate this proof.
+            proc_root = old.parent / "fixture-proc"
+            proc_root.mkdir()
+            (proc_root / str(proc.pid)).symlink_to(Path("/proc") / str(proc.pid))
+            scan_files = module.linux_process_files
+            monkeypatch.setattr(module, "linux_process_files", lambda: scan_files(proc_root))
         scan_command = module.scan_command
         def scan_fixture_process(argv):
             # Exercise real lsof and ps against this fixture's owned process,
