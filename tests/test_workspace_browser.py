@@ -1,5 +1,7 @@
 import asyncio
 import os
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -25,6 +27,7 @@ def test_directory_navigation_paging_and_hidden_files(tmp_path):
     assert file["kind"] == "file" and file["path"] == str(tmp_path / "a.txt")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink/fifo contract; native reparse boundaries have separate tests")
 def test_escape_symlinks_special_files_and_changed_page_are_rejected(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
@@ -46,8 +49,9 @@ def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path
     outside = tmp_path / "outside.txt"
     outside.write_text("outside")
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     start = browse_workspace(str(root), ".", confine_to_cwd=False)
-    assert start["root"] == os.path.abspath(os.sep)
+    assert start["root"] == Path(tmp_path).anchor
     assert start["path"] == str(root)
     assert start["parent"] == str(tmp_path)
     for path in ("..", str(tmp_path), "~"):
@@ -57,10 +61,11 @@ def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path
     file = browse_workspace(str(root), str(outside), confine_to_cwd=False)
     assert file["kind"] == "file" and file["path"] == str(outside)
     assert "content" not in file  # File content still uses the preview authorization flow.
-    top = browse_workspace(str(root), os.path.abspath(os.sep), confine_to_cwd=False)
-    assert top["parent"] is None
+    top = browse_workspace(str(root), Path(tmp_path).anchor, confine_to_cwd=False)
+    assert top["parent"] == ("::drives::" if sys.platform == "win32" else None)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink/fifo contract; native reparse boundaries have separate tests")
 def test_code_external_browsing_still_rejects_symlinks_and_special_files(tmp_path):
     root = tmp_path / "project"
     root.mkdir()

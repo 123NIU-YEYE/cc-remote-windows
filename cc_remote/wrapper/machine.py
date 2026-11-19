@@ -221,8 +221,30 @@ from cc_remote.wrapper.codex_daemon import (
     CodexProfileDaemonUnavailable,
 )
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
-from cc_remote.claude_broker import BrokerClient, BrokerClientError
-from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+# The Claude PTY broker is a Unix-only subsystem (Unix sockets, fcntl, termios).
+# It is opt-in behind `experimental_claude_broker` (default off) and unrelated to
+# DSH/Codex, so import it opportunistically: on Windows the rest of the Wrapper
+# must still start and serve DSH sessions.
+try:  # pragma: no cover - exercised on Unix
+    from cc_remote.claude_broker import BrokerClient, BrokerClientError
+    from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
+
+    CLAUDE_BROKER_AVAILABLE = True
+except ImportError:  # pragma: no cover - Windows
+    CLAUDE_BROKER_AVAILABLE = False
+    BrokerClient = None  # type: ignore[assignment]
+    ClaudeBrokerHandle = None  # type: ignore[assignment]
+
+    class BrokerClientError(RuntimeError):  # type: ignore[no-redef]
+        """Placeholder so broker-only ``except`` clauses still import."""
+
+        def __init__(self, code: str, message: str):
+            super().__init__(message)
+            self.code = code
+
+# These history parsers are plain transcript utilities, not part of the PTY
+# broker: the Claude transcript watcher uses them on every platform, so they
+# must never be stubbed out just because the broker is unavailable.
 from cc_remote.wrapper.claude_broker_history import (
     MAX_PARTIAL_LINE,
     claude_broker_tail_state,
@@ -451,6 +473,7 @@ from cc_remote.wrapper.session_files import (
     path_is_below,
     read_session_file,
 )
+from cc_remote.wrapper.os_compat import current_uid
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -2211,6 +2234,8 @@ class WrapperMachine:
         self._codex_daemons = {
             profile.id: CodexDaemonManager(
                 getattr(cfg, "codex_daemon_mode", "auto"),
+                websocket_url=(getattr(cfg, "codex_app_server_ws_url", None)
+                               if profile.id == self._codex_profiles.default.id else None),
                 require_shared=(getattr(cfg, "codex_daemon_mode", "auto") == "auto"),
                 allow_restart=False,
             )
@@ -2272,13 +2297,15 @@ class WrapperMachine:
         except CodexProcessClockStoreError:
             self._codex_process_clocks = None
             log.exception("Codex process-clock store unavailable")
-        self._claude_broker = BrokerClient(
-            getattr(cfg, "claude_broker_socket", None))
+        self._claude_broker = (
+            BrokerClient(getattr(cfg, "claude_broker_socket", None))
+            if CLAUDE_BROKER_AVAILABLE else None
+        )
         # Claude's official SDK/CLI does not expose a supported multi-writer
         # control plane. Keep the PTY broker code available for development,
         # but never discover or adopt it in the customer path by default.
         self._claude_broker_enabled = bool(getattr(
-            cfg, "experimental_claude_broker", False))
+            cfg, "experimental_claude_broker", False)) and CLAUDE_BROKER_AVAILABLE
         self._claude_rate_limit_lock = asyncio.Lock()
         self._claude_rate_limit_emit_lock = asyncio.Lock()
         legacy_claude_root = str(
@@ -13147,7 +13174,7 @@ class WrapperMachine:
                 if process_identity(identity.pid) == identity:
                     remaining.add(identity)
                 continue
-            if owner_uid != os.getuid():
+            if owner_uid != current_uid():
                 log.warning(
                     "refusing to migrate Claude process owned by another uid",
                     pid=identity.pid,
@@ -15378,6 +15405,9 @@ class WrapperMachine:
                     generation=self.instance_id,
                     build_seq=build_seq,
                     live_seq=live_seq,
+                    # Read failures never prove that a conversation is empty.
+                    authoritative=False,
+                    error=message,
                     events=[notice.model_dump(mode="json")],
                     has_more=False,
                     before=before,
@@ -39803,7 +39833,7 @@ class WrapperMachine:
                         if entry.is_symlink():
                             continue
                         info = entry.stat(follow_symlinks=False)
-                        if info.st_uid != os.getuid() or info.st_mtime >= cutoff:
+                        if info.st_uid != current_uid() or info.st_mtime >= cutoff:
                             continue
                         if turn_dir.fullmatch(entry.name) and entry.is_dir(
                                 follow_symlinks=False):

@@ -28,6 +28,8 @@ from cc_remote.wrapper.process_scan import (
     process_command_environment_value,
     process_command,
     process_identity,
+    windows_process_cwds,
+    windows_process_snapshot,
 )
 
 
@@ -315,7 +317,7 @@ def _darwin_process_cwds(
             ],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=2.0,
         )
     except (OSError, subprocess.SubprocessError):
@@ -351,7 +353,14 @@ def _darwin_claude_session_holders(
     owner_identities: Collection[ProcessIdentity] = (),
 ) -> HolderScan:
     holders = {sid: set() for sid in paths}
-    snapshot, complete = darwin_process_snapshot()
+    # macOS and Windows both lack procfs; macOS reads libproc directly and
+    # Windows goes through psutil. Linux keeps using /proc below.
+    if sys.platform == "win32":
+        snapshot, complete = windows_process_snapshot()
+        scan_cwds = windows_process_cwds
+    else:
+        snapshot, complete = darwin_process_snapshot()
+        scan_cwds = _darwin_process_cwds
     if not complete:
         return HolderScan(holders, False)
     roots = set(config_dirs.values()) if config_dirs is not None else set()
@@ -384,7 +393,7 @@ def _darwin_claude_session_holders(
     if len(candidates) > _MAX_DARWIN_CLAUDE_CANDIDATES:
         return HolderScan(holders, False)
 
-    process_cwds, cwd_scan_complete = _darwin_process_cwds(
+    process_cwds, cwd_scan_complete = scan_cwds(
         [info[0].pid for info in candidates])
     cwd_sids: dict[str, set[str]] = {}
     for sid in paths:
@@ -523,7 +532,7 @@ def claude_session_holders(
     bindings = continue_bindings if continue_bindings is not None else {}
     candidates = (
         continue_candidates if continue_candidates is not None else {})
-    if sys.platform == "darwin" and proc_root == "/proc":
+    if sys.platform in ("darwin", "win32") and proc_root == "/proc":
         return _darwin_claude_session_holders(
             paths,
             cwds,

@@ -14,6 +14,13 @@ assert.equal(gate.take("machine", ask, view), false, "duplicate live delivery st
 assert.equal(gate.take("machine", { ...ask, ask_id: "replay", notification_context: null }, view), false);
 assert.equal(gate.take("machine", { ...ask, ask_id: "focused" }, { ...view, sid: ask.sid! }), false);
 assert.equal(gate.take("machine", { ...ask, ask_id: "hidden" }, { ...view, sid: ask.sid!, hidden: true }), true);
+assert.equal(gate.take("machine", { ...ask, ask_id: "desktop-unfocused" }, {
+  ...view, sid: ask.sid!, focused: false,
+}), true, "a visible browser behind another desktop app still alerts");
+assert.equal(gate.take("machine", { ...ask, ask_id: "reading-sidechat",
+  notification_context: { ...ask.notification_context!, parent_session_id: "parent" } }, {
+  ...view, sid: "parent", focused: true,
+}), false, "reading the parent suppresses its side-chat question");
 assert.equal(gate.take("machine", { ...ask, ask_id: "engine" }, { ...view, sid: ask.sid!, engine: "codex" }), true);
 assert.equal(gate.take("other-machine", ask, view), true, "identical ids on other machines stay independent");
 const generic = questionNotificationPresentation(ask, "generic");

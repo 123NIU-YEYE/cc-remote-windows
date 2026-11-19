@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -119,7 +120,7 @@ def test_compact_graph_reuse_validates_source(tmp_path, change):
 def test_compact_graph_cache_respects_snapshots_limits_and_partial_rows(tmp_path):
     path = tmp_path / "transcript.jsonl"
     first = _compact_row("first")
-    path.write_text(first + _compact_row("second"))
+    path.write_text(first + _compact_row("second"), encoding="utf-8", newline="\n")
     store = HistoryIndexStore(tmp_path / "state")
     assert len(_compact_index(store, path).rows) == 2
     assert set(_compact_index(store, path, snapshot_size=len(first)).rows) == {"first"}
@@ -599,7 +600,11 @@ def test_history_index_is_bounded_and_invalidatable(tmp_path):
     store.invalidate_session("session-2")
     assert store.get_page(
         "session-2", "claude", source, before=None, limit=4) is None
-    assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        assert owned_path(store.path, private=True)
+    else:
+        assert oct(os.stat(store.path).st_mode & 0o777) == "0o600"
 
 
 def test_agent_detail_cache_is_source_bound_and_invalidatable(tmp_path):

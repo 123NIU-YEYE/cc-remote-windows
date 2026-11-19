@@ -55,7 +55,7 @@ def test_wrapper_startup_config_fails_closed():
     # the supported native-CLI mirror path. Its socket is validated only after
     # an explicit opt-in.
     validate_wrapper_config(_wrapper_cfg(claude_broker_socket="relative.sock"))
-    with pytest.raises(ValueError, match="CC_REMOTE_CLAUDE_BROKER_SOCKET"):
+    with pytest.raises(ValueError, match="CC_REMOTE_(?:CLAUDE_BROKER_SOCKET|EXPERIMENTAL_CLAUDE_BROKER)"):
         validate_wrapper_config(_wrapper_cfg(
             claude_broker_socket="relative.sock",
             experimental_claude_broker=True,
@@ -180,8 +180,9 @@ def test_connect_honors_explicit_http_proxy_and_bypass(
         if key.lower().endswith("_proxy"):
             monkeypatch.delenv(key)
     monkeypatch.delenv("REQUEST_METHOD", raising=False)
-    for key, value in environment.items():
-        monkeypatch.setenv(key, value)
+    # Preserve the exact mapping on Windows too, whose real environment is
+    # case-insensitive and cannot represent Unix lower/upper precedence cases.
+    monkeypatch.setattr(os, "environ", {**os.environ, **environment})
 
     def system_proxy_lookup():
         pytest.fail("transport must not consult system proxy settings")

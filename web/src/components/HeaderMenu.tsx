@@ -25,6 +25,7 @@ interface Props {
   notificationNative?: boolean;
   notificationError?: string;
   onNotificationMode: (mode: NotificationMode) => Promise<boolean>;
+  onTestNotification?: () => Promise<string>;
   onOpenUsageActivity: () => void;
   onOpenBtw?: () => void;
   onOpenViewer?: () => void;
@@ -59,6 +60,7 @@ export function HeaderMenu({
   notificationNative = false,
   notificationError = "",
   onNotificationMode,
+  onTestNotification,
   onOpenUsageActivity,
   onOpenBtw,
   onOpenViewer,
@@ -74,6 +76,8 @@ export function HeaderMenu({
   const [themeOpen, setThemeOpen] = useState(false);
   const [page, setPage] = useState<"main" | "notifications">("main");
   const [changingMode, setChangingMode] = useState(false);
+  const [testingNotification, setTestingNotification] = useState(false);
+  const [notificationTestResult, setNotificationTestResult] = useState("");
   const [position, setPosition] = useState<Position>({ top: 58, right: 8 });
 
   const close = () => setOpen(false);
@@ -253,7 +257,7 @@ export function HeaderMenu({
                     onClick={() => setPage("main")} aria-label="返回设置">
                     <Icon name="back" size={17} />
                   </button>
-                  <b>会话通知</b>
+                  <b>桌面通知</b>
                 </header>
                 <p className="header-menu-help">
                   会话完成、失败、中断或需要你回答时发送通知。
@@ -266,6 +270,24 @@ export function HeaderMenu({
                 {!notificationAvailable && (
                   <p className="header-menu-warning">当前浏览器不支持系统通知。</p>
                 )}
+                {!notificationNative && <p className="header-menu-help">
+                  {notificationBinding === "remote"
+                    ? "后台 Push 已连接；关闭标签页后能否到达仍取决于浏览器及网络。"
+                    : "当前使用页面提醒，请保持网页连接。关闭标签页后的提醒需要后台 Push。"}
+                </p>}
+                {onTestNotification && !notificationNative && <>
+                  <button type="button" disabled={testingNotification || notificationMode === "off"}
+                    onClick={async () => {
+                      setTestingNotification(true);
+                      setNotificationTestResult("");
+                      try { setNotificationTestResult(await onTestNotification()); }
+                      catch { setNotificationTestResult("测试通知未能提交，请稍后重试。"); }
+                      finally { setTestingNotification(false); }
+                    }}>
+                    {testingNotification ? "正在测试…" : "发送测试通知"}
+                  </button>
+                  {notificationTestResult && <p className="header-menu-help" role="status">{notificationTestResult}</p>}
+                </>}
                 <div className="header-menu-modes" role="radiogroup" aria-label="通知隐私模式">
                   {(["off", "generic", "session"] as const).map((mode) => (
                     <button key={mode} type="button" role="radio"

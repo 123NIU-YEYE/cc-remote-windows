@@ -18,6 +18,8 @@ try {
   assert.deepEqual(producedFiles(patchEvents("Success. Updated the following files:\nA unrequested.txt")), []);
   assert.deepEqual(producedFiles(patchEvents("Success. Updated the following files:\nA /project/created.txt"), "/project").map((f: { path: string }) => f.path), ["/project/created.txt"]);
   assert.deepEqual(producedFiles(patchEvents("Success. Updated the following files:\nA /other/created.txt"), "/project"), []);
+  assert.deepEqual(producedFiles(patchEvents("Success. Updated the following files:\nA D:\\project\\created.txt"), "D:\\project").map((f: { path: string }) => f.path), ["D:\\project\\created.txt"]);
+  assert.deepEqual(producedFiles(patchEvents("Success. Updated the following files:\nA D:\\other\\created.txt"), "D:\\project"), []);
   const { routeComposerInput, commandsFor, defaultModelFor } = await harness.ssrLoadModule("/src/data.ts");
   const { dshCommandMatches } = await harness.ssrLoadModule("/src/dsh-commands.ts");
   for (const input of ["/btw", "/btw question", " /BTW question "]) {

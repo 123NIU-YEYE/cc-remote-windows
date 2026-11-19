@@ -4,3 +4,6 @@ Pillow==12.3.0
 pillow-heif==1.8.1
 playwright==1.62.0
 backports.zstd==1.8.0 ; python_version < "3.14"
+
+# Native Windows process identity/ownership; optional on Unix.
+psutil==7.2.2 ; sys_platform == "win32"

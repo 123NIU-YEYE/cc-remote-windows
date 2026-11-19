@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl
 import os
 from pathlib import Path
 import stat

@@ -1,6 +1,6 @@
 /** Bounded authenticated integration endpoints over native DSH services. */
 import { createRequire } from 'node:module';
-import { isAbsolute, normalize, relative, resolve } from 'node:path';
+import { isAbsolute, posix, win32 } from 'node:path';
 export const name = 'cc-remote-metadata';
 export const inject = ['connection', 'sessionQuery', 'agents', 'commands', 'agentPresets', 'skills'];
 const SID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,123}$/u;
@@ -32,6 +32,10 @@ export async function metadata(ctx, request) {
   finally { await lease?.[Symbol.asyncDispose](); observation?.[Symbol.dispose](); }
 }
 export function producedFiles(events, cwd) {
+  // Native metadata can be rendered/tested on another OS. Choose the path
+  // namespace from its cwd rather than the JavaScript host's current drive.
+  const pathsFor = value => /^[A-Za-z]:[\\/]|^\\\\/u.test(cwd || value || '') ? win32 : posix;
+  const normalize = value => pathsFor(value).normalize(value);
   const calls = new Map(), patches = new Map(), files = new Map();
   for (const event of events) {
     if (event.surfaceOp && typeof event.surfaceOp === 'object') continue;
@@ -44,10 +48,10 @@ export function producedFiles(events, cwd) {
           const match = /^\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\0\r\n]{1,4096})$/u.exec(line);
           if (!match) continue;
           paths.add(normalize(match[1]));
-          if (typeof cwd === 'string' && isAbsolute(cwd)) {
-            const absolute = resolve(cwd, match[1]);
+          if (typeof cwd === 'string' && pathsFor(cwd).isAbsolute(cwd)) {
+            const absolute = pathsFor(cwd).resolve(cwd, match[1]);
             paths.add(absolute);
-            paths.add(relative(cwd, absolute));
+            paths.add(pathsFor(cwd).relative(cwd, absolute));
           }
         }
         patches.set(data.callId, paths);

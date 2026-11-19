@@ -2,6 +2,7 @@
 import base64
 import io
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -28,7 +29,11 @@ def test_artifact_upload_survives_reopen_and_has_isolated_identity(tmp_path):
     rows, _, more = reopened.page("session-a")
     assert len(rows) == 1 and not more
     assert Path(rows[0]["path"]).read_bytes() == b"keep me"
-    assert Path(rows[0]["path"]).stat().st_mode & 0o777 == 0o600
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        assert owned_path(rows[0]["path"], private=True)
+    else:
+        assert Path(rows[0]["path"]).stat().st_mode & 0o777 == 0o600
     assert reopened.page("session-b")[0] == []
     assert reopened.get("session-b", rows[0]["id"]) is None
     assert public_entry(rows[0])["available"] is True
@@ -396,6 +401,7 @@ async def test_live_and_historical_delivery_lists_share_the_same_artifact_catalo
     assert service.store.page(service.scope(engine, "code", "unrelated"))[0] == []
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink fixture; native reparse rejection is verified separately")
 def test_artifact_root_symlink_is_rejected(tmp_path):
     target = tmp_path / "elsewhere"
     target.mkdir()

@@ -4645,6 +4645,7 @@ def test_history_content_does_not_wait_for_external_ownership_scan():
             summary_page=lambda *_args, **_kwargs: (_ for _ in ()).throw(
                 CodexHistoryUnsupported("compatibility path"))
         )
+        machine._codex_rollout_for_wire = lambda _sid: None
         history = await asyncio.wait_for(machine._build_requested_history(
             "session-1", before=None, limit=4, cwd=None, detail="summary",
         ), timeout=0.1)
@@ -6791,6 +6792,7 @@ def test_scoped_empty_claude_history_retries_global_lookup(
     transcript = tmp_path / "claude.jsonl"
     transcript.write_text("{}\n")
     calls = []
+    hint = str(tmp_path / "browser-project")
     canned = [
         UserMsg(msg_id="turn-1", prompt="recovered"),
         TurnEnd(result=TurnResult(
@@ -6816,11 +6818,11 @@ def test_scoped_empty_claude_history_retries_global_lookup(
     async def go():
         machine, _ = _mk_machine()
         history = await machine._build_history(
-            "claude-session", limit=4, cwd_hint="/stale/browser")
+            "claude-session", limit=4, cwd_hint=hint)
 
         assert [row["prompt"] for row in history.events
                 if row["type"] == "user_msg"] == ["recovered"]
-        assert calls == ["/stale/browser", None]
+        assert calls == [hint, None]
 
     asyncio.run(go())
 
@@ -6830,6 +6832,7 @@ def test_truly_empty_claude_history_is_authoritative_after_global_retry(
     transcript = tmp_path / "claude-empty.jsonl"
     transcript.write_text("{}\n")
     calls = []
+    hint = str(tmp_path / "browser-project")
     monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
     monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
 
@@ -6849,12 +6852,12 @@ def test_truly_empty_claude_history_is_authoritative_after_global_retry(
         machine, _ = _mk_machine()
         machine._history_index = HistoryIndexStore(tmp_path / "state-empty")
         history = await machine._build_history(
-            "claude-empty", limit=4, cwd_hint="/listed/project")
+            "claude-empty", limit=4, cwd_hint=hint)
         source = HistorySourceFingerprint.capture(transcript)
 
         assert history.authoritative is True
         assert history.events == []
-        assert calls == ["/listed/project", None]
+        assert calls == [hint, None]
         cached = machine._history_index.get_page(
             "claude-empty", "claude", source, before=None, limit=4)
         assert cached is not None and cached.turns == ()
@@ -8710,7 +8713,7 @@ def test_unpaired_history_agent_message_is_not_lost_at_snapshot_eof(tmp_path):
                     }]},
     }
     encoded_prefix = "".join(json.dumps(row) + "\n" for row in prefix)
-    source.write_text(encoded_prefix + json.dumps(suffix) + "\n")
+    source.write_text(encoded_prefix + json.dumps(suffix) + "\n", encoding="utf-8", newline="\n")
 
     events, _ = codex_translate_history(
         str(source), tool_result_max=4096,
@@ -9589,7 +9592,7 @@ def test_image_read_fallback_clears_provisional_preview_candidate():
         )
         await machine._observe_preview_image_event(ctx, start)
         assert set(ctx.preview_image_candidates) == {"tool-image-fallback"}
-        assert ctx.preview_image_candidates["tool-image-fallback"].endswith(
+        assert ctx.preview_image_candidates["tool-image-fallback"].replace("\\", "/").endswith(
             "/tmp/not-an-image.png")
 
         fallback = ProcessEvent(

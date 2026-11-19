@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl
 import hashlib
 import json
 import os

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
+# Tests never discover a parent checkout\'s production credentials.
+os.environ.setdefault("PYTHON_DOTENV_DISABLED", "1")
+
 import pytest
 
 

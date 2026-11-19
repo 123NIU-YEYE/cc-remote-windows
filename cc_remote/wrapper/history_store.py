@@ -198,6 +198,28 @@ def _historical_turn_failure(value: Any) -> str:
     return _GENERIC_HISTORY_TURN_FAILURE
 
 
+def _sqlite_int(value: int) -> int:
+    """Map a filesystem identity number into SQLite's signed 64-bit range.
+
+    Windows reports `st_dev` as an UNSIGNED 64-bit volume serial number, so it
+    can exceed SQLite's signed INTEGER maximum. Persisting that value raised
+    `OverflowError: Python int too large to convert to SQLite INTEGER` and made
+    every history page and compact index row unwritable on Windows.
+
+    Reinterpreting the value as two's complement is lossless and reversible, so
+    two distinct devices can never collide. The mapping is idempotent: a value
+    already inside the signed range is returned unchanged, which keeps stored
+    fingerprints equal to freshly read ones on every platform.
+    """
+    wrapped = value & 0xFFFFFFFFFFFFFFFF
+    return wrapped - (1 << 64) if wrapped >= (1 << 63) else wrapped
+
+
+def _source_identity(stat: os.stat_result) -> tuple[int, int]:
+    """Return the normalized (device, inode) pair for one open file."""
+    return _sqlite_int(int(stat.st_dev)), _sqlite_int(int(stat.st_ino))
+
+
 @dataclass(frozen=True)
 class HistorySourceFingerprint:
     """Identity of the exact transcript snapshot used to build a page."""
@@ -224,12 +246,13 @@ class HistorySourceFingerprint:
                 source.seek(max(0, stat.st_size - _FINGERPRINT_SAMPLE_BYTES))
                 tail = source.read(_FINGERPRINT_SAMPLE_BYTES)
                 digest.update(tail)
+        device, inode = _source_identity(stat)
         return cls(
             path=resolved,
-            device=int(stat.st_dev),
-            inode=int(stat.st_ino),
+            device=device,
+            inode=inode,
             size=int(stat.st_size),
-            mtime_ns=int(stat.st_mtime_ns),
+            mtime_ns=_sqlite_int(stat.st_mtime_ns),
             head_sha256=hashlib.sha256(head).hexdigest(),
             tail_sha256=hashlib.sha256(tail).hexdigest(),
             sample_sha256=digest.hexdigest(),
@@ -290,9 +313,10 @@ def history_source_extends(
     try:
         with rollout_open(current.path, "rb") as source:
             stat = rollout_fstat(source)
+            current_device, current_inode = _source_identity(stat)
             if (
-                int(stat.st_dev) != current.device
-                or int(stat.st_ino) != current.inode
+                current_device != current.device
+                or current_inode != current.inode
                 or int(stat.st_size) < current.size
             ):
                 return False
@@ -1367,11 +1391,12 @@ class HistoryIndexStore:
 
     @contextmanager
     def _connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
+        if os.name == "nt":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(self.path.parent)
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass
         connection = sqlite3.connect(self.path, timeout=5)
         try:
             connection.row_factory = sqlite3.Row
@@ -1920,8 +1945,7 @@ class HistoryIndexStore:
                 stat = os.fstat(source.fileno())
             except OSError:
                 return None
-            device = int(stat.st_dev)
-            inode = int(stat.st_ino)
+            device, inode = _source_identity(stat)
             target_size = int(stat.st_size)
             if snapshot_size is not None:
                 target_size = min(target_size, max(0, int(snapshot_size)))
@@ -2031,7 +2055,7 @@ class HistoryIndexStore:
                 current_stat = os.stat(resolved)
             except OSError:
                 return None
-            if (current_stat.st_dev != device or current_stat.st_ino != inode
+            if (_source_identity(current_stat) != (device, inode)
                     or current_stat.st_size < sampled_size):
                 return None
             head, tail = _prefix_samples(source, indexed_size)
@@ -2325,8 +2349,7 @@ class HistoryIndexStore:
         try:
             with rollout_open(source.path, "rb") as current:
                 stat = rollout_fstat(current)
-                if (int(stat.st_dev) != source.device
-                        or int(stat.st_ino) != source.inode
+                if (_source_identity(stat) != (source.device, source.inode)
                         or int(stat.st_size) < source.size):
                     return None
                 sample_size = min(old_size, _FINGERPRINT_SAMPLE_BYTES)

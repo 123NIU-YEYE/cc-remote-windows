@@ -70,6 +70,9 @@ class FakeClient:
 
 @contextlib.asynccontextmanager
 async def environment():
+    import sys
+    if sys.platform == "win32":
+        pytest.skip("integration requires Unix sockets with peer UID authentication")
     # Darwin sockaddr_un is short; pytest's normal temp hierarchy exceeds it.
     with tempfile.TemporaryDirectory(prefix="cc-sdk-", dir="/tmp") as root:
         directory = Path(root)

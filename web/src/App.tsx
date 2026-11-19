@@ -1,3 +1,5 @@
+import { testDesktopNotification } from "./notification-test";
+import { needsDesktopNotification } from "./notification-attention";
 import { AsyncQuestionStore } from "./async-question-state";
 import { QuestionNotificationGate, questionNotificationId, questionNotificationPresentation } from "./question-notification";
 import { SessionStatus } from "./components/SessionStatus";
@@ -3894,7 +3896,7 @@ export default function App() {
           if ((msg.type === "ask_user" || msg.type === "assistant_msg_end")
               && questionNotificationsRef.current.take(machineId, msg, {
             sid: stateRef.current.focusedSid, engine: engineRef.current,
-            space: spaceRef.current, hidden: document.hidden,
+            space: spaceRef.current, hidden: document.hidden, focused: document.hasFocus(),
           })) {
             const mode = readNotificationMode(localStorage);
             // System notifications have one owner: remote Push when bound,
@@ -3917,7 +3919,10 @@ export default function App() {
           }
           if (msg.type === "turn_end" && msg.sid && msg.notification_context
               && freshBtwCompletion
-              && document.hidden
+              && needsDesktopNotification(msg.sid, msg.notification_context, {
+                sid: stateRef.current.focusedSid, engine: engineRef.current,
+                space: spaceRef.current, hidden: document.hidden, focused: document.hasFocus(),
+              })
               && typeof Notification !== "undefined"
               && Notification.permission === "granted") {
             const mode = readNotificationMode(localStorage);
@@ -6361,6 +6366,11 @@ export default function App() {
             notificationNative={harmonyPush.available}
             notificationError={harmonyPush.error}
             onNotificationMode={updateNotificationMode}
+            onTestNotification={() => testDesktopNotification({
+              permission: typeof Notification === "undefined" ? "unsupported" : Notification.permission,
+              registration: () => navigator.serviceWorker
+                ? navigator.serviceWorker.ready : Promise.reject(new Error("unsupported")),
+            })}
             onOpenDshTools={engine === "dsh" && focusedSid ? () => setDshPanel({ sid: focusedSid, scope: activeScopeKey, selection: { kind: "subagents" } }) : undefined}
             onOpenUsageActivity={openUsageActivity}
             onOpenBtw={btwPanelKey && !archivedBrowse ? () => openBtw() : undefined}

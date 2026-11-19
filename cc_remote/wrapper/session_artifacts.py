@@ -8,11 +8,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import ntpath
+import posixpath
 import os
 import re
 import shutil
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -35,10 +38,12 @@ class ArtifactStorageFull(OSError):
     """An optional durable copy would exceed its storage budget."""
 
 
-def _upload_copy_name(name: str, digest: str) -> str:
+def _upload_copy_name(name: str, digest: str, component_limit: int = 255) -> str:
     """Fit one filesystem component, keeping the extension used by previews."""
     safe = re.sub(r"[^\w. -]", "_", Path(name).name).strip(". ") or "attachment"
-    budget = 255 - len(digest) - 1  # SHA-256 hex plus the separating dash.
+    budget = component_limit - len(digest) - 1
+    if budget < 1:
+        raise ValueError("artifact storage path is too long")
     if len(safe.encode("utf-8")) > budget:
         suffix = Path(safe).suffix
         if len(suffix.encode("utf-8")) >= budget:
@@ -94,6 +99,12 @@ _FILE_TABLE_HEADERS = frozenset({
     "file", "files", "filename", "filenames", "path", "paths", "artifact", "artifacts",
     "文件", "文件名", "文件路径", "路径", "产物", "输出文件", "交付文件",
 })
+
+
+def _source_absolute(cwd: str, value: str) -> str:
+    """Resolve metadata in its source namespace, independently of the reader OS."""
+    paths = ntpath if re.match(r"^[A-Za-z]:[\\/]", cwd or value) else posixpath
+    return paths.normpath(paths.join(cwd, paths.expanduser(value)))
 
 
 def _inline_local_paths(text: str, cwd: str):
@@ -165,14 +176,18 @@ def _inline_local_paths(text: str, cwd: str):
         values = []
         for match in re.finditer(r"(?<!`)(`{1,2})([^`\n]+)\1(?!`)", line):
             value = match[2].strip()
+            if sys.platform == "win32":
+                value = value.replace("\\", "/")
+            drive_path = sys.platform == "win32" and re.match(r"^[A-Za-z]:/", value)
             if (not value or len(value) > 4096
                     or any(ord(char) < 32 for char in value)
                     or re.search(r"[<>|*?;$={}\\]", value)
                     or value.startswith(("//", "#"))
-                    or re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", value)):
+                    or (not drive_path and re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", value))
+                    or (drive_path and ":" in re.sub(r":\d+(?::\d+)?$", "", value[2:]))):
                 continue
             # Relative path prefixes must look like directories, not commands.
-            if "/" in value and not value.startswith(("/", "~/", "./", "../")):
+            if "/" in value and not drive_path and not value.startswith(("/", "~/", "./", "../")):
                 if not re.fullmatch(r"[\w.-]+", value.split("/", 1)[0]):
                     continue
             values.append(value)
@@ -188,7 +203,7 @@ def _inline_local_paths(text: str, cwd: str):
             if ("/" in value and not Path(value).suffix) or location:
                 directories = [value]
         if directories:
-            directory = (os.path.abspath(os.path.join(cwd, os.path.expanduser(directories[0])))
+            directory = (_source_absolute(cwd, directories[0])
                          if len(directories) == 1 and not in_list
                          and stripped.endswith((":", "：")) else None)
         for index, value in enumerate(values):
@@ -198,10 +213,10 @@ def _inline_local_paths(text: str, cwd: str):
             if not re.fullmatch(r"\.[a-zA-Z0-9]{1,16}", Path(value).suffix):
                 continue
             if "/" in value:
-                yield os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
+                yield _source_absolute(cwd, value)
             elif directory and in_list and (index == 0 or is_table):
                 # Only the file label in a bullet, not identifiers in its description.
-                yield os.path.abspath(os.path.join(directory, value))
+                yield _source_absolute(directory, value)
 
 
 def local_links(text: str, cwd: str) -> list[str]:
@@ -220,18 +235,25 @@ def local_links(text: str, cwd: str) -> list[str]:
             pass
     paths = []
     for value in candidates[:128]:
-        if not isinstance(value, str) or len(value) > 4096:
+        if not isinstance(value, str) or len(value) > 4096 or value.startswith(("//", "\\\\")):
             continue
         try:
-            parsed = urlsplit(value)
+            # A native drive letter is a file path, not a URL scheme. UNC
+            # shares remain excluded, as with file://server references.
+            drive_path = sys.platform == "win32" and re.match(r"^[A-Za-z]:[\\/]", value)
+            parsed = urlsplit("" if drive_path else value)
         except ValueError:
             continue
         if parsed.scheme not in ("", "file") or parsed.netloc or value.startswith("#"):
             continue
-        path = re.sub(r":\d+(?::\d+)?$", "", unquote(parsed.path))
+        path = re.sub(r":\d+(?::\d+)?$", "", unquote(value if drive_path else parsed.path))
+        if sys.platform == "win32" and parsed.scheme == "file" and re.match(r"^/[A-Za-z]:[\\/]", path):
+            path = path[1:]
+        if sys.platform == "win32" and re.match(r"^[A-Za-z]:[\\/]", path) and ":" in path[2:]:
+            continue
         if not path or not Path(path).suffix:
             continue
-        path = os.path.abspath(os.path.join(cwd, os.path.expanduser(path)))
+        path = _source_absolute(cwd, path)
         if path not in paths:
             paths.append(path)
     for path in _inline_local_paths(inline_text, cwd):
@@ -246,6 +268,8 @@ def artifact_kind(name: str) -> str:
     ext = Path(name).suffix.lower()
     if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif"}:
         return "image"
+    if ext in {".mp4", ".m4v", ".mov", ".webm", ".ogv"}:
+        return "video"
     if ext in {".md", ".txt", ".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".csv"}:
         return "document"
     return "file"
@@ -254,7 +278,14 @@ def artifact_kind(name: str) -> str:
 class SessionArtifactStore:
     def __init__(self, state_dir: Path):
         self.root = Path(state_dir) / "session-artifacts"
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            from cc_remote.wrapper.os_compat import _win32_long_path
+            self.root = Path(_win32_long_path(str(self.root)))
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(self.root)
+        else:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.root.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
             raise OSError("unsafe artifact directory")
@@ -378,11 +409,12 @@ class SessionArtifactStore:
                 previous = db.execute("SELECT path FROM artifacts WHERE scope=? AND identity=?",
                                       (scope, identity)).fetchone()
                 digest = hashlib.sha256(f"{scope}\0{identity}".encode()).hexdigest()
-                path = Path(previous[0]) if previous else self.root / _upload_copy_name(name, digest)
+                limit = min(255, 259 - len(str(self.root.absolute())) - 1) if sys.platform == "win32" else 255
+                path = Path(previous[0]) if previous else self.root / _upload_copy_name(name, digest, limit)
                 if path.parent != self.root:
                     raise OSError("unsafe artifact upload path")
                 try:
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
                 except FileNotFoundError:
                     new_files[path] = len(data)
                 else:
@@ -428,7 +460,7 @@ class SessionArtifactStore:
             path = file.get("path")
             if not isinstance(path, str) or not path or len(path) > 4096:
                 raise ValueError("invalid native artifact path")
-            paths.append(os.path.abspath(os.path.join(cwd, os.path.expanduser(path))))
+            paths.append(_source_absolute(cwd, path))
         with self.lock, self.connect() as db:
             scope = self.canonical_scope(db, scope)
             for path in paths:

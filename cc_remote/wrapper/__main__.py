@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import asyncio
 
-from cc_remote.config import validate_wrapper_config, wrapper_config
+from cc_remote.config import WrapperConfig, validate_wrapper_config, wrapper_config
 from cc_remote.log import logger
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.transport import WrapperTransport
+from cc_remote.wrapper.instance_lock import wrapper_instance
 from cc_remote.wrapper.child_env import scrub_parent_control_secrets
 from cc_remote.wrapper.codex_launch_barrier import serve as serve_launch_barrier
 from cc_remote.viewer import registry_path
@@ -25,6 +26,14 @@ async def main() -> None:
 async def run_wrapper() -> None:
     cfg = wrapper_config()
     validate_wrapper_config(cfg)
+    with wrapper_instance(cfg.state_dir) as acquired:
+        if not acquired:
+            log.warning("Wrapper already owns this state directory; duplicate start ignored")
+            return
+        await _run_configured_wrapper(cfg)
+
+
+async def _run_configured_wrapper(cfg: WrapperConfig) -> None:
     # cfg now owns the one token transport needs. Remove control credentials from
     # the parent environment before any model/plugin/tool subprocess can inherit.
     scrub_parent_control_secrets()

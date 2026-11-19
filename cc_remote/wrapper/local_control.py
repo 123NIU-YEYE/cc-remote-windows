@@ -13,7 +13,7 @@ One JSON line in, one JSON line out::
 from __future__ import annotations
 
 import asyncio
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl
 import json
 import os
 from pathlib import Path
@@ -51,6 +51,9 @@ class LocalControl:
 
     async def start(self):
         """Serve the socket; a failure only disables this optional entry point."""
+        if os.name == "nt":
+            log.info("Unix peer-authenticated local control is unavailable on Windows")
+            return
         try:
             self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
             info = self.root.lstat()

@@ -17,7 +17,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from cc_remote.claude_broker.paths import default_socket_path
+# The Claude PTY broker is Unix-only (Unix sockets). Import its default socket
+# path opportunistically so configuration keeps loading on Windows, where the
+# broker is unavailable and its setting is never used.
+try:  # pragma: no cover - exercised on Unix
+    from cc_remote.claude_broker.paths import default_socket_path
+except ImportError:  # pragma: no cover - Windows
+    def default_socket_path() -> str:  # type: ignore[misc]
+        """No broker socket exists on this platform."""
+        return ""
 from cc_remote.claude_profiles import ClaudeProfileRegistry
 from cc_remote.codex_profiles import CodexProfileRegistry
 
@@ -36,7 +44,7 @@ def _env(key: str, default: str = "") -> str:
 def _claude_bin() -> str:
     """Use the user's normal Claude Code install unless explicitly overridden."""
     configured = _env("CLAUDE_BIN", "").strip()
-    return configured or str(Path.home() / ".local/bin/claude")
+    return configured or str(Path.home() / ".local/bin" / ("claude.exe" if sys.platform == "win32" else "claude"))
 
 
 def _int(key: str, default: int) -> int:
@@ -67,8 +75,13 @@ def _load_device_config() -> dict[str, str]:
     path = device_config_path()
     if not path.exists():
         return {}
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        info = path.lstat()
+        private = stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and owned_path(path, private=True)
+    else:
+        private = not stat.S_IMODE(path.stat().st_mode) & 0o077
+    if not private:
         raise ValueError(
             f"device credential file must not be accessible by group/others: {path}")
     try:
@@ -161,7 +174,7 @@ def _claude_service_socket(key: str = "socket") -> str:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:
         return ""
-    with os.fdopen(fd, "r") as source:
+    with os.fdopen(fd, "r", encoding="utf-8") as source:
         info = os.fstat(source.fileno())
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
                 or info.st_mode & 0o077 or info.st_size > 4096):
@@ -193,13 +206,16 @@ class RelayConfig:
     # disconnected; individual deltas are never shed because that would make a
     # partial answer look complete.
     client_queue_cap: int = field(default_factory=lambda: _int("CLIENT_QUEUE_CAP", 4096))
+    # Must stay >= ws_max_size_bytes: one queued frame can be a whole preview
+    # asset. 32 MiB covers a 20 MiB artifact after base64 inflation.
     client_queue_bytes: int = field(
-        default_factory=lambda: _int("CLIENT_QUEUE_BYTES", 16 * 1024 * 1024)
+        default_factory=lambda: _int("CLIENT_QUEUE_BYTES", 32 * 1024 * 1024)
     )
     # Maximum decoded WebSocket text frame accepted by the relay. Attachment
     # commands are validated more tightly by the wrapper after transport.
+    # 32 MiB carries a 20 MiB artifact (base64 is 4/3 of raw).
     ws_max_size_bytes: int = field(
-        default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 16 * 1024 * 1024)
+        default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 32 * 1024 * 1024)
     )
     # Login gate: web clients POST /api/login with this password and receive a
     # short-lived HMAC session in an HttpOnly cookie.
@@ -338,7 +354,8 @@ class WrapperConfig:
     cc_cwd: str = field(default_factory=lambda: _env("CC_CWD", os.getcwd()))
     resume_session_id: str = field(default_factory=lambda: _env("CC_RESUME_SESSION_ID", ""))
     ring_max_events: int = field(default_factory=lambda: _int("RING_MAX_EVENTS", 10000))
-    ring_max_bytes: int = field(default_factory=lambda: _int("RING_MAX_BYTES", 24 * 1024 * 1024))
+    # Must stay >= ws_max_size_bytes: a single preview frame lives in the ring.
+    ring_max_bytes: int = field(default_factory=lambda: _int("RING_MAX_BYTES", 32 * 1024 * 1024))
     tool_result_max: int = field(default_factory=lambda: _int("TOOL_RESULT_MAX", 65536))
     history_source_max_bytes: int = field(
         default_factory=lambda: _int("HISTORY_SOURCE_MAX_BYTES", 64 * 1024 * 1024)
@@ -358,7 +375,7 @@ class WrapperConfig:
     transport_send_bytes: int = field(
         default_factory=lambda: _int("WRAPPER_SEND_QUEUE_BYTES", 32 * 1024 * 1024)
     )
-    ws_max_size_bytes: int = field(default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 16 * 1024 * 1024))
+    ws_max_size_bytes: int = field(default_factory=lambda: _int("WS_MAX_SIZE_BYTES", 32 * 1024 * 1024))
     # Consumer-facing per-turn queue. CodexHandle derives a separate bounded
     # burst window from this value so app-server stdout never waits on relay I/O.
     turn_reader_queue_cap: int = field(
@@ -372,6 +389,12 @@ class WrapperConfig:
     # intentionally keeps its private stdio app-server for isolation.
     codex_daemon_mode: str = field(
         default_factory=lambda: _env("CC_REMOTE_CODEX_DAEMON", "auto").strip().lower()
+    )
+    # Optional legacy Windows loopback WebSocket endpoint. Leave empty to use
+    # the official native daemon/proxy, including current Windows CLIs.
+    # Desktop sharing uses its own App-only bridge environment, not this field.
+    codex_app_server_ws_url: str = field(
+        default_factory=lambda: _env("CODEX_APP_SERVER_WS_URL", "").strip()
     )
     # Max cc subprocesses (resident sessions) the wrapper runs concurrently. Each
     # session = one `claude --resume` child (~190MB RAM). Over the cap → evict an
@@ -691,16 +714,22 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
                 "CC_REMOTE_CODEX_PROXY must be an http(s) or socks5 URL "
                 "without credentials, path, query, or fragment")
     if cfg.experimental_claude_broker:
-        if (not cfg.claude_broker_socket
-                or "\x00" in cfg.claude_broker_socket
-                or len(cfg.claude_broker_socket.encode(
-                    "utf-8", errors="surrogatepass")) > 4096):
+        if sys.platform == "win32":
+            errors.append(
+                "CC_REMOTE_EXPERIMENTAL_CLAUDE_BROKER is not supported on "
+                "Windows")
+        elif (not cfg.claude_broker_socket
+              or "\x00" in cfg.claude_broker_socket
+              or len(cfg.claude_broker_socket.encode(
+                  "utf-8", errors="surrogatepass")) > 4096):
             errors.append(
                 "CC_REMOTE_CLAUDE_BROKER_SOCKET must be a non-empty path of at "
                 "most 4096 UTF-8 bytes")
         elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
             errors.append(
                 "CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
+    if sys.platform == "win32" and (cfg.claude_service_socket or cfg.session_messages_enabled):
+        errors.append("Unix peer-authenticated Claude service/session messaging is unavailable on Windows")
     if cfg.claude_service_socket:
         service_socket = os.path.expanduser(cfg.claude_service_socket)
         if (not os.path.isabs(service_socket) or "\x00" in service_socket

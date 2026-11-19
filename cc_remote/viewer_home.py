@@ -147,9 +147,9 @@ class HomePages:
                     root, entry = found
                 else:
                     expanded = str(self.home) + raw[1:] if raw.startswith("~/") else raw
-                    if not expanded.startswith("/") or expanded.startswith("//"):
+                    if not Path(expanded).is_absolute() or expanded.startswith(("//", "\\\\")):
                         continue
-                    if any(part in {".", ".."} for part in expanded.split("/")):
+                    if any(part in {".", ".."} for part in expanded.replace("\\", "/").split("/")):
                         continue
                     entry = Path(expanded)
                     if entry.suffix.lower() not in {".htm", ".html"}:

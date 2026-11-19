@@ -68,7 +68,20 @@ class DeviceStore:
 
     def __init__(self, path: str):
         self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            from cc_remote.windows_privacy import create_private_file, owned_path, private_directory
+            private_directory(self.path.parent)
+            try:
+                descriptor = create_private_file(self.path)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) not in {80, 183}:
+                    raise
+            else:
+                os.close(descriptor)
+            if not owned_path(self.path, private=True):
+                raise ValueError("Device registry must be private and owned by this user")
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
         os.chmod(self.path, 0o600)
 

@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import re
-import resource
+from cc_remote.wrapper import resource_compat as resource  # Windows rlimit shim
 import signal
 import shutil
 import stat
@@ -23,8 +23,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 from cc_remote.log import logger
+from cc_remote.wrapper.os_compat import current_uid
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
 from cc_remote.wrapper.process_scan import (
@@ -32,6 +34,7 @@ from cc_remote.wrapper.process_scan import (
     ProcessIdentity,
     process_identity,
     process_owner_uid,
+    process_command_environment_value,
 )
 
 log = logger("cc_remote.wrapper.codex_daemon")
@@ -42,6 +45,7 @@ _COMMAND_TIMEOUT = 30.0
 _OUTPUT_MAX = 64 * 1024
 _PID_RECORD_MAX = 4096
 _STALE_UPDATER_EXIT_TIMEOUT = 3.0
+_WINDOWS_WS_START_TIMEOUT = 10.0
 _DAEMON_UPGRADE_SETTLE_TIMEOUT = 5.0
 _DAEMON_UPGRADE_POLL_INTERVAL = 0.1
 _DAEMON_NOFILE_SOFT_LIMIT = 4096
@@ -70,6 +74,7 @@ def codex_daemon_mode(value: Optional[str] = None) -> str:
 class CodexDaemonInfo:
     socket_path: Optional[str]
     verified_remote_control: bool = False
+    websocket_url: Optional[str] = None
     nofile_verified: bool = False
 
 
@@ -344,7 +349,7 @@ def _managed_pid(path: Path) -> Optional[int]:
         )
         file_stat = os.fstat(descriptor)
         if (not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_uid != os.getuid()
+                or file_stat.st_uid != current_uid()
                 or file_stat.st_size > _PID_RECORD_MAX):
             return None
         data = os.read(descriptor, _PID_RECORD_MAX + 1)
@@ -388,10 +393,30 @@ def _managed_daemon_process_identity(
     proxy look current.
     """
     home = Path(os.path.realpath(os.path.expanduser(os.fspath(codex_home))))
-    pid = _managed_pid(_daemon_pid_record(home / "app-server-daemon"))
+    pid_path = _daemon_pid_record(home / "app-server-daemon")
+    pid = _managed_pid(pid_path)
     if pid is None or process_owner_uid(pid) != os.getuid():
         return None
-    return process_identity(pid)
+    identity = process_identity(pid)
+    if sys.platform == "win32" and identity is not None:
+        # Native Windows state uses FILETIME, rather than Linux start ticks.
+        # Bind the PID record to the exact account and process generation.
+        try:
+            with pid_path.open("rb") as stream:
+                raw = stream.read(_PID_RECORD_MAX + 1)
+            if len(raw) > _PID_RECORD_MAX:
+                return None
+            record = json.loads(raw)
+            started = int(record["processStartTime"]) // 10000 - 11644473600000
+            complete, args, configured_home = process_command_environment_value(
+                identity, "CODEX_HOME")
+            actual_home = Path(configured_home or Path.home() / ".codex").resolve()
+            if (abs(started - identity.start_ticks) > 1 or not complete or not args
+                    or b"app-server" not in args or actual_home != home):
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    return identity
 
 
 def _protected_socket_directory(uid: int) -> Path:
@@ -410,11 +435,19 @@ def socket_identity(path: str, *, owner_uid: int | None = None) -> tuple[int, in
     address = Path(path)
     parent = address.parent
     parent_info = parent.lstat()
-    if (not address.is_absolute() or str(parent.resolve()) != str(parent)
+    if (not address.is_absolute()
+            or os.path.normcase(str(parent.resolve())) != os.path.normcase(str(parent))
             or not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != uid
-            or parent_info.st_mode & 0o022):
+            or (sys.platform != "win32" and parent_info.st_mode & 0o022)):
         raise ValueError("Codex socket parent is not private to its owner")
     info = address.lstat()
+    if sys.platform == "win32":
+        # Windows AF_UNIX endpoints are a specific reparse type, not S_IFSOCK.
+        # Python need not implement AF_UNIX: the official raw proxy owns I/O.
+        if (getattr(info, "st_reparse_tag", None) != 0x80000023
+                or _managed_daemon_process_identity(parent.parent) is None):
+            raise ValueError("Codex Windows socket has no matching native owner")
+        return info.st_dev, info.st_ino, info.st_ctime_ns
     if stat.S_ISLNK(info.st_mode):
         directory = _protected_socket_directory(uid)
         target = directory / hashlib.sha256(os.fsencode(address)).hexdigest()
@@ -559,7 +592,7 @@ def _darwin_process_state(pid: int) -> Optional[str]:
             ["/bin/ps", "-p", str(pid), "-o", "state="],
             check=False,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=1.0,
         )
     except (OSError, subprocess.SubprocessError):
@@ -608,8 +641,8 @@ def _terminate_stale_darwin_daemon_updater(
         return False
     if updater_bin != os.path.realpath(codex_bin):
         return False
-    if (process_owner_uid(updater_pid) != os.getuid()
-            or process_owner_uid(app_server_pid) != os.getuid()
+    if (process_owner_uid(updater_pid) != current_uid()
+            or process_owner_uid(app_server_pid) != current_uid()
             or not (_darwin_process_state(app_server_pid) or "").startswith("Z")):
         return False
     # Close the PID-reuse window immediately before signalling both identities.
@@ -735,13 +768,59 @@ def _binary_identity(path: str) -> tuple[object, ...]:
 
 
 def _daemon_identity(
-    path: str, env: Mapping[str, str], socket_path: Optional[str],
+    path: str,
+    env: Mapping[str, str],
+    socket_path: Optional[str],
+    websocket_url: Optional[str] = None,
 ) -> tuple[object, ...]:
     return (
         *_binary_identity(path),
         env.get("CODEX_HOME"),
         socket_path,
+        websocket_url,
     )
+
+
+def _windows_ws_target(value: Optional[str]) -> Optional[tuple[str, str, int]]:
+    """Return a normalized root loopback ws URL, host and port on Windows."""
+    raw = value
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    parsed = urlsplit(raw.strip())
+    if (
+        parsed.scheme != "ws"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None or not 1 <= port <= 65535:
+        return None
+    host = parsed.hostname
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"ws://{rendered_host}:{port}", host, port
+
+
+async def _tcp_listener_ready(host: str, port: int) -> bool:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=0.5)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    del reader
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
+    return True
 
 
 class CodexDaemonManager:
@@ -752,12 +831,14 @@ class CodexDaemonManager:
         mode: Optional[str] = None,
         *,
         socket_path: Optional[str] = None,
+        websocket_url: Optional[str] = None,
         command_timeout: float = _COMMAND_TIMEOUT,
         require_shared: bool = False,
         allow_restart: bool = True,
     ):
         self.mode = codex_daemon_mode(mode)
         self.socket_path = socket_path
+        self.websocket_url = websocket_url
         self.command_timeout = max(1.0, float(command_timeout))
         self.require_shared = bool(require_shared)
         self.allow_restart = bool(allow_restart)
@@ -766,6 +847,7 @@ class CodexDaemonManager:
         self._capable = False
         self._ready_identity: Optional[tuple[object, ...]] = None
         self._ready: Optional[CodexDaemonInfo] = None
+        self._windows_server_proc: Optional[asyncio.subprocess.Process] = None
         self._ready_codex_home: Optional[str] = None
         self._standalone_socket_path: Optional[str] = None
         self._managed_identity_required = False
@@ -832,7 +914,23 @@ class CodexDaemonManager:
         self, codex_bin: str, env: Mapping[str, str],
     ) -> bool:
         """Check both official commands, caching by executable identity."""
-        if self.mode == "off" or os.name != "posix":
+        if self.mode == "off":
+            return False
+        if os.name == "nt" and self.websocket_url:
+            if _windows_ws_target(self.websocket_url) is None:
+                return False
+            identity = _daemon_identity(
+                codex_bin, env, self.socket_path, self.websocket_url)
+            if identity == self._capability_identity:
+                return self._capable
+            help_result = await self._run(codex_bin, env, "app-server", "--help")
+            capable = help_result.returncode == 0
+            self._capability_identity = identity
+            self._capable = capable
+            if not capable:
+                self.invalidate()
+            return capable
+        if os.name not in {"posix", "nt"}:
             return False
         identity = _daemon_identity(codex_bin, env, self.socket_path)
         if identity == self._capability_identity:
@@ -960,6 +1058,8 @@ class CodexDaemonManager:
         """Start and remotely enable the daemon, or return ``None`` for stdio."""
         if self.mode == "off":
             return None
+        if os.name == "nt" and self.websocket_url:
+            return await self._ensure_windows_ws_started(codex_bin, env)
         codex_home = os.path.realpath(os.path.expanduser(
             env.get("CODEX_HOME") or "~/.codex"
         ))
@@ -1107,6 +1207,67 @@ class CodexDaemonManager:
             self._standalone_socket_path = None
             return info
 
+    async def _ensure_windows_ws_started(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> Optional[CodexDaemonInfo]:
+        target = _windows_ws_target(self.websocket_url)
+        if target is None:
+            return None
+        url, host, port = target
+        identity = _daemon_identity(
+            codex_bin, env, self.socket_path, self.websocket_url)
+        if identity == self._ready_identity and self._ready is not None:
+            return self._ready
+        async with self._lock:
+            identity = _daemon_identity(
+                codex_bin, env, self.socket_path, self.websocket_url)
+            if identity == self._ready_identity and self._ready is not None:
+                return self._ready
+            if not await self.capability(codex_bin, env):
+                return None
+            if not await _tcp_listener_ready(host, port):
+                creationflags = (
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    codex_bin,
+                    "app-server",
+                    "--listen",
+                    url,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=dict(env),
+                    creationflags=creationflags,
+                )
+                self._windows_server_proc = proc
+                deadline = time.monotonic() + _WINDOWS_WS_START_TIMEOUT
+                while time.monotonic() < deadline:
+                    if proc.returncode is not None:
+                        break
+                    if await _tcp_listener_ready(host, port):
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    proc.terminate()
+                    await proc.wait()
+                if not await _tcp_listener_ready(host, port):
+                    self.invalidate()
+                    log.warning(
+                        "Codex Windows shared WebSocket unavailable; using stdio",
+                        url=url,
+                    )
+                    return None
+                log.info("started Codex Windows shared WebSocket", url=url)
+            info = CodexDaemonInfo(
+                socket_path=None,
+                verified_remote_control=True,
+                websocket_url=url,
+            )
+            self._ready_identity = identity
+            self._ready = info
+            return info
     async def _prepare_without_restart(
         self, codex_bin: str, env: Mapping[str, str], identity: tuple[object, ...],
     ) -> Optional[CodexDaemonInfo]:
@@ -1159,6 +1320,13 @@ class CodexDaemonManager:
         info = await self.ensure_started(codex_bin, env)
         if info is None:
             return None
+        if os.name == "nt" and info.websocket_url:
+            return [
+                sys.executable,
+                "-m",
+                "cc_remote.wrapper.codex_ws_proxy",
+                info.websocket_url,
+            ]
         argv = [codex_bin, "app-server", "proxy"]
         socket_path = self.socket_path or info.socket_path
         if socket_path:

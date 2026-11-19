@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl
 import json
 import os
 import signal

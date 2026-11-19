@@ -1,7 +1,7 @@
 """Installer-owned activation receipts and a process-lifetime admission gate."""
 from __future__ import annotations
 
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl
 import os
 from pathlib import Path
 import stat

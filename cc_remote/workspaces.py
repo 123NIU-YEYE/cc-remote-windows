@@ -38,15 +38,16 @@ _WORK_ARTIFACT_PREVIEW_SUFFIXES = frozenset({
     ".htm", ".html", ".ini", ".java", ".js", ".json", ".jsonl", ".log", ".md",
     ".mdown", ".markdown", ".mmd", ".mermaid", ".mjs", ".py", ".rs", ".sh", ".sql", ".svg",
     ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
-    ".avif", ".doc", ".docx", ".gif", ".jpeg", ".jpg", ".odp", ".ods",
-    ".odt", ".pdf", ".png", ".ppt", ".pptx", ".rtf", ".webp", ".xls",
-    ".xlsx",
+    ".avif", ".doc", ".docx", ".gif", ".jpeg", ".jpg", ".m4v", ".mov", ".mp4",
+    ".odp", ".ods", ".odt", ".ogv", ".pdf", ".png", ".ppt", ".pptx", ".rtf",
+    ".webm", ".webp", ".xls", ".xlsx",
 })
 _WORK_ARTIFACT_KIND_SUFFIXES = {
     "document": frozenset({".doc", ".docx", ".md", ".mmd", ".mermaid", ".odt", ".rtf", ".txt"}),
     "spreadsheet": frozenset({".csv", ".ods", ".xls", ".xlsx"}),
     "presentation": frozenset({".odp", ".ppt", ".pptx"}),
     "image": frozenset({".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}),
+    "video": frozenset({".m4v", ".mov", ".mp4", ".ogv", ".webm"}),
     "pdf": frozenset({".pdf"}),
 }
 
@@ -2018,6 +2019,10 @@ class WorkRegistry:
 
     @staticmethod
     def _mkdir_private(path: Path) -> None:
+        if os.name == "nt":
+            from cc_remote.windows_privacy import private_directory
+            private_directory(path)
+            return
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.chmod(0o700)
 

@@ -47,6 +47,7 @@ from cc_remote.wrapper.artifact_inspection import (
 from cc_remote.wrapper.rollout_io import rollout_open, rollout_size
 from cc_remote.log import logger
 from cc_remote.wrapper.token_usage import CodexUsageTracker
+from cc_remote.wrapper.os_compat import kill_process_tree
 from cc_remote.wrapper.btw_history import CodexBtwCompletions
 from cc_remote.protocol import (
     MAX_SAFE_WIRE_INTEGER,
@@ -188,12 +189,20 @@ _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
     "turn/started",
 })
 _EXTERNAL_THREAD_STARTED_SOURCES = frozenset({"cli", "vscode", "exec"})
+# Catalog-only lifecycle from any client of a shared daemon (the App, the CLI or
+# another Wrapper): the sidebar must re-read names and archive state.
+_CATALOG_CHANGE_NOTIFICATIONS = frozenset({
+    "thread/archived",
+    "thread/name/updated",
+    "thread/unarchived",
+})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[ApprovalDecision]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
 ThreadStartedCallback = Callable[[str], None]
+CatalogChangedCallback = Callable[[str], None]
 RuntimeEvent = Notice | RateLimitUpdate | Fast
 RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
@@ -1534,6 +1543,7 @@ class CodexHandle:
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
                  thread_started_callback: Optional[ThreadStartedCallback] = None,
+                 catalog_changed_callback: Optional[CatalogChangedCallback] = None,
                  runtime_event_callback: Optional[RuntimeEventCallback] = None,
                  daemon_mode: Optional[str] = None,
                  daemon_manager: Optional[CodexDaemonManager] = None,
@@ -1655,6 +1665,7 @@ class CodexHandle:
         self.turn_lifecycle_callback = turn_lifecycle_callback
         self.thread_started_callback = thread_started_callback
         self.metadata_changed_callback: Optional[ThreadStartedCallback] = None
+        self.catalog_changed_callback = catalog_changed_callback
         # App-server can emit initialize/config warnings before thread/start has
         # returned.  Machine binds this callback immediately but activates it only
         # after the SessionContext has a non-null routing key.  Until then, keep a
@@ -4587,7 +4598,14 @@ class CodexHandle:
                     if process_group is not None:
                         os.killpg(process_group, sig)
                     elif proc.returncode is None:
-                        (proc.kill() if force else proc.terminate())
+                        if os.name == "nt":
+                            # Windows: terminate the tree, not just the direct
+                            # child. The app-server's node helpers inherit the
+                            # thread-writer locks and would otherwise survive,
+                            # blocking the next resume of the same session.
+                            kill_process_tree(proc.pid)
+                        else:
+                            (proc.kill() if force else proc.terminate())
                 except ProcessLookupError:
                     pass
                 except Exception as exc:
@@ -5617,6 +5635,19 @@ class CodexHandle:
                 error_type=type(exc).__name__,
             )
 
+    def _publish_catalog_changed_hint(self, thread_id: str) -> None:
+        """Schedule-only rename/archive hint; never await on the stdout reader."""
+        callback = self.catalog_changed_callback
+        if callback is None:
+            return
+        try:
+            callback(thread_id)
+        except Exception as exc:
+            log.warning(
+                "codex catalog change callback failed",
+                error_type=type(exc).__name__,
+            )
+
     async def get_context_usage(self) -> dict:
         configured_capacity = (
             self.context_settings.applied_model is not None
@@ -6287,8 +6318,11 @@ class CodexHandle:
             obj["params"] = params
         completed = False
         try:
-            await self._send(obj)
-            result = await asyncio.wait_for(fut, timeout=_REQ_TIMEOUT)
+            # Include send-lock/pipe backpressure in the deadline. Waiting only
+            # for the response leaves a stalled official proxy stuck forever.
+            async with asyncio.timeout(_REQ_TIMEOUT):
+                await self._send(obj)
+                result = await fut
             if method in _HTTP_PROVIDER_PERSISTING_METHODS:
                 await self._restore_http_provider_state()
             completed = True
@@ -7197,6 +7231,16 @@ class CodexHandle:
                 # subscribed handle. Preserve the strict foreign-frame drop below;
                 # expose only this content-free catalog hint to Machine.
                 self._publish_thread_started_hint(target_thread_id)
+        if method in _CATALOG_CHANGE_NOTIFICATIONS:
+            # Our own archive is collected above. A rename or (un)archive made
+            # by the App or CLI changes only catalog metadata: expose a
+            # content-free hint and keep the foreign-frame drop below.
+            target_thread_id = _notification_thread_id(m)
+            if (
+                isinstance(target_thread_id, str)
+                and _STATUS_WIRE_ID.fullmatch(target_thread_id)
+            ):
+                self._publish_catalog_changed_hint(target_thread_id)
         if method == "serverRequest/resolved":
             params = m.get("params")
             request_id = _server_request_key(

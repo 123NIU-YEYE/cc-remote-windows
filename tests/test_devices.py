@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from argparse import Namespace
 
@@ -18,6 +19,14 @@ from cc_remote.relay.auth import SESSION_COOKIE_NAME, session_token_claims
 from cc_remote.relay import server
 from cc_remote.relay.devices import DeviceStore
 from cc_remote.relay.server import create_app
+
+
+def _assert_private(path):
+    if sys.platform == "win32":
+        from cc_remote.windows_privacy import owned_path
+        assert owned_path(path, private=True)
+    else:
+        assert os.stat(path).st_mode & 0o777 == 0o600
 
 
 def _cfg(tmp_path, **overrides) -> RelayConfig:
@@ -89,7 +98,7 @@ def test_pairing_code_is_single_use_and_plaintext_credential_is_not_stored(tmp_p
         return enrolled.token
 
     token = asyncio.run(scenario())
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    _assert_private(path)
     assert token.encode() not in path.read_bytes()
 
 
@@ -304,7 +313,18 @@ def test_wrapper_config_rejects_group_readable_device_credentials(
         "wrapper_token": "t" * 64,
         "machine_id": "device-1234",
     }), encoding="utf-8")
-    os.chmod(path, 0o640)
+    if sys.platform == "win32":
+        import ntsecuritycon
+        import win32security as security
+        descriptor = security.GetNamedSecurityInfo(str(path), security.SE_FILE_OBJECT,
+                                                  security.DACL_SECURITY_INFORMATION)
+        acl = descriptor.GetSecurityDescriptorDacl()
+        acl.AddAccessAllowedAceEx(security.ACL_REVISION, 0, ntsecuritycon.FILE_GENERIC_READ,
+                                 security.CreateWellKnownSid(security.WinWorldSid))
+        security.SetNamedSecurityInfo(str(path), security.SE_FILE_OBJECT,
+                                     security.DACL_SECURITY_INFORMATION, None, None, acl, None)
+    else:
+        os.chmod(path, 0o640)
     monkeypatch.setenv("CC_REMOTE_DEVICE_CONFIG", str(path))
     monkeypatch.delenv("RELAY_URL", raising=False)
     with pytest.raises(ValueError, match="must not be accessible"):
@@ -340,7 +360,7 @@ def test_pairing_cli_writes_private_config_without_printing_token(
         replace=False,
     )
     assert device_cli.pair(args) == 0
-    assert os.stat(target).st_mode & 0o777 == 0o600
+    _assert_private(target)
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["wrapper_token"] == token
     assert token not in capsys.readouterr().out

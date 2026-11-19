@@ -1,5 +1,6 @@
 """Cross-platform process identity helpers shared by engine ownership scans."""
 from __future__ import annotations
+from typing import Collection
 
 import ctypes
 import os
@@ -322,6 +323,20 @@ def process_identity(pid: int, *, proc_root: str = "/proc",
         if parent_pid is not None and stat[0] != parent_pid:
             return None
         return ProcessIdentity(pid, stat[1])
+    if sys.platform == "win32" and proc_root == "/proc":
+        psutil = _windows_psutil()
+        if psutil is None:
+            return None
+        try:
+            process = psutil.Process(pid)
+            started = int(process.create_time() * 1000)
+            if parent_pid is not None and process.ppid() != parent_pid:
+                return None
+            if int(process.create_time() * 1000) != started:
+                return None
+            return ProcessIdentity(pid, started)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
     if sys.platform == "darwin" and proc_root == "/proc":
         info = _darwin_process_info(pid)
         if info is None or (parent_pid is not None and info[1] != parent_pid):
@@ -414,6 +429,30 @@ def process_command_environment_value(
         complete, value = _environment_value(
             tuple(item for item in raw.split(b"\0") if item), key)
         return complete, args, value
+    if sys.platform == "win32" and proc_root == "/proc":
+        # Windows has no procfs: take argv and the named variable from psutil,
+        # after re-verifying the creation time so a recycled PID is rejected.
+        psutil = _windows_psutil()
+        if psutil is None:
+            return False, None, None
+        try:
+            proc = psutil.Process(identity.pid)
+            if int(float(proc.create_time()) * 1000) != identity.start_ticks:
+                return False, None, None
+            args = tuple(
+                str(arg).encode("utf-8", "surrogatepass")
+                for arg in proc.cmdline()
+            )
+            environment = proc.environ()
+        except (psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.ZombieProcess):
+            return False, None, None
+        except Exception:  # noqa: BLE001 - unreadable means uncertain
+            return False, None, None
+        if not isinstance(environment, dict):
+            return False, None, None
+        value = environment.get(key)
+        return True, args, value if isinstance(value, str) else None
     if sys.platform != "darwin" or proc_root != "/proc":
         return False, None, None
     payload = _darwin_exact_process_payload(identity.pid, identity)
@@ -442,7 +481,114 @@ def process_owner_uid(pid: int, *, proc_root: str = "/proc") -> int | None:
         return os.stat(str(Path(proc_root) / str(pid))).st_uid
     except OSError:
         pass
+    if sys.platform == "win32" and proc_root == "/proc":
+        psutil = _windows_psutil()
+        if psutil is None:
+            return None
+        try:
+            if psutil.Process(pid).username().casefold() == psutil.Process().username().casefold():
+                return os.getuid()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return None
     if sys.platform != "darwin" or proc_root != "/proc":
         return None
     metadata = _darwin_bsd_snapshot(pid)
     return metadata[3] if metadata is not None else None
+
+
+def _windows_psutil():
+    """Return the optional psutil module, or None when it is unavailable.
+
+    The Unix paths read /proc and libproc directly. Windows has neither, and
+    the Claude ownership scan needs argv and
+    cwd to tell the wrapper's own SDK child apart from a user's terminal CLI, so
+    it uses psutil when installed. Without it the scan stays "incomplete" and
+    every Claude session stays read-only, which is the safe failure mode.
+    """
+    try:
+        import psutil  # noqa: PLC0415 - optional dependency
+    except Exception:  # noqa: BLE001 - any import problem means "unavailable"
+        return None
+    return psutil
+
+
+def windows_process_snapshot(
+    *, names: Collection[str] | None = None,
+) -> tuple[list[DarwinProcessInfo], bool]:
+    """Windows analogue of :func:`darwin_process_snapshot`.
+
+    ``start_ticks`` carries the creation time in whole milliseconds so a
+    recycled PID is still distinguishable, matching how the /proc and libproc
+    sources fingerprint a process.
+    """
+    psutil = _windows_psutil()
+    if psutil is None:
+        return [], False
+    result: list[DarwinProcessInfo] = []
+    complete = True
+    fields = (["pid", "name"] if names is not None
+              else ["pid", "ppid", "create_time", "name", "cmdline"])
+    selected_names = {name.casefold() for name in names} if names is not None else None
+    for index, proc in enumerate(psutil.process_iter(fields)):
+        if index >= MAX_PROC_SCAN:
+            return result, False
+        try:
+            info = proc.info
+            pid = int(info["pid"])
+            name = info.get("name") or ""
+            if selected_names is not None and name.casefold() not in selected_names:
+                continue
+            ppid = int((proc.ppid() if selected_names is not None else info["ppid"]) or 0)
+            created = float((proc.create_time() if selected_names is not None else info["create_time"]) or 0.0)
+            if selected_names is None:
+                raw_args = info.get("cmdline") or []
+            else:
+                try:
+                    raw_args = proc.cmdline()
+                except psutil.AccessDenied:
+                    complete = False
+                    raw_args = []
+            args = tuple(
+                str(arg).encode("utf-8", "surrogatepass") for arg in raw_args
+            ) or ((name.encode("utf-8", "surrogatepass"),) if name else ())
+            result.append((
+                ProcessIdentity(pid, int(created * 1000)),
+                ppid,
+                0,                       # no controlling terminal on Windows
+                args,
+            ))
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.AccessDenied:
+            complete = False
+            continue
+        except Exception:  # noqa: BLE001 - an unreadable process is uncertain
+            complete = False
+            continue
+        if len(result) >= MAX_PROC_SCAN:
+            return result, False
+    return result, complete
+
+
+def windows_process_cwds(
+    pids: Collection[int],
+) -> tuple[dict[int, str], bool]:
+    """Return each pid's working directory, mirroring ``_darwin_process_cwds``."""
+    psutil = _windows_psutil()
+    if psutil is None:
+        return {}, False
+    if not pids:
+        return {}, True
+    cwds: dict[int, str] = {}
+    complete = True
+    for pid in pids:
+        try:
+            cwds[pid] = psutil.Process(pid).cwd()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            # A candidate we cannot attribute leaves the scan incomplete so the
+            # caller keeps failing closed rather than guessing ownership.
+            complete = False
+        except Exception:  # noqa: BLE001
+            complete = False
+    return cwds, complete

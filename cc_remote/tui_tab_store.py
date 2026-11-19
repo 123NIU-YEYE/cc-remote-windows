@@ -1,6 +1,6 @@
 """Private, endpoint-scoped tab identities; no transcript or credentials."""
 
-import fcntl
+from cc_remote.wrapper import file_lock_compat as fcntl  # cross-platform flock
 import hashlib
 import json
 import os
@@ -57,7 +57,7 @@ class TabStore:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_path = self.path.with_suffix(".lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "a") as lock:
+        with os.fdopen(fd, "a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             latest = self._read() or clean(None)
             removed = set(self.previous["tabs"]) - set(current["tabs"])

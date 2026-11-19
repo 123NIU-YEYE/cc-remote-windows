@@ -89,6 +89,7 @@ def test_prepare_codex_daemons_starts_every_profile_best_effort(
 
 def test_default_account_check_resolves_home_even_with_legacy_none_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     cfg = WrapperConfig(
         codex_daemon_mode="auto", state_dir=tmp_path / "state", codex_profiles_json="",
@@ -153,9 +154,9 @@ def test_unavailable_profiles_preserve_account_homes(monkeypatch, tmp_path, fail
     assert receipt["profiles"][0]["home"] == str(account)
 
 
-def test_wrapper_entrypoint_initializes_work_before_optional_codex_probe(monkeypatch) -> None:
+def test_wrapper_entrypoint_initializes_work_before_optional_codex_probe(monkeypatch, tmp_path) -> None:
     events: list[str] = []
-    cfg = WrapperConfig()
+    cfg = WrapperConfig(state_dir=tmp_path / "state")
 
     class FakeTransport:
         def __init__(self, *_args, **_kwargs) -> None:

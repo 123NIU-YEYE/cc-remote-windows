@@ -1,6 +1,7 @@
 import type { AskUser, AssistantMsgEnd } from "./protocol.ts";
 import type { NotificationMode } from "./notification-mode.ts";
 import type { TurnNotificationPresentation } from "./turn-notification.ts";
+import { needsDesktopNotification, type NotificationView } from "./notification-attention.ts";
 
 type QuestionNotification = AskUser | AssistantMsgEnd;
 
@@ -12,9 +13,7 @@ export function questionNotificationId(message: QuestionNotification): string {
 export class QuestionNotificationGate {
   private readonly seen = new Set<string>();
 
-  take(machineId: string, message: QuestionNotification, view: {
-    sid: string | null; engine: string; space: string; hidden: boolean;
-  }): boolean {
+  take(machineId: string, message: QuestionNotification, view: NotificationView): boolean {
     const context = message.notification_context;
     if (!context || !message.sid || message.to) return false;
     if (message.type === "assistant_msg_end"
@@ -23,8 +22,7 @@ export class QuestionNotificationGate {
     if (this.seen.has(key)) return false;
     this.seen.add(key);
     if (this.seen.size > 256) this.seen.delete(this.seen.values().next().value!);
-    return view.hidden || message.sid !== view.sid
-      || context.engine !== view.engine || context.space !== view.space;
+    return needsDesktopNotification(message.sid, context, view);
   }
 }
 

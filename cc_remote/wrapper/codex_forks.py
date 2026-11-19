@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from cc_remote.wrapper.os_compat import fchmod, fsync_directory
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _MAX_ENTRIES = 4096
@@ -53,7 +54,7 @@ class CodexForkJournal:
         try:
             if self.path.stat().st_size > _MAX_FILE_BYTES:
                 raise ValueError("fork journal exceeds size limit")
-            with self.path.open() as stream:
+            with self.path.open(encoding="utf-8") as stream:
                 raw_text = stream.read(_MAX_FILE_BYTES + 1)
             if len(raw_text.encode("utf-8", "surrogatepass")) > _MAX_FILE_BYTES:
                 raise ValueError("fork journal exceeds size limit")
@@ -722,17 +723,13 @@ class CodexForkJournal:
             payload = json.dumps(serializable, separators=(",", ":"))
             if len(payload.encode("utf-8")) > _MAX_FILE_BYTES:
                 raise ValueError("fork journal exceeds size limit")
-            with tmp.open("w") as stream:
-                os.fchmod(stream.fileno(), 0o600)
+            with tmp.open("w", encoding="utf-8") as stream:
+                fchmod(stream.fileno(), tmp, 0o600)
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(tmp, self.path)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            fsync_directory(self.path.parent)
         except Exception as exc:
             try:
                 tmp.unlink()
@@ -746,7 +743,7 @@ def rollout_fork_meta(path: Optional[str]) -> Optional[dict[str, str]]:
     if not path:
         return None
     try:
-        with open(path) as stream:
+        with open(path, encoding="utf-8", errors="replace") as stream:
             # session_meta is normally the first record. Bound both malformed
             # leading data and record size so recovery cannot become a file scan.
             for _ in range(16):
