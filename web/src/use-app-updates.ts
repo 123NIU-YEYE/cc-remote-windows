@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { uuid } from "./util";
 import { AppUpdateClient, parseAppUpdate, parseUpdateJob, parseUpdateReceipt, UpdateIntentStore, UPDATE_TERMINAL,
   type AppUpdateState, type UpdateIntent } from "./app-updates";
 
@@ -107,7 +108,7 @@ export function useAppUpdates(enabled: boolean, machine: string, open: boolean, 
       mutation = true; mutationRevision++; operationError = null; setChanging(true); setError(null);
       // Persist BEFORE sending. An unknown acknowledgement keeps the same id
       // across page reloads; an explicit retry cannot launch a second OS job.
-      intent ??= { id: crypto.randomUUID().replaceAll("-", ""), version, coordinated };
+      intent ??= { id: uuid().replaceAll("-", ""), version, coordinated };
       intent = { id: intent.id, version: intent.version, coordinated: intent.coordinated };
       ledger.save(intent); setPending(intent);
       setPendingStatus(lookupUnsupported ? "unsupported" : "unconfirmed");

@@ -4,6 +4,7 @@ import { PanelVisible } from "../right-panel-presentation";
 import type { FilesListed } from "../protocol";
 import type { RelayWs } from "../ws";
 import { Icon } from "../icons";
+import { uuid } from "../util";
 import { PanelResizer } from "./PanelResizer";
 import { PanelCloseButton, RefreshButton } from "./PanelActions";
 import "./FileBrowserPanel.css";
@@ -36,7 +37,7 @@ export function FileBrowserPanel({ sid, initialPath, ws, hidden, onListen,
   const browse = useCallback((target: string, includeHidden: boolean,
     offset = 0, revision?: string | null) => {
     if (timeout.current) clearTimeout(timeout.current);
-    const id = crypto.randomUUID();
+    const id = uuid();
     pending.current = { id, append: offset > 0, target };
     setError(null);
     const fail = (message: string) => {
