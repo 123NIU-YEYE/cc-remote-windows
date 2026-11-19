@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import sqlite3
 import tempfile
 import threading
@@ -13,6 +14,13 @@ from cc_remote.workspaces import WorkRegistry, WorkStores
 
 
 class WorkRegistryTests(unittest.TestCase):
+    def assert_private_path(self, path, mode):
+        if sys.platform == "win32":
+            from cc_remote.windows_privacy import owned_path
+            self.assertTrue(owned_path(path, private=True))
+        else:
+            self.assertEqual(Path(path).stat().st_mode & 0o777, mode)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / "provider" / "work"
@@ -59,6 +67,7 @@ class WorkRegistryTests(unittest.TestCase):
                     updated_at REAL NOT NULL
                 )"""
             )
+        db.close()
 
         workers = 8
         barrier = threading.Barrier(workers)
@@ -87,6 +96,7 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertNotRegex(table_sql, r"session_id\s+TEXT\s+UNIQUE")
         self.assertIn("work_sessions_updated", indexes)
         self.assertIn("work_sessions_project", indexes)
+        db.close()
         self.assertIn("work_sessions_identity", indexes)
 
         primary = store.create_session(codex_profile_id="primary")
@@ -247,8 +257,8 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertIn("结论先行", context)
         self.assertEqual((workspace / "资料库" / "report.csv").read_bytes(),
                          b"name,value\nA,1\n")
-        self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((workspace / "WORK.md").stat().st_mode & 0o777, 0o600)
+        self.assert_private_path(workspace, 0o700)
+        self.assert_private_path(workspace / "WORK.md", 0o600)
 
     def test_existing_work_session_tracks_later_project_context_changes(self):
         project_id = self.store.create_project("持续项目", "初始说明")
@@ -445,6 +455,7 @@ class WorkRegistryTests(unittest.TestCase):
                    VALUES ('legacy-run', 'legacy', ?, 'queued', ?, 0, ?, ?)""",
                 (now - 1, now, now, now),
             )
+        db.close()
 
         self.assertEqual(store.assign_legacy_codex_profile("stack"), 0)
         # A second startup remains a no-op even though no topology revision was
@@ -461,6 +472,7 @@ class WorkRegistryTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(schedule_owner, "stack")
         self.assertEqual(run_owner, "stack")
+        db.close()
 
     def test_deleting_running_schedule_defers_cleanup_until_completion(self):
         now = time.time()
@@ -486,6 +498,7 @@ class WorkRegistryTests(unittest.TestCase):
                 "SELECT 1 FROM work_schedule_runs WHERE run_id = ?",
                 (run["run_id"],),
             ).fetchone())
+        db.close()
 
     def test_delete_session_removes_only_registry_owned_random_directory(self):
         record = self.store.create_session()
@@ -535,6 +548,7 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(records[os.path.realpath(unbound.cwd)].work_id,
                          unbound.work_id)
 
+    @unittest.skipIf(sys.platform == "win32", "Windows symlink privileges are optional")
     def test_artifacts_list_only_user_deliverables_inside_private_workspace(self):
         record = self.store.create_session()
         self.store.bind_session(record.work_id, "session-1")
@@ -574,7 +588,7 @@ class WorkRegistryTests(unittest.TestCase):
         workspace = Path(record.cwd)
 
         self.assertTrue((workspace / "uploads").is_dir())
-        self.assertEqual((workspace / "uploads").stat().st_mode & 0o777, 0o700)
+        self.assert_private_path(workspace / "uploads", 0o700)
         self.assertTrue(
             (workspace / "uploads" / ".cc-remote-upload-root").is_file())
         self.assertFalse((workspace.parent / "uploads").exists())
@@ -629,7 +643,7 @@ class WorkRegistryTests(unittest.TestCase):
                          [record.cwd])
         self.assertEqual(payload["sandbox"]["filesystem"]["allowWrite"],
                          [record.cwd])
-        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        self.assert_private_path(policy, 0o600)
 
     def test_repeated_initialize_does_not_rebuild_profile_identity_index(self):
         self.store.initialize()
@@ -639,11 +653,13 @@ class WorkRegistryTests(unittest.TestCase):
                 "SELECT sql FROM sqlite_master "
                 "WHERE type = 'index' AND name = 'work_sessions_identity'"
             ).fetchone()[0]
+        db.close()
 
         self.store.initialize()
 
         with sqlite3.connect(self.store.db_path) as db:
             after = db.execute("PRAGMA schema_version").fetchone()[0]
+        db.close()
         self.assertIn("claude_profile_id", index_sql)
         self.assertEqual(after, before)
 
@@ -688,7 +704,7 @@ class WorkRegistryTests(unittest.TestCase):
             payload["env"]["CLAUDE_CODE_OAUTH_TOKEN"],
             "rotated-token",
         )
-        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        self.assert_private_path(policy, 0o600)
 
 
 if __name__ == "__main__":
