@@ -27,7 +27,7 @@ from cc_remote import __version__
 from cc_remote.config import RelayConfig
 from cc_remote.log import logger
 from cc_remote.protocol import (
-    Error, ProtocolError, WrapperDisconnected, WrapperReconnected,
+    Error, Pong, ProtocolError, WrapperDisconnected, WrapperReconnected,
     PROTOCOL_VERSION, deserialize, is_client_message, serialize,
     ERR_BUSY, ERR_WRAPPER_OFFLINE, ERR_WRAPPER_ALREADY_CONNECTED, ERR_PROTOCOL,
 )
@@ -326,6 +326,13 @@ class RelayHub:
                     self.remember_wrapper_version(machine_id, PROTOCOL_VERSION,
                                                   getattr(ws, "headers", {}).get("x-cc-remote-version"))
                 assert machine_id is not None
+                if msg.type == "ping":
+                    # Transport keepalives terminate at this authenticated
+                    # socket. They must work without browsers and never enter
+                    # session routing, replay or notification hooks.
+                    async with self._wrapper_send_lock_for(machine_id):
+                        await ws.send_text(serialize(Pong(n=msg.n)))
+                    continue
                 await self._on_wrapper_msg(msg, machine_id)
         except WebSocketDisconnect:
             pass

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from cc_remote.protocol import (
-    Delta, Hello, Query, TurnEnd, TurnNotificationContext, TurnResult, serialize,
+    Delta, Hello, Ping, Query, TurnEnd, TurnNotificationContext, TurnResult, serialize,
 )
 from cc_remote.relay.forward import ClientConn, SlowClientError
 from cc_remote.relay import pairing
@@ -35,6 +35,69 @@ class ScriptedWs(FakeWs):
     def __init__(self):
         super().__init__()
         self.block.set()
+
+
+@pytest.mark.parametrize("machine_id", ["default", "device-a"])
+def test_wrapper_application_keepalive_is_answered_without_browser(machine_id, monkeypatch):
+    from cc_remote.wrapper import transport as transport_module
+
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+        wrapper = ScriptedWs()
+        replies = asyncio.Queue()
+
+        async def send_text(raw):
+            wrapper.sent.append(raw)
+            await replies.put(raw)
+
+        wrapper.send_text = send_text
+
+        class Socket:
+            async def send(self, raw):
+                await wrapper.incoming.put(raw)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await replies.get()
+
+        transport = transport_module.WrapperTransport("ws://relay/ws", "secret")
+        socket = Socket()
+        await socket.send(serialize(Hello(role="wrapper", machine_id=machine_id)))
+        server = asyncio.create_task(hub.serve_wrapper(wrapper, machine_id))
+        receiver = asyncio.create_task(transport._receiver(socket))
+        keepalive = asyncio.create_task(transport._keepalive(socket))
+        try:
+            async with asyncio.timeout(1):
+                while len(wrapper.sent) < 3:
+                    await asyncio.sleep(0.001)
+            assert not keepalive.done()
+            assert [json.loads(raw)["n"] for raw in wrapper.sent] == [1, 2, 3]
+            assert all(json.loads(raw)["type"] == "pong" for raw in wrapper.sent)
+            assert transport._inbox.qsize() == 0
+            assert hub.client_count == 0
+        finally:
+            for task in (server, receiver, keepalive):
+                task.cancel()
+            await asyncio.gather(server, receiver, keepalive, return_exceptions=True)
+
+    monkeypatch.setattr(transport_module, "_APPLICATION_PING_INTERVAL", 0.005)
+    monkeypatch.setattr(transport_module, "_APPLICATION_PING_TIMEOUT", 0.1)
+    asyncio.run(run())
+
+
+def test_wrapper_ping_cannot_replace_authenticated_hello():
+    async def run():
+        hub = RelayHub(SimpleNamespace())
+        ws = ScriptedWs()
+        await ws.incoming.put(serialize(Ping(n=1)))
+        await hub.serve_wrapper(ws, "device-a")
+        assert not hub.wrapper_connected
+        assert not any(json.loads(raw)["type"] == "pong" for raw in ws.sent)
+        assert ws.closed
+
+    asyncio.run(run())
 
 
 def test_client_queue_is_bounded_by_items_and_bytes():
