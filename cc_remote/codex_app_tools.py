@@ -237,8 +237,8 @@ def _manifest_hash(entry: dict) -> str:
     ).encode()).hexdigest()
 
 
-def _runtime_fingerprint(node: Path) -> str:
-    info = node.stat()
+def _runtime_fingerprint(node: Path, *, descriptor: int | None = None) -> str:
+    info = node.stat() if descriptor is None else os.fstat(descriptor)
     return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
 
 
@@ -262,11 +262,15 @@ def discover(profile: Path, app: Path, expected_manifest: str | None = None) -> 
             pipe = _pipe_from_open_logs(pid, bundle_id)
             if pipe is None:
                 continue
-            runtime = _runtime_fingerprint(node)
-            _signed(app.resolve())
-            _signed(node)
-            if _runtime_fingerprint(node) != runtime:
-                continue  # An updater replaced the runtime during validation.
+            # Pin the original inode until validation finishes. A fast updater
+            # can otherwise replace it twice and reuse the same inode, size and
+            # filesystem timestamp, making a changed runtime look unchanged.
+            with node.open("rb") as pinned:
+                runtime = _runtime_fingerprint(node, descriptor=pinned.fileno())
+                _signed(app.resolve())
+                _signed(node)
+                if _runtime_fingerprint(node) != runtime:
+                    continue  # An updater replaced the runtime during validation.
             socket = _private_socket(pipe)
             if process_owner_uid(pid) != os.getuid() or process_identity(pid) != identity:
                 continue

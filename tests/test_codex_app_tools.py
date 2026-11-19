@@ -155,9 +155,11 @@ def test_changed_official_policy_cannot_use_old_approval_rules(monkeypatch, tmp_
 
 
 def test_discovery_rejects_two_matching_apps_and_pid_reuse(monkeypatch, tmp_path):
+    node = tmp_path / "node"
+    node.write_text("runtime")
     monkeypatch.setattr(tools.sys, "platform", "darwin")
     monkeypatch.setattr(tools, "socket_identity", lambda _path: (0, 0, 0))
-    monkeypatch.setattr(tools, "app_paths", lambda _app: (tmp_path, tmp_path, tmp_path, "test"))
+    monkeypatch.setattr(tools, "app_paths", lambda _app: (tmp_path, node, tmp_path, "test"))
     monkeypatch.setattr(tools, "_signed", lambda _path: None)
     monkeypatch.setattr(tools, "_matching_app_pids", lambda _exe: [41, 42])
     monkeypatch.setattr(tools, "process_identity", lambda pid: ProcessIdentity(pid, 1))
