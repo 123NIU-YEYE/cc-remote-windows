@@ -1,6 +1,7 @@
 """Native video file permissions and HTTP ranges across the real binary channel."""
 import asyncio
 import base64
+import os
 from functools import partial
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -55,6 +56,9 @@ def test_video_descriptor_owner_expiry_file_identity_and_deletion(tmp_path):
         with path.open("r+b") as writer:
             writer.seek(20)
             writer.write(b"changed")
+        # A fast in-place write can share the original timestamp on VPS disks.
+        info = path.stat()
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
         with pytest.raises(PermissionError):
             store.validate(key, "owner-a", stream)
     with pytest.raises(PermissionError):

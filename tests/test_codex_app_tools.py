@@ -276,7 +276,11 @@ def test_runtime_update_changes_generation_without_app_or_pipe_restart(monkeypat
 
 def test_runtime_replaced_during_signature_validation_stays_unavailable(monkeypatch, tmp_path):
     node = _ready_app(monkeypatch, tmp_path)
-    monkeypatch.setattr(tools, "_signed", lambda _path: node.write_text("replacement"))
+    def replace_runtime(_path):
+        replacement = tmp_path / "replacement-node"
+        replacement.write_text("replacement")
+        replacement.replace(node)
+    monkeypatch.setattr(tools, "_signed", replace_runtime)
     assert tools.discover(tmp_path, tmp_path)["state"] == "unavailable"
 
 

@@ -2,10 +2,17 @@
 from __future__ import annotations
 
 import argparse
-from cc_remote.wrapper import file_lock_compat as fcntl
 import os
 from pathlib import Path
 import stat
+import sys
+
+if os.name == "nt":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from cc_remote.wrapper import file_lock_compat as fcntl
+else:
+    # Installers can copy this stdlib-only bootstrap before the package exists.
+    import fcntl
 
 LOCK_FD_ENV = "CC_REMOTE_INSTALL_LOCK_FD"
 
