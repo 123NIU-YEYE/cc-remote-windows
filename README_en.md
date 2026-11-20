@@ -127,7 +127,7 @@ Check that the computer is awake, Wrapper is running and the Relay address is re
 
 **Will a notification appear when a task finishes?**
 
-Allow notifications for the site in your browser and enable the relevant alerts in the app. Use HTTPS for public access. OS focus modes and browser settings affect delivery. Notifications after closing the page require Web Push setup; browser permission alone does not ensure delivery. See [notification configuration](docs/configuration_en.md).
+Enable Web Push on the server and enable alerts and notification permission separately on each phone. On iPhone, use iOS 16.4+ and launch the site after adding it to the home screen with Safari. On Android, use a browser supporting Web Push. See the [phone notification guide](docs/mobile-notifications_en.md) for setup, delivery checks and click navigation.
 
 **Do I need a paid model account?**
 
@@ -168,6 +168,7 @@ Web/PWA is the main interface. See [Desktop compatibility](docs/desktop.md) for 
 | Start locally on Windows | [Windows quick start](docs/windows-quickstart_en.md) |
 | Install, deploy or upgrade | [Installation and upgrades](docs/installation_en.md) |
 | Set up accounts, proxies, devices and notifications | [Configuration, accounts and data](docs/configuration_en.md) |
+| Receive task alerts on Android or iPhone | [Phone notifications](docs/mobile-notifications_en.md) |
 | Connect DSH | [DSH guide](docs/dsh-integration.md) |
 | Open static pages and media | [Remote Viewer](docs/remote-viewer.md) |
 | Use a terminal interface | [TUI guide](docs/tui.md) |

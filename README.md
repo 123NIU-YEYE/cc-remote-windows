@@ -131,7 +131,7 @@ Claude Work 启动时要求系统沙箱，原生 Windows 不能满足。请切�
 
 **任务结束会有右下角通知吗？**
 
-需要在浏览器允许该站点发送通知，并在网页设置中启用相应提醒。公网使用 HTTPS；操作系统的专注模式、浏览器设置也会影响弹窗。关闭页面后的通知需额外配置 Web Push，不能仅凭已允许权限就保证送达。见 [通知配置](docs/configuration.md)。
+需要服务端启用 Web Push，并在每台手机上分别开启提醒与通知权限。iPhone 需 iOS 16.4+，从 Safari 添加到主屏幕后启动；安卓使用支持 Web Push 的浏览器。完整步骤、测试方式及点击跳转说明见 [手机任务通知指南](docs/mobile-notifications.md)。
 
 **模型账号还要另外付费吗？**
 
@@ -172,6 +172,7 @@ cc-remote 本身开源，不附带模型额度。消息、侧聊和原生任务�
 | 在 Windows 本机开始使用 | [Windows 入门](docs/windows-quickstart.md) |
 | 安装、部署或升级服务 | [安装与升级](docs/installation.md) |
 | 配置多账号、代理、设备和通知 | [配置、账号与数据](docs/configuration.md) |
+| 在安卓或 iPhone 上接收任务弹窗 | [手机任务通知](docs/mobile-notifications.md) |
 | 接入 DSH | [DSH 指南](docs/dsh-integration.md) |
 | 查看静态网页和媒体产物 | [远程 Viewer](docs/remote-viewer.md) |
 | 使用终端界面 | [TUI 中文指南](docs/tui_zh.md) |
