@@ -1894,7 +1894,8 @@ class SessionMigrated(_Base):
 class ListDir(_Command):
     """client -> wrapper: list subdirectories of a path on the wrapper host.
     Used by the directory picker when creating a session in an arbitrary cwd.
-    path=None starts at $HOME."""
+    path=None starts at $HOME. Windows drive roots expose the navigation-only
+    `::drives::` parent; listing it returns drive roots, never a usable cwd."""
     type: Literal["list_dir"] = "list_dir"
     path: Optional[str] = Field(default=None, max_length=4096)
 
@@ -1902,7 +1903,8 @@ class ListDir(_Command):
 class DirList(_Base):
     """wrapper -> client: subdirectories of the requested path. One-shot like
     SessionList (not buffered/replayed). `parent` is the parent dir for the
-    "go up" button; null at filesystem root. Hidden dirs (dotfiles) are omitted."""
+    "go up" button; null at filesystem root or the Windows drive list.
+    Hidden dirs (dotfiles) are omitted."""
     type: Literal["dir_list"] = "dir_list"
     path: str
     parent: Optional[str] = None

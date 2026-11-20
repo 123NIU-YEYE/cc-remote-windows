@@ -1,4 +1,5 @@
 import { MobileSidebarFixture } from "./fixtures/mobile-sidebar";
+import { WorkspaceDrivesFixture } from "./fixtures/workspace-drives";
 import DirectoryActionSheet from "../src/components/DirectoryActionSheet";
 import type { DirectoryActionScope } from "../src/protocol";
 import { RightPanelPresentation } from "../src/right-panel-presentation";
@@ -3270,7 +3271,8 @@ function CodexFileCitationFixture() {
 
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
-  rootParams.has("mobile-sidebar") ? <MobileSidebarFixture />
+  rootParams.has("workspace-drives") ? <WorkspaceDrivesFixture />
+    : rootParams.has("mobile-sidebar") ? <MobileSidebarFixture />
     : rootParams.has("completion-reading") ? <CompletionReadingFixture />
     : rootParams.has("rewind") ? <RewindFixture />
     : rootParams.has("quota-layout") ? <QuotaLayoutFixture />

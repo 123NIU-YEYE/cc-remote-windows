@@ -466,6 +466,7 @@ export interface WorkPluginInfo { plugin_id: string; project_id?: string | null;
 export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; claude_profile_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; last_run_id?: string | null; last_run_status?: "queued" | "claimed" | "running" | "succeeded" | "failed" | null; last_run_attempt?: number | null; created_at: number; updated_at: number }
 export interface WorkDashboard extends Base { type: "work_dashboard"; engine: Engine; projects: WorkProjectInfo[]; sources: WorkSourceInfo[]; plugins: WorkPluginInfo[]; schedules: WorkScheduleInfo[] }
 export interface DirEntry { name: string; path: string }
+// Windows drive roots use the navigation-only ::drives:: parent. It is never a cwd.
 export interface ListDir extends Base { type: "list_dir"; path?: string | null }
 export interface DirList extends Base { type: "dir_list"; path: string; parent?: string | null; dirs: DirEntry[]; request_id?: string | null }
 export interface SetPerm extends Base { type: "set_perm"; mode: PermissionMode }

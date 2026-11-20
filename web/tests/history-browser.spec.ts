@@ -4,6 +4,37 @@ import { readFileSync } from "node:fs";
 import { pngChunk, staticPng } from "./fixtures/png";
 import { PROTOCOL_VERSION, type ServerEvent } from "../src/protocol";
 
+for (const width of [390, 1100]) {
+  test(`workspace drive picker returns from C root to all disks at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 760 });
+    await page.goto("/tests/history-browser.html?workspace-drives=1");
+    const dialog = page.getByRole("dialog", { name: "选择本地工作区" });
+    const confirm = dialog.getByRole("button", { name: "在此创建" });
+    await expect(dialog.locator(".dp-crumbs")).toHaveText("C:\\");
+    await dialog.getByRole("button", { name: "返回上级（此电脑）" }).click();
+    await expect(dialog.locator(".dp-crumbs")).toHaveText("此电脑");
+    await expect(dialog.getByRole("button", { name: "C:\\", exact: true })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "D:\\", exact: true })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: /返回上级/ })).toHaveCount(0);
+    await expect(confirm).toBeDisabled();
+    const manual = dialog.getByRole("textbox");
+    await manual.fill("::drives::");
+    await manual.press("Enter");
+    await expect(page.getByTestId("drive-picker-confirmed")).toBeEmpty();
+    await expect(confirm).toBeDisabled();
+    await manual.fill("");
+    await dialog.getByRole("button", { name: "D:\\", exact: true }).click();
+    await expect(dialog.locator(".dp-crumbs")).toHaveText("D:\\");
+    await expect(dialog.getByRole("button", { name: "Projects", exact: true })).toBeVisible();
+    await dialog.getByRole("button", { name: "Projects", exact: true }).click();
+    await expect(dialog.locator(".dp-crumbs")).toHaveText("D:\\Projects");
+    await expect(confirm).toBeEnabled();
+    await confirm.click();
+    await expect(page.getByTestId("drive-picker-confirmed")).toHaveText("D:\\Projects");
+    expect(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+  });
+}
+
 test("Claude rewind keeps long prompts bounded and requires explicit capsule confirmation", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 375, height: 740 });
   await page.goto("/tests/history-browser.html?rewind=1");

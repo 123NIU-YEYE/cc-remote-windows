@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import type { DirEntry } from "../protocol";
 import { Icon } from "../icons";
 import { useImeSubmit } from "../use-ime-submit";
+import { WINDOWS_DRIVES_PATH, selectedWorkspacePath } from "../directory-picker";
 
 interface Props {
   open: boolean;
@@ -51,7 +52,7 @@ export function DirPicker({
       : null,
   );
   const imeSubmit = useImeSubmit<HTMLInputElement>((value) => {
-    const cwd = value.trim() || (pendingBrowse === null ? path : null);
+    const cwd = selectedWorkspacePath(value, path, pendingBrowse !== null);
     if (cwd) onConfirm(cwd);
   });
   // Each open starts from its caller-owned path so stale state from a previous
@@ -86,6 +87,7 @@ export function DirPicker({
   };
   const listingPending = pendingBrowse !== null;
   const visiblePath = listingPending ? pendingBrowse.path : path;
+  const visibleLabel = visiblePath === WINDOWS_DRIVES_PATH ? "此电脑" : visiblePath || "…";
   const visibleParent = listingPending ? null : parent;
   const visibleDirs = listingPending ? [] : dirs;
   return (
@@ -96,19 +98,21 @@ export function DirPicker({
           <button className="iconbtn" onClick={onClose} disabled={busy}
             aria-label="关闭"><Icon name="close" /></button>
         </div>
-        <div className="dp-crumbs" title={visiblePath || ""}>
-          {visiblePath || "…"}
+        <div className="dp-crumbs" title={visibleLabel}>
+          {visibleLabel}
         </div>
         <div className="dp-list">
           {visibleParent && (
             <button className="dp-row up" onClick={() => browse(visibleParent)} disabled={busy}>
-              <Icon name="back" size={14} /><span>返回上级</span>
+              <Icon name="back" size={14} /><span>{visibleParent === WINDOWS_DRIVES_PATH
+                ? "返回上级（此电脑）" : "返回上级"}</span>
             </button>
           )}
           {listingPending
             ? <div className="dp-empty">正在读取目录…</div>
             : visibleDirs.length === 0
-              && <div className="dp-empty">无可见子目录</div>}
+              && <div className="dp-empty">{visiblePath === WINDOWS_DRIVES_PATH
+                ? "没有可用磁盘" : "无可见子目录"}</div>}
           {visibleDirs.map((d) => (
             <button key={d.path} className="dp-row" onClick={() => browse(d.path)}
               title={d.path} disabled={busy}>
@@ -141,7 +145,7 @@ export function DirPicker({
             onPointerDown={imeSubmit.commitCompositionBeforePointerSubmit}
             onClick={imeSubmit.requestSubmit}
             disabled={
-              busy || !(manual.trim() || (!listingPending && path))
+              busy || !selectedWorkspacePath(manual, path, listingPending)
             }>
             {busy
               ? <><span className="dp-spinner" />迁移中…</>

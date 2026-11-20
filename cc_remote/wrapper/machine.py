@@ -268,6 +268,7 @@ from cc_remote.wrapper.sdk import (
     same_claude_model_selection,
 )
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
+from cc_remote.wrapper.directory_picker import scan_directory
 from cc_remote.wrapper.claude_work_runtime import (
     ClaudeWorkSandboxUnavailable,
     WORK_SANDBOX_UNAVAILABLE,
@@ -37616,27 +37617,7 @@ class WrapperMachine:
 
     @staticmethod
     def _scan_dir(path: Optional[str]) -> tuple[str, Optional[str], list[dict[str, str]]]:
-        base = path or os.path.expanduser("~")
-        base = os.path.realpath(os.path.expanduser(base))
-        if not os.path.isdir(base):
-            raise FileNotFoundError(base)
-        parent = os.path.dirname(base) or None
-        if parent and os.path.realpath(parent) == base:
-            parent = None
-        dirs: list[dict[str, str]] = []
-        try:
-            with os.scandir(base) as entries:
-                for entry in entries:
-                    if entry.name.startswith("."):
-                        continue
-                    if entry.is_dir(follow_symlinks=True):
-                        dirs.append({"name": entry.name[:255], "path": entry.path[:4096]})
-                        if len(dirs) >= 1000:
-                            break
-            dirs.sort(key=lambda item: item["name"])
-        except PermissionError:
-            pass
-        return base, parent, dirs
+        return scan_directory(path)
 
     @staticmethod
     def _bg_blocked_session_ids(
