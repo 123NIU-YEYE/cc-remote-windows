@@ -4,7 +4,7 @@
 
 连接本机的 Claude Code、Codex 或 DSH，查看进度、回答询问、补充指令，随时回到同一个会话。
 
-[English](README_en.md) · [Windows 入门](docs/windows-quickstart.md) · [安装与部署](#安装与升级) · [常见问题](#faq) · [文档](#文档)
+[English](README_en.md) · [Windows 入门](docs/windows-quickstart.md) · [安装与部署](#安装与升级) · [桌面与网页协同](#桌面端与网页一起使用) · [常见问题](#faq) · [文档](#文档)
 
 本仓库基于 [muggle-stack/cc-remote](https://github.com/muggle-stack/cc-remote)，增加 Windows 适配，以及连接恢复、长会话历史和本地文件访问等改进。采用自托管方式：你运行自己的服务，使用已有的模型账号。
 
@@ -82,6 +82,46 @@
 
 更新前保留配置与数据，等待正在运行和排队中的任务结束。具体上线、回滚和验证步骤见 [部署流程](deploy/README.md)。
 
+## 桌面端与网页一起使用
+
+如果电脑上能用，网页里同一会话却显示「只读」「被本机占用」或无法发送，先检查下面的连接方式。三种引擎的会话共享机制不同。
+
+| 引擎 | 常见原因 | 处理方法 |
+|---|---|---|
+| **Codex** | App、终端或 Wrapper 启动了不同的后端，同一会话出现控制权冲突 | 让三端使用同一账号、同一 `CODEX_HOME` 和同一个官方 app-server daemon |
+| **Claude Code** | 本地 Claude CLI、Desktop 或 Agent View 正在持有会话，网页按只读方式镜像 | 本地任务结束后正常释放会话，再从网页恢复；或在确认影响后使用页面提供的主动接管 |
+| **DeepSeek Harness（DSH）** | Wrapper 配对到另一实例、旧端口或已轮换的控制凭据 | 配对桌面实际使用的兼容本地 API，保持同一 DSH 实例与原生会话 |
+
+### Codex：使用共享 daemon 的启动入口
+
+共享 daemon 是电脑上的官方会话服务。将 **Codex App、Codex 终端和 cc-remote Wrapper** 连到它，可以避免各自运行后端导致的会话占用冲突；是否可输入仍遵循原生会话的运行、排队和审批状态。
+
+在已配置共享入口的 Windows 电脑上：
+
+1. 使用桌面或开始菜单中的 **Codex Shared** 打开 Codex App。
+2. 需要终端时，使用 **Codex CLI Shared**，它显式连接同一个 daemon。
+3. 在网页中选择对应设备、同一账号下的 **Codex → Code** 会话。
+
+这两个快捷方式需要先单独配置，克隆仓库不会自动生成。首次配置见 [Windows 共享入口](docs/windows-quickstart.md#codex-shared-entry)；macOS/Linux 分别参考 [macOS 共享启动器](docs/codex-desktop-launcher.md)与 [Linux 共享连接](docs/codex-desktop-linux.md)。
+
+如果 App 已通过普通入口连接到另一个后端，先完成任务并正常退出，再用共享入口打开。账号目录相同、能看到历史，都不足以证明共享成功；应核对 App、终端和 Wrapper 实际连接的服务。该方法适用于 **Codex Code**，Work 使用独立后端。网络和模型账号仍需正常可用。
+
+### Claude：先交接会话控制权
+
+Claude 不使用 Codex 的共享 daemon。网页发现本地客户端持有同一会话时，会先只读展示历史和进度，避免两个进程同时写入。
+
+本地任务完成后，在本地正常退出或释放该会话，再从网页重新进入。若页面提供「接管」，请先确认本地工作可以结束，再主动接管；接管可能终止当前本地 Claude 进程，不应当作无中断切换。需要桌面和网页各自处理任务时，使用不同会话。
+
+原生控制权规则见 [Claude 配置说明](docs/configuration.md#claude)。独立 Claude session service 用于保留 Wrapper 管理的任务，不会让原生 Claude 终端获得与 Codex 相同的共享输入能力。
+
+### DeepSeek Harness：连接同一个本地 API
+
+这里的 DeepSeek 指 **DeepSeek Harness（DSH）**。它通过自己的官方本地 API 接入，不使用 Codex daemon，也不通过配对模型 API Key 来共享会话。
+
+先确认桌面所用的 DSH 实例提供兼容的本地 API，并加载所需的 cc-remote 元数据扩展；将 Wrapper 配对到这个正在运行的实例。桌面重启后，如果 API 端口或控制凭据发生变化，需要重新配对。网页中还要选中同一设备、DSH 引擎和同一个原生会话。
+
+不要另外启动一个 DSH 实例来替代桌面原来的连接。若该桌面版本没有兼容 API，此共享方式不可用。运行中的消息是否接受、引导或排队由 DSH 决定。配对步骤和版本要求见 [DSH 接入指南](docs/dsh-integration.md#local-setup)。
+
 ## 日常使用
 
 在输入框输入 `/`，查看当前引擎可用的命令。
@@ -128,6 +168,10 @@ Claude Work 启动时要求系统沙箱，原生 Windows 不能满足。请切�
 **为什么提示设备离线或等待重连？**
 
 依次确认电脑未休眠、Wrapper 仍在运行、Relay 网址可访问。临时隧道地址变化后，两端连接配置也要更新。排查步骤见 [Windows 连接排错](docs/windows-quickstart.md#connection-troubleshooting)。
+
+**电脑上能用，网页却提示会话被占用？**
+
+按 [三种引擎的协同方式](#桌面端与网页一起使用)排查：Codex 共用官方 daemon，Claude 交接会话控制权，DSH 配对同一个本地 API。先核对已有任务和发送结果，再决定是否重发。
 
 **任务结束会有右下角通知吗？**
 

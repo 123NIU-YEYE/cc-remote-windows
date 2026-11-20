@@ -169,7 +169,54 @@ Check whether Relay is already running before starting another process. To use a
 
 ### How do I connect Codex?
 
-Install and sign in to the official Codex CLI first. Shared sessions require Wrapper and the terminal to connect to the same official app-server; Windows supports an explicit loopback WebSocket endpoint. See [Windows compatibility](windows-upstream-migration.md) and [shared-control acceptance](../deploy/README.md#codex-code-shared-control-plane-acceptance). The first-message walkthrough above uses Claude Code.
+Install and sign in to the official Codex CLI first. Shared sessions require Wrapper and the terminal to connect to the same official app-server; Windows supports an explicit loopback WebSocket endpoint. See [desktop and Web sharing](../README_en.md#use-desktop-and-web-together) for the differences between the three engines.
+
+<a id="codex-shared-entry"></a>
+
+### Codex shared entry points on Windows
+
+On a computer with shared launchers configured, **Codex Shared** opens App and **Codex CLI Shared** opens the terminal. Codex Code in Web must use the same account and daemon. These are local shortcut names, not official Codex commands, and `git clone` does not install them.
+
+Complete [shared-control acceptance](../deploy/README.md#codex-code-shared-control-plane-acceptance) first, then use the repository's [`cc_remote.codex_windows_shared`](../cc_remote/codex_windows_shared.py) module. Let the old App's work finish and quit normally; preserve running App, terminal and daemon processes during setup.
+
+Run the example below from this repository directory. It requires the official Codex App installed as a Windows application package and the current account's official daemon already reporting `running`. It selects a matching official CLI in the current PowerShell session and launches App through a loopback-only bridge:
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$daemonInfo = codex app-server daemon version | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or $daemonInfo.status -ne 'running') {
+    throw 'Start the selected account daemon normally before configuring sharing.'
+}
+$package = Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $package) { throw 'The official Codex App package is not installed.' }
+$manifest = Get-AppxPackageManifest -Package $package.PackageFullName
+$relativeApp = $manifest.Package.Applications.Application | Select-Object -First 1 -ExpandProperty Executable
+$appPath = Join-Path $package.InstallLocation $relativeApp
+$env:PYTHON_DOTENV_DISABLED = '1'
+$env:CODEX_HOME = $codexHome
+$env:CODEX_BIN = $daemonInfo.managedCodexPath
+$selectedVersion = & $env:CODEX_BIN --version
+if ($LASTEXITCODE -ne 0 -or $selectedVersion -ne ('codex-cli ' + $daemonInfo.appServerVersion)) {
+    throw 'CLI and running daemon versions must match; finish active work before updating.'
+}
+.\.venv\Scripts\python.exe -X utf8 -m cc_remote.codex_windows_shared app --home $codexHome --port 8766 --app $appPath
+```
+
+These variables affect only this terminal and its children. From the same PowerShell session, check App's actual connection:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m cc_remote.codex_windows_shared check --home $codexHome --port 8766 --app $appPath
+```
+
+`state: verified` means that App currently connects to the selected daemon's local bridge. Use the matching CLI to explicitly connect to the same endpoint:
+
+```powershell
+& $env:CODEX_BIN --remote ws://127.0.0.1:8766
+```
+
+An operator can save these verified launch paths as **Codex Shared** and **Codex CLI Shared** shortcuts. Keep installation paths, Python locations and account directories local. Recheck after App, CLI or Wrapper updates and keep the bridge port on loopback.
+
+Once App and terminal connections pass, verify that Wrapper's corresponding account reaches the same official service. Seeing the same history files alone does not establish three-client sharing; read-only connection checks also do not prove live model replies. This applies to **Codex Code** and preserves Work's private backend.
 
 ### Desktop notifications do not appear
 

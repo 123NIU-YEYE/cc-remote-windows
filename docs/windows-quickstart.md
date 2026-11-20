@@ -169,7 +169,54 @@ Claude Work 必须启动系统沙箱。Claude 官方目前支持 macOS、Linux �
 
 ### 怎样接入 Codex
 
-先安装并登录官方 Codex CLI。与本地终端共享会话需要 Wrapper 和终端连接同一个官方 app-server；Windows 支持显式的 loopback WebSocket 接入。配置边界见 [Windows 适配说明](windows-upstream-migration.md)及[共享控制验收](../deploy/README.md#codex-code-shared-control-plane-acceptance)。本指南的第一条消息流程以 Claude Code 为例。
+先安装并登录官方 Codex CLI。与本地终端共享会话需要 Wrapper 和终端连接同一个官方 app-server；Windows 支持显式的 loopback WebSocket 接入。完整的三引擎区别见 [桌面端与网页协同](../README.md#桌面端与网页一起使用)。
+
+<a id="codex-shared-entry"></a>
+
+### Windows 上的 Codex 共享入口
+
+在已完成共享入口配置的电脑上，**Codex Shared** 用于 App，**Codex CLI Shared** 用于终端。网页中的 Codex Code 也要连接同一账号的同一个 daemon。这两个名称是本地快捷方式，不是 Codex 官方命令，也不会随着 `git clone` 自动安装。
+
+首次配置先完成 [共享控制验收](../deploy/README.md#codex-code-shared-control-plane-acceptance)，再使用仓库的 [`cc_remote.codex_windows_shared`](../cc_remote/codex_windows_shared.py) 模块。先让旧 App 的任务完成并正常退出；不要在运行中强行关闭 App、终端或 daemon。
+
+下面的示例从本仓库目录运行，要求官方 Codex App 已通过 Windows 应用包安装，并且当前账号的官方 daemon 已处于 `running` 状态。它在当前 PowerShell 中选择匹配的官方 CLI，通过仅监听本机的桥接入口启动 App：
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$daemonInfo = codex app-server daemon version | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or $daemonInfo.status -ne 'running') {
+    throw 'Start the selected account daemon normally before configuring sharing.'
+}
+$package = Get-AppxPackage -Name OpenAI.Codex | Sort-Object Version -Descending | Select-Object -First 1
+if (-not $package) { throw 'The official Codex App package is not installed.' }
+$manifest = Get-AppxPackageManifest -Package $package.PackageFullName
+$relativeApp = $manifest.Package.Applications.Application | Select-Object -First 1 -ExpandProperty Executable
+$appPath = Join-Path $package.InstallLocation $relativeApp
+$env:PYTHON_DOTENV_DISABLED = '1'
+$env:CODEX_HOME = $codexHome
+$env:CODEX_BIN = $daemonInfo.managedCodexPath
+$selectedVersion = & $env:CODEX_BIN --version
+if ($LASTEXITCODE -ne 0 -or $selectedVersion -ne ('codex-cli ' + $daemonInfo.appServerVersion)) {
+    throw 'CLI and running daemon versions must match; finish active work before updating.'
+}
+.\.venv\Scripts\python.exe -X utf8 -m cc_remote.codex_windows_shared app --home $codexHome --port 8766 --app $appPath
+```
+
+这些变量仅影响当前终端及其子进程。使用同一个 PowerShell，可读取 App 的实际连接验收结果：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m cc_remote.codex_windows_shared check --home $codexHome --port 8766 --app $appPath
+```
+
+`state: verified` 表示该 App 当前连到了所选 daemon 的本机桥接。再用匹配的 CLI 显式连接同一入口：
+
+```powershell
+& $env:CODEX_BIN --remote ws://127.0.0.1:8766
+```
+
+部署者可以把这两种已验证的启动方式保存为 **Codex Shared** 与 **Codex CLI Shared** 快捷方式。安装位置、Python 路径和账号目录应保存在本机；App、CLI 或 Wrapper 更新后重新核对连接，不要向公网开放这个本机端口。
+
+App 与终端的连接通过后，还要确认 Wrapper 对应账号连接的是同一个官方服务。仅能看到相同的历史文件不足以证明三端共享；只读连接验收也不等于已经验证真实模型回复。此方式适用于 **Codex Code**，不改变 Work 的独立后端。
 
 ### 没有桌面通知
 

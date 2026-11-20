@@ -4,7 +4,7 @@
 
 Connect to Claude Code, Codex or DSH on your machine. Follow progress, answer questions and add instructions without leaving the conversation.
 
-[中文](README.md) · [Windows quick start](docs/windows-quickstart_en.md) · [Installation](#install-and-upgrade) · [FAQ](#faq) · [Documentation](#documentation)
+[中文](README.md) · [Windows quick start](docs/windows-quickstart_en.md) · [Installation](#install-and-upgrade) · [Desktop and Web](#use-desktop-and-web-together) · [FAQ](#faq) · [Documentation](#documentation)
 
 This fork of [muggle-stack/cc-remote](https://github.com/muggle-stack/cc-remote) adds Windows compatibility and improvements to reconnects, long conversation history and local file access. It is self-hosted: you run the service and use your existing model accounts.
 
@@ -80,6 +80,46 @@ Upstream managed installations can run `cc-remote update --check` from an indepe
 
 Preserve configuration and data, and let running and queued tasks finish before switching. See the [deployment procedure](deploy/README.md) for activation, rollback and acceptance.
 
+## Use desktop and Web together
+
+If a conversation works on your computer but Web reports read-only access, local ownership or an inability to send, check the connection path below. The three engines have different session-sharing mechanisms.
+
+| Engine | Common cause | What to do |
+|---|---|---|
+| **Codex** | App, terminal or Wrapper starts a different backend, causing a session ownership conflict | Connect all three to the same account, `CODEX_HOME` and official app-server daemon |
+| **Claude Code** | The local CLI, Desktop or Agent View owns the session, so Web mirrors it read-only | Let local work finish and release the session before resuming in Web, or deliberately take over when the UI offers it |
+| **DeepSeek Harness (DSH)** | Wrapper is paired to a different instance, an old port or a rotated control credential | Pair to the compatible local API used by the desktop, preserving the same DSH instance and native session |
+
+### Codex: use the shared-daemon launchers
+
+The shared daemon is the official session service running on your computer. Connecting **Codex App, the Codex terminal and cc-remote Wrapper** to it avoids ownership conflicts caused by separate backends. Input still follows native running, queue and approval rules.
+
+On a Windows computer where the shared launchers have been configured:
+
+1. Open Codex App using **Codex Shared** on the desktop or Start menu.
+2. Use **Codex CLI Shared** for a terminal explicitly connected to the same daemon.
+3. In Web, select the matching device and account, then the relevant **Codex → Code** session.
+
+These shortcuts require separate setup; cloning the repository does not create them. See [Windows shared entry points](docs/windows-quickstart_en.md#codex-shared-entry). Other platforms have separate [macOS](docs/codex-desktop-launcher.md) and [Linux](docs/codex-desktop-linux.md) procedures.
+
+If App is already connected to another backend through its ordinary launcher, finish its tasks and quit normally before opening the shared entry. Matching account directories or visible history alone does not prove sharing; verify the actual service used by App, terminal and Wrapper. This applies to **Codex Code**; Work has a private backend. Network and model-account access must also remain available.
+
+### Claude: hand over session ownership
+
+Claude does not use the Codex shared daemon. When a local client owns the same conversation, Web initially displays history and progress read-only to avoid two writers.
+
+After local work finishes, exit or release that session normally, then reopen it in Web. If the UI offers takeover, confirm that local work can end before choosing it. Takeover may terminate the current local Claude process; it is not an uninterrupted handoff. Use different sessions when you need independent desktop and Web tasks.
+
+See [Claude configuration](docs/configuration_en.md#claude) for native ownership rules. The independent Claude session service preserves Wrapper-managed work; it does not give the native terminal Codex-style shared input ownership.
+
+### DeepSeek Harness: connect to the same local API
+
+DeepSeek here means **DeepSeek Harness (DSH)**. It connects through its official local API, using neither the Codex daemon nor a model API key to establish session sharing.
+
+Confirm that the desktop's DSH instance exposes a compatible local API and loads the required cc-remote metadata extension, then pair Wrapper to that running instance. Pair again if a desktop restart changes the port or control credential. Select the same device, DSH engine and native session in Web.
+
+Keep the desktop's existing API instance when pairing. A desktop version without a compatible API cannot use this path. DSH controls whether input during a running task is accepted, steered or queued. See the [DSH setup guide](docs/dsh-integration.md#local-setup) for pairing and version requirements.
+
 ## Everyday use
 
 Type `/` in the composer to see commands available for the selected engine.
@@ -124,6 +164,10 @@ Claude Work requires an OS sandbox that native Windows cannot provide. Select Co
 **Why does the device show as offline or reconnecting?**
 
 Check that the computer is awake, Wrapper is running and the Relay address is reachable. If a temporary tunnel address changes, the connection configuration must change too. See [connection troubleshooting](docs/windows-quickstart_en.md#connection-troubleshooting).
+
+**Why does a conversation work locally but Web report that it is in use?**
+
+Follow the [engine-specific sharing steps](#use-desktop-and-web-together): Codex shares an official daemon, Claude hands over session ownership, and DSH pairs to the same local API. Check existing work and message acceptance before resending anything.
 
 **Will a notification appear when a task finishes?**
 
