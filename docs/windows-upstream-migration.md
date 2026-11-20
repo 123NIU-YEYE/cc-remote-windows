@@ -51,6 +51,13 @@ This proves the isolated control link, not native model execution or deployment.
 
 ## Remaining acceptance
 
+- Claude Work requires Claude Code's OS sandbox. Native Windows does not
+  support it; use Code on the Windows Wrapper, or run Work from a separately
+  configured WSL2/Linux Wrapper. See the [official sandboxing documentation](https://code.claude.com/docs/en/sandboxing).
+  An explicit sandbox startup rejection produces actionable guidance and closes
+  the failed client without submitting a query, retrying as a fresh session or
+  relaxing `sandbox.failIfUnavailable`. Other startup errors retain their normal
+  classification. Installing a newer Windows CLI alone does not add the sandbox.
 - Run the complete Python gate in a supported Linux environment. Windows
   collection still encounters Unix-only service/broker/retention tests (`pwd`,
   `fcntl` and PTY dependencies). Do not count collection failures as test passes.

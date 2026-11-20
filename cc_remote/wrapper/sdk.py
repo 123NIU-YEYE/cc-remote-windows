@@ -72,6 +72,9 @@ from cc_remote.wrapper.claude_controls import (
 )
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
 from cc_remote.wrapper.work_context import claude_recent_context_usage
+from cc_remote.wrapper.claude_work_runtime import (
+    ClaudeWorkSandboxUnavailable, sandbox_unavailable,
+)
 from cc_remote.wrapper import claude_catalog
 from cc_remote.wrapper.claude_goal import (
     NO_GOAL_EVENT,
@@ -668,7 +671,12 @@ class SdkHandle:
         else:
             self.client = ClaudeSDKClient(options=opts)
         self._conversation_rewind_capability = None
-        await self.client.connect()
+        try:
+            await self.client.connect()
+        except Exception as exc:
+            if self.work_mode and sandbox_unavailable(exc):
+                raise ClaudeWorkSandboxUnavailable() from exc
+            raise
         await self._configure_model_fallback_policy()
         if self.service_metadata is not None and getattr(self.client, "id", None):
             # Retain both across failed closes/connects. A worker ID alone

@@ -268,6 +268,11 @@ from cc_remote.wrapper.sdk import (
     same_claude_model_selection,
 )
 from cc_remote.wrapper.claude_rewind import ClaudeRewindError
+from cc_remote.wrapper.claude_work_runtime import (
+    ClaudeWorkSandboxUnavailable,
+    WORK_SANDBOX_UNAVAILABLE,
+    WORK_SANDBOX_UNAVAILABLE_MESSAGE,
+)
 from cc_remote.wrapper.rollback_commands import (
     RollbackCommandJournal,
     RollbackJournalError,
@@ -38753,6 +38758,20 @@ class WrapperMachine:
                     # merely because the wrapper restarted.
                     ctx.sdk.set_auto_compact(*desired_auto_compact)
                     ctx.auto_compact_phase = "waiting_terminal"
+        except ClaudeWorkSandboxUnavailable:
+            # Initialization stopped before query. Do not retry as a fresh
+            # conversation or weaken Work's required sandbox.
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.warning("unavailable Work sandbox spawn cleanup failed")
+            log.warning("required Claude Work sandbox unavailable")
+            await reject(
+                WORK_SANDBOX_UNAVAILABLE,
+                WORK_SANDBOX_UNAVAILABLE_MESSAGE,
+                route="sid", sid=wire_resume_id,
+            )
+            return None
         except CodexProfileDaemonUnavailable as e:
             try:
                 await ctx.sdk.disconnect()

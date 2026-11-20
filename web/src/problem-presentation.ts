@@ -11,6 +11,9 @@ const CODEX_UPDATE_INTERRUPTION =
 const CODEX_CONNECTION_INTERRUPTION =
   "与 Codex 的连接中断，本轮未确认完成。请检查已有结果后继续。";
 const STOP_TIMEOUT_FAILURE = "停止确认超时，本轮未确认完成。";
+const WORK_SANDBOX_UNAVAILABLE =
+  "当前设备无法启动 Claude Work 的隔离环境。"
+  + "可切换到 Code 继续使用；Windows 用户需在 WSL2 中运行 Work。";
 const CODEX_PROVIDER_MISMATCH =
   "当前模型服务商与此会话保存的服务商不同，本次未发送。"
   + "历史仍可查看；请切回原服务商继续，或使用分支功能在当前服务商下创建新会话。";
@@ -121,6 +124,7 @@ function ownershipMessage(message: string): string | null {
 
 export function presentTurnProblem(error: Pick<ErrorMsg, "code" | "message">): string {
   if (isUpdateMaintenance(error)) return UPDATE_MAINTENANCE_MESSAGE;
+  if (error.code === "work_sandbox_unavailable") return WORK_SANDBOX_UNAVAILABLE;
   if (error.code === "busy") {
     return ownershipMessage(error.message)
       ?? "本次消息未发送，会话当前不可写，请稍后重试。";
@@ -153,6 +157,8 @@ export function presentCommandProblem(
     return DELETE_OUTCOME_UNKNOWN;
   }
   switch (error.code) {
+    case "work_sandbox_unavailable":
+      return WORK_SANDBOX_UNAVAILABLE;
     case "drain_timeout":
       return STOP_TIMEOUT_FAILURE;
     case "dsh_invalid_session":

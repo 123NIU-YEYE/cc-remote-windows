@@ -427,6 +427,11 @@ try {
   ]);
 
   const hiddenDiagnostic = "provider crash at /private/token; see wrapper logs";
+  const workSandbox = { code: "work_sandbox_unavailable", message: hiddenDiagnostic };
+  const workSandboxGuidance = "当前设备无法启动 Claude Work 的隔离环境。"
+    + "可切换到 Code 继续使用；Windows 用户需在 WSL2 中运行 Work。";
+  assert.equal(presentCommandProblem(workSandbox), workSandboxGuidance);
+  assert.equal(presentTurnProblem(workSandbox), workSandboxGuidance);
   const stopTimeoutMessage = "停止确认超时，本轮未确认完成。";
   const stopTimeout = { code: "drain_timeout", message: hiddenDiagnostic };
   assert.equal(presentTurnProblem(stopTimeout), stopTimeoutMessage);
