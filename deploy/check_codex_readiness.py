@@ -78,7 +78,8 @@ def socket_still_ready(row: dict, owner_uid: int) -> bool:
 
 def read_receipt(path: Path, release: Path, after: float) -> dict | None:
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW
+                     | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
         return None
     with os.fdopen(fd, "rb") as stream:

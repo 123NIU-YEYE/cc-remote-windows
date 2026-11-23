@@ -229,6 +229,16 @@ def test_installer_rejects_symlink_and_bounds_receipt(tmp_path):
         installer.read_receipt(target, tmp_path, 0)
 
 
+def test_installer_receipt_does_not_require_posix_nonblocking_flag(tmp_path, monkeypatch):
+    monkeypatch.delattr(installer.os, "O_NONBLOCK", raising=False)
+    before = time.time()
+    readiness.write_report(tmp_path, [{"profile": "primary", "status": "disabled"}])
+    report = installer.read_receipt(
+        tmp_path / readiness.REPORT_NAME, readiness.SOURCE_ROOT, before)
+    assert report is not None
+    assert report["profiles"][0]["status"] == "disabled"
+
+
 def test_installer_checks_listener_again_before_printing_ready(tmp_path, account_socket):
     home, path = account_socket
     row = {"profile": "account", "status": "ready", "socket": str(path),

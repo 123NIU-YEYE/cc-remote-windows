@@ -315,6 +315,10 @@ async def test_native_terminal_reconciles_stale_machine_claims_in_source_order(p
 @pytest.mark.parametrize("background_result", ["before", "before_request", "after", "none"])
 async def test_autonomous_steer_waits_for_exact_echo_then_uses_normal_turn(uncertain, background_result, origin):
     sdk = SdkHandle(WrapperConfig())
+    # This fake models an already-connected child with current settings applied.
+    # Do not trigger a real reconnect while testing steering ownership.
+    sdk.applied_auto_compact_mode = sdk.auto_compact_mode
+    sdk.applied_auto_compact_threshold_tokens = sdk.auto_compact_threshold_tokens
     machine, transport, ctx = _machine_with_sdk(sdk)
     machine._configure_claude_sdk_callbacks(ctx, sdk)
     sdk.refresh_goal = AsyncMock(return_value=None)
