@@ -6950,7 +6950,24 @@ class WrapperMachine:
         identities = cls._claude_followup_result_keys(ctx, message)
         for identity in identities:
             ctx.claude_background_followups.pop(identity, None)
-        return bool(identities)
+        reconciled = cls._reconcile_claude_followups(
+            ctx, getattr(message, "_cc_background_pending", None))
+        return bool(identities) or reconciled
+
+    @staticmethod
+    def _reconcile_claude_followups(
+        ctx: SessionContext, pending: tuple[str, ...] | None,
+    ) -> bool:
+        if pending is None:
+            return False
+        # This is the sole reader's ledger at an actual native Result, delivered
+        # in callback order. Presentation aliases must not outlive that owner.
+        # Preserve every still-open native continuation; silence, final text and
+        # an empty child-task list are never sufficient to make a session idle.
+        stale = set(ctx.claude_background_followups).difference(pending)
+        for identity in stale:
+            ctx.claude_background_followups.pop(identity, None)
+        return bool(stale)
 
     @staticmethod
     def _claude_injected_user_boundary(message: object) -> bool:
@@ -23373,6 +23390,7 @@ class WrapperMachine:
         if isinstance(message, ClaudeBackgroundBoundary):
             for identity in message.identities:
                 ctx.claude_background_followups.pop(identity, None)
+            self._reconcile_claude_followups(ctx, message.pending)
             ctx.claude_background_translator = None
             await self._settle_claude_lifecycle_if_quiescent(ctx)
             self._schedule_pending_claude_auto_compact(ctx)

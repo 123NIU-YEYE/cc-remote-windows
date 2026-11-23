@@ -156,9 +156,11 @@ class _MessagePumpFailure:
 class ClaudeBackgroundBoundary:
     """Retire in-turn injections in callback order without duplicating Result."""
 
-    def __init__(self, identities: tuple[str, ...], *, durable: bool = False):
+    def __init__(self, identities: tuple[str, ...], *, durable: bool = False,
+                 pending: tuple[str, ...] | None = None):
         self.identities = identities
         self.durable = durable
+        self.pending = pending
 
 
 _MESSAGE_PUMP_END = object()
@@ -1944,6 +1946,13 @@ class SdkHandle:
                     message._cc_background_start = data.get("__cc_background_start")
                     message._cc_background_end = data.get("__cc_background_end")
                     message._cc_background_ends = background_end_ids(data)
+                    if isinstance(message, ResultMessage) and not (
+                        data.get("parent_tool_use_id") or data.get("parentToolUseID")
+                    ):
+                        # Capture at this exact native terminal, never later in
+                        # the asynchronous callback. Later continuations may
+                        # already have reached the sole reader by then.
+                        message._cc_background_pending = self._steers.background_ids
                 self._observe_recent_context_usage(message)
                 self._observe_context_boundary(message)
                 self._observe_permission_mode(message)
@@ -2120,7 +2129,10 @@ class SdkHandle:
                             compaction_owner = None
 
                     if owner == "managed":
-                        if isinstance(message, ResultMessage) and getattr(message, "_cc_background_ends", ()):
+                        if isinstance(message, ResultMessage) and (
+                            getattr(message, "_cc_background_ends", ())
+                            or hasattr(message, "_cc_background_pending")
+                        ):
                             # The human Result may also settle task inputs that
                             # arrived during this response. Queue only their
                             # lifecycle boundary behind those callbacks; waiting
@@ -2129,7 +2141,8 @@ class SdkHandle:
                             release.set()
                             await self._queue_background_message(
                                 ClaudeBackgroundBoundary(message._cc_background_ends,
-                                                         durable=service_seq is not None),
+                                                         durable=service_seq is not None,
+                                                         pending=getattr(message, "_cc_background_pending", None)),
                                 release, self._turn_origin_id)
                         if isinstance(message, ResultMessage) and (
                                 intermediate or self._steers.pending):

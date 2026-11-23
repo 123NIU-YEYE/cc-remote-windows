@@ -106,6 +106,10 @@ class PendingSteers:
     def begin_turn(self) -> None:
         self._consumed_user_id = None
 
+    @property
+    def background_ids(self) -> tuple[str, ...]:
+        return tuple(self._backgrounds)
+
     def handoff_background(self, identity: str | None) -> None:
         self._backgrounds.pop(identity, None)
         self.background_id = next(reversed(self._backgrounds), None)

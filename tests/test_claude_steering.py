@@ -274,6 +274,41 @@ async def test_native_continuation_without_replayed_user_is_visible_and_interact
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('persistent', [False, True])
+async def test_native_terminal_reconciles_stale_machine_claims_in_source_order(persistent):
+    async with environment() as (service, attach):
+        client = await attach() if persistent else NativeClient()
+        native = service.sessions[client.id].client if persistent else client
+        sdk = SdkHandle(WrapperConfig())
+        machine, _transport, ctx = _machine_with_sdk(sdk)
+        machine._configure_claude_sdk_callbacks(ctx, sdk)
+        sdk.refresh_goal = AsyncMock(return_value=None)
+        sdk.client = client
+        sdk._start_message_pump()
+        try:
+            await native.queue.put({**user('first'), 'origin': ORIGIN})
+            await until(lambda: ctx.state == 'running')
+            ctx.claude_background_followups['stale-presentation-alias'] = 'active'
+            next_origin = {'kind': 'task-notification', 'taskId': 'next-task'}
+            await native.queue.put({**user('next'), 'origin': next_origin})
+            await until(lambda: len(ctx.claude_background_followups) == 3)
+            await native.queue.put({**result(), 'origin': ORIGIN})
+            await until(lambda: sdk._background_callbacks_pending == 0 and native.queue.empty())
+            assert ctx.state == 'running'
+            assert set(ctx.claude_background_followups) == set(sdk._steers.background_ids)
+            assert len(ctx.claude_background_followups) == 1
+            await native.queue.put({**result(), 'origin': next_origin})
+            await until(lambda: ctx.state == 'idle')
+            assert not ctx.claude_background_followups
+            assert not sdk._steers.background_ids
+            assert not native.interrupts
+        finally:
+            await sdk._stop_message_pump()
+            if persistent:
+                await client.detach()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("origin", [{"kind": "task-notification"}, ORIGIN])
 @pytest.mark.parametrize("uncertain", [False, True])
 @pytest.mark.parametrize("background_result", ["before", "before_request", "after", "none"])

@@ -2468,6 +2468,50 @@ def test_background_result_and_managed_finalizer_race_still_reaches_idle():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    'remaining', [(), ('native-next',)], ids=['finished', 'next-continuation'],
+)
+def test_native_result_snapshot_retires_only_stale_continuation_claims(remaining):
+    async def run():
+        machine, _transport, ctx = _machine_with_sdk(_AutoCompactSdk())
+        ctx.state = 'running'
+        ctx.claude_background_followups = {
+            'legacy-origin': 'active', 'native-finished': 'active',
+            **{identity: 'active' for identity in remaining},
+        }
+        terminal = ResultMessage(
+            subtype='success', duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id=SESSION_ID,
+            origin={'kind': 'task-notification', 'taskId': 'finished'},
+        )
+        terminal._cc_background_ends = ('native-finished',)
+        terminal._cc_background_pending = remaining
+
+        await machine._on_claude_background_message(ctx, terminal, 'parent')
+
+        assert set(ctx.claude_background_followups) == set(remaining)
+        assert ctx.state == ('running' if remaining else 'idle')
+        assert ctx.queued_query_wakeup.is_set() is (not remaining)
+
+    asyncio.run(run())
+
+
+def test_managed_result_snapshot_retires_stale_claim_in_callback_order():
+    from cc_remote.wrapper.sdk import ClaudeBackgroundBoundary
+
+    async def run():
+        machine, _transport, ctx = _machine_with_sdk(_AutoCompactSdk())
+        ctx.state = 'running'
+        ctx.claude_background_followups = {'legacy-origin': 'active'}
+        await machine._on_claude_background_message(
+            ctx, ClaudeBackgroundBoundary((), pending=()), 'parent',
+        )
+        assert ctx.claude_background_followups == {}
+        assert ctx.state == 'idle'
+
+    asyncio.run(run())
+
+
 def test_followup_task_id_spellings_share_one_exact_ledger_key():
     machine, _transport, ctx = _machine_with_sdk(_AutoCompactSdk())
 
