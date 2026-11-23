@@ -293,7 +293,8 @@ async def test_native_terminal_reconciles_stale_machine_claims_in_source_order(p
             await native.queue.put({**user('next'), 'origin': next_origin})
             await until(lambda: len(ctx.claude_background_followups) == 3)
             await native.queue.put({**result(), 'origin': ORIGIN})
-            await until(lambda: sdk._background_callbacks_pending == 0 and native.queue.empty())
+            await until(lambda: len(sdk._steers.background_ids) == 1
+                        and sdk._background_callbacks_pending == 0)
             assert ctx.state == 'running'
             assert set(ctx.claude_background_followups) == set(sdk._steers.background_ids)
             assert len(ctx.claude_background_followups) == 1
