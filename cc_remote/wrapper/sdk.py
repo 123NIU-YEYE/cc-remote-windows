@@ -2129,10 +2129,7 @@ class SdkHandle:
                             compaction_owner = None
 
                     if owner == "managed":
-                        if isinstance(message, ResultMessage) and (
-                            getattr(message, "_cc_background_ends", ())
-                            or hasattr(message, "_cc_background_pending")
-                        ):
+                        if isinstance(message, ResultMessage) and getattr(message, "_cc_background_ends", ()):
                             # The human Result may also settle task inputs that
                             # arrived during this response. Queue only their
                             # lifecycle boundary behind those callbacks; waiting
