@@ -4,6 +4,8 @@
 
 Connect to Claude Code, Codex or DSH on your machine. Follow progress, answer questions and add instructions without leaving the conversation.
 
+**Product version: v5.3.59** · Wire protocol v98
+
 [中文](README.md) · [Windows quick start](docs/windows-quickstart_en.md) · [Installation](#install-and-upgrade) · [Desktop and Web](#use-desktop-and-web-together) · [FAQ](#faq) · [Documentation](#documentation)
 
 This fork of [muggle-stack/cc-remote](https://github.com/muggle-stack/cc-remote) adds Windows compatibility and improvements to reconnects, long conversation history and local file access. It is self-hosted: you run the service and use your existing model accounts.
@@ -140,12 +142,13 @@ On desktop, **Enter sends and Shift+Enter inserts a newline**. You can switch se
 
 ### Images, videos and files
 
-- **Images, text, Markdown and PDF:** preview in the browser; enlarge images for a closer look.
-- **Video:** play and seek MP4/M4V files. Decoding depends on the browser; H.264/AAC is recommended. The current per-file limit is 256 MiB.
+- **Images, text, Markdown and PDF:** browser previews, image zoom, PDF pagination, zoom and search (a text layer is required). The device decodes HEIC/HEIF, TIFF and BMP previews, with original-file downloads.
+- **Video:** play and seek MP4/M4V and video WebM files. Decoding depends on the browser; H.264/AAC is recommended. The current per-file limit is 256 MiB.
 - **Audio:** play, change speed and download supported formats, subject to format and size limits.
-- **XLSX:** read worksheets and saved cell values without Office; formulas are not recalculated.
+- **XLSX and UTF-8 CSV/TSV:** paged cell previews, XLSX worksheets and common date, time and percentage formats without Office; formulas are not recalculated.
+- **PPTX and DOCX:** PPTX renders in the browser; DOCX uses sandboxed PDF conversion when available and otherwise renders in the browser.
 - **Other Office documents:** some formats require LibreOffice conversion on Linux. Direct previews are not available for every file.
-- **Interactive HTML:** use [Remote Viewer](docs/remote-viewer.md) for authorized static pages and their resources.
+- **Interactive HTML:** single-file previews run inline scripts and authorized local images in an opaque sandbox. Use [Remote Viewer](docs/remote-viewer.md) for pages with multiple files.
 
 Access follows device authorization, OS permissions and workspace boundaries. Previewing a file does not provide a full desktop editor. See the [preview documentation](docs/remote-viewer.md) for details.
 
@@ -230,7 +233,7 @@ Share access only with people you trust. Someone who can sign in and operate Cod
 <details>
 <summary>For developers and operators</summary>
 
-**Product version: v5.3.52** · Wire protocol v97. This version follows the upstream baseline; consult the commit history for this fork's additional fixes.
+This version includes upstream v5.3.59; consult the commit history for Windows adaptations and this fork's additional fixes.
 
 Source development uses Python 3.13 and Node 24. See [AGENTS.md](AGENTS.md) for contributions and checks, and [deploy/README.md](deploy/README.md) for deployment, rollback and acceptance. Linux releases live under `/opt/cc-remote/releases/` and switch atomically through `/opt/cc-remote/current`.
 

@@ -4,6 +4,8 @@
 
 连接本机的 Claude Code、Codex 或 DSH，查看进度、回答询问、补充指令，随时回到同一个会话。
 
+**产品版本：v5.3.59** · Wire protocol v98
+
 [English](README_en.md) · [Windows 入门](docs/windows-quickstart.md) · [安装与部署](#安装与升级) · [桌面与网页协同](#桌面端与网页一起使用) · [常见问题](#faq) · [文档](#文档)
 
 本仓库基于 [muggle-stack/cc-remote](https://github.com/muggle-stack/cc-remote)，增加 Windows 适配，以及连接恢复、长会话历史和本地文件访问等改进。采用自托管方式：你运行自己的服务，使用已有的模型账号。
@@ -144,12 +146,13 @@ Claude 不使用 Codex 的共享 daemon。网页发现本地客户端持有同�
 
 ### 图片、视频和文件
 
-- **图片、文本、Markdown、PDF**：在网页中预览，图片支持放大查看。
-- **视频**：MP4/M4V 支持播放和拖动进度；能否解码取决于浏览器，推荐 H.264/AAC。当前单文件上限为 256 MiB。
+- **图片、文本、Markdown、PDF**：在网页中预览；图片支持放大，PDF 支持翻页、缩放和文字搜索（需要文字层）。HEIC/HEIF、TIFF、BMP 在设备上解码，可下载原图。
+- **视频**：MP4/M4V 和视频 WebM 支持播放和拖动进度；能否解码取决于浏览器，推荐 H.264/AAC。当前单文件上限为 256 MiB。
 - **音频**：支持的格式可播放、调速和下载，受格式与大小限制。
-- **XLSX**：查看工作表及已保存的单元格值，无需安装 Office；不重新计算公式。
+- **XLSX、UTF-8 CSV/TSV**：分页查看单元格，XLSX 支持工作表及常见日期、时间和百分比格式；无需安装 Office，不重新计算公式。
+- **PPTX、DOCX**：PPTX 在浏览器渲染；DOCX 优先使用沙箱 PDF 转换，转换不可用时由浏览器渲染。
 - **其他 Office 文档**：部分格式需要 Linux 上的 LibreOffice 转换环境，不承诺所有文件都可直接预览。
-- **交互式 HTML**：通过 [远程 Viewer](docs/remote-viewer.md) 打开受控的静态页面及其资源。
+- **交互式 HTML**：单文件预览在隔离沙箱中运行内联脚本并显示经授权的本地图片；多文件页面通过 [远程 Viewer](docs/remote-viewer.md) 打开。
 
 文件访问受设备授权、系统权限和工作目录边界约束；预览不等于完整的桌面编辑器。详细格式与限制见[文件预览说明](docs/remote-viewer.md)。
 
@@ -234,7 +237,7 @@ cc-remote 本身开源，不附带模型额度。消息、侧聊和原生任务�
 <details>
 <summary>给开发者和部署者</summary>
 
-**产品版本：v5.3.52** · Wire protocol v97。此版本号沿用上游基线，本仓库的额外修复以提交记录为准。
+本版本已合入上游 v5.3.59；Windows 适配和本仓库的额外修复以提交记录为准。
 
 源码开发使用 Python 3.13 与 Node 24。贡献、检查和发布约定见 [AGENTS.md](AGENTS.md)；部署、回滚和验收见 [deploy/README.md](deploy/README.md)。Linux 发布目录为 `/opt/cc-remote/releases/`，通过 `/opt/cc-remote/current` 原子切换。
 

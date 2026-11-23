@@ -5,7 +5,7 @@ Two independent links:
   - control link: client <-> relay(WS) <-> wrapper <-> ClaudeSDKClient <-> cc
 """
 
-__version__ = "5.3.52"
+__version__ = "5.3.59"
 
 # Define the POSIX-only ``os`` attributes that Windows lacks before any wrapper
 # module reads them. No-op on Unix. See cc_remote.wrapper.os_compat.

@@ -1,7 +1,9 @@
 # Windows upstream migration foundation
 
-This Windows adaptation is based on upstream v5.3.52 (`c8c8326`), wire protocol
-97 and Claude Agent SDK 0.2.174. Production activation still requires the repository deployment gate and
+This Windows adaptation includes upstream v5.3.59 (`3b1051ec`), wire protocol
+98 and Claude Agent SDK 0.2.174. The v5.3.52–v5.3.59 source delta preserves the
+Windows handle, privacy, shared-daemon, workspace and Claude lifecycle fixes.
+Production activation still requires the repository deployment gate and
 transaction procedure; a Git push alone is not a deployment receipt.
 
 ## Implemented foundation

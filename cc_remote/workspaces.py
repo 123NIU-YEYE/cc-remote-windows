@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Iterable, Literal, cast
 from uuid import uuid4
 
+from cc_remote.audio_preview import AUDIO_PREVIEW_MEDIA_TYPES
 from cc_remote.claude_paths import claude_config_dir
 
 
@@ -33,20 +34,22 @@ WORK_UPLOADS_MARKER = ".cc-remote-upload-root"
 WORK_UPLOADS_MARKER_PAYLOAD = b"cc-remote Work uploads v1\n"
 _WORK_SCHEDULE_MAX_ATTEMPTS = 3
 _CODEX_PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_WORK_ARTIFACT_IMAGE_SUFFIXES = frozenset({
+    ".avif", ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp",
+})
 _WORK_ARTIFACT_PREVIEW_SUFFIXES = frozenset({
     ".c", ".cc", ".conf", ".cpp", ".css", ".csv", ".go", ".h", ".hpp",
     ".htm", ".html", ".ini", ".java", ".js", ".json", ".jsonl", ".log", ".md",
     ".mdown", ".markdown", ".mmd", ".mermaid", ".mjs", ".py", ".rs", ".sh", ".sql", ".svg",
-    ".toml", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
-    ".avif", ".doc", ".docx", ".gif", ".jpeg", ".jpg", ".m4v", ".mov", ".mp4",
-    ".odp", ".ods", ".odt", ".ogv", ".pdf", ".png", ".ppt", ".pptx", ".rtf",
-    ".webm", ".webp", ".xls", ".xlsx",
+    ".toml", ".ts", ".tsx", ".tsv", ".txt", ".xml", ".yaml", ".yml",
+    ".doc", ".docx", ".m4v", ".mov", ".mp4", ".odp", ".ods", ".odt", ".ogv", ".pdf", ".ppt", ".webm",
+    ".pptx", ".rtf", ".xls", ".xlsx", *AUDIO_PREVIEW_MEDIA_TYPES, *_WORK_ARTIFACT_IMAGE_SUFFIXES,
 })
 _WORK_ARTIFACT_KIND_SUFFIXES = {
     "document": frozenset({".doc", ".docx", ".md", ".mmd", ".mermaid", ".odt", ".rtf", ".txt"}),
-    "spreadsheet": frozenset({".csv", ".ods", ".xls", ".xlsx"}),
+    "spreadsheet": frozenset({".csv", ".ods", ".tsv", ".xls", ".xlsx"}),
     "presentation": frozenset({".odp", ".ppt", ".pptx"}),
-    "image": frozenset({".avif", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}),
+    "image": _WORK_ARTIFACT_IMAGE_SUFFIXES,
     "video": frozenset({".m4v", ".mov", ".mp4", ".ogv", ".webm"}),
     "pdf": frozenset({".pdf"}),
 }
