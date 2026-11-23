@@ -81,7 +81,12 @@ def test_video_does_not_expand_file_permissions_or_read_whole_file(tmp_path):
     outside = video_file(tmp_path)
     with pytest.raises(ValueError):
         register(store, root, outside)
-    (root / "escape.mp4").symlink_to(outside)
+    try:
+        (root / "escape.mp4").symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account has no symbolic-link creation privilege")
+        raise
     with pytest.raises(ValueError):
         register(store, root, root / "escape.mp4")
     path = video_file(root, size=MAX_FILE_BYTES + 1)

@@ -1,6 +1,7 @@
 """Async MCP activity and continuation rendering never drive model lifecycle."""
 import asyncio
 import json
+import os
 import shlex
 from types import SimpleNamespace
 from uuid import uuid4
@@ -198,7 +199,12 @@ def test_task_activity_rejects_symlink_state(tmp_path):
     home.mkdir()
     external = tmp_path / "external"
     external.mkdir(mode=0o700)
-    (home / "cc-remote-async-tasks").symlink_to(external, target_is_directory=True)
+    try:
+        (home / "cc-remote-async-tasks").symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account has no symbolic-link creation privilege")
+        raise
     with pytest.raises(ValueError):
         read_task_activity(home)
 

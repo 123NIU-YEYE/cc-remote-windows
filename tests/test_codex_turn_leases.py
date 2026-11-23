@@ -26,7 +26,11 @@ def test_codex_turn_lease_round_trip_and_matched_release(tmp_path):
     assert lease.automatic is True
     assert lease.stream_bindings == ()
     assert store.list() == (lease,)
-    assert os.stat(store.path).st_mode & 0o777 == 0o600
+    if os.name == "nt":
+        from cc_remote.windows_privacy import owned_path
+        assert owned_path(store.path, private=True)
+    else:
+        assert os.stat(store.path).st_mode & 0o777 == 0o600
 
     assert store.release("session", turn_id="turn-b") is False
     assert store.get("session") == lease

@@ -5033,8 +5033,10 @@ class WrapperMachine:
                 control_turn_id,
                 stream_turn_id,
                 native_message_id,
-                source_device=source.device,
-                source_inode=source.inode,
+                # The history index stores signed SQLite int64s. Leases store
+                # native unsigned identities, including Windows volume IDs.
+                source_device=source.device & ((1 << 64) - 1),
+                source_inode=source.inode & ((1 << 64) - 1),
                 expected_msg_id=ctx.codex_owned_msg_id,
                 daemon_epoch=(
                     None

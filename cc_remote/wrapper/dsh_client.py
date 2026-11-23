@@ -123,8 +123,13 @@ class DshConnection:
             fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
             with os.fdopen(fd, "rb") as stream:
                 info = os.fstat(stream.fileno())
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                        or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 8192):
+                if os.name == "nt":
+                    from cc_remote.windows_privacy import owned_descriptor
+                    private = owned_descriptor(stream.fileno(), private=True)
+                else:
+                    private = info.st_uid == os.getuid() and not info.st_mode & 0o077
+                if (not stat.S_ISREG(info.st_mode) or not private
+                        or info.st_nlink != 1 or info.st_size > 8192):
                     raise ValueError
                 data = json.loads(stream.read(8193))
             if not isinstance(data, dict) or set(data) != {"schema", "origin", "token"} or data["schema"] != 1:

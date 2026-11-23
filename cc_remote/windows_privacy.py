@@ -27,6 +27,25 @@ def owned_path(path: str | Path, *, private: bool = False) -> bool:
     descriptor = security.GetNamedSecurityInfo(
         str(path), security.SE_FILE_OBJECT,
         security.OWNER_SECURITY_INFORMATION | security.DACL_SECURITY_INFORMATION)
+    return _owned_security(descriptor, security, current, private=private)
+
+
+def owned_descriptor(fd: int, *, private: bool = False) -> bool:
+    """Check the open file's owner/DACL without trusting a replaceable path."""
+    import msvcrt
+    import pywintypes
+
+    security, _rights, current = _security()
+    try:
+        descriptor = security.GetSecurityInfo(
+            msvcrt.get_osfhandle(fd), security.SE_FILE_OBJECT,
+            security.OWNER_SECURITY_INFORMATION | security.DACL_SECURITY_INFORMATION)
+    except (OSError, pywintypes.error):
+        return False
+    return _owned_security(descriptor, security, current, private=private)
+
+
+def _owned_security(descriptor, security, current, *, private: bool) -> bool:
     if descriptor.GetSecurityDescriptorOwner() != current:
         return False
     if not private:

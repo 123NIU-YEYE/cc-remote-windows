@@ -13,6 +13,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 from cc_remote.wrapper.dsh_client import (
     DshClient, DshConnection, DshError,
@@ -21,11 +22,17 @@ from cc_remote.wrapper.dsh_client import (
 
 def save_connection(connection: DshConnection, path: Path) -> None:
     path = path.expanduser().absolute()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = path.parent.stat()
-    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
-        raise DshError("invalid_connection", "配对文件所在目录必须由当前用户拥有且其他用户不可写。")
-    fd, staging = tempfile.mkstemp(prefix=".dsh-pair-", dir=path.parent)
+    if os.name == "nt":
+        from cc_remote.windows_privacy import create_private_file, private_directory
+        private_directory(path.parent)
+        staging = path.parent / (".dsh-pair-" + uuid4().hex)
+        fd = create_private_file(staging)
+    else:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = path.parent.stat()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise DshError("invalid_connection", "配对文件所在目录必须由当前用户拥有且其他用户不可写。")
+        fd, staging = tempfile.mkstemp(prefix=".dsh-pair-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({"schema": 1, "origin": connection.origin, "token": connection.token}, stream)
@@ -38,8 +45,7 @@ def save_connection(connection: DshConnection, path: Path) -> None:
             os.unlink(staging)
 
 
-async def pair(launch_url: str, path: Path) -> None:
-    connection = DshConnection.from_launch_url(launch_url)
+async def validate(connection: DshConnection) -> None:
     client = DshClient(connection)
     try:
         # Read-only contract validation. Pairing must not create/resume an Agent.
@@ -52,16 +58,31 @@ async def pair(launch_url: str, path: Path) -> None:
             raise DshError("unsupported", "DSH 未提供 0.2.2-rc.1 的模型与 Preset 接口。")
     finally:
         await client.close()
+
+
+async def pair(launch_url: str, path: Path) -> None:
+    connection = DshConnection.from_launch_url(launch_url)
+    await validate(connection)
     save_connection(connection, path)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Pair cc-remote with local DSH 0.2.2-rc.1")
     parser.add_argument("--file", type=Path, required=True, help="Private Wrapper connection file")
+    parser.add_argument("--desktop", action="store_true", help="Read the running desktop integration's private state")
+    parser.add_argument("--state", type=Path, help="Desktop state file; requires --desktop")
     args = parser.parse_args()
+    if args.state and not args.desktop:
+        parser.error("--state requires --desktop")
     try:
-        url = getpass.getpass("DSH 本机登录地址（输入不回显）：")
-        asyncio.run(pair(url, args.file))
+        if args.desktop:
+            from cc_remote.wrapper.dsh_desktop import load_connection
+            connection = load_connection(args.state)
+            asyncio.run(validate(connection))
+            save_connection(connection, args.file)
+        else:
+            url = getpass.getpass("DSH 本机登录地址（输入不回显）：")
+            asyncio.run(pair(url, args.file))
     except (EOFError, KeyboardInterrupt):
         return 130
     except DshError as exc:

@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 from typing import Callable, Optional
+from uuid import uuid4
 
 from cc_remote.wrapper.os_compat import fchmod
 
@@ -81,8 +82,8 @@ class CodexTurnLease:
             binding.task_id
             for binding in self.stream_bindings
             if (
-                binding.source_device == source_device
-                and binding.source_inode == source_inode
+                binding.source_device == (source_device & ((1 << 64) - 1))
+                and binding.source_inode == (source_inode & ((1 << 64) - 1))
             )
         )
 
@@ -284,10 +285,16 @@ class CodexTurnLeaseStore:
             payload = encode()
         if len(payload.encode("utf-8")) > _MAX_BYTES:
             raise ValueError("Codex turn lease state exceeds limit")
-        fd, temporary = tempfile.mkstemp(
-            prefix=f".{self.path.name}.", dir=self.path.parent)
+        if os.name == "nt":
+            from cc_remote.windows_privacy import create_private_file
+            temporary = self.path.parent / (f".{self.path.name}." + uuid4().hex)
+            fd = create_private_file(temporary)
+        else:
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
-            fchmod(fd, temporary, 0o600)
+            if os.name != "nt":
+                fchmod(fd, temporary, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 fd = -1
                 stream.write(payload)
