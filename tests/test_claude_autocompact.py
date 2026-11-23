@@ -2512,6 +2512,18 @@ def test_managed_result_snapshot_retires_stale_claim_in_callback_order():
     asyncio.run(run())
 
 
+def test_native_result_snapshot_preserves_unrelated_claim_without_matching_end():
+    machine, _transport, ctx = _machine_with_sdk(_AutoCompactSdk())
+    ctx.claude_background_followups = {'native-next': 'active'}
+    terminal = ResultMessage(
+        subtype='success', duration_ms=1, duration_api_ms=1,
+        is_error=False, num_turns=1, session_id=SESSION_ID,
+    )
+    terminal._cc_background_pending = ('native-next',)
+    assert machine._retire_claude_followup(ctx, terminal) is False
+    assert ctx.claude_background_followups == {'native-next': 'active'}
+
+
 def test_followup_task_id_spellings_share_one_exact_ledger_key():
     machine, _transport, ctx = _machine_with_sdk(_AutoCompactSdk())
 

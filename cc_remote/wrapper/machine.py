@@ -6947,12 +6947,13 @@ class WrapperMachine:
         cls, ctx: SessionContext, message: ResultMessage,
     ) -> bool:
         """Retire only the autonomous turn closed by this exact Result."""
+        pending = getattr(message, "_cc_background_pending", None)
+        if pending is not None:
+            return cls._reconcile_claude_followups(ctx, pending)
         identities = cls._claude_followup_result_keys(ctx, message)
         for identity in identities:
             ctx.claude_background_followups.pop(identity, None)
-        reconciled = cls._reconcile_claude_followups(
-            ctx, getattr(message, "_cc_background_pending", None))
-        return bool(identities) or reconciled
+        return bool(identities)
 
     @staticmethod
     def _reconcile_claude_followups(
