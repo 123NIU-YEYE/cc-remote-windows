@@ -509,6 +509,18 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertFalse(Path(record.cwd).parent.exists())
         self.assertEqual(outside.read_text(encoding="utf-8"), "keep")
 
+    def test_delete_session_removes_read_only_agent_files(self):
+        # Git creates its object files read-only; Windows refuses to unlink
+        # them unless the attribute is cleared first.
+        record = self.store.create_session()
+        self.store.bind_session(record.work_id, "session-1")
+        objects = Path(record.cwd) / "repo" / ".git" / "objects" / "ab"
+        objects.mkdir(parents=True)
+        (objects / "cdef").write_bytes(b"blob")
+        os.chmod(objects / "cdef", 0o444)
+        self.store.delete("session-1")
+        self.assertFalse(Path(record.cwd).parent.exists())
+
     def test_engine_stores_are_strictly_separate(self):
         stores = WorkStores(self.root / "claude", self.root / "codex")
         claude = stores.for_engine("claude").create_session()

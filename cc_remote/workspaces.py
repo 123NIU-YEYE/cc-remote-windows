@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from cc_remote.audio_preview import AUDIO_PREVIEW_MEDIA_TYPES
 from cc_remote.claude_paths import claude_config_dir
+from cc_remote.wrapper.os_compat import force_rmtree
 
 
 Engine = Literal["claude", "codex"]
@@ -1910,7 +1911,7 @@ class WorkRegistry:
         if changed != 1:
             raise LookupError(f"unknown Work session: {session_id}")
         if chat_root.exists():
-            shutil.rmtree(chat_root)
+            force_rmtree(chat_root)
         policy = self.root / "policies" / f"{record.work_id}.json"
         try:
             policy.unlink()
@@ -1931,7 +1932,7 @@ class WorkRegistry:
                 (work_id,),
             )
         if chat_root.exists():
-            shutil.rmtree(chat_root)
+            force_rmtree(chat_root)
         policy = self.root / "policies" / f"{work_id}.json"
         try:
             policy.unlink()

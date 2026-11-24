@@ -13,7 +13,6 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
-import shutil
 from typing import Iterable
 
 from claude_agent_sdk._internal.session_mutations import (
@@ -43,6 +42,7 @@ from claude_agent_sdk._internal.sessions import (
 from claude_agent_sdk.types import SDKSessionInfo, SessionMessage
 
 from cc_remote.attachments import MAX_TOTAL_ATTACHMENT_BYTES
+from cc_remote.wrapper.os_compat import force_rmtree
 
 
 _MAX_PROJECT_DIRS = 16_384
@@ -526,7 +526,10 @@ def delete_session(
         path.unlink()
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Session {session_id} not found") from exc
-    shutil.rmtree(path.parent / session_id, ignore_errors=True)
+    try:
+        force_rmtree(path.parent / session_id)
+    except OSError:
+        pass
 
 
 def fork_session(
