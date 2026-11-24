@@ -53,6 +53,53 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  python-windows:
+    name: Python (Windows)
+    needs: web
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      # Test fixtures write UTF-8 text without naming it; product code names
+      # its encodings, which tests/test_text_io_encoding.py enforces.
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.13 .venv
+          uv pip sync \
+            --python .venv/Scripts/python.exe \
+            --require-hashes --only-binary=:all: --no-binary=http-ece \
+            requirements.lock
+          uv pip install --python .venv/Scripts/python.exe -r requirements-dev.txt
+      - name: Restore built Web client
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+      - name: Run pytest
+        run: .venv/Scripts/python.exe -m pytest -n 4 --junitxml=test-results/pytest-windows.xml
+      - name: Preserve Python test timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-windows-test-results
+          path: test-results/pytest-windows.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
   web:
     name: Web build
     runs-on: ubuntu-24.04
