@@ -19,6 +19,8 @@ from cc_remote.wrapper.process_scan import (
     ProcessIdentity, process_identity, process_owner_uid,
 )
 
+_FILETIME_UNIX_EPOCH_MS = 11_644_473_600_000
+
 
 def registered_pids(roots: Collection[str]) -> tuple[set[int], bool]:
     """Bounded argv-scan hints, never ownership evidence on their own."""
@@ -60,10 +62,15 @@ def _native_process_start(identity: ProcessIdentity) -> str:
 
 
 def _recorded_start_matches(identity: ProcessIdentity, recorded: object) -> bool:
-    # Claude on Linux records the /proc start ticks; elsewhere it records
-    # ``ps lstart`` text.
+    # Claude on Linux records the /proc start ticks, on Windows the creation
+    # FILETIME (100 ns since 1601) and on macOS ``ps lstart`` text.
     if sys.platform.startswith("linux") and recorded == str(identity.start_ticks):
         return True
+    if sys.platform == "win32":
+        # start_ticks holds the same creation time in whole Unix milliseconds.
+        if not isinstance(recorded, str) or not recorded.isascii() or not recorded.isdecimal():
+            return False
+        return int(recorded) // 10_000 - _FILETIME_UNIX_EPOCH_MS == identity.start_ticks
     fingerprint = _native_process_start(identity)
     return bool(fingerprint) and recorded == fingerprint
 

@@ -367,7 +367,28 @@ def process_command(
         if info is None or info[0] != identity:
             return None
         return info[3]
+    if sys.platform == "win32" and proc_root == "/proc":
+        return _windows_process_command(identity)
     return None
+
+
+def _windows_process_command(identity: ProcessIdentity) -> tuple[bytes, ...] | None:
+    """Windows argv from psutil, only while the exact process generation lives."""
+    psutil = _windows_psutil()
+    if psutil is None:
+        return None
+    try:
+        proc = psutil.Process(identity.pid)
+        if int(float(proc.create_time()) * 1000) != identity.start_ticks:
+            return None
+        args = tuple(
+            str(arg).encode("utf-8", "surrogatepass") for arg in proc.cmdline())
+        # A PID reused during the read would report another program's argv.
+        if int(float(proc.create_time()) * 1000) != identity.start_ticks:
+            return None
+        return args
+    except Exception:  # noqa: BLE001 - unreadable means uncertain
+        return None
 
 
 def _environment_value(
