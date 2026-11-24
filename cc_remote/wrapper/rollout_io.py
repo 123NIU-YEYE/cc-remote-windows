@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import threading
 
@@ -47,7 +48,11 @@ def is_compressed_rollout(path) -> bool:
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    # Windows path stats report the creation time as st_ctime but descriptor
+    # stats the last change time, so they disagree for any file written after
+    # creation. Both report the same st_birthtime_ns.
+    ctime = info.st_birthtime_ns if sys.platform == "win32" else info.st_ctime_ns
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, ctime)
 
 
 def _discard(path: str) -> None:

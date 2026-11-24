@@ -235,6 +235,25 @@ def test_cache_identity_invalidation_and_independent_readers(tmp_path, monkeypat
         assert stream.read() == b"replacement\n"
 
 
+def test_rollout_written_after_creation_still_decodes(tmp_path):
+    # Windows path stats report the creation time as st_ctime, descriptor stats
+    # the last change time. Writing after creation makes the two differ.
+    data = b"first\nsecond\n" * 1000
+    encoded = rollout_io.zstd.compress(data)
+    path = tmp_path / "rollout-thread.jsonl.zst"
+    path.write_bytes(encoded[:8])
+    time.sleep(0.05)
+    with path.open("ab") as stream:
+        stream.write(encoded[8:])
+    for _ in range(2):  # decode, then a cache hit
+        with rollout_io.rollout_open(path) as stream:
+            assert stream.read() == data
+    with path.open("ab") as stream:
+        stream.write(rollout_io.zstd.compress(b"third\n"))
+    with rollout_io.rollout_open(path) as stream:
+        assert stream.read() == data + b"third\n"
+
+
 @pytest.mark.parametrize("failure", ["truncated", "corrupt", "oversized"])
 def test_failed_decode_never_publishes_partial_cache(tmp_path, monkeypatch, failure):
     path = _compress(tmp_path / "broken.jsonl", b"important history\n" * 100)
