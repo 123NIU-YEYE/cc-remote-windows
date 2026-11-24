@@ -15,7 +15,7 @@ from cc_remote.wrapper.claude_rate_limits import ClaudeRateLimitStore
 from cc_remote.wrapper.claude_usage import ClaudeUsageError, ClaudeUsageReader
 from tests.test_claude_rate_limits import _event
 from tests.test_multisession import _mk_ctx, _mk_machine
-from tests.platform_support import set_home
+from tests.platform_support import make_public, set_home
 
 
 def usage(value=37):
@@ -137,7 +137,7 @@ async def test_real_helper_receives_only_profile_binding(monkeypatch, tmp_path):
     other = replace(profile, config_dir=tmp_path / "other-account")
     with pytest.raises(ClaudeUsageError, match="configuration invalid"):
         await reader.refresh(other, apply)
-    reader.path.chmod(0o644)
+    make_public(reader.path, 0o644)
     with pytest.raises(ClaudeUsageError, match="configuration invalid"):
         await reader.refresh(profile, apply)
 

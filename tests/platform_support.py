@@ -23,6 +23,18 @@ def native_path(path: str) -> str:
     return os.path.abspath(path) if WINDOWS else path
 
 
+def extended_path(path) -> str:
+    """``path`` that plain open() can use beyond MAX_PATH (260) on Windows.
+
+    Native engines write with long-path-aware runtimes, so files of a deep
+    project can exceed that limit. Unchanged on POSIX.
+    """
+    if not WINDOWS:
+        return os.fspath(path)
+    absolute = os.path.abspath(path)
+    return absolute if absolute.startswith("\\\\?\\") else "\\\\?\\" + absolute
+
+
 def set_home(monkeypatch, path) -> None:
     """Redirect ``~``. Windows resolves it from USERPROFILE and ignores HOME."""
     monkeypatch.setenv("HOME", str(path))
@@ -48,6 +60,32 @@ def has_mode(path, mode: int) -> bool:
     if WINDOWS:
         return is_private(path) if not mode & 0o077 else True
     return stat.S_IMODE(os.stat(path).st_mode) == mode
+
+
+def make_public(path, mode: int) -> None:
+    """Give ``path`` a POSIX ``mode`` that may expose it to other users.
+
+    POSIX: exactly ``os.chmod``. Windows has no mode bits: a mode granting
+    group or other access adds an Everyone ACE (read, plus write when the mode
+    grants it), which is what makes a file non-private there.
+    """
+    if not WINDOWS:
+        os.chmod(path, mode)
+        return
+    if not mode & 0o077:
+        return
+    import ntsecuritycon
+    import win32security as security
+
+    descriptor = security.GetNamedSecurityInfo(
+        str(path), security.SE_FILE_OBJECT, security.DACL_SECURITY_INFORMATION)
+    acl = descriptor.GetSecurityDescriptorDacl() or security.ACL()
+    rights = ntsecuritycon.FILE_GENERIC_READ
+    if mode & 0o022:
+        rights |= ntsecuritycon.FILE_GENERIC_WRITE
+    acl.AddAccessAllowedAce(security.ACL_REVISION, rights, security.CreateWellKnownSid(security.WinWorldSid))
+    security.SetNamedSecurityInfo(str(path), security.SE_FILE_OBJECT,
+                                  security.DACL_SECURITY_INFORMATION, None, None, acl, None)
 
 
 def fake_executable(path, source: str) -> Path:

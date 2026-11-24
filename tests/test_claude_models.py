@@ -10,6 +10,7 @@ import pytest
 from cc_remote.wrapper import claude_models as models
 from cc_remote.config import WrapperConfig
 from cc_remote.wrapper.sdk import SdkHandle
+from tests.platform_support import has_mode
 
 
 @pytest.mark.asyncio
@@ -203,7 +204,7 @@ async def test_probe_only_initializes_and_always_reaps_child(
     async def spawn_child(*args, **kwargs):
         if work_only:
             path = Path(args[args.index("--settings") + 1])
-            assert path.stat().st_mode & 0o777 == 0o600
+            assert has_mode(path, 0o600)
             assert json.loads(path.read_text()) == {
                 "model": "work-model", "env": {"ANTHROPIC_API_KEY": "profile-key"}}
         return proc

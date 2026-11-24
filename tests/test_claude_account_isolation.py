@@ -8,14 +8,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from cc_remote.claude_broker.client import BrokerClientError
 from cc_remote.config import WrapperConfig
 from cc_remote.wrapper import machine as machine_module, sdk as sdk_module
 from cc_remote.wrapper.claude_transport import AccountIsolatedSubprocessCLITransport
 from cc_remote.wrapper.sdk import SdkHandle
-from tests.test_claude_broker_machine import _BrokerSdk, SESSION_ID
+from tests.platform_support import WINDOWS
 from tests.test_claude_permission_state import _FakeClaudeClient
 from tests.test_multisession import _mk_ctx, _StubTransport
+
+# The PTY broker modules need fcntl/termios; only the broker test uses them.
+SESSION_ID = "11111111-1111-4111-8111-111111111111"
 
 
 @pytest.fixture(params=[
@@ -111,7 +113,11 @@ def test_spawn_reconnect_and_btw_keep_the_selected_account(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(WINDOWS, reason="The Claude PTY broker is Unix-only (Unix sockets and PTYs)")
 def test_broker_exit_restores_the_selected_account(account_machine, monkeypatch):
+    from cc_remote.claude_broker.client import BrokerClientError
+    from tests.test_claude_broker_machine import _BrokerSdk
+
     machine, selected, explicit = account_machine
     created = []
 

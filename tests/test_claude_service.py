@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+
+if sys.platform == "win32":
+    import pytest as _pytest_skip_module
+    _pytest_skip_module.skip("The Claude session service is Unix-only; Windows rejects CC_REMOTE_CLAUDE_SERVICE_SOCKET", allow_module_level=True)
+
 import asyncio
 import contextlib
 import tempfile
-import sys
 from pathlib import Path
 
 import pytest

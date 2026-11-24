@@ -1,8 +1,13 @@
 """Validate service syntax with the system manager that consumes it."""
 
+import sys
+
+if sys.platform == "win32":
+    import pytest as _pytest_skip_module
+    _pytest_skip_module.skip("Claude session service installation is Linux/macOS only", allow_module_level=True)
+
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest

@@ -13,12 +13,13 @@ from cc_remote.wrapper.stream import (
     recover_claude_native_metadata, transcript_compact_history_page, translate_history,
 )
 from cc_remote.wrapper.turn_changes import TurnChangeArchive, project_turn_changes
+from tests.platform_support import native_path
 from tests.test_claude_queued_prompt_history import SID, record, response, write
 
 
 def _edit_result(before="A", after="B", *, include_path=True):
     return {
-        **({"filePath": "/repo/code.py"} if include_path else {}),
+        **({"filePath": native_path("/repo/code.py")} if include_path else {}),
         "structuredPatch": [{
             "oldStart": 20, "oldLines": 1, "newStart": 20, "newLines": 1,
             "lines": [f"-{before}", f"+{after}"],
@@ -34,7 +35,7 @@ def _rows(*, missing=False, failed=False, include_path=True):
         tool_id = f"edit-{index}"
         rows.append(record(tool_id, rows[-1]["uuid"], "assistant", [{
             "type": "tool_use", "id": tool_id, "name": "Edit",
-            "input": {"file_path": "/repo/code.py", "old_string": before, "new_string": after},
+            "input": {"file_path": native_path("/repo/code.py"), "old_string": before, "new_string": after},
         }], 1 + index * 2))
         rows.append(record(f"result-{index}", tool_id, "user", [{
             "type": "tool_result", "tool_use_id": tool_id, "content": "done " * 1000,
@@ -79,10 +80,10 @@ def test_cold_history_restores_native_diffs_and_replaces_unavailable_archive(tmp
         if not attempt:
             # A previously cached failed projection must not win over repaired evidence.
             stale = [{**e, "diff": None} if e["type"] == "tool_result" else e for e in rows]
-            assert archive.history_summary("claude:session", turn, stale, "/repo")["files"][0]["state"] == "unavailable"
-        summary = archive.history_summary("claude:session", turn, rows, "/repo")
+            assert archive.history_summary("claude:session", turn, stale, native_path("/repo"))["files"][0]["state"] == "unavailable"
+        summary = archive.history_summary("claude:session", turn, rows, native_path("/repo"))
         assert summary["files"][0]["state"] == "available"
-        file = archive.file("claude:session", "human", summary["revision"], "/repo/code.py")
+        file = archive.file("claude:session", "human", summary["revision"], native_path("/repo/code.py"))
         assert "@@ -20,1 +20,1 @@\n-A\n+C\n" in file["diff"]
         assert file["additions"] == file["deletions"] == 1
     assert path.read_bytes() == original
@@ -95,7 +96,7 @@ def test_history_never_invents_unavailable_or_failed_file_evidence(tmp_path, mod
     rows = _rows(missing=kind == "missing", failed=kind == "failed")
     if kind == "discontinuous":
         # An unrecorded Bash overwrite between edits breaks the before-image chain.
-        rows[5]["toolUseResult"] = _edit_result("outside change", "C")
+        rows[5]["toolUseResult"] = _edit_result("outside change", "C", include_path=True)
     write(path, rows)
     files = project_turn_changes([e.model_dump(mode="json") for e in _read(path, mode)])["files"]
     if kind == "failed":
@@ -112,7 +113,7 @@ def test_write_history_uses_proven_native_before_image(role, operation):
         record("human", None, "user", "write file", 0),
         record("write", "human", "assistant", [{
             "type": "tool_use", "id": "write", "name": "Write",
-            "input": {"file_path": "/repo/code.py", "content": "new\n"},
+            "input": {"file_path": native_path("/repo/code.py"), "content": "new\n"},
         }], 1),
         record("result", "write", role, [{
             "type": "tool_result", "tool_use_id": "write", "content": "done",

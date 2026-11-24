@@ -1,5 +1,12 @@
 """Focused wrapper integration tests for broker-owned official Claude TUIs."""
 from __future__ import annotations
+
+import sys
+
+if sys.platform == "win32":
+    import pytest as _pytest_skip_module
+    _pytest_skip_module.skip("The Claude PTY broker is Unix-only (Unix sockets and PTYs)", allow_module_level=True)
+
 from unittest.mock import AsyncMock
 
 import asyncio

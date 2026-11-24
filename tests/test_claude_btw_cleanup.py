@@ -12,11 +12,12 @@ from claude_agent_sdk._internal.sessions import _sanitize_path
 from cc_remote.config import WrapperConfig
 from cc_remote.protocol import Error, GetHistory, ListSessions, SessionList, SwitchSession
 from cc_remote.wrapper.machine import WrapperMachine
+from tests.platform_support import native_path
 from tests.test_multisession import _mk_machine, _StubTransport
 
 
 SID = "11111111-1111-4111-8111-111111111111"
-CWD = "/workspace/project"
+CWD = native_path("/workspace/project")
 
 
 def write_transcript(root, sid):

@@ -33,7 +33,7 @@ from cc_remote.wrapper.claude_transport import (
 from cc_remote.wrapper.codex_handle import _codex_env
 from cc_remote.wrapper.sdk import CLAUDE_WORK_TOOLS, SdkHandle
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
-from tests.platform_support import set_home
+from tests.platform_support import native_path, set_home
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -156,7 +156,7 @@ async def test_claude_profiles_use_the_daily_cli_account_metadata(
     parent = dict(os.environ)
     profile = native if selected == "native" else other
     handle = SdkHandle(
-        WrapperConfig(claude_bin="/fake/claude"),
+        WrapperConfig(claude_bin=native_path("/fake/claude")),
         claude_config_dir=str(profile),
         isolate_account_env=True,
     )
@@ -801,11 +801,17 @@ def test_claude_bin_defaults_to_daily_local_cli_and_can_be_configured(
     home.mkdir()
     set_home(monkeypatch, str(home))
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
-    assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
+    expected = str(home / ".local/bin/claude")
+    if sys.platform == "win32":
+        expected += ".exe"
+    assert WrapperConfig().claude_bin == expected
 
     # An explicitly empty dotenv value must not silently restore the SDK bundle.
     monkeypatch.setenv("CLAUDE_BIN", "   ")
-    assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
+    expected_empty = str(home / ".local/bin/claude")
+    if sys.platform == "win32":
+        expected_empty += ".exe"
+    assert WrapperConfig().claude_bin == expected_empty
 
     cli = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_BIN", f"  {cli}  ")

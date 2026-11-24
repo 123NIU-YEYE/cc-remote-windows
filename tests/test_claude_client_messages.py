@@ -9,6 +9,7 @@ from cc_remote.wrapper.claude_client_messages import (
     ClaudeClientMessageStore,
     ClaudeClientMessageStoreError,
 )
+from tests.platform_support import has_mode
 
 
 SESSION_ID = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
@@ -28,7 +29,7 @@ def test_client_message_alias_survives_reopen_and_append(tmp_path):
     reopened = ClaudeClientMessageStore(state)
     assert reopened.get(SESSION_ID, source) == {NATIVE_ID: CLIENT_ID}
     record = next((state / "claude-client-message-ids").glob("*.json"))
-    assert oct(record.stat().st_mode & 0o777) == "0o600"
+    assert has_mode(record, 0o600)
     assert CLIENT_ID in record.read_text()
     assert "prompt" not in record.read_text().lower()
 

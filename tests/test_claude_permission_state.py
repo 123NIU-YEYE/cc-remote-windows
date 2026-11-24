@@ -1097,6 +1097,9 @@ def test_fresh_claude_spawn_inherits_native_defaults(
     project = tmp_path / "project"
     (home / ".claude").mkdir(parents=True)
     project.mkdir()
+    # The project scope search stops at a Git root. On Windows tmp_path lies
+    # inside the real user profile, whose ~/.claude it would otherwise reach.
+    (project / ".git").mkdir()
     (home / ".claude" / "settings.json").write_text("{}")
     set_home(monkeypatch, str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)

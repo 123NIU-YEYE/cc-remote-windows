@@ -19,17 +19,20 @@ from cc_remote.attachments import (
 )
 from cc_remote.protocol import SwitchSession
 from cc_remote.wrapper import claude_catalog
+from tests.platform_support import WINDOWS, native_path
 from tests.test_attachments import _complete_png
 from tests.test_multisession import _mk_machine
 
 
 SID = "11111111-1111-4111-8111-111111111111"
-LONG_CWD = "/workspace/" + "/".join(["long-project-component"] * 12)
+LONG_CWD = native_path("/workspace/" + "/".join(["long-project-component"] * 12))
 LONG_PREFIX = ("-workspace-" + "long-project-component-" * 12)[:200]
 EMOJI_PREFIX = ("----workspace-" + "long-project-component-" * 12)[:200]
 
 
-def write_image_transcript(root, cwd="/original-project", *, image_sizes=(100_000,), bucket=None, parent_uuid=None):
+def write_image_transcript(root, cwd=None, *, image_sizes=(100_000,), bucket=None, parent_uuid=None):
+    if cwd is None:
+        cwd = native_path("/original-project")
     path = root / "projects" / (bucket or _sanitize_path(cwd)) / f"{SID}.jsonl"
     path.parent.mkdir(parents=True)
     metadata = b"Comment\x00"
@@ -80,10 +83,11 @@ def test_large_image_session_recovers_original_cwd_and_can_be_selected(tmp_path,
                 "other": {"label": "Other", "config_dir": str(tmp_path / "other-profile")},
             }))
             profile = machine._claude_profiles.default
+        expected_cwd = native_path("/original-project")
         info = machine._claude_catalog_session_info(profile, SID)
-        assert info is not None and info.cwd == "/original-project"
+        assert info is not None and info.cwd == expected_cwd
         listed = machine._claude_catalog_list_sessions(profile, limit=10)
-        assert [item.cwd for item in listed if item.session_id == SID] == ["/original-project"]
+        assert [item.cwd for item in listed if item.session_id == SID] == [expected_cwd]
 
         class SpawnReached(Exception):
             pass
@@ -111,6 +115,8 @@ def test_large_image_session_recovers_original_cwd_and_can_be_selected(tmp_path,
 def test_image_session_recovers_full_cwd_from_hashed_project_bucket(tmp_path, cwd, bucket, parent_uuid):
     # Native keys above were evaluated from Claude 2.1.276's JS sanitizer.
     # Non-root rows must match the native key exactly, never just its prefix.
+    if WINDOWS:
+        pytest.skip("bucket names here are Claude JS sanitizer vectors for POSIX paths; Windows deep paths: test_windows_claude_long_paths.py")
     root = tmp_path / "profile"
     path = write_image_transcript(root, cwd, bucket=bucket, parent_uuid=parent_uuid)
     original = path.read_bytes()
@@ -128,10 +134,12 @@ def test_image_session_recovers_full_cwd_from_hashed_project_bucket(tmp_path, cw
     (LONG_PREFIX + "-invalid-hash", LONG_CWD, None),
     (LONG_PREFIX + "-INVALID", LONG_CWD, None),
     ("-another-project-" + LONG_PREFIX[17:] + "-1legacyhash", LONG_CWD, None),
-    ("-short-project-1legacyhash", "/short-project", None),
+    ("-short-project-1legacyhash", native_path("/short-project"), None),
     (LONG_PREFIX + "-qyxukm", LONG_CWD + "/later-shell-directory", "earlier-turn"),
 ])
 def test_cwd_recovery_rejects_invalid_buckets_and_later_prefix_collisions(tmp_path, bucket, cwd, parent_uuid):
+    if WINDOWS and LONG_CWD in cwd:
+        pytest.skip("bucket names here are Claude JS sanitizer vectors for POSIX paths; Windows deep paths: test_windows_claude_long_paths.py")
     path = tmp_path / bucket / f"{SID}.jsonl"
     path.parent.mkdir()
     row = {"type": "user", "uuid": "human", "parentUuid": parent_uuid,
@@ -142,6 +150,8 @@ def test_cwd_recovery_rejects_invalid_buckets_and_later_prefix_collisions(tmp_pa
 
 
 def test_long_cwd_legacy_hash_requires_explicit_native_root(tmp_path):
+    if WINDOWS:
+        pytest.skip("bucket names here are Claude JS sanitizer vectors for POSIX paths; Windows deep paths: test_windows_claude_long_paths.py")
     path = write_image_transcript(tmp_path, LONG_CWD, bucket=LONG_PREFIX + "-1legacyhash")
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     del rows[1]["parentUuid"]
@@ -156,7 +166,8 @@ def test_cwd_recovery_skips_oversized_rows_without_unbounded_allocation(tmp_path
     original = path.read_bytes()
     path.write_bytes((json.dumps({"type": "queue-operation", "content": "A" * (claude_catalog._CWD_RECORD_BYTES + 10)}) + "\n").encode() + original)
     info = claude_catalog.get_session_info(root, SID)
-    assert info is not None and info.cwd == "/original-project"
+    expected_cwd = native_path("/original-project")
+    assert info is not None and info.cwd == expected_cwd
 
 
 @pytest.mark.parametrize("invalid", [
@@ -187,13 +198,14 @@ def test_cwd_recovery_stops_at_scan_budget_and_keeps_existing_native_metadata(tm
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("directory", [None, "/original-project"])
+@pytest.mark.parametrize("directory_id", ["None", "cwd"], ids=["None", "/original-project"])
 def test_catalog_hides_metadata_stub_without_removing_real_history(
-    tmp_path, monkeypatch, explicit, directory,
+    tmp_path, monkeypatch, explicit, directory_id,
 ):
     root = tmp_path / "profile"
     path = write_image_transcript(root)
     original = path.read_bytes()
+    directory = None if directory_id == "None" else native_path("/original-project")
     stub_sid = "22222222-2222-4222-8222-222222222222"
     stub = path.with_name(f"{stub_sid}.jsonl")
     records = [
@@ -224,20 +236,22 @@ def test_catalog_hides_metadata_stub_without_removing_real_history(
 
 
 @pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("directory", [None, "/original-project"])
+@pytest.mark.parametrize("directory_id", ["None", "cwd"], ids=["None", "/original-project"])
 @pytest.mark.parametrize("limit", [0, 1, 2, 200])
 def test_catalog_limit_counts_real_sessions_after_metadata_filter(
-    tmp_path, monkeypatch, explicit, directory, limit,
+    tmp_path, monkeypatch, explicit, directory_id, limit,
 ):
     root = tmp_path / "profile"
     image = write_image_transcript(root)
+    directory = None if directory_id == "None" else native_path("/original-project")
     os.utime(image, (1_700_000_002, 1_700_000_002))
     newer_sid, older_sid = str(UUID(int=1)), str(UUID(int=2))
+    expected_cwd = native_path("/original-project")
     for sid, modified in [(newer_sid, 1_700_000_003), (older_sid, 1_700_000_001)]:
         path = image.with_name(f"{sid}.jsonl")
         path.write_text(json.dumps({
             "type": "user", "uuid": "human", "parentUuid": None,
-            "sessionId": sid, "cwd": "/original-project",
+            "sessionId": sid, "cwd": expected_cwd,
             "message": {"role": "user", "content": "real conversation"},
         }) + "\n")
         os.utime(path, (modified, modified))
@@ -268,7 +282,7 @@ def test_catalog_limit_counts_real_sessions_after_metadata_filter(
     )
     expected = [newer_sid, SID, older_sid]
     assert [info.session_id for info in listed] == (expected[:limit] if limit > 0 else expected)
-    assert all(info.cwd == "/original-project" for info in listed)
+    assert all(info.cwd == expected_cwd for info in listed)
     assert {path: path.read_bytes() for path in image.parent.iterdir()} == originals
 
 
