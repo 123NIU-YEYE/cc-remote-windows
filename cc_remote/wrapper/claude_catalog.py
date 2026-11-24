@@ -42,7 +42,7 @@ from claude_agent_sdk._internal.sessions import (
 from claude_agent_sdk.types import SDKSessionInfo, SessionMessage
 
 from cc_remote.attachments import MAX_TOTAL_ATTACHMENT_BYTES
-from cc_remote.wrapper.os_compat import force_rmtree
+from cc_remote.wrapper.os_compat import force_rmtree, open_shared
 
 
 _MAX_PROJECT_DIRS = 16_384
@@ -72,7 +72,7 @@ def is_metadata_only(path: str | os.PathLike[str] | None) -> bool:
     try:
         if source.stat().st_size > LITE_READ_BUF_SIZE:
             return False
-        with source.open("rb") as stream:
+        with open_shared(source, "rb") as stream:
             data = stream.read(LITE_READ_BUF_SIZE + 1)
     except OSError:
         return False
@@ -282,7 +282,7 @@ def recover_session_cwd(
     remaining = _CWD_SCAN_BYTES
     discard = False
     try:
-        with source.open("rb") as stream:
+        with open_shared(source, "rb") as stream:
             while remaining > 0:
                 limit = min(_CWD_RECORD_BYTES, remaining)
                 line = stream.readline(limit)
@@ -393,7 +393,8 @@ def get_session_messages(
     if path is None:
         return []
     try:
-        content = path.read_text(encoding="utf-8", errors="replace")
+        with open_shared(path, "r", encoding="utf-8", errors="replace") as stream:
+            content = stream.read()
     except OSError:
         return []
     entries = _parse_transcript_entries(content)
@@ -427,7 +428,8 @@ def get_subagent_messages(
     if match is None:
         return []
     try:
-        content = match.read_text(encoding="utf-8")
+        with open_shared(match, "r", encoding="utf-8") as stream:
+            content = stream.read()
     except OSError:
         return []
     if not content:
@@ -547,7 +549,8 @@ def fork_session(
     path = find_session_file(config_dir, session_id, directory=directory)
     if path is None:
         raise FileNotFoundError(f"Session {session_id} not found")
-    content = path.read_bytes()
+    with open_shared(path, "rb") as stream:
+        content = stream.read()
     if not content:
         raise ValueError(f"Session {session_id} has no messages to fork")
     transcript, replacements = _parse_fork_transcript(content, session_id)
