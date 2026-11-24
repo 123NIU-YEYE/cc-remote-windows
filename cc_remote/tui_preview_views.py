@@ -98,7 +98,9 @@ class MarkdownReader(PanelReader):
 
     def reflow(self):
         width = max(10, self.size.width - 2)
-        console = Console(width=width)
+        # Off-screen render for Textual, which always drives a VT console. Without
+        # this, rich swaps in legacy Windows console glyphs when stdout is not a terminal.
+        console = Console(width=width, legacy_windows=False)
         browser_key = (self.app.client.keys.layer_label("preview", "browser")
                        if self.is_mounted else "Space B")
         lines = console.render_lines(

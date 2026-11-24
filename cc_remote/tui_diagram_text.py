@@ -198,7 +198,9 @@ def diagram_source(source):
 class Canvas:
     def __init__(self, width, title):
         self.width = max(8, min(int(width), 240))
-        self.console = Console(width=self.width)
+        # Off-screen render for Textual, which always drives a VT console. Without
+        # this, rich swaps in legacy Windows console glyphs when stdout is not a terminal.
+        self.console = Console(width=self.width, legacy_windows=False)
         self.text = Text()
         self.line(title, style="bold")
 

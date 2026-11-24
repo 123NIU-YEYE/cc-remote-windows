@@ -204,7 +204,9 @@ def table_text(tokens, width):
             table.add_column(heading, overflow="fold")
         for values in rows[1:]:
             table.add_row(*values)
-        console = Console(width=width, color_system="truecolor")
+        # Off-screen render for Textual, which always drives a VT console. Without
+        # this, rich swaps in legacy Windows console glyphs when stdout is not a terminal.
+        console = Console(width=width, color_system="truecolor", legacy_windows=False)
         for line in console.render_lines(table, pad=False):
             result.append_text(
                 Text.assemble(
