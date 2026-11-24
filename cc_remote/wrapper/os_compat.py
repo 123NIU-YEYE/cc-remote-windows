@@ -31,6 +31,22 @@ def fchmod(fd: int, path: str | PathLike[str], mode: int) -> None:
         os.chmod(path, mode)
 
 
+def clear_readonly(path: str | PathLike[str]) -> None:
+    """Let a file be deleted or replaced whatever its mode, as POSIX does.
+
+    Windows refuses both for a file with the read-only attribute, which
+    ``os.chmod`` sets for any mode without owner write. No-op elsewhere.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(mode) and not mode & stat.S_IWRITE:
+        os.chmod(path, stat.S_IMODE(mode) | stat.S_IWRITE)
+
+
 def fsync_directory(path: str | PathLike[str]) -> None:
     """Persist a directory entry on Unix; Windows has no directory fsync."""
     if sys.platform == "win32":

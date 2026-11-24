@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -384,7 +385,9 @@ def test_finish_rejects_commit_with_changed_untracked_baseline(tmp_path, change)
     elif change == "new":
         (root / "new.txt").write_text("new\n")
     elif change == "permission":
-        leftover.chmod(0o600)  # Same Git blob/mode, different filesystem permission.
+        # Same Git blob/mode, different filesystem permission. Read-only is
+        # the one permission Windows mode bits can express.
+        leftover.chmod(0o444)
     elif change == "symlink":
         leftover.unlink()
         os.symlink("tracked.txt", leftover)
@@ -488,6 +491,32 @@ def test_retention_bounds_turn_window_and_invalidates_oversize_objects(
     assert (object_limited.objects_dir / "info" / "alternates").exists()
 
 
+@pytest.mark.parametrize("change", ["content", "permission", "new"])
+def test_rollback_replaces_files_the_turn_made_read_only(tmp_path, change):
+    # Windows refuses to rename over or delete a read-only file; POSIX does not.
+    root = _repo(tmp_path, {"tracked.txt": "baseline\n"})
+    target = root / ("created.txt" if change == "new" else "tracked.txt")
+    journal = CodexCheckpointJournal(
+        str(root), tmp_path / "state", f"session-read-only-{change}"
+    )
+    journal.begin_turn("turn-1")
+    if change != "permission":
+        target.write_text("agent\n", encoding="utf-8")
+    target.chmod(0o444)
+    journal.accept_turn("turn-1")
+    assert journal.finish_turn("turn-1").changed_paths == (target.name,)
+
+    journal.rollback()
+
+    if change == "new":
+        assert not target.exists()
+    else:
+        assert target.read_text(encoding="utf-8") == "baseline\n"
+        assert os.access(target, os.W_OK)
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows has no POSIX mode bits: 0o600 and 0o640 both read back as 0o666")
 def test_rollback_restores_exact_noncanonical_file_permissions(tmp_path):
     root = _repo(tmp_path, {"secret.txt": "baseline\n"})
     secret = root / "secret.txt"
@@ -507,6 +536,8 @@ def test_rollback_restores_exact_noncanonical_file_permissions(tmp_path):
     assert stat.S_IMODE(secret.stat().st_mode) == 0o600
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="Windows has no POSIX mode bits: 0o600, 0o640 and 0o660 all read back as 0o666")
 def test_chmod_only_turn_is_checkpointed_and_restored(tmp_path):
     root = _repo(tmp_path, {"secret.txt": "unchanged\n"})
     _git(root, "config", "core.filemode", "false")

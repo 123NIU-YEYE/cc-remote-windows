@@ -36,7 +36,7 @@ from typing import Any, Callable, Iterator, Optional
 
 from cc_remote.wrapper.child_env import sanitized_child_env
 from cc_remote.wrapper.file_lock_compat import flock, LOCK_EX, LOCK_UN
-from cc_remote.wrapper.os_compat import force_rmtree
+from cc_remote.wrapper.os_compat import clear_readonly, force_rmtree
 
 
 _FORMAT_VERSION = 2
@@ -1570,6 +1570,7 @@ class CodexCheckpointJournal:
             if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
                 target.rmdir()
             else:
+                clear_readonly(target)
                 target.unlink()
             self._prune_empty_parents(target.parent)
 
@@ -1610,9 +1611,11 @@ class CodexCheckpointJournal:
                         handle.flush()
                         os.fsync(handle.fileno())
                     os.chmod(temporary, permission)
+                clear_readonly(target)
                 os.replace(temporary, target)
             finally:
                 try:
+                    clear_readonly(temporary)
                     temporary.unlink()
                 except FileNotFoundError:
                     pass
