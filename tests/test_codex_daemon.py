@@ -4,13 +4,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import signal
 import socket
+import sys
 import tempfile
 
 import pytest
+
+from tests.platform_support import WINDOWS, native_path
 
 from cc_remote.wrapper import codex_daemon as daemon_module
 from cc_remote.wrapper import codex_handle as handle_module
@@ -46,7 +50,7 @@ def _stub_managed_daemon_nofile_verification(monkeypatch):
 
 
 class _Cfg:
-    cc_cwd = "/tmp"
+    cc_cwd = native_path("/tmp")
     tool_result_max = 8000
 
 
@@ -266,21 +270,49 @@ def test_linux_managed_daemon_nofile_is_applied_to_exact_pid(
     assert calls[-1][2] is None
 
 
+def _pid_record(pid, start_ticks):
+    """The official daemon PID record for a process started at ``start_ticks``.
+
+    On Windows it also carries the creation FILETIME, which the Wrapper
+    matches against the process (start_ticks are Unix milliseconds there).
+    """
+    record = {"pid": pid}
+    if WINDOWS:
+        record["processStartTime"] = str((start_ticks + 11_644_473_600_000) * 10_000)
+    return json.dumps(record)
+
+
+def _daemon_process(monkeypatch, codex_home):
+    """On Windows the record is also bound to the daemon's argv and CODEX_HOME."""
+    if WINDOWS:
+        monkeypatch.setattr(
+            daemon_module, "process_command_environment_value",
+            lambda _identity, _key: (True, (b"codex.exe", b"app-server", b"daemon"), str(codex_home)))
+
+
 @pytest.mark.parametrize("record_name", ["app-server.pid", "daemon.pid"])
 def test_managed_daemon_identity_uses_same_user_pid_and_start_token(
         monkeypatch, tmp_path, record_name):
     daemon_root = tmp_path / "app-server-daemon"
     daemon_root.mkdir()
-    (daemon_root / record_name).write_text(
-        '{"pid":4321}', encoding="utf-8")
     identity = ProcessIdentity(4321, 987654)
+    (daemon_root / record_name).write_text(
+        _pid_record(identity.pid, identity.start_ticks), encoding="utf-8")
     monkeypatch.setattr(
         daemon_module, "process_owner_uid", lambda _pid: os.getuid())
     monkeypatch.setattr(
         daemon_module, "process_identity", lambda _pid: identity)
+    _daemon_process(monkeypatch, tmp_path)
 
     assert daemon_module._managed_daemon_process_identity(
         tmp_path) == identity
+    if WINDOWS:
+        # A reused PID carries another process's creation time.
+        (daemon_root / record_name).write_text(
+            _pid_record(identity.pid, identity.start_ticks + 5000), encoding="utf-8")
+        assert daemon_module._managed_daemon_process_identity(tmp_path) is None
+        (daemon_root / record_name).write_text(
+            _pid_record(identity.pid, identity.start_ticks), encoding="utf-8")
 
     monkeypatch.setattr(
         daemon_module,
@@ -296,14 +328,15 @@ def test_new_daemon_record_never_falls_back_to_retired_pid(
     root = tmp_path / "app-server-daemon"
     root.mkdir()
     legacy = root / "app-server.pid"
-    legacy.write_text('{"pid":4321}')
+    legacy.write_text(_pid_record(4321, 999))
     current = root / "daemon.pid"
     if current_record == "symlink":
         current.symlink_to(legacy)
     else:
-        current.write_text('{"pid":5432}' if current_record == "valid" else '{}')
+        current.write_text(_pid_record(5432, 999) if current_record == "valid" else '{}')
     monkeypatch.setattr(daemon_module, "process_owner_uid", lambda _pid: os.getuid())
     monkeypatch.setattr(daemon_module, "process_identity", lambda pid: ProcessIdentity(pid, 999))
+    _daemon_process(monkeypatch, tmp_path)
     expected = ProcessIdentity(5432, 999) if current_record == "valid" else None
     assert daemon_module._managed_daemon_process_identity(tmp_path) == expected
 
@@ -311,6 +344,8 @@ def test_new_daemon_record_never_falls_back_to_retired_pid(
 @pytest.fixture(params=[False, True], ids=["socket", "native-alias"])
 def standalone_listener(request, monkeypatch):
     # Keep the path below macOS's Unix socket length limit.
+    if WINDOWS:
+        pytest.skip("Unix socket fixture; Windows does not support AF_UNIX")
     with (tempfile.TemporaryDirectory(prefix="cc-sock-", dir="/tmp") as root,
           tempfile.TemporaryDirectory(prefix="ca-", dir="/tmp") as protected):
         home = Path(root).resolve()
@@ -1274,6 +1309,7 @@ def test_existing_official_app_server_is_exposed_for_proxy_validation(monkeypatc
         monkeypatch.setattr(
             daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
         manager = CodexDaemonManager("auto")
+        sock_path = native_path("/tmp/codex.sock")
 
         async def command(_bin, _env, *args):
             if args[-1] == "--help":
@@ -1283,7 +1319,7 @@ def test_existing_official_app_server_is_exposed_for_proxy_validation(monkeypatc
                     "status": "running",
                     "managedCodexPath": "/opt/codex/current/codex",
                     "managedCodexVersion": "0.144.4",
-                    "socketPath": "/tmp/codex.sock",
+                    "socketPath": sock_path,
                     "cliVersion": "0.144.4",
                     "appServerVersion": "0.144.1",
                 })
@@ -1292,10 +1328,10 @@ def test_existing_official_app_server_is_exposed_for_proxy_validation(monkeypatc
 
         manager._run = command  # type: ignore[method-assign]
         assert await manager.proxy_args("/bin/codex", {}) == [
-            "/bin/codex", "app-server", "proxy", "--sock", "/tmp/codex.sock",
+            "/bin/codex", "app-server", "proxy", "--sock", sock_path,
         ]
         assert manager.info is not None
-        assert manager.info.socket_path == "/tmp/codex.sock"
+        assert manager.info.socket_path == sock_path
 
     asyncio.run(run())
 
@@ -1520,6 +1556,7 @@ def test_handle_detects_managed_daemon_process_generation_change(
     assert handle.daemon_process_generation_current is False
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_proxy_connect_retries_if_daemon_changes_during_initialize(monkeypatch):
     async def run():
         nonce = b"0123456789abcdef"
@@ -1597,6 +1634,7 @@ def test_proxy_connect_retries_if_daemon_changes_during_initialize(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_proxy_connect_rebinds_resume_if_daemon_changes_after_thread_read(
     monkeypatch,
 ):
@@ -1670,6 +1708,7 @@ def test_proxy_connect_rebinds_resume_if_daemon_changes_after_thread_read(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_proxy_connect_resumes_created_thread_if_sticky_settings_disconnect(
     monkeypatch,
 ):
@@ -1990,6 +2029,7 @@ def test_established_shared_session_never_falls_back_to_private_stdio(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_proxy_handshake_failure_falls_back_to_stdio(monkeypatch):
     async def run():
         nonce = b"0123456789abcdef"
@@ -2043,6 +2083,7 @@ def test_proxy_handshake_failure_falls_back_to_stdio(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_verified_shared_proxy_failure_never_falls_back_to_stdio(monkeypatch):
     async def run():
         nonce = b"0123456789abcdef"
@@ -2132,6 +2173,7 @@ def test_strict_daemon_preparation_failure_never_starts_private_stdio(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_proxy_connect_exposes_shared_state_and_disconnect_keeps_manager(
         monkeypatch):
     async def run():
@@ -2183,6 +2225,7 @@ def test_proxy_connect_exposes_shared_state_and_disconnect_keeps_manager(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups (os.killpg); Windows stops the process tree with taskkill /T")
 def test_oversized_http_resume_keeps_shared_affinity_and_thread_local_provider(
         monkeypatch):
     async def run():

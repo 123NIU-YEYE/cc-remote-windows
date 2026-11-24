@@ -1,4 +1,12 @@
 """No model calls or real App lifecycle changes: desktop launch regressions."""
+import sys
+
+import pytest
+
+# codex_desktop is macOS-only
+if sys.platform != "darwin":
+    pytest.skip("macOS only", allow_module_level=True)
+
 import asyncio
 import hashlib
 import json
@@ -6,8 +14,6 @@ import os
 from pathlib import Path
 import plistlib
 import tempfile
-
-import pytest
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import unix_serve
 

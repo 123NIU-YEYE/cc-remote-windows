@@ -5,6 +5,8 @@ import os
 
 import pytest
 
+from tests.platform_support import is_private
+
 from cc_remote.wrapper.codex_process_clocks import (
     CodexProcessClockStore,
     CodexProcessClockStoreError,
@@ -101,7 +103,7 @@ def test_process_clock_store_is_private_and_fails_closed(tmp_path):
     store = CodexProcessClockStore(tmp_path / "state")
     store.observe_start(source, "browser-message", "native-turn", 10_000)
 
-    assert store.path.stat().st_mode & 0o077 == 0
+    assert is_private(store.path)
     payload = json.loads(store.path.read_text())
     payload["sources"][0]["clocks"][0]["started_ms"] = -1
     store.path.write_text(json.dumps(payload))

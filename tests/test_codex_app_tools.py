@@ -1,4 +1,12 @@
 """Zero-model-turn coverage for the opt-in Desktop tools transport."""
+import sys
+
+import pytest
+
+# codex_app_tools is macOS-only
+if sys.platform != "darwin":
+    pytest.skip("macOS only", allow_module_level=True)
+
 import hashlib
 import json
 import os
@@ -8,8 +16,6 @@ import socket
 import subprocess
 import tempfile
 import tomllib
-
-import pytest
 
 from cc_remote import codex_app_tools as tools
 from cc_remote.wrapper import codex_daemon

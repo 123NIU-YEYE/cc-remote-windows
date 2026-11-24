@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 
 import pytest
+
+from tests.platform_support import has_mode
 
 from cc_remote import codex_daemon_restart as restart_module
 from cc_remote.codex_daemon_restart import (
@@ -41,7 +42,7 @@ def test_restart_state_round_trip_is_private_and_rejects_malformed(tmp_path):
 
     assert state.epoch == "a" * 32
     assert read_restart_state(path) == state
-    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert has_mode(path, 0o600)
     assert state.deadline_at > state.updated_at
 
     path.write_text(json.dumps({

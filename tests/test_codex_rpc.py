@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import pytest
 
@@ -139,6 +140,10 @@ def test_ephemeral_codex_pages_do_not_consume_the_public_catalog_limit(
 ):
     async def run():
         calls = []
+        # Mock _rollout_only_sessions to avoid reading actual user Codex home
+        monkeypatch.setattr(
+            codex_sessions_module, "_rollout_only_sessions",
+            lambda *_args, **_kwargs: {})
         pages = {
             (False, None): {
                 "data": [
@@ -194,6 +199,7 @@ def test_ephemeral_codex_pages_do_not_consume_the_public_catalog_limit(
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX RLIMIT_NOFILE only")
 def test_codex_rpc_can_raise_only_the_isolated_child_nofile_limit(
     monkeypatch,
     tmp_path,

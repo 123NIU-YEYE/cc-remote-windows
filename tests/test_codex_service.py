@@ -7,6 +7,10 @@ import sys
 
 import pytest
 
+# codex_service systemd isolation is Linux-only
+if sys.platform == "win32":
+    pytest.skip("systemd isolation; Linux only", allow_module_level=True)
+
 from cc_remote.wrapper import codex_daemon, codex_service
 from deploy import check_codex_lifetime
 

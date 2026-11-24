@@ -14,6 +14,9 @@ import time
 from types import SimpleNamespace
 
 import pytest
+
+from tests.platform_support import WINDOWS, fake_executable, has_mode
+
 from websockets.asyncio.server import unix_serve
 
 from cc_remote.wrapper import codex_daemon as daemon
@@ -80,6 +83,8 @@ def test_non_disruptive_first_start_reuses_official_lifecycle(tmp_path, monkeypa
 
 @pytest.fixture(params=[False, True], ids=["socket", "native-alias"])
 def account_socket(request, monkeypatch):
+    if WINDOWS:
+        pytest.skip("Python cannot create AF_UNIX listeners on Windows")
     # macOS Unix paths are limited to 104 bytes; pytest's path can exceed that.
     with (tempfile.TemporaryDirectory(prefix="cc-readiness-", dir="/tmp") as directory,
           tempfile.TemporaryDirectory(prefix="ca-", dir="/tmp") as protected):
@@ -144,12 +149,45 @@ def test_profile_checks_endpoint_versions_and_real_handshake(
         assert probes == ["/wrapper/codex", "/daily/codex"]
 
 
+# Windows has no AF_UNIX in Python and cannot select() on pipes: the fake
+# official proxy there relays stdio to a loopback WebSocket from two threads.
+_WINDOWS_FAKE_PROXY = """
+import os, pathlib, socket, sys, threading
+pathlib.Path({pid_file!r}).write_text(str(os.getpid()))
+assert sys.argv[1:4] == ['app-server', 'proxy', '--sock']
+with socket.create_connection(('127.0.0.1', {port})) as daemon:
+    def upstream():
+        while data := sys.stdin.buffer.read1(65536):
+            daemon.sendall(data)
+        daemon.shutdown(socket.SHUT_WR)
+    threading.Thread(target=upstream, daemon=True).start()
+    while data := daemon.recv(65536):
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+"""
+
+
+def _exited(pid):
+    if WINDOWS:
+        import psutil
+        try:
+            return psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
 @pytest.mark.parametrize("mode", ["success", "reject", "hang", "oversized", "eof"])
 def test_proxy_probe_only_initializes_and_reaps_child(tmp_path, monkeypatch, mode):
     binary = tmp_path / "codex"
     messages = []
     pid_file = tmp_path / "pid"
-    binary.write_text(f"""#!{sys.executable}
+    if not WINDOWS:
+        binary.write_text(f"""#!{sys.executable}
 import os, pathlib, selectors, socket, sys
 pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))
 assert sys.argv[1:4] == ['app-server', 'proxy', '--sock']
@@ -167,8 +205,10 @@ while True:
             sys.stdout.buffer.write(data)
             sys.stdout.buffer.flush()
 """)
-    binary.chmod(0o700)
-    monkeypatch.setattr(readiness, "_TIMEOUT", 0.2 if mode == "hang" else 3)
+        binary.chmod(0o700)
+    # The hang must outlast starting the fake proxy; a .cmd launcher plus
+    # Python startup takes longer than 0.2 s on Windows.
+    monkeypatch.setattr(readiness, "_TIMEOUT", 0.2 if mode == "hang" and not WINDOWS else 3)
     async def handler(ws):
         request = json.loads(await ws.recv())
         messages.append(request["method"])
@@ -190,27 +230,37 @@ while True:
             await ws.send([response[:12], response[12:]])
             messages.append(json.loads(await ws.recv())["method"])
         await ws.wait_closed()
+    async def probe(executable, path):
+        if mode == "success":
+            await readiness.probe_proxy(str(executable), dict(os.environ), path)
+        else:
+            with pytest.raises((RuntimeError, ValueError, TimeoutError)):
+                await readiness.probe_proxy(str(executable), dict(os.environ), path)
+
     async def check():
+        if WINDOWS:
+            from websockets.asyncio.server import serve
+            async with serve(handler, "127.0.0.1", 0, close_timeout=0.2) as server:
+                port = server.sockets[0].getsockname()[1]
+                launcher = fake_executable(binary, _WINDOWS_FAKE_PROXY.format(
+                    pid_file=str(pid_file), port=port))
+                await probe(launcher, str(tmp_path / "socket"))
+            return
         with tempfile.TemporaryDirectory(prefix="cc-proxy-", dir="/tmp") as directory:
             path = str(Path(directory) / "socket")
             async with unix_serve(handler, path, close_timeout=0.2):
-                if mode == "success":
-                    await readiness.probe_proxy(str(binary), dict(os.environ), path)
-                else:
-                    with pytest.raises((RuntimeError, ValueError, TimeoutError)):
-                        await readiness.probe_proxy(str(binary), dict(os.environ), path)
+                await probe(binary, path)
     asyncio.run(check())
     assert messages == (
         ["initialize", "initialized"] if mode == "success" else ["initialize"])
-    with pytest.raises(ProcessLookupError):
-        os.kill(int(pid_file.read_text()), 0)
+    assert _exited(int(pid_file.read_text()))
 
 
 def test_installer_rejects_previous_activation_dead_or_reused_pid(tmp_path, monkeypatch):
     before = time.time()
     readiness.write_report(tmp_path, [{"profile": "test", "status": "disabled"}])
     path = tmp_path / readiness.REPORT_NAME
-    assert path.stat().st_mode & 0o777 == 0o600
+    assert has_mode(path, 0o600)
     assert installer.read_receipt(path, readiness.SOURCE_ROOT, before)
     assert installer.read_receipt(path, tmp_path / "another-release", before) is None
     assert installer.read_receipt(path, readiness.SOURCE_ROOT, time.time() + 1) is None
@@ -345,6 +395,7 @@ def test_optional_missing_codex_is_reported_without_starting_a_daemon(tmp_path, 
     assert rows == [{'profile': 'primary', 'home': str(tmp_path), 'status': 'absent', 'reason': 'cli_not_installed'}]
 
 
+@pytest.mark.skipif(WINDOWS, reason="deploy/check_codex_readiness.py is the Linux/macOS install-time check; it connects over AF_UNIX")
 @pytest.mark.parametrize("mode", ["ready", "deleted_cwd", "invalid", "hang", "swapped"])
 def test_live_config_probe_rejects_healthy_handshake_but_unusable_config(monkeypatch, mode):
     calls = []
@@ -385,6 +436,7 @@ def test_live_config_probe_rejects_healthy_handshake_but_unusable_config(monkeyp
     assert calls == ["initialize", "initialized", "config/read"]
 
 
+@pytest.mark.skipif(WINDOWS, reason="deploy/check_codex_readiness.py is the Linux/macOS install-time check; it connects over AF_UNIX")
 @pytest.mark.parametrize("wrong_user", [False, True])
 def test_live_installer_check_is_fresh_and_runs_only_as_service_owner(monkeypatch, wrong_user):
     calls = []
