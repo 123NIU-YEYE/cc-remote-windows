@@ -221,6 +221,7 @@ Web/PWA is the main interface. See [Desktop compatibility](docs/desktop.md) for 
 | Use a terminal interface | [TUI guide](docs/tui.md) |
 | Understand history and file recovery | [Claude rewind](docs/claude-rewind.md) |
 | Understand Windows compatibility | [Windows adaptation notes](docs/windows-upstream-migration.md) |
+| Follow upstream changes | [Upstream sync](docs/upstream-sync.md) |
 | Read version changes | [Changelog](CHANGELOG.md) |
 
 <a id="security-please-read"></a>

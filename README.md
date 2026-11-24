@@ -225,6 +225,7 @@ cc-remote 本身开源，不附带模型额度。消息、侧聊和原生任务�
 | 使用终端界面 | [TUI 中文指南](docs/tui_zh.md) |
 | 了解恢复历史与文件的行为 | [Claude 回退](docs/claude-rewind.md) |
 | 了解 Windows 适配范围 | [Windows 适配说明](docs/windows-upstream-migration.md) |
+| 跟进上游更新 | [上游同步](docs/upstream-sync.md) |
 | 查看版本变化 | [更新记录](CHANGELOG_zh.md) |
 
 <a id="安全须知务必读"></a>
