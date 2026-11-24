@@ -47,6 +47,7 @@ from cc_remote.wrapper.claude_compaction import (
 )
 from cc_remote.wrapper.claude_model_fallback import FALLBACK_TOOL, model_fallback_event
 from cc_remote.wrapper.claude_rewind_history import REWIND_ANCHOR, rewind_anchor_row
+from cc_remote.wrapper.os_compat import open_shared
 from cc_remote.wrapper.turn_changes import native_claude_diff
 from cc_remote.wrapper.token_usage import UsageLedger, native_usage
 
@@ -1875,7 +1876,7 @@ def read_claude_history_image_asset(
     if not isinstance(image_id, str) or not _SAFE_WIRE_ID.fullmatch(image_id):
         return None
     try:
-        with open(source_path, encoding="utf-8") as source:
+        with open_shared(source_path, "r", encoding="utf-8") as source:
             for line in _bounded_jsonl_lines(source):
                 try:
                     row = json.loads(line)
@@ -2040,7 +2041,7 @@ def _transcript_graph_index(
         queued = set(indexed.queued_notifications)
     else:
         try:
-            with open(source_path, "rb") as source:
+            with open_shared(source_path, "rb") as source:
                 stat = os.fstat(source.fileno())
                 target_size = min(
                     int(stat.st_size),
@@ -2173,7 +2174,7 @@ def _compact_chain_index(
     commands: dict[str, str] = {}
     boundary = None
     try:
-        with open(source_path, "rb") as source:
+        with open_shared(source_path, "rb") as source:
             for uid in chain_ids:
                 if rows[uid][:2] == ("system", "compact_boundary"):
                     boundary = uid
@@ -2496,7 +2497,7 @@ def recover_claude_delayed_retry_tail(
     ] = {}
     recovered_ids: set[str] = set()
     try:
-        with open(source_path, "rb") as source:
+        with open_shared(source_path, "rb") as source:
             for index, uid in enumerate(active_chain):
                 metadata = rows[uid]
                 if metadata[0] != "system" or metadata[1] != "api_error":
@@ -2553,7 +2554,7 @@ def _recover_pending_meta_tail(
         return None
     visible_ids = {getattr(message, "uuid", None) for message in messages}
     try:
-        with open(path, "rb") as source:
+        with open_shared(path, "rb") as source:
             tail = _indexed_transcript_row(
                 source, chain[-1], rows[chain[-1]], max_record_bytes=max_record_bytes)
             if (not tail or tail.get("isMeta") is not True
@@ -2677,7 +2678,7 @@ def recover_claude_native_metadata(
     anchor = None
     restored = 0
     try:
-        with open(path, "rb") as source:
+        with open_shared(path, "rb") as source:
             for uid in chain:
                 metadata = rows[uid]
                 if metadata[0] == "attachment" and metadata[6]:
@@ -2756,7 +2757,7 @@ def _load_compact_chain_messages(
     timestamps: dict[str, float] = {}
     internal_events: dict[str, ProcessEvent] = {}
     try:
-        with open(source_path, "rb") as source:
+        with open_shared(source_path, "rb") as source:
             for uid in chain_ids:
                 metadata = rows.get(uid)
                 if metadata is None or not isinstance(metadata[5], int):
@@ -2851,7 +2852,7 @@ def transcript_timestamps(
         source_path = path or transcript_path(session_id)
         if not source_path:
             return out
-        with open(source_path) as f:
+        with open_shared(source_path, "r", encoding="utf-8") as f:
             for line in _bounded_jsonl_lines(f):
                 try:
                     d = json.loads(line)
@@ -3158,7 +3159,7 @@ def transcript_internal_user_events(
     queued: set[tuple[int, str]] = set()
     events: dict[str, ProcessEvent] = {}
     try:
-        with open(source_path, encoding="utf-8") as source:
+        with open_shared(source_path, "r", encoding="utf-8") as source:
             for line in _bounded_jsonl_lines(source):
                 try:
                     row = json.loads(line)

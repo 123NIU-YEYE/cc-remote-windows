@@ -40,6 +40,7 @@ from cc_remote.wrapper.process_scan import (
     process_command,
     process_command_environment_value,
 )
+from cc_remote.wrapper.os_compat import open_shared
 
 MAX_FDS_PER_PROCESS = 8192
 MAX_PARTIAL_RECORD_BYTES = 16 * 1024 * 1024
@@ -539,7 +540,7 @@ def _is_owned_npm_app_server_child(
 def _rollout_cwd(path: str) -> str | None:
     """Read only the bounded session_meta cwd needed for TUI attribution."""
     try:
-        with open(path, "rb") as stream:
+        with open_shared(path, "rb") as stream:
             line = stream.readline(1024 * 1024 + 1)
         if len(line) > 1024 * 1024:
             return None
@@ -1072,7 +1073,7 @@ def codex_active_goal_turn(path: str, *, max_bytes: int) -> str | None:
     This is a bounded candidate read, never proof that a writer is alive. The
     caller must validate the exact id against the owning shared app-server.
     """
-    with open(path, "rb") as stream:
+    with open_shared(path, "rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         start = max(0, size - max_bytes)
         stream.seek(start)

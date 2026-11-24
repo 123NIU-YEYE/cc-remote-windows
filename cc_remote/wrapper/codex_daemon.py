@@ -26,7 +26,7 @@ from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit
 
 from cc_remote.log import logger
-from cc_remote.wrapper.os_compat import current_uid
+from cc_remote.wrapper.os_compat import current_uid, open_shared
 from cc_remote.wrapper.codex_service import needs_isolation, run_isolated
 from cc_remote.wrapper.codex_launch_barrier import barrier, mutates_daemon
 from cc_remote.wrapper.process_scan import (
@@ -402,7 +402,7 @@ def _managed_daemon_process_identity(
         # Native Windows state uses FILETIME, rather than Linux start ticks.
         # Bind the PID record to the exact account and process generation.
         try:
-            with pid_path.open("rb") as stream:
+            with open_shared(pid_path, "rb") as stream:
                 raw = stream.read(_PID_RECORD_MAX + 1)
             if len(raw) > _PID_RECORD_MAX:
                 return None

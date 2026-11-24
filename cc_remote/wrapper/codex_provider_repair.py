@@ -29,7 +29,7 @@ import sqlite3
 import stat
 from typing import Any, Iterable, Optional
 
-from cc_remote.wrapper.os_compat import fsync_directory, pread, pwrite
+from cc_remote.wrapper.os_compat import fsync_directory, open_shared, pread, pwrite
 
 
 CANONICAL_OPENAI_PROVIDER_ID = "openai"
@@ -101,7 +101,7 @@ def _sqlite_home(codex_home: Path) -> Path:
     try:
         if config_path.stat().st_size > 4 * 1024 * 1024:
             raise CodexProviderRepairError("Codex config.toml exceeds size limit")
-        with config_path.open("rb") as stream:
+        with open_shared(config_path, "rb") as stream:
             config = tomllib.load(stream)
     except FileNotFoundError:
         return codex_home
@@ -150,7 +150,7 @@ def _is_below(path: Path, root: Path) -> bool:
 
 def _read_first_record(path: Path) -> tuple[bytes, dict[str, Any]]:
     try:
-        with path.open("rb") as stream:
+        with open_shared(path, "rb") as stream:
             line = stream.readline(MAX_META_BYTES + 1)
     except OSError as exc:
         raise CodexProviderRepairError("unable to read rollout metadata") from exc

@@ -23,6 +23,7 @@ from cc_remote.wrapper.rollout_io import rollout_first_line, rollout_open, rollo
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_rpc import codex_rpc, codex_history_rpc_scope
 from cc_remote.wrapper.codex_organization import PINNED_SECTION_ID, native_pinned, native_read_state
+from cc_remote.wrapper.os_compat import open_shared
 
 
 def _load_tomllib():
@@ -254,7 +255,7 @@ def _read_rollout_head(
     branch: Optional[str] = None
     subagent = False
     try:
-        with path.open("rb") as handle:
+        with open_shared(path, "rb") as handle:
             raw = handle.read(_ROLLOUT_HEAD_BYTES)
     except OSError:
         return None, None, None, False
@@ -529,7 +530,7 @@ def _state_db_path(
     try:
         if os.path.getsize(config_path) > _CONFIG_MAX_BYTES:
             return None
-        with open(config_path, "rb") as stream:
+        with open_shared(config_path, "rb") as stream:
             config = tomllib.load(stream)
     except FileNotFoundError:
         config = {}
@@ -1457,7 +1458,7 @@ def _config_value(
         target = os.path.realpath(_config_path(codex_home))
         if os.path.getsize(target) > _CONFIG_MAX_BYTES:
             return default
-        with open(target, "rb") as f:
+        with open_shared(target, "rb") as f:
             config = tomllib.load(f)
         # tomllib preserves table boundaries. Looking only at the root prevents
         # a profile/provider's nested `model`, effort or service tier from being

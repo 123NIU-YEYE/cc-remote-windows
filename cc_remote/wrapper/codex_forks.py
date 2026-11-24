@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
-from cc_remote.wrapper.os_compat import fchmod, fsync_directory
+from cc_remote.wrapper.os_compat import fchmod, fsync_directory, open_shared
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _MAX_ENTRIES = 4096
@@ -743,7 +743,7 @@ def rollout_fork_meta(path: Optional[str]) -> Optional[dict[str, str]]:
     if not path:
         return None
     try:
-        with open(path, encoding="utf-8", errors="replace") as stream:
+        with open_shared(path, "r", encoding="utf-8", errors="replace") as stream:
             # session_meta is normally the first record. Bound both malformed
             # leading data and record size so recovery cannot become a file scan.
             for _ in range(16):

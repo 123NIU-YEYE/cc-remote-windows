@@ -115,6 +115,19 @@ def open_with_share_delete(
     return open_descriptor(path, flags, mode)
 
 
+def open_shared(path: str | PathLike[str], mode: str = "rb", **kwargs):
+    """Builtin open that lets the owning program move or delete the file.
+
+    Native engines rename and replace their own files while cc-remote reads
+    them: Codex moves archived rollouts and rewrites its config, and Claude
+    removes expired transcripts. A Windows handle without delete sharing makes
+    those operations fail for as long as the read lasts.
+    """
+    if sys.platform == "win32":
+        kwargs.setdefault("opener", open_with_share_delete)
+    return open(path, mode, **kwargs)
+
+
 def pread(fd: int, length: int, offset: int) -> bytes:
     """Positioned read, backed by lseek+read where the platform lacks pread.
 

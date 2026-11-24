@@ -16,7 +16,7 @@ from uuid import UUID, uuid4
 from claude_agent_sdk import get_session_messages
 
 from cc_remote.claude_permissions import CLAUDE_PERMISSION_MODES
-from cc_remote.wrapper.os_compat import current_uid, fsync_directory
+from cc_remote.wrapper.os_compat import current_uid, fsync_directory, open_shared
 from cc_remote.wrapper.stream import transcript_path
 from cc_remote.wrapper.stream import (
     recover_claude_delayed_retry_tail,
@@ -677,7 +677,7 @@ def _bounded_jsonl(path: str, max_bytes: int):
     info = os.stat(path, follow_symlinks=False)
     if (not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes):
         return
-    with open(path, "rb") as stream:
+    with open_shared(path, "rb") as stream:
         while True:
             line = stream.readline(_MAX_RECORD_BYTES + 1)
             if not line:

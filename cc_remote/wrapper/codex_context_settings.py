@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 import time
 
+from cc_remote.wrapper.os_compat import open_shared
+
 
 # Codex 0.154.0 ModelInfo::auto_compact_token_limit caps the trigger at
 # floor(raw context window * 9 / 10), independently of usable_context_window.
@@ -49,7 +51,7 @@ def model_context_bounds(model: str, codex_home: str | None) -> ContextBounds | 
     # contains them; never guess a window from a model name or another account.
     home = Path(codex_home or os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
     try:
-        with (home / "models_cache.json").open("rb") as stream:
+        with open_shared(home / "models_cache.json", "rb") as stream:
             data = stream.read(4 * 1024 * 1024 + 1)
         if len(data) > 4 * 1024 * 1024:
             return None

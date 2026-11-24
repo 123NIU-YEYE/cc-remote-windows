@@ -480,7 +480,7 @@ from cc_remote.wrapper.session_files import (
     path_is_below,
     read_session_file,
 )
-from cc_remote.wrapper.os_compat import current_uid
+from cc_remote.wrapper.os_compat import current_uid, open_shared
 from cc_remote.wrapper.transport import WrapperTransport
 
 log = logger("cc_remote.wrapper.machine")
@@ -20183,7 +20183,7 @@ class WrapperMachine:
     def _read_claude_settings(cls, path: str) -> Optional[dict]:
         """Read one settings object without trusting an unbounded config file."""
         try:
-            with open(path, "rb") as handle:
+            with open_shared(path, "rb") as handle:
                 raw = handle.read(cls.CLAUDE_SETTINGS_MAX_BYTES + 1)
         except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
             return None
