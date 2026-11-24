@@ -7,6 +7,7 @@ import pytest
 
 from cc_remote.protocol import BrowseFiles, FilesListed, deserialize, serialize
 from cc_remote.wrapper.workspace_browser import browse_workspace
+from tests.platform_support import set_home
 
 
 def test_directory_navigation_paging_and_hidden_files(tmp_path):
@@ -48,7 +49,7 @@ def test_code_can_browse_parents_absolute_paths_home_and_external_files(tmp_path
     root.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("outside")
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     start = browse_workspace(str(root), ".", confine_to_cwd=False)
     assert start["root"] == Path(tmp_path).anchor

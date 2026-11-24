@@ -3,11 +3,57 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import sys
+import traceback
 
 # Tests never discover a parent checkout\'s production credentials.
 os.environ.setdefault("PYTHON_DOTENV_DISABLED", "1")
 
 import pytest
+
+_REPO = Path(__file__).resolve().parents[1]
+_ERROR_PRIVILEGE_NOT_HELD = 1314
+
+
+def pytest_configure(config):
+    # Windows text I/O follows the ANSI code page (cp936, cp1252, ...) unless
+    # UTF-8 mode is on; test fixtures write UTF-8 text without naming it.
+    if sys.platform == "win32" and not sys.flags.utf8_mode:
+        raise pytest.UsageError(
+            "Run the test suite in Python UTF-8 mode on Windows: set PYTHONUTF8=1")
+
+
+def _test_symlink_refused(exc: BaseException | None) -> bool:
+    """A symlink created by test code was refused for lack of privilege.
+
+    Windows grants SeCreateSymbolicLinkPrivilege only to administrators and in
+    Developer Mode. A refusal raised from product code is a real failure.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if (isinstance(exc, OSError)
+                and getattr(exc, "winerror", None) == _ERROR_PRIVILEGE_NOT_HELD):
+            frames = [Path(frame.filename).resolve()
+                      for frame in traceback.extract_tb(exc.__traceback__)]
+            own = [frame for frame in frames if any(
+                frame.is_relative_to(_REPO / part) for part in ("tests", "cc_remote", "deploy"))]
+            return bool(own) and own[-1].is_relative_to(_REPO / "tests")
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    if (sys.platform == "win32" and call.excinfo is not None
+            and _test_symlink_refused(call.excinfo.value)):
+        report = outcome.get_result()
+        path, line = item.reportinfo()[:2]
+        report.outcome = "skipped"
+        report.longrepr = (os.fspath(path), (line or 0) + 1,
+                           "Skipped: creating symlinks needs Windows Developer Mode or administrator rights")
 
 
 _ACCOUNT_PROFILE_ENV = (

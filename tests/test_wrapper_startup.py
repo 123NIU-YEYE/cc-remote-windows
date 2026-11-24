@@ -11,6 +11,7 @@ from cc_remote.config import WrapperConfig
 from cc_remote.wrapper import __main__ as wrapper_main
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
+from tests.platform_support import set_home
 
 
 class _Transport:
@@ -88,7 +89,7 @@ def test_prepare_codex_daemons_starts_every_profile_best_effort(
 
 
 def test_default_account_check_resolves_home_even_with_legacy_none_env(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.delenv("CODEX_HOME", raising=False)
     cfg = WrapperConfig(

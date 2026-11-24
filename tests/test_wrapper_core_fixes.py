@@ -40,6 +40,7 @@ from cc_remote.wrapper.session import (
 )
 from cc_remote.wrapper.stream import replayed_user_message_id
 from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
+from tests.platform_support import set_home
 
 
 class _StalledSdk:
@@ -870,7 +871,7 @@ def test_background_job_scan_caps_entries_and_state_file_size(
         monkeypatch, tmp_path):
     jobs = tmp_path / ".claude" / "jobs"
     jobs.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
 
     valid = jobs / "valid"
     valid.mkdir()

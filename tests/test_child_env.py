@@ -33,6 +33,7 @@ from cc_remote.wrapper.claude_transport import (
 from cc_remote.wrapper.codex_handle import _codex_env
 from cc_remote.wrapper.sdk import CLAUDE_WORK_TOOLS, SdkHandle
 from cc_remote.wrapper.work_prompt import WORK_SYSTEM_PROMPT
+from tests.platform_support import set_home
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -148,7 +149,7 @@ async def test_claude_profiles_use_the_daily_cli_account_metadata(
     for path, value in metadata.items():
         path.write_text(json.dumps(value), encoding="utf-8")
     before_files = {path: path.read_bytes() for path in metadata}
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ambient-other-account")
     monkeypatch.delenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", raising=False)
@@ -210,7 +211,7 @@ def test_native_claude_profile_symlink_uses_the_same_account_layout(
     native.mkdir(parents=True)
     alias = tmp_path / "native-alias"
     alias.symlink_to(native, target_is_directory=True)
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/unrelated/account")
 
     overlay = claude_profile_child_env(
@@ -329,7 +330,7 @@ def test_single_claude_account_preserves_ambient_provider_configuration(
 
 def test_direct_claude_profile_process_keeps_runtime_environment(monkeypatch):
     monkeypatch.setenv("PATH", "/runtime/bin")
-    monkeypatch.setenv("HOME", "/runtime/home")
+    set_home(monkeypatch, "/runtime/home")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-account")
     monkeypatch.setenv("WRAPPER_TOKEN", "control-secret")
@@ -573,7 +574,7 @@ def test_secondary_claude_profile_does_not_load_primary_as_home_project(
     selected_settings.write_text(json.dumps({
         "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:19195"},
     }), encoding="utf-8")
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
 
     options = SdkHandle(
         WrapperConfig(state_dir=tmp_path / "state"),
@@ -601,7 +602,7 @@ def test_primary_claude_profile_is_also_isolated_from_project_settings(
     profile = home / ".claude"
     profile.mkdir(parents=True)
     (profile / "settings.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
 
     options = SdkHandle(
         WrapperConfig(state_dir=tmp_path / "state"),
@@ -620,7 +621,7 @@ def test_secondary_oauth_profile_without_settings_still_blocks_home_collision(
     (home / ".claude").mkdir(parents=True)
     profile = home / ".claude-subscription"
     profile.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
 
     options = SdkHandle(
         WrapperConfig(state_dir=tmp_path / "state"),
@@ -798,7 +799,7 @@ def test_claude_bin_defaults_to_daily_local_cli_and_can_be_configured(
 ):
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.delenv("CLAUDE_BIN", raising=False)
     assert WrapperConfig().claude_bin == str(home / ".local/bin/claude")
 

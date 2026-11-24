@@ -46,6 +46,7 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper.claude_broker_handle import ClaudeBrokerHandle
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_support import set_home
 
 
 @pytest.fixture
@@ -271,7 +272,7 @@ async def control_broker(
 ):
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     supports_auto, reports_manual = request.param
     monkeypatch.setenv("FAKE_CLAUDE_AUTO", "1" if supports_auto else "0")
     monkeypatch.setenv(
@@ -314,7 +315,7 @@ async def test_context_query_retries_one_ignored_startup_command(
 ):
     home = tmp_path / "retry-home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.setenv("FAKE_CLAUDE_DROP_FIRST_CONTEXT", "1")
     monkeypatch.setattr(
         broker_session_module, "CONTEXT_CONFIRM_TIMEOUT_SECONDS", 0.2)
@@ -350,7 +351,7 @@ async def test_model_control_confirms_changed_native_prompt_after_fresh_output(
 ):
     home = tmp_path / "model-confirm-home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.setenv("FAKE_CLAUDE_UNKNOWN_MODEL_PROMPT", "1")
     monkeypatch.setenv("FAKE_CLAUDE_IGNORE_FIRST_MODEL_CONFIRM", "1")
     monkeypatch.setattr(
@@ -856,7 +857,7 @@ async def test_control_confirmation_window_rejects_remote_send_and_interrupt():
 def test_transcript_fallback_fails_closed_for_duplicate_sid_across_cwds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
     sid = "11111111-1111-4111-8111-111111111111"
     root = tmp_path / ".claude" / "projects"
     for project in ("-old-cwd", "-copied-cwd"):
@@ -875,7 +876,7 @@ def test_transcript_lookup_uses_configured_claude_root(
 ):
     home = tmp_path / "home"
     active = tmp_path / "profiles" / "claude"
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(active))
     sid = "11111111-1111-4111-8111-111111111111"
     cwd = "/configured-root"

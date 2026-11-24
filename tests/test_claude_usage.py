@@ -15,6 +15,7 @@ from cc_remote.wrapper.claude_rate_limits import ClaudeRateLimitStore
 from cc_remote.wrapper.claude_usage import ClaudeUsageError, ClaudeUsageReader
 from tests.test_claude_rate_limits import _event
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_support import set_home
 
 
 def usage(value=37):
@@ -44,7 +45,7 @@ def enable_queries(machine):
 def isolate_native_account(monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     return home
 

@@ -13,6 +13,7 @@ from claude_agent_sdk import (
 
 from cc_remote.claude_paths import claude_config_dir, claude_projects_dir
 from cc_remote.wrapper.stream import transcript_path, transcript_presence
+from tests.platform_support import set_home
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -79,7 +80,7 @@ def test_settings_only_provider_switch_keeps_one_claude_catalog(
     active = tmp_path / "shared-claude-home"
     decoy = _write_transcript(home / ".claude", "wrong root")
     source = _write_transcript(active, "shared session")
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(active))
 
     assert claude_config_dir() == active.resolve()
@@ -105,7 +106,7 @@ def test_settings_only_provider_switch_keeps_one_claude_catalog(
 
 
 def test_default_claude_root_remains_home_scoped(monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     assert claude_config_dir() == (tmp_path / ".claude").resolve()

@@ -34,6 +34,7 @@ from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.session_presentation import SessionPresentationStore
 from cc_remote.viewer_pages import PageRef, PageScope, ViewerPageStore
 from tests.test_multisession import _mk_ctx
+from tests.platform_support import set_home
 
 
 NATIVE_ID = "11111111-1111-4111-8111-111111111111"
@@ -325,7 +326,7 @@ def test_macos_default_profile_file_survives_an_older_launchagent(
     payload = _profiles(tmp_path / "personal", tmp_path / "company")
     profile_file.write_text(payload, encoding="utf-8")
     monkeypatch.setattr(config_module.sys, "platform", "darwin")
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
     monkeypatch.setenv(
         "XPC_SERVICE_NAME", "com.mugglepro.cc-remote-wrapper")
     monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_JSON", raising=False)
@@ -345,7 +346,7 @@ def test_unrelated_process_does_not_implicitly_enable_claude_profiles(
         encoding="utf-8",
     )
     monkeypatch.setattr(config_module.sys, "platform", "darwin")
-    monkeypatch.setenv("HOME", str(tmp_path))
+    set_home(monkeypatch, str(tmp_path))
     monkeypatch.setenv("XPC_SERVICE_NAME", "com.example.unrelated")
     monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_JSON", raising=False)
     monkeypatch.delenv("CC_REMOTE_CLAUDE_PROFILES_FILE", raising=False)

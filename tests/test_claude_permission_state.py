@@ -27,6 +27,7 @@ from cc_remote.wrapper.sdk import CLAUDE_DEFAULT_MODEL, SdkHandle
 from cc_remote.wrapper.claude_controls import ClaudeControls, ClaudeControlStore
 from cc_remote.workspaces import WorkStores
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_support import set_home
 
 
 class _FakeClaudeClient:
@@ -959,7 +960,7 @@ def test_claude_new_session_defaults_use_settings_without_session_probe(
         '{"model":"claude-sonnet-5"}')
     (project / ".claude" / "settings.local.json").write_text(
         '{"model":"claude-mythos-5[1m]"}')
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.setattr(
@@ -1097,7 +1098,7 @@ def test_fresh_claude_spawn_inherits_native_defaults(
     (home / ".claude").mkdir(parents=True)
     project.mkdir()
     (home / ".claude" / "settings.json").write_text("{}")
-    monkeypatch.setenv("HOME", str(home))
+    set_home(monkeypatch, str(home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
     monkeypatch.setattr(
@@ -1237,7 +1238,7 @@ def test_implicit_claude_default_failure_reports_probed_provider_model(
             sdk_module, "ClaudeSDKClient", RejectingModelClient)
         monkeypatch.setattr(
             SdkHandle, "preflight", staticmethod(lambda _path: None))
-        monkeypatch.setenv("HOME", str(tmp_path))
+        set_home(monkeypatch, str(tmp_path))
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
         settings = tmp_path / ".claude" / "settings.json"
@@ -1286,7 +1287,7 @@ def test_implicit_claude_default_and_probe_failure_emit_no_fake_model(
             sdk_module, "ClaudeSDKClient", UnreportedModelClient)
         monkeypatch.setattr(
             SdkHandle, "preflight", staticmethod(lambda _path: None))
-        monkeypatch.setenv("HOME", str(tmp_path))
+        set_home(monkeypatch, str(tmp_path))
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
         monkeypatch.setattr(
@@ -1510,7 +1511,7 @@ def test_claude_work_resume_never_applies_code_fresh_default(
             lambda _sid: SimpleNamespace(cwd=record.cwd))
         monkeypatch.setattr(
             machine_module, "save_session_id", lambda *_args: None)
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        set_home(monkeypatch, str(tmp_path / "home"))
         machine, _ = _mk_machine()
         machine._work = WorkStores(
             tmp_path / "work-claude", tmp_path / "work-codex")
