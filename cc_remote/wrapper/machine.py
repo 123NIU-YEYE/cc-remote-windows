@@ -5815,8 +5815,9 @@ class WrapperMachine:
                 binding.native_message_id: binding.task_id
                 for binding in lease.stream_bindings
                 if (
-                    binding.source_device == source.device
-                    and binding.source_inode == source.inode
+                    # Bindings store unsigned ids, the source signed SQLite ones.
+                    binding.source_device == source.device & ((1 << 64) - 1)
+                    and binding.source_inode == source.inode & ((1 << 64) - 1)
                 )
             }
             if source is not None else {}
@@ -6026,8 +6027,9 @@ class WrapperMachine:
                                 lease.turn_id,
                                 active_stream_id,
                                 native_message_id,
-                                source_device=source.device,
-                                source_inode=source.inode,
+                                # Signed SQLite int64s, as in the live binding.
+                                source_device=source.device & ((1 << 64) - 1),
+                                source_inode=source.inode & ((1 << 64) - 1),
                                 expected_msg_id=lease.msg_id,
                                 daemon_epoch=lease.daemon_epoch,
                             )
