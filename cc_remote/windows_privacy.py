@@ -112,26 +112,36 @@ def create_private_file(path: str | Path) -> int:
 
 
 def private_descriptor(fd: int) -> None:
-    """Protect the same open file even when a CRT descriptor lacks WRITE_DAC."""
+    """Protect the same open file or directory even when a CRT descriptor lacks WRITE_DAC."""
     import ctypes
     import msvcrt
+    import os
+    import stat
     from ctypes import wintypes
     security, rights, owner = _security()
+    directory = stat.S_ISDIR(os.fstat(fd).st_mode)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    reopen = kernel.ReOpenFile
-    reopen.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
-    reopen.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = reopen(msvcrt.get_osfhandle(fd), 0x20000 | 0x40000, 7, 0x02000000)
-    if handle == wintypes.HANDLE(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
+    if directory:
+        # ReOpenFile rejects directory handles.
+        from cc_remote.wrapper.windows_fd import reopen_handle
+        handle = reopen_handle(fd, 0x20000 | 0x40000).Detach()
+    else:
+        reopen = kernel.ReOpenFile
+        reopen.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD]
+        reopen.restype = wintypes.HANDLE
+        handle = reopen(msvcrt.get_osfhandle(fd), 0x20000 | 0x40000, 7, 0x02000000)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
     try:
         descriptor = security.GetSecurityInfo(handle, security.SE_FILE_OBJECT,
                                             security.OWNER_SECURITY_INFORMATION)
         if descriptor.GetSecurityDescriptorOwner() != owner:
             raise PermissionError("File descriptor must belong to this user")
         acl = security.ACL()
-        acl.AddAccessAllowedAceEx(security.ACL_REVISION, 0, rights.FILE_ALL_ACCESS, owner)
+        # Like private_directory: children inherit the owner-only rule.
+        acl.AddAccessAllowedAceEx(security.ACL_REVISION, 3 if directory else 0,
+                                  rights.FILE_ALL_ACCESS, owner)
         security.SetSecurityInfo(handle, security.SE_FILE_OBJECT,
                                 security.DACL_SECURITY_INFORMATION | security.PROTECTED_DACL_SECURITY_INFORMATION,
                                 None, None, acl, None)

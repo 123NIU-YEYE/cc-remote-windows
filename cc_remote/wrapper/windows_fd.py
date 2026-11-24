@@ -78,14 +78,26 @@ def open_descriptor(path, flags: int, mode: int = 0o600, *, dir_fd=None) -> int:
 
 
 
-def _relative_handle(path, root_fd, access, disposition, flags, *, directory=False):
+def reopen_handle(fd: int, access: int):
+    """Reopen the object behind ``fd`` itself with ``access``.
+
+    ReOpenFile rejects directory handles; an empty NT name relative to the
+    handle reopens the same file or directory without a path lookup.
+    """
+    return _relative_handle("", fd, access, 3, NOFOLLOW, directory=None, same_object=True)
+
+
+def _relative_handle(path, root_fd, access, disposition, flags, *, directory=False, same_object=False):
     """Open one child via NT RootDirectory, pinned to the actual parent handle."""
     import ctypes as ct
     import msvcrt
     from ctypes import wintypes as w
 
     name = os.fsdecode(path)
-    if not name or name in {".", ".."} or any(c in name for c in "\\/:\0"):
+    if same_object:
+        if name:
+            raise ValueError("Reopening a descriptor takes no path component")
+    elif not name or name in {".", ".."} or any(c in name for c in "\\/:\0"):
         raise ValueError("A descriptor-relative child must be one literal path component")
 
     class UnicodeString(ct.Structure):

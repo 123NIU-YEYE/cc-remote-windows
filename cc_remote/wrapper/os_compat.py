@@ -147,6 +147,14 @@ def pwrite(fd: int, data: bytes, offset: int) -> int:
         os.lseek(fd, saved, os.SEEK_SET)
 
 
+def _windows_fchmod(fd: int, mode: int) -> None:
+    """Owner-only modes become an owner-only ACL; other modes keep the
+    inherited ACL, the Windows counterpart of a shared POSIX mode."""
+    if not mode & 0o077:
+        from cc_remote.windows_privacy import private_descriptor
+        private_descriptor(fd)
+
+
 def install_windows_shims() -> None:
     """Install only explicit Windows primitives; never fake permission checks.
 
@@ -162,9 +170,10 @@ def install_windows_shims() -> None:
         os.getuid = lambda: 0  # type: ignore[attr-defined]
     if not hasattr(os, "geteuid"):
         os.geteuid = lambda: 0  # type: ignore[attr-defined]
-    if not hasattr(os, "fchmod"):
-        from cc_remote.windows_privacy import private_descriptor
-        os.fchmod = lambda fd, _mode: private_descriptor(fd)  # type: ignore[attr-defined]
+    # Python 3.13 added a native os.fchmod on Windows that only toggles the
+    # read-only attribute (and rejects directories). Replace it either way so
+    # an owner-only mode really gets an owner-only ACL.
+    os.fchmod = _windows_fchmod  # type: ignore[attr-defined]
     if not hasattr(os, "pread"):
         os.pread = pread  # type: ignore[attr-defined]
     if not hasattr(os, "pwrite"):
