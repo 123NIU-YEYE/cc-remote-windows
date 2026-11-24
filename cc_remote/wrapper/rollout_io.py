@@ -17,6 +17,8 @@ import sys
 import tempfile
 import threading
 
+from cc_remote.wrapper.os_compat import open_with_share_delete
+
 try:
     from compression import zstd
 except ImportError:  # Python 3.10–3.13.
@@ -112,6 +114,10 @@ def _decoded_path(path: str, *, follow_symlinks=True) -> str:
 def _native_open(path, mode, *, follow_symlinks=True, **kwargs):
     if not follow_symlinks:
         kwargs["opener"] = lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    elif sys.platform == "win32":
+        # Builtin open denies delete sharing: Codex could not archive (move)
+        # or compress a rollout while it is being read.
+        kwargs["opener"] = open_with_share_delete
     return open(path, mode, **kwargs)
 
 
@@ -161,7 +167,7 @@ def rollout_size(path) -> int:
 
 def rollout_first_line(path, limit: int, *, source=None) -> bytes:
     """Metadata discovery must not decompress/cache an entire cold session."""
-    with (open(path, "rb") if source is None else nullcontext(source)) as raw:
+    with (_native_open(path, "rb") if source is None else nullcontext(source)) as raw:
         if not is_compressed_rollout(path):
             return raw.readline(limit)
         try:

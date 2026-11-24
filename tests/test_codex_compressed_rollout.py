@@ -642,3 +642,25 @@ def test_source_replaced_during_decode_is_rejected(tmp_path, monkeypatch):
         rollout_io.rollout_open(path)
     assert not rollout_io._cache
     assert not list(Path(rollout_io._directory.name).iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file sharing")
+def test_codex_can_archive_or_compress_a_rollout_while_it_is_read(tmp_path):
+    # Builtin open denies delete sharing on Windows; rollout reads must not
+    # block the official client from moving or deleting the file.
+    plain = tmp_path / "sessions" / "rollout-thread.jsonl"
+    plain.parent.mkdir()
+    plain.write_bytes(b"first\nsecond\n")
+    archived = tmp_path / "archived_sessions" / plain.name
+    archived.parent.mkdir()
+    with rollout_io.rollout_open(plain) as reader:
+        assert reader.readline() == b"first\n"
+        os.rename(plain, archived)
+        assert reader.readline() == b"second\n"
+    with rollout_io.rollout_open(archived) as reader:
+        assert rollout_io.rollout_first_line(archived, 64) == b"first\n"
+        compressed = _compress(archived)
+        archived.unlink()
+        assert reader.read() == b"first\nsecond\n"
+    with rollout_io.rollout_open(compressed) as stream:
+        assert stream.read() == b"first\nsecond\n"
