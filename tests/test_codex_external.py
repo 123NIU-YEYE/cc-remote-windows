@@ -38,6 +38,7 @@ from cc_remote.wrapper.process_scan import (
     process_environment_value,
     process_identity,
 )
+from tests.platform_support import native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -117,14 +118,15 @@ def test_codex_app_server_proxy_socket_requires_one_absolute_socket(
         )
         return codex_app_server_proxy_socket(identity)
 
-    expected = str(Path("/tmp/codex-stack.sock").resolve())
+    socket_path = os.fsencode(native_path("/tmp/codex-stack.sock"))
+    expected = str(Path(os.fsdecode(socket_path)).resolve())
     assert socket_for((
         b"/usr/local/bin/codex", b"app-server", b"proxy",
-        b"--sock", b"/tmp/codex-stack.sock",
+        b"--sock", socket_path,
     )) == expected
     assert socket_for((
         b"codex", b"app-server", b"proxy",
-        b"--sock=/tmp/codex-stack.sock",
+        b"--sock=" + socket_path,
     )) == expected
     for args in (
         None,
@@ -157,13 +159,13 @@ def test_codex_app_server_client_socket_routes_implicit_profile_home(
         ),
     )
 
-    default_home = "/Users/test/.codex"
+    default_home = native_path("/Users/test/.codex")
     assert codex_app_server_client_socket(
         identity, default_codex_home=default_home,
     ) == (True, str(Path(default_home, "app-server-control",
                          "app-server-control.sock").resolve()))
 
-    home = "/Volumes/Stack/.codex"
+    home = native_path("/Volumes/Stack/.codex")
     assert codex_app_server_client_socket(
         identity, default_codex_home=default_home,
     ) == (True, str(Path(home, "app-server-control",
@@ -188,7 +190,7 @@ def test_codex_app_server_client_socket_routes_implicit_profile_home(
         identity, default_codex_home=default_home,
     ) == (False, None)
 
-    socket_with_spaces = "/Volumes/Muggle SSD/codex socket.sock"
+    socket_with_spaces = native_path("/Volumes/Muggle SSD/codex socket.sock")
     args = (
         b"/usr/local/bin/codex", b"app-server", b"proxy", b"--sock",
         os.fsencode(socket_with_spaces),

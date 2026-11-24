@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from tests.platform_support import WINDOWS, has_mode
+from tests.platform_support import WINDOWS, has_mode, make_public
 from cc_remote.protocol import PROTOCOL_VERSION
 from deploy.caddy_managed_block import (
     BEGIN_MARKER,
@@ -367,7 +367,6 @@ def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
     assert not controls.exists()
 
 
-@pytest.mark.skipif(WINDOWS, reason="Cannot create non-private files on Windows (uses ACLs)")
 def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
     roots = {
         "claude": tmp_path / "claude-work",
@@ -377,11 +376,12 @@ def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
     state_dir.mkdir(mode=0o700)
     controls = state_dir / "claude-session-controls.json"
     controls.write_text('{"version":3,"sessions":{}}')
-    controls.chmod(0o644)
+    make_public(controls, 0o644)
 
+    # Windows checks the ACL instead of mode bits.
     with pytest.raises(
         WorkRegistrySnapshotError,
-        match="private bounded file",
+        match="must (be a private bounded file|have a private DACL)",
     ):
         create_snapshot(
             tmp_path / "snapshot", roots, state_dir=state_dir)

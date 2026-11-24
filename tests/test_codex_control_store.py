@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from cc_remote.wrapper.codex_controls import (
     CodexControlStore,
     CodexControlStoreError,
 )
+from tests.platform_support import is_private, make_public
 
 
 def test_codex_control_store_round_trips_and_clears_override(tmp_path):
@@ -29,7 +28,7 @@ def test_codex_control_store_round_trips_and_clears_override(tmp_path):
         "web_search": "live",
     }
     assert CodexControlStore(tmp_path).get(thread_id) == controls
-    assert (os.stat(store.path).st_mode & 0o077) == 0
+    assert is_private(store.path)
 
     store.update(
         thread_id,
@@ -152,6 +151,6 @@ def test_codex_control_store_loads_legacy_search_only_entry(tmp_path):
 def test_codex_control_store_rejects_unsafe_file(tmp_path):
     path = tmp_path / "codex-session-controls.json"
     path.write_text('{"version":1,"sessions":{}}')
-    path.chmod(0o644)
+    make_public(path, 0o644)
     with pytest.raises(CodexControlStoreError, match="private"):
         CodexControlStore(tmp_path)

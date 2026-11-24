@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -13,6 +12,7 @@ from cc_remote.wrapper.codex_forks import (
     ForkJournalError,
     find_rollout_fork,
 )
+from tests.platform_support import has_mode
 
 
 def test_fork_journal_persists_intent_and_result_atomically(tmp_path):
@@ -21,7 +21,7 @@ def test_fork_journal_persists_intent_and_result_atomically(tmp_path):
     intent = journal.begin("request-1", "parent", "turn-1", "/repo")
     assert intent["status"] == "intent"
     assert intent["thread_source"] == "cc-remote-fork:request-1"
-    assert stat.S_IMODE((tmp_path / "codex-forks.json").stat().st_mode) == 0o600
+    assert has_mode(tmp_path / "codex-forks.json", 0o600)
 
     journal.complete("request-1", "child")
     reloaded = CodexForkJournal(tmp_path)

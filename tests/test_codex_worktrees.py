@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -55,8 +56,11 @@ def test_prepare_worktree_preserves_session_subdirectory_and_is_idempotent(tmp_p
     assert replay.worktree_root == first.worktree_root
     assert replay.cwd == first.cwd
     assert replay.branch == first.branch
-    assert _git(root, "worktree", "list", "--porcelain").count(
-        f"worktree {first.worktree_root}") == 1
+    # Git on Windows lists forward-slash paths; read them as the product does.
+    listed = [os.path.realpath(line.removeprefix("worktree "))
+              for line in _git(root, "worktree", "list", "--porcelain").splitlines()
+              if line.startswith("worktree ")]
+    assert listed.count(first.worktree_root) == 1
 
     rollback_worktree(first)
     assert not Path(first.worktree_root).exists()

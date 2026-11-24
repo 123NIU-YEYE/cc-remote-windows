@@ -21,7 +21,10 @@ from cc_remote.wrapper.codex_worktrees import WorktreeSpec
 from cc_remote.wrapper.codex_forks import CodexForkJournal
 from cc_remote.wrapper.codex_forks import ForkJournalError
 from cc_remote.wrapper.codex_rpc import CodexRpcOutcomeUnknown, CodexRpcRejected
+from tests.platform_support import native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
+
+_CWD = native_path("/repo/component")
 
 
 @pytest.fixture(autouse=True)
@@ -60,7 +63,7 @@ def _ctx(state: str = "idle"):
     ctx = _mk_ctx("parent", "parent")
     ctx.engine = "codex"
     ctx.state = state
-    ctx.cwd = "/repo/component"
+    ctx.cwd = _CWD
     ctx.sdk = SimpleNamespace(model="gpt-test")
     return ctx
 
@@ -119,7 +122,7 @@ def test_same_cwd_fork_invalidates_catalog_before_publication(monkeypatch):
             "request-1",
             "parent",
             "turn-2",
-            "/repo/component",
+            _CWD,
         )
         machine._codex_session_list_cache = (
             0.0,
@@ -144,7 +147,7 @@ def test_same_cwd_fork_invalidates_catalog_before_publication(monkeypatch):
         result = await machine._finish_same_cwd_fork(
             _command(last_turn_id="turn-2"),
             "parent",
-            "/repo/component",
+            _CWD,
             "forked-thread",
         )
 
@@ -214,7 +217,7 @@ def test_same_cwd_fork_refresh_includes_child_after_fresh_parent_cache(
             "request-1",
             "parent",
             "turn-2",
-            "/repo/component",
+            _CWD,
         )
         machine._codex_session_list_cache = (
             time.monotonic(),
@@ -228,7 +231,7 @@ def test_same_cwd_fork_refresh_includes_child_after_fresh_parent_cache(
             "type": "session_meta",
             "payload": {
                 "id": "forked-thread",
-                "cwd": "/repo/component",
+                "cwd": _CWD,
                 "thread_source": "cc-remote-fork:request-1",
                 "forked_from_id": "parent",
             },
@@ -242,7 +245,7 @@ def test_same_cwd_fork_refresh_includes_child_after_fresh_parent_cache(
                     "codex_profile_id": "primary",
                     "codex_profile_label": "Primary",
                     "summary": "Parent task",
-                    "cwd": "/repo/component",
+                    "cwd": _CWD,
                     "last_modified": "1",
                 },
             ], ())
@@ -269,7 +272,7 @@ def test_same_cwd_fork_refresh_includes_child_after_fresh_parent_cache(
         await machine._finish_same_cwd_fork(
             _command(last_turn_id="turn-2"),
             "parent",
-            "/repo/component",
+            _CWD,
             "forked-thread",
         )
 
@@ -287,7 +290,7 @@ def test_completed_fork_without_rollout_is_not_restored(monkeypatch):
     async def run():
         machine, _ = _mk_machine()
         machine._codex_forks.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _CWD)
         machine._codex_forks.complete("request-1", "deleted-child")
 
         async def read_catalog():
@@ -318,7 +321,7 @@ def test_renamed_fork_keeps_title_while_native_catalog_omits_it(
     async def run():
         machine, _ = _mk_machine()
         machine._codex_forks.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _CWD)
         machine._codex_forks.complete("request-1", "forked-thread")
         rollout = tmp_path / (
             "rollout-2026-08-13T09-06-10-forked-thread.jsonl")
@@ -326,7 +329,7 @@ def test_renamed_fork_keeps_title_while_native_catalog_omits_it(
             "type": "session_meta",
             "payload": {
                 "id": "forked-thread",
-                "cwd": "/repo/component",
+                "cwd": _CWD,
                 "thread_source": "cc-remote-fork:request-1",
                 "forked_from_id": "parent",
             },
@@ -449,7 +452,7 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
             "approvalPolicy": "never",
         }, None)]
         assert result.session_id == "forked-thread"
-        assert result.cwd == "/repo/component"
+        assert result.cwd == _CWD
         assert result.target == "same_cwd"
         assert result.git_branch is None
         assert result.last_turn_id == "turn-2"
@@ -460,7 +463,7 @@ def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):
         # the in-memory command ACK cache.
         reloaded = CodexForkJournal(machine.cfg.state_dir)
         entry = reloaded.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _CWD)
         assert entry["status"] == "complete"
         assert entry["session_id"] == "forked-thread"
 
@@ -553,7 +556,7 @@ def test_codex_same_cwd_fork_inherits_model_and_permissions_once(monkeypatch):
             return {"thread": {"id": "forked-thread"}}
 
         async def profiles(cwd):
-            assert cwd == "/repo/component"
+            assert cwd == _CWD
             return [{
                 "id": ":workspace", "description": None, "allowed": True,
             }]
@@ -697,7 +700,7 @@ def test_codex_same_cwd_fork_recovers_committed_rollout_intent(monkeypatch):
         machine, _ = _mk_machine()
         machine.sessions = {"parent": _ctx()}
         machine._codex_forks.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _CWD)
 
         async def is_codex(_sid): return True
         async def list_sessions(_cmd): return None
@@ -709,7 +712,7 @@ def test_codex_same_cwd_fork_recovers_committed_rollout_intent(monkeypatch):
         monkeypatch.setattr(machine_module, "codex_rpc", rpc)
         monkeypatch.setattr(machine_module, "find_rollout_fork", lambda *_args: {
             "session_id": "recovered-thread",
-            "cwd": "/repo/component",
+            "cwd": _CWD,
             "thread_source": "cc-remote-fork:request-1",
             "forked_from_id": "parent",
         })
@@ -785,7 +788,7 @@ def test_codex_same_cwd_fork_unknown_rpc_outcome_only_reconciles_on_retry(monkey
                 return None
             return {
                 "session_id": child,
-                "cwd": "/repo/component",
+                "cwd": _CWD,
                 "thread_source": "cc-remote-fork:request-1",
                 "forked_from_id": "parent",
             }
@@ -842,7 +845,7 @@ def test_codex_same_cwd_fork_background_reconcile_acks_current_connection(monkey
                 return None
             return {
                 "session_id": "background-child",
-                "cwd": "/repo/component",
+                "cwd": _CWD,
                 "thread_source": "cc-remote-fork:request-1",
                 "forked_from_id": "parent",
             }
@@ -882,7 +885,7 @@ def test_codex_same_cwd_fork_restart_submitted_state_never_reforks(monkeypatch):
     async def run():
         first, first_transport = _mk_machine()
         first._codex_forks.begin(
-            "request-1", "parent", "turn-2", "/repo/component")
+            "request-1", "parent", "turn-2", _CWD)
         first._codex_forks.mark_submitted("request-1")
 
         transport = type(first_transport)()
@@ -926,7 +929,7 @@ def test_codex_same_identity_new_request_aliases_submitted_child(monkeypatch):
         machine.FORK_RECONCILE_DELAY = 0
         machine.FORK_BACKGROUND_ATTEMPTS = 1
         machine._codex_forks.begin(
-            "request-old", "parent", "turn-2", "/repo/component")
+            "request-old", "parent", "turn-2", _CWD)
         machine._codex_forks.mark_submitted("request-old")
         rpc_calls = []
         visible = {"child": None}
@@ -941,7 +944,7 @@ def test_codex_same_identity_new_request_aliases_submitted_child(monkeypatch):
                 return None
             return {
                 "session_id": visible["child"],
-                "cwd": "/repo/component",
+                "cwd": _CWD,
                 "thread_source": marker,
                 "forked_from_id": "parent",
             }

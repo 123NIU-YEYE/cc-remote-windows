@@ -40,12 +40,21 @@ from cc_remote.wrapper.work_prompt import (
     WORK_DEVELOPER_INSTRUCTIONS,
 )
 from cc_remote.workspaces import WorkStores
+from tests.platform_support import native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
 class _Cfg:
     cc_cwd = "/tmp"
     tool_result_max = 8000
+
+
+def _stub_process_tree_kill(monkeypatch):
+    """A fake process's pid is made up: never signal whatever it names."""
+    if codex_handle_module.os.name == "posix":
+        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+    else:
+        monkeypatch.setattr(codex_handle_module, "kill_process_tree", lambda *_args: None)
 
 
 def test_codex_work_btw_uses_private_profile_bound_runtime(
@@ -4345,18 +4354,23 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
             spawned.extend(args)
             raise RuntimeError("captured work profile")
 
-        monkeypatch.setenv("CODEX_HOME", "/home/test/.codex-custom")
+        # Use native paths so Windows paths in overrides match
+        codex_home = native_path("/home/test/.codex-custom")
+        codex_bin = native_path("/usr/bin/codex")
+        tmp_dir = native_path("/home/test/.codex-custom/tmp")
+        cwd = native_path("/home/test/.codex-custom/cc-remote/work/chats/work-1/workspace")
+
+        monkeypatch.setenv("CODEX_HOME", codex_home)
         monkeypatch.setattr(
-            codex_handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+            codex_handle_module, "_resolve_codex_bin", lambda: codex_bin)
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec", capture)
-        cwd = "/home/test/.codex-custom/cc-remote/work/chats/work-1/workspace"
         with pytest.raises(RuntimeError, match="captured work profile"):
             await CodexHandle(_Cfg(), cwd=cwd, work_mode=True).connect()
 
-        stdio_index = spawned.index("/usr/bin/codex")
+        stdio_index = spawned.index(codex_bin)
         assert spawned[stdio_index:stdio_index + 3] == [
-            "/usr/bin/codex", "app-server", "--stdio",
+            codex_bin, "app-server", "--stdio",
         ]
         if os.name == "posix":
             assert spawned[:3] == [
@@ -4375,9 +4389,10 @@ def test_codex_work_profile_grants_runtime_helper_binary_and_registered_cwd(
             if value.startswith("permissions.cc_remote_work.filesystem="))
         assert '":minimal" = "read"' in filesystem
         assert '"~"' not in filesystem
-        assert '"/home/test/.codex-custom/tmp" = "read"' in filesystem
-        assert '"/usr/bin/codex" = "read"' in filesystem
-        assert f'"{cwd}" = "write"' in filesystem
+        # Entries are TOML basic strings; json.dumps renders them identically.
+        assert f'{json.dumps(tmp_dir)} = "read"' in filesystem
+        assert f'{json.dumps(codex_bin)} = "read"' in filesystem
+        assert f'{json.dumps(cwd)} = "write"' in filesystem
         assert "permissions.cc_remote_work.network.enabled=false" in overrides
 
     asyncio.run(run())
@@ -4472,7 +4487,7 @@ def test_codex_resume_adopts_native_settings_unless_controls_are_preserved(
             "canonical_thread_provider_is_restored",
             lambda _sid: True,
         )
-        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+        _stub_process_tree_kill(monkeypatch)
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         if preserve_controls:
             handle.approval = "never"
@@ -4730,7 +4745,7 @@ def test_codex_legacy_resume_rejects_oversized_rollout_before_request(
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
-        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+        _stub_process_tree_kill(monkeypatch)
 
         handle = CodexHandle(_Cfg())
         calls = []
@@ -4785,7 +4800,7 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
-        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+        _stub_process_tree_kill(monkeypatch)
 
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         handle.model = "first-model"
@@ -4947,7 +4962,7 @@ def test_codex_ephemeral_fork_replaces_coding_prompt_only_for_work(
         monkeypatch.setattr(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
-        monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+        _stub_process_tree_kill(monkeypatch)
 
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         if web_override:

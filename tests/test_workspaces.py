@@ -560,7 +560,6 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(records[os.path.realpath(unbound.cwd)].work_id,
                          unbound.work_id)
 
-    @unittest.skipIf(sys.platform == "win32", "Windows symlink privileges are optional")
     def test_artifacts_list_only_user_deliverables_inside_private_workspace(self):
         record = self.store.create_session()
         self.store.bind_session(record.work_id, "session-1")

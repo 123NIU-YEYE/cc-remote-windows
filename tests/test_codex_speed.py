@@ -154,10 +154,13 @@ def test_catalog_reads_later_pages_and_rejects_cursor_loops(monkeypatch, repeat_
             replies.feed_data((json.dumps({"id": request["id"], "result": result}) + "\n").encode())
 
         process = SimpleNamespace(
+            pid=424246,
             stdin=SimpleNamespace(write=write, drain=lambda: asyncio.sleep(0),
                                   close=lambda: closed.append(True)),
             stdout=replies, terminate=lambda: None, wait=lambda: asyncio.sleep(0),
         )
+        # Windows stops the whole app-server tree by pid instead of terminate().
+        monkeypatch.setattr(models, "kill_process_tree", lambda _pid: None)
 
         async def spawn(*args, **_kwargs):
             argv.extend(args)

@@ -1,6 +1,7 @@
 """History/file-list regressions: all I/O is private fixtures, no engine calls."""
 import asyncio
 import json
+import os
 import sqlite3
 
 import pytest
@@ -18,6 +19,9 @@ from cc_remote.wrapper.history_store import (
 from cc_remote.wrapper.turn_changes import TurnChangeArchive, project_turn_changes
 from tests.test_multisession import _mk_ctx, _mk_machine
 from tests.test_codex_turn_change_bounds import _changes
+from tests.platform_support import native_path
+
+_CWD = native_path("/repo")
 
 
 def _record(kind, **payload):
@@ -34,7 +38,7 @@ def _patch(call, before, after, path="src/code.py", success=True):
 
 def _rows():
     return [
-        {"type": "session_meta", "payload": {"id": "history-files", "cwd": "/repo"}},
+        {"type": "session_meta", "payload": {"id": "history-files", "cwd": _CWD}},
         _record("task_started", turn_id="native-one"),
         _record("user_message", message="first"),
         _patch("first-edit", "A", "B"),
@@ -101,7 +105,7 @@ def test_official_idle_history_recovers_file_lists_without_expanding_tools(tmp_p
         machine, transport = _mk_machine()
         machine._codex_history = Official()
         ctx = _mk_ctx("history-files", "history-files")
-        ctx.engine, ctx.cwd = "codex", "/repo"
+        ctx.engine, ctx.cwd = "codex", _CWD
         machine.sessions[ctx.key] = ctx
         history = await machine._build_requested_history(
             ctx.key, before="older-page" if older else None,
@@ -109,7 +113,7 @@ def test_official_idle_history_recovers_file_lists_without_expanding_tools(tmp_p
         )
         first, second = history.turns
         assert all(not turn.blocks for turn in history.turns)
-        assert first.fileChanges.files[0].path == "/repo/src/code.py"
+        assert first.fileChanges.files[0].path == os.path.join(_CWD, "src", "code.py")
         assert first.fileChanges.files[0].state == "available"
         assert first.fileChanges.total_files == count
         assert len(first.fileChanges.files) == min(count, 64)
@@ -117,13 +121,13 @@ def test_official_idle_history_recovers_file_lists_without_expanding_tools(tmp_p
         assert first.fileChanges.revision != second.fileChanges.revision
         await machine._handle_get_diff(GetDiff(
             sid=ctx.key, engine="codex", turn_id=first.id,
-            revision=first.fileChanges.revision, file="/repo/src/code.py",
+            revision=first.fileChanges.revision, file=os.path.join(_CWD, "src", "code.py"),
         ))
         assert "-A\n+B" in transport.sent[-1].diff
         assert "+C" not in transport.sent[-1].diff
         # Reopening a cold session has no live events to rescue its file list.
         machine.sessions.clear()
-        machine._watch[ctx.key]["cwd"] = "/repo"
+        machine._watch[ctx.key]["cwd"] = _CWD
         again = await machine._build_requested_history(
             ctx.key, before="older-page" if older else None,
             limit=4, cwd=ctx.cwd, detail="summary",
@@ -149,7 +153,7 @@ def test_full_history_cache_keeps_changes_in_later_summary_reads(tmp_path, monke
     async def run():
         machine, _ = _mk_machine()
         ctx = _mk_ctx("history-files", "history-files")
-        ctx.engine, ctx.cwd = "codex", "/repo"
+        ctx.engine, ctx.cwd = "codex", _CWD
         machine.sessions[ctx.key] = ctx
         full = await machine._build_history(ctx.key, limit=4, detail="full")
         assert any(e["type"] == "tool_use" for e in full.events)
@@ -218,7 +222,7 @@ def test_history_copies_exact_live_alias_but_not_shared_native_task(tmp_path):
     summary = archive.history_summary("codex:session", {
         "id": "official-user", "clientMsgId": "client-message", "done": True,
     }, [], "/repo")
-    assert summary["files"][0]["path"] == "/repo/README.md"
+    assert summary["files"][0]["path"] == os.path.normpath("/repo/README.md")
     assert archive.get("codex:session", "official-user", summary["revision"]) == payload
     assert not archive.history_summary("codex:other", {
         "id": "official-user", "clientMsgId": "client-message", "done": True,
@@ -294,9 +298,9 @@ def test_missing_native_diff_keeps_markdown_list_and_storage_failure_keeps_paths
     machine, _ = _mk_machine()
     turn = {"id": "claude-old", "done": True}
     summary = machine._history_file_changes("session", "claude", [turn], {turn["id"]: events}, cwd="/repo")
-    assert summary[turn["id"]]["files"][0]["path"] == "/repo/README.md"
+    assert summary[turn["id"]]["files"][0]["path"] == os.path.normpath("/repo/README.md")
     assert summary[turn["id"]]["files"][0]["state"] == "unavailable"
     monkeypatch.setattr(machine._turn_change_archive, "put", lambda *_a, **_k: (_ for _ in ()).throw(OSError("full")))
     summary = machine._history_file_changes("session", "claude", [turn], {turn["id"]: events}, cwd="/repo")
-    assert summary[turn["id"]]["files"][0]["path"] == "/repo/README.md"
+    assert summary[turn["id"]]["files"][0]["path"] == os.path.normpath("/repo/README.md")
     assert summary[turn["id"]]["files"][0]["state"] == "unavailable"

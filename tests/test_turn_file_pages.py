@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import contextmanager
 import json
+import os
 import sqlite3
 
 import pytest
@@ -74,13 +75,15 @@ def test_file_pages_and_diffs_are_scoped_and_immutable_after_later_edits(tmp_pat
     reopened = TurnChangeArchive(tmp_path)
     identity = ("codex:one@session", "first", original["revision"])
     assert reopened.page(*identity, 128)["next_offset"] is None
-    assert "+later" not in reopened.file(*identity, "src/file-129.py")["diff"]
+    # Normalize path for Windows (product normalizes all paths via os.path.normpath)
+    lookup_path = os.path.normpath("src/file-129.py")
+    assert "+later" not in reopened.file(*identity, lookup_path)["diff"]
     for scope in (("claude:one@session", *identity[1:]),
                   ("codex:two@session", *identity[1:]),
                   (identity[0], "second", identity[2]),
                   (identity[0], identity[1], "missing")):
         assert reopened.page(*scope, 64) is None
-        assert reopened.file(*scope, "src/file-129.py") is None
+        assert reopened.file(*scope, lookup_path) is None
     assert reopened.file(*identity, "../../secrets") is None
     for offset, limit in ((-1, 64), (True, 64), (131, 64), (0, 0), (0, 65)):
         with pytest.raises(ValueError):
@@ -97,7 +100,9 @@ def test_pre_normalization_archives_still_support_pages_and_rekey_cleanup(tmp_pa
                    ("codex:old", "turn", payload["revision"], json.dumps(payload)))
     identity = ("codex:old", "turn", payload["revision"])
     assert len(archive.page(*identity, 64)["files"]) == 64
-    assert archive.file(*identity, "src/file-129.py")["state"] == "available"
+    # Normalize path for Windows (product normalizes all paths via os.path.normpath)
+    lookup_path = os.path.normpath("src/file-129.py")
+    assert archive.file(*identity, lookup_path)["state"] == "available"
     current = capture(321)
     archive.put("codex:old", "new-turn", current, final=True)
     archive.rekey("codex:old", "codex:renamed")

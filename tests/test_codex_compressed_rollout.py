@@ -27,6 +27,7 @@ from tests.test_codex_profiles import _context, _machine
 from tests.test_codex_external import _event
 from tests.test_codex_shared_machine import _SharedSdk
 from tests.test_codex_agents import activity, answer, rollout as agent_rollout, task
+from tests.platform_support import replace_open_file
 
 
 @pytest.fixture(autouse=True)
@@ -634,7 +635,7 @@ def test_source_replaced_during_decode_is_rejected(tmp_path, monkeypatch):
                 self.replaced = True
                 replacement = path.with_suffix(".replacement")
                 replacement.write_bytes(rollout_io.zstd.compress(b"replacement\n"))
-                replacement.replace(path)
+                replace_open_file(replacement, path)
             return chunk
 
     monkeypatch.setattr(rollout_io.zstd, "ZstdFile", ReplacingFile)

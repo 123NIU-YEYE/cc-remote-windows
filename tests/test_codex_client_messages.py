@@ -9,6 +9,7 @@ from cc_remote.wrapper.codex_client_messages import (
     CodexClientMessageStore,
     CodexClientMessageStoreError,
 )
+from tests.platform_support import has_mode, make_public
 
 
 def _rollout(tmp_path, name: str = "rollout.jsonl"):
@@ -56,7 +57,7 @@ def test_codex_client_message_alias_round_trip_and_upgrade(tmp_path):
         segment_index=0,
         native_message_id="native-user-first",
     ) is False
-    assert os.stat(store.path).st_mode & 0o777 == 0o600
+    assert has_mode(store.path, 0o600)
 
 
 def test_codex_client_message_alias_accepts_live_and_history_native_ids(
@@ -187,7 +188,7 @@ def test_codex_client_message_alias_rejects_corrupt_or_public_store(tmp_path):
         json.dumps({"version": 1, "sources": []}),
         encoding="utf-8",
     )
-    os.chmod(store.path, 0o644)
+    make_public(store.path, 0o644)
     with pytest.raises(CodexClientMessageStoreError):
         store.get(rollout)
 

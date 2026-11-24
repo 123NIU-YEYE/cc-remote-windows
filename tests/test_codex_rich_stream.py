@@ -442,7 +442,7 @@ async def test_codex_delta_bursts_coalesce_before_structural_boundaries():
         yield {"method": "item/commandExecution/outputDelta", "params": {
             "turnId": "turn-1", "itemId": "command-coalesced", "delta": "a",
         }}
-        await asyncio.sleep(0.001)
+        await asyncio.sleep(0.05)
         yield {"method": "item/commandExecution/outputDelta", "params": {
             "turnId": "turn-1", "itemId": "command-coalesced", "delta": "b",
         }}
@@ -455,9 +455,11 @@ async def test_codex_delta_bursts_coalesce_before_structural_boundaries():
             "aggregatedOutput": "abc", "exitCode": 0,
         }}}
 
+    # "a" is emitted at once; "b" arrives later but inside its flush window
+    # and merges with "c". The window is far above Windows' ~16 ms timer.
     coalesced = [message async for message in
                  coalesce_codex_live_notifications(
-                     source(), flush_seconds=0.01)]
+                     source(), flush_seconds=1.0)]
     assert [message["params"].get("delta") for message in coalesced] == [
         "a", "bc", None,
     ]
