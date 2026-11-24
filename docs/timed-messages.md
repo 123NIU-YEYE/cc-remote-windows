@@ -35,6 +35,11 @@ contract; do not turn an ordinary reminder into a persistent Goal.
 
 For a non-default Wrapper state location, put
 `--state-dir /absolute/path/to/wrapper-state` before the subcommand.
+
+On Windows, run `.venv\Scripts\python.exe -X utf8 -m cc_remote.timed_tasks`
+from the same directory. The helper reaches the daemon through the official
+`codex app-server proxy` (using `CODEX_BIN` or the newest Codex CLI on `PATH`)
+and runs without a console window.
 The helper and Wrapper must read the same state directory. Prompts and account
 paths stay in its private SQLite store; public task metadata contains only a
 title, schedule, counters and message receipt identity.

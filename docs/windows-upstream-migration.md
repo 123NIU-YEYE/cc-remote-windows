@@ -24,6 +24,8 @@ upstream commits are cherry-picked as described in
 - Official shared Codex control support and explicit loopback WS compatibility.
 - Same-user loopback endpoints in place of Unix sockets for cross-session
   messaging and the local control entrance.
+- Async tasks and timed messages reach the account daemon through the official
+  `codex app-server proxy`, since Python cannot connect to its AF_UNIX socket.
 - Large Claude history partial-write/read failures stay provisional; they never
   publish an authoritative empty page that erases the browser's history.
 - Explicit environment HTTP proxy selection, reconnect announcement ordering,

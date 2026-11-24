@@ -981,6 +981,7 @@ def test_mcp_tools_bind_native_caller_and_reject_target_override(store, monkeypa
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix socket/fd handoff contract; Windows uses the official proxy, tested in test_windows_daemon_proxy.py")
 def test_lifetime_lock_and_detached_worker_survive_mcp_parent(store, monkeypatch):
     fd = tasks.lock_worker(store)
     try:

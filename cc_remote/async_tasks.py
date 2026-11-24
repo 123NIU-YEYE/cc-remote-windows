@@ -54,12 +54,23 @@ def ensure_worker(store):
     fd = lock_worker(store)
     if fd is None:
         return
+    command = [sys.executable, "-m", "cc_remote.async_tasks", "worker", "--codex-home", str(store.home)]
+    if sys.platform == "win32":
+        # Windows cannot pass the held lock to the child. The worker takes it
+        # itself; a worker that loses the race exits, and a pending task left
+        # by an exiting worker is picked up by the check at the end of main().
+        os.close(fd)
+        subprocess.Popen(
+            command, cwd=Path(__file__).resolve().parent.parent, env=sanitized_child_env(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return
     # Pass the already-held lock through exec, so concurrent starts don't race
     # an idle worker's exit. The child keeps its immutable runtime cwd in use.
     try:
         subprocess.Popen(
-            [sys.executable, "-m", "cc_remote.async_tasks", "worker", "--codex-home",
-             str(store.home), "--lock-fd", str(fd)],
+            [*command, "--lock-fd", str(fd)],
             cwd=Path(__file__).resolve().parent.parent, env=sanitized_child_env(),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, pass_fds=(fd,),

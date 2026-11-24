@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import sys
 from uuid import uuid4
 
 import pytest
@@ -91,6 +92,7 @@ def test_worker_marks_unknown_once_without_resending(tmp_path, monkeypatch):
     assert store.active() == {}
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix socket/fd handoff contract; Windows uses the official proxy, tested in test_windows_daemon_proxy.py")
 def test_queue_uses_existing_thread_exact_client_id_and_accepts_before_start(tmp_path, monkeypatch):
     import os
     import stat

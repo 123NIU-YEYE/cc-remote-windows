@@ -192,15 +192,29 @@ class NativeQueueError(RuntimeError):
     pass
 
 
+def _daemon_connection(socket: Path, **options):
+    if sys.platform == "win32":
+        from cc_remote.task_rpc import daemon_connection
+        return daemon_connection(socket, **options)
+    return unix_connect(str(socket), uri="ws://localhost/rpc", **options)
+
+
 async def deliver(task: dict, delivery_id: str, on_accepted) -> None:
     """Queue on the existing account daemon, without resuming or creating a thread."""
     socket = Path(task["home"]) / "app-server-control/app-server-control.sock"
-    info = socket.lstat()
-    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
-        raise NativeQueueError("Shared daemon unavailable")
-    async with asyncio.timeout(30), unix_connect(
-        str(socket), uri="ws://localhost/rpc", compression=None,
-        max_size=2**20, open_timeout=5, close_timeout=1,
+    if sys.platform == "win32":
+        # A Windows AF_UNIX endpoint is a reparse point, not S_IFSOCK.
+        from cc_remote.wrapper.codex_daemon import socket_identity
+        try:
+            socket_identity(str(socket))
+        except (OSError, ValueError) as exc:
+            raise NativeQueueError("Shared daemon unavailable") from exc
+    else:
+        info = socket.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise NativeQueueError("Shared daemon unavailable")
+    async with asyncio.timeout(30), _daemon_connection(
+        socket, compression=None, max_size=2**20, open_timeout=5, close_timeout=1,
     ) as ws:
         seq = 0
 
@@ -304,7 +318,9 @@ def main() -> None:
                               str(store.path.parent), "run", task_id],
                              cwd=Path(__file__).resolve().parent.parent,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+                             stderr=subprocess.DEVNULL, start_new_session=True,
+                             # No console window, whose closing would end the timer.
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError:
             store.finish(task_id, "failed")
             raise

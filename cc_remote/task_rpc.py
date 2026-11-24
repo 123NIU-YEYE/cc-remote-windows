@@ -5,12 +5,86 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import json
 from pathlib import Path
+import socket
+import subprocess
+import sys
 
-from websockets.asyncio.client import unix_connect
+from websockets.asyncio.client import connect as websocket_connect, unix_connect
 from websockets.protocol import State
 
 from cc_remote.task_store import parse_task_receipt
 from cc_remote.wrapper.codex_daemon import socket_identity
+
+_PROXY_EXIT_TIMEOUT = 2
+
+
+def _proxy_argv(codex_bin: str, path: Path) -> list[str]:
+    return [codex_bin, "app-server", "proxy", "--sock", str(path)]
+
+
+@asynccontextmanager
+async def _proxy_socket(path: Path):
+    """A local socket carrying the official proxy's stdio to the daemon.
+
+    Python cannot connect to the daemon's AF_UNIX socket on Windows. The
+    official ``codex app-server proxy`` connects instead; it forwards raw
+    bytes, so the WebSocket handshake still reaches the daemon itself.
+    """
+    from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
+    from cc_remote.wrapper.os_compat import kill_process_tree
+
+    binary = resolve_codex_bin()
+    process = await asyncio.create_subprocess_exec(
+        *_proxy_argv(binary, path), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        env=codex_env(binary, str(path.parent.parent)),
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    ours, theirs = socket.socketpair()
+    ours.setblocking(False)
+    loop = asyncio.get_running_loop()
+
+    async def to_proxy():
+        while data := await loop.sock_recv(ours, 65536):
+            process.stdin.write(data)
+            await process.stdin.drain()
+        process.stdin.close()
+
+    async def from_proxy():
+        while data := await process.stdout.read(65536):
+            await loop.sock_sendall(ours, data)
+        ours.shutdown(socket.SHUT_WR)
+
+    pumps = [asyncio.create_task(to_proxy()), asyncio.create_task(from_proxy())]
+    try:
+        yield theirs
+    finally:
+        theirs.close()
+        with suppress(Exception):
+            await asyncio.wait_for(asyncio.shield(pumps[0]), _PROXY_EXIT_TIMEOUT)
+        if process.stdin is not None and not process.stdin.is_closing():
+            process.stdin.close()
+        try:
+            await asyncio.wait_for(process.wait(), _PROXY_EXIT_TIMEOUT)
+        except TimeoutError:
+            # codex.cmd runs the proxy under cmd.exe; stop the whole tree.
+            await asyncio.to_thread(kill_process_tree, process.pid)
+            await process.wait()
+        for pump in pumps:
+            pump.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
+        ours.close()
+
+
+@asynccontextmanager
+async def daemon_connection(path: Path, **options):
+    """Open a WebSocket to an account daemon's control socket."""
+    if sys.platform != "win32":
+        async with unix_connect(str(path), uri="ws://localhost/rpc", **options) as ws:
+            yield ws
+        return
+    async with _proxy_socket(path) as sock:
+        async with websocket_connect("ws://localhost/rpc", sock=sock, **options) as ws:
+            yield ws
 
 
 class Rejected(RuntimeError):
@@ -142,8 +216,8 @@ class NativeTasks:
 async def connect(home: Path, on_output=None):
     path = home / "app-server-control/app-server-control.sock"
     identity = socket_identity(str(path))
-    async with unix_connect(str(path), uri="ws://localhost/rpc", compression=None,
-                            max_size=4 * 1024 * 1024, open_timeout=5, close_timeout=1) as ws:
+    async with daemon_connection(path, compression=None, max_size=4 * 1024 * 1024,
+                                 open_timeout=5, close_timeout=1) as ws:
         if socket_identity(str(path)) != identity:
             raise ConnectionError("Selected account's daemon socket changed while connecting")
         client = NativeTasks(ws, on_output)

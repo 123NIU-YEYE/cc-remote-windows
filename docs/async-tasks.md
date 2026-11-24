@@ -37,6 +37,18 @@ run the repository venv's Python with `-m cc_remote.async_tasks mcp
 Configuration is opt-in; installing/upgrading cc-remote does not enable this MCP
 or restart any engine automatically.
 
+On Windows there is no `cc-remote` launcher, and Python cannot connect to the
+daemon's socket directly. Register the Wrapper's interpreter; the helper reaches
+the daemon through the official `codex app-server proxy`, using `CODEX_BIN` or
+the newest Codex CLI found on `PATH`. The worker runs without a console window.
+
+```toml
+[mcp_servers.cc_remote_tasks]
+command = 'C:\path\to\release\.venv\Scripts\python.exe'
+args = ["-X", "utf8", "-m", "cc_remote.async_tasks", "mcp", "--codex-home", 'C:\Users\you\.codex']
+cwd = 'C:\path\to\release'
+```
+
 ### Refresh after an upgrade
 
 For an already-enabled standard launcher, run the installed release's command:
