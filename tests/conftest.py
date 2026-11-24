@@ -56,6 +56,46 @@ def pytest_runtest_makereport(item, call):
                            "Skipped: creating symlinks needs Windows Developer Mode or administrator rights")
 
 
+_foreign_tree_kills: list[int] = []
+
+if sys.platform == "win32":
+    import psutil
+
+    from cc_remote.wrapper import os_compat
+
+    _kill_process_tree = os_compat.kill_process_tree
+
+    def _kill_own_process_tree(pid: int) -> None:
+        """Stop only a process tree this test process started.
+
+        Windows cleanup runs ``taskkill /F /T``, which POSIX tests do not stub
+        the way they stub ``os.killpg``. A test double's made-up pid can name
+        a live process of the developer; it would die with its descendants.
+        """
+        try:
+            parents = psutil.Process(pid).parents()
+        except psutil.NoSuchProcess:
+            return
+        except psutil.Error:
+            parents = []
+        if all(parent.pid != os.getpid() for parent in parents):
+            _foreign_tree_kills.append(pid)
+            return
+        _kill_process_tree(pid)
+
+    # Product modules bind the name when imported, which is after conftest.
+    os_compat.kill_process_tree = _kill_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _refuse_foreign_process_tree_kills():
+    yield
+    if _foreign_tree_kills:
+        pids = _foreign_tree_kills[:]
+        _foreign_tree_kills.clear()
+        pytest.fail(f"refused to stop process trees this test did not start: {pids}")
+
+
 _ACCOUNT_PROFILE_ENV = (
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
@@ -103,6 +143,21 @@ def _isolate_native_picker_writes(monkeypatch, tmp_path_factory):
         return None
 
     monkeypatch.setattr(sdk, "save_user_defaults", isolated_save)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_codex_home(monkeypatch, tmp_path_factory):
+    """codex_sessions resolves the default ~/.codex once, at import.
+
+    Redirecting the home directory in a test cannot move it, so point it at
+    an empty directory: no test reads the developer's real sessions.
+    """
+    from cc_remote.wrapper import codex_sessions
+
+    home = tmp_path_factory.getbasetemp() / "default-codex-home"
+    monkeypatch.setattr(codex_sessions, "_CONFIG", str(home / "config.toml"))
+    monkeypatch.setattr(codex_sessions, "_ROOT", str(home / "sessions"))
+    monkeypatch.setattr(codex_sessions, "_ARCHIVE_ROOT", str(home / "archived_sessions"))
 
 
 @pytest.fixture

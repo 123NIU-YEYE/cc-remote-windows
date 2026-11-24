@@ -65,3 +65,30 @@ def test_only_symlinks_refused_in_test_code_become_skips():
     except RuntimeError as wrapped:
         assert not conftest._test_symlink_refused(wrapped)
     assert not conftest._test_symlink_refused(OSError(None, "other", None, 5))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows taskkill guard")
+def test_product_code_stops_only_process_trees_the_test_started():
+    import psutil
+
+    from cc_remote.wrapper import codex_handle
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        codex_handle.kill_process_tree(child.pid)
+        child.wait(timeout=30)
+    finally:
+        child.kill()
+    # A grandchild whose parent exited is no longer a descendant of the test.
+    spawn = ("import subprocess, sys; print(subprocess.Popen("
+             "[sys.executable, '-c', 'import time; time.sleep(60)'], stdin=subprocess.DEVNULL,"
+             " stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)")
+    orphan = psutil.Process(int(subprocess.run(
+        [sys.executable, "-c", spawn], capture_output=True, text=True, check=True, timeout=60).stdout))
+    try:
+        codex_handle.kill_process_tree(orphan.pid)
+        assert orphan.is_running()
+        assert conftest._foreign_tree_kills == [orphan.pid]
+    finally:
+        conftest._foreign_tree_kills.clear()
+        orphan.kill()
