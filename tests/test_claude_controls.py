@@ -18,6 +18,7 @@ from cc_remote.wrapper.claude_controls import (
     last_completed_assistant_controls,
     valid_claude_auto_compact,
 )
+from tests.platform_support import has_mode, make_public
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -39,7 +40,7 @@ def test_remote_control_store_is_private_bounded_and_roundtrips(tmp_path):
     assert saved.model == "claude-opus-4-6[1m]"
     assert saved.effort == "max"
     assert saved.permission_mode == "bypassPermissions"
-    assert (tmp_path / "claude-session-controls.json").stat().st_mode & 0o777 == 0o600
+    assert has_mode(tmp_path / "claude-session-controls.json", 0o600)
     assert ClaudeControlStore(tmp_path).get(SESSION_ID) == saved
 
 
@@ -359,7 +360,7 @@ def test_autocompact_helpers_accept_only_canonical_cli_values():
 def test_remote_control_store_rejects_public_or_symlink_state(tmp_path):
     path = tmp_path / "claude-session-controls.json"
     path.write_text(json.dumps({"version": 1, "sessions": {}}))
-    os.chmod(path, 0o644)
+    make_public(path, 0o644)
     with pytest.raises(ClaudeControlStoreError, match="private bounded"):
         ClaudeControlStore(tmp_path)
 

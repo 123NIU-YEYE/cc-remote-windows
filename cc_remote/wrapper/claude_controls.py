@@ -538,6 +538,12 @@ class ClaudeControlStore:
                 or info.st_size > _MAX_FILE_BYTES):
             raise ClaudeControlStoreError(
                 "Claude control store is not a private bounded file")
+        if sys.platform == "win32":
+            # Windows has no mode bits: other users' access is in the ACL.
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(self.path, private=True):
+                raise ClaudeControlStoreError(
+                    "Claude control store is not a private bounded file")
         try:
             raw_bytes = self.path.read_bytes()
             if len(raw_bytes) > _MAX_FILE_BYTES:

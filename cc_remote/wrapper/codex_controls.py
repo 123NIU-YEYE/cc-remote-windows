@@ -474,6 +474,12 @@ class CodexControlStore:
                 or info.st_size > _MAX_FILE_BYTES):
             raise CodexControlStoreError(
                 "Codex control store is not a private bounded file")
+        if sys.platform == "win32":
+            # Windows has no mode bits: other users' access is in the ACL.
+            from cc_remote.windows_privacy import owned_path
+            if not owned_path(self.path, private=True):
+                raise CodexControlStoreError(
+                    "Codex control store is not a private bounded file")
         try:
             raw = json.loads(self.path.read_bytes().decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:

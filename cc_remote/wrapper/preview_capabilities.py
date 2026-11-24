@@ -184,6 +184,11 @@ class PreviewCapabilityStore:
             or path_info.st_ino != descriptor_info.st_ino
         ):
             raise OSError("preview invalidation marker is unsafe")
+        if sys.platform == "win32":
+            # Windows has no mode bits: other users' access is in the ACL.
+            from cc_remote.windows_privacy import owned_descriptor
+            if not owned_descriptor(descriptor, private=True):
+                raise OSError("preview invalidation marker is unsafe")
         raw = pread(descriptor, _INVALIDATION_FILE_MAX_BYTES + 1, 0)
         if len(raw) > _INVALIDATION_FILE_MAX_BYTES:
             raise OSError("preview invalidation marker is oversized")
