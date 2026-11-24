@@ -235,6 +235,41 @@ def test_cache_identity_invalidation_and_independent_readers(tmp_path, monkeypat
         assert stream.read() == b"replacement\n"
 
 
+def test_eviction_removes_a_decoded_file_that_is_still_open(tmp_path, monkeypatch):
+    # Windows refuses to delete an open file unless every handle shares delete
+    # access. Eviction must neither fail nor leave the file behind.
+    monkeypatch.setattr(rollout_io, "_CACHE_ENTRIES", 1)
+    first = _compress(tmp_path / "first.jsonl", b"first\n" * 1000)
+    with rollout_io.rollout_open(first) as reader:
+        evicted = reader.name
+        with rollout_io.rollout_open(_compress(tmp_path / "second.jsonl", b"second\n")) as other:
+            assert other.read() == b"second\n"
+        assert reader.read() == b"first\n" * 1000
+    assert not os.path.exists(evicted)
+    assert len(list(Path(rollout_io._directory.name).iterdir())) == 1
+
+
+def test_failed_eviction_does_not_leave_a_dangling_entry(tmp_path, monkeypatch):
+    monkeypatch.setattr(rollout_io, "_CACHE_ENTRIES", 1)
+    first = _compress(tmp_path / "first.jsonl", b"first\n")
+    second = _compress(tmp_path / "second.jsonl", b"second\n")
+    with rollout_io.rollout_open(first) as stream:
+        held = Path(stream.name)
+    unlink = Path.unlink
+
+    def held_by_another_program(self, missing_ok=False):
+        if self == held:
+            raise PermissionError("in use")
+        return unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", held_by_another_program)
+    with pytest.raises(PermissionError):
+        rollout_io.rollout_open(second)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with rollout_io.rollout_open(second) as stream:
+        assert stream.read() == b"second\n"
+
+
 def test_rollout_written_after_creation_still_decodes(tmp_path):
     # Windows path stats report the creation time as st_ctime, descriptor stats
     # the last change time. Writing after creation makes the two differ.

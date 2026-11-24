@@ -100,6 +100,9 @@ def _decoded_path(path: str, *, follow_symlinks=True) -> str:
             _discard(next(iter(_cache)))
         return target
     except BaseException as exc:
+        # A failed eviction must not leave this path pointing at a deleted file.
+        if _cache.get(path, (None, None))[1] == target:
+            del _cache[path]
         Path(target).unlink(missing_ok=True)
         if isinstance(exc, (zstd.ZstdError, EOFError)):
             raise OSError("Compressed Codex rollout is incomplete or invalid") from exc
@@ -126,7 +129,13 @@ def rollout_open(path, mode="rb", *, follow_symlinks=True, **kwargs):
         identity, _, size = _cache[native]
         if _identity(info) != identity:
             raise OSError("Codex rollout changed before opening read view")
-        stream = open(decoded, mode, **kwargs)
+        if sys.platform == "win32":
+            # Builtin open denies delete sharing on Windows. The no-follow open
+            # (windows_fd) shares it, so eviction can unlink this cache file
+            # while the reader keeps using it, as on POSIX.
+            stream = _native_open(decoded, mode, follow_symlinks=False, **kwargs)
+        else:
+            stream = open(decoded, mode, **kwargs)
         stream.rollout_read_stat = _ReadStat(info, size)
         return stream
 
