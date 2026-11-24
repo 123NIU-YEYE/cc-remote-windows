@@ -21,7 +21,7 @@ class DshSidechats:
         self.path = runtime.machine.cfg.state_dir / "dsh-sidechats.json"
         self.lock = asyncio.Lock()
         try:
-            self.rows = json.loads(self.path.read_text())
+            self.rows = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(self.rows, dict) or len(self.rows) > 512:
                 raise ValueError
             for sid, row in self.rows.items():
@@ -47,7 +47,7 @@ class DshSidechats:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, name = tempfile.mkstemp(dir=self.path.parent, prefix=".dsh-sidechats-")
         try:
-            with os.fdopen(fd, "w") as stream:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(self.rows, stream)
                 stream.flush()
                 os.fsync(stream.fileno())

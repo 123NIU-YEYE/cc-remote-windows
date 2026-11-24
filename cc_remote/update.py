@@ -76,7 +76,7 @@ def read_installation(root: Path, system: str, machine: str) -> Installation:
     if metadata_path.is_symlink() or not current.is_symlink():
         raise UpdateError(f"not a managed Release installation: {root}")
     try:
-        metadata = json.loads(metadata_path.read_text())
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         release = current.resolve(strict=True)
         manifest = load_manifest(release / "release-manifest.json")
     except (OSError, ValueError, TypeError) as exc:
@@ -205,7 +205,7 @@ def download_bundle(installation: Installation, version: str, base: str, stage: 
         _download(f"{base}/SHA256SUMS", checksum, 1024 * 1024)
         matches = []
         try:
-            lines = checksum.read_text().splitlines()
+            lines = checksum.read_text(encoding="utf-8").splitlines()
         except UnicodeError as exc:
             raise UpdateError("release checksum file is invalid") from exc
         for line in lines:
@@ -256,9 +256,9 @@ def download_bundle(installation: Installation, version: str, base: str, stage: 
 def _claude_contract(release: Path) -> tuple[str, int]:
     """Read constants without importing an SDK or executing the new release."""
     try:
-        lock = (release / "requirements-wrapper.lock").read_text()
+        lock = (release / "requirements-wrapper.lock").read_text(encoding="utf-8")
         sdk = re.search(r"^claude-agent-sdk==([0-9.]+)(?:\s|$)", lock, re.MULTILINE)
-        tree = ast.parse((release / "cc_remote/claude_service/wire.py").read_text())
+        tree = ast.parse((release / "cc_remote/claude_service/wire.py").read_text(encoding="utf-8"))
         for statement in tree.body:
             if isinstance(statement, ast.Assign) and any(
                 isinstance(name, ast.Name) and name.id == "VERSION" for name in statement.targets
@@ -294,7 +294,7 @@ def require_independent_terminal() -> None:
         try:
             result = subprocess.run(
                 ["ps", "-p", str(pid), "-o", "ppid=", "-o", "args="],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True, text=True, timeout=5, check=False, encoding="utf-8", errors="replace",
             )
         except subprocess.TimeoutExpired as exc:
             raise UpdateError("cannot verify updater ancestry; run from an independent terminal") from exc

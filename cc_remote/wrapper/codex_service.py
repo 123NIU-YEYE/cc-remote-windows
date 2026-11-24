@@ -23,7 +23,7 @@ class DaemonIsolationError(RuntimeError):
 
 def process_cgroup(pid: str | int, proc_root: Path = Path("/proc")) -> str:
     """Read the unified or legacy systemd hierarchy without guessing a unit."""
-    text = (proc_root / str(pid) / "cgroup").read_text()
+    text = (proc_root / str(pid) / "cgroup").read_text(encoding="utf-8")
     paths = {}
     for line in text.splitlines():
         hierarchy, controllers, path = line.split(":", 2)

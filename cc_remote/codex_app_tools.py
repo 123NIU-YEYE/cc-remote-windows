@@ -251,7 +251,7 @@ def discover(profile: Path, app: Path, expected_manifest: str | None = None) -> 
         socket_identity(str(profile / "app-server-control/app-server-control.sock"))
         executable, node, plugin, bundle_id = app_paths(app)
         if expected_manifest is not None:
-            entry = json.loads((plugin / "desktop-mcp.json").read_text())["mcpServers"]["codex_app"]
+            entry = json.loads((plugin / "desktop-mcp.json").read_text(encoding="utf-8"))["mcpServers"]["codex_app"]
             if _manifest_hash(entry) != expected_manifest:
                 return {"state": "unavailable", "reason": "official_policy_changed"}
         matches = []
@@ -292,7 +292,7 @@ def mcp_config(profile: Path, app: Path) -> dict:
     _, node, plugin, _ = app_paths(app)
     _signed(app.resolve())
     _signed(node)
-    entry = json.loads((plugin / "desktop-mcp.json").read_text())["mcpServers"]["codex_app"]
+    entry = json.loads((plugin / "desktop-mcp.json").read_text(encoding="utf-8"))["mcpServers"]["codex_app"]
     manifest_hash = _manifest_hash(entry)
     entry.update({
         "command": str(node),

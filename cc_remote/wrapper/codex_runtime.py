@@ -67,7 +67,7 @@ def codex_version(path: str) -> tuple[int, ...]:
             capture_output=True,
             text=True,
             timeout=_CODEX_VERSION_TIMEOUT,
-            env=codex_env(path),
+            env=codex_env(path), encoding="utf-8", errors="replace",
         )
     except Exception:
         return (-1,)

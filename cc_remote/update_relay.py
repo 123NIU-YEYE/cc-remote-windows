@@ -50,7 +50,7 @@ def relay_origin(installation: Installation, *, home: Path | None = None) -> str
             value = environment.get("RELAY_URL")
             if not value:
                 path = Path(environment.get("CC_REMOTE_DEVICE_CONFIG") or home / ".cc-remote/device.json")
-                value = json.loads(path.read_text()).get("relay_url")
+                value = json.loads(path.read_text(encoding="utf-8")).get("relay_url")
         except (OSError, ValueError, AttributeError) as exc:
             raise UpdateError("cannot read this device's Relay URL; check its pairing configuration") from exc
     elif installation.metadata.get('linux_service'):
@@ -122,7 +122,7 @@ class RelayUpdate:
         stored = {}
         if self.settings.exists():
             try:
-                stored = json.loads(self.settings.read_text())
+                stored = json.loads(self.settings.read_text(encoding="utf-8"))
                 if not isinstance(stored, dict):
                     raise ValueError("invalid settings")
             except (OSError, ValueError) as exc:
@@ -160,7 +160,7 @@ class RelayUpdate:
             if user != 'root':
                 args = ["runuser", "-u", user, "--", *args] if self.installation.metadata.get('linux_service') else ["sudo", "-H", "-u", user, "--", *args]
         try:
-            response = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+            response = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False, encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired as exc:
             raise RelayConnectionError(f"{operation} timed out; check your network and SSH access; a submitted job may still be running, so retry update to inspect the same transaction") from exc
         except OSError as exc:
@@ -209,7 +209,7 @@ class RelayUpdate:
             request["operation"] = "inspect"
         # Send the small stdlib-only launcher so older Relays need no separate
         # bootstrap deployment. The remote receipt serializes lost-SSH retries.
-        script = Path(relay_update_job.__file__).read_text()
+        script = Path(relay_update_job.__file__).read_text(encoding="utf-8")
         output = self._ssh(
             ["sudo", "-n", "/opt/cc-remote/current/.venv/bin/python", "-I", "-c",
              script, json.dumps(request)], operation="Relay update submission",
@@ -302,7 +302,7 @@ class RelayUpdate:
         # A lost SSH acknowledgement is not permission to launch a second job.
         if self.journal.exists():
             try:
-                transaction = json.loads(self.journal.read_text())
+                transaction = json.loads(self.journal.read_text(encoding="utf-8"))
                 if not isinstance(transaction, dict):
                     raise ValueError("invalid journal")
             except (OSError, ValueError) as exc:
@@ -406,7 +406,7 @@ def installer_main(argv: list[str] | None = None) -> int:
             metadata["service_label"] = args.service_label
         if args.linux_service:
             from deploy.linux_service import validate
-            metadata['linux_service'] = validate(json.loads(args.linux_service.read_text()))
+            metadata['linux_service'] = validate(json.loads(args.linux_service.read_text(encoding="utf-8")))
         installation = Installation(args.root, previous, old, metadata)
         relay = RelayUpdate(installation, args.relay_ssh)
         # Restrictive only: the independent UI worker propagates its explicit

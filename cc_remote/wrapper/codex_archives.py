@@ -103,7 +103,7 @@ class CodexArchiveJournal:
         try:
             if self.path.stat().st_size > _MAX_FILE_BYTES:
                 raise ValueError("archive journal exceeds size limit")
-            text = self.path.read_text()
+            text = self.path.read_text(encoding="utf-8")
             if len(text.encode("utf-8", "surrogatepass")) > _MAX_FILE_BYTES:
                 raise ValueError("archive journal exceeds size limit")
             raw = json.loads(text)
@@ -317,7 +317,7 @@ class CodexArchiveJournal:
                 payload, _payload_bytes = self._serialized_bytes(entries)
             if len(payload.encode("utf-8")) > _MAX_FILE_BYTES:
                 raise ValueError("archive journal exceeds size limit")
-            with tmp.open("w") as stream:
+            with tmp.open("w", encoding="utf-8") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(payload)
                 stream.flush()

@@ -52,7 +52,7 @@ def _native_process_start(identity: ProcessIdentity) -> str:
         result = subprocess.run(
             ["/bin/ps", "-o", "lstart=", "-p", str(identity.pid)],
             env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            capture_output=True, text=True, timeout=1, check=False,
+            capture_output=True, text=True, timeout=1, check=False, encoding="utf-8", errors="replace",
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise OSError("Claude process start unavailable") from exc

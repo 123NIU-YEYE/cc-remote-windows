@@ -39,7 +39,7 @@ async def serve(directory: Path) -> None:
         }
         descriptor = directory / "service.json"
         fd = os.open(descriptor, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as out:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
             json.dump(state, out)
         stopped = asyncio.Event()
         loop = asyncio.get_running_loop()

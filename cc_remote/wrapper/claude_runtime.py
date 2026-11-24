@@ -143,7 +143,7 @@ def probe_claude_cli_version(path: str) -> str:
     try:
         result = subprocess.run(
             [path, "--version"], capture_output=True, text=True,
-            timeout=_CLI_VERSION_TIMEOUT, check=False,
+            timeout=_CLI_VERSION_TIMEOUT, check=False, encoding="utf-8", errors="replace",
         )
     except Exception as exc:
         raise RuntimeError(f"unable to execute Claude CLI: {path}") from exc

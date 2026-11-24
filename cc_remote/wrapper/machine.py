@@ -9142,7 +9142,7 @@ class WrapperMachine:
             path = self._alias_file()
             if path.stat().st_size > self.SESSION_ALIAS_FILE_MAX_BYTES:
                 raise ValueError("session alias state exceeds size limit")
-            with path.open() as stream:
+            with path.open(encoding="utf-8") as stream:
                 raw_text = stream.read(self.SESSION_ALIAS_FILE_MAX_BYTES + 1)
             if len(raw_text.encode("utf-8", "surrogatepass")) \
                     > self.SESSION_ALIAS_FILE_MAX_BYTES:
@@ -9314,7 +9314,7 @@ class WrapperMachine:
             path = self._private_btw_file()
             if path.stat().st_size > self.PRIVATE_BTW_FILE_MAX_BYTES:
                 raise ValueError("private btw state exceeds size limit")
-            with path.open() as stream:
+            with path.open(encoding="utf-8") as stream:
                 raw_text = stream.read(self.PRIVATE_BTW_FILE_MAX_BYTES + 1)
             if len(raw_text.encode("utf-8", "surrogatepass")) \
                     > self.PRIVATE_BTW_FILE_MAX_BYTES:
@@ -9421,7 +9421,7 @@ class WrapperMachine:
             payload = json.dumps(serializable, separators=(",", ":"))
             if len(payload.encode("utf-8")) > self.PRIVATE_BTW_FILE_MAX_BYTES:
                 raise ValueError("private btw state exceeds size limit")
-            with tmp.open("w") as stream:
+            with tmp.open("w", encoding="utf-8") as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 stream.write(payload)
                 stream.flush()
@@ -37902,7 +37902,7 @@ class WrapperMachine:
                                 or state_info.st_size
                                 > WrapperMachine.BG_JOB_STATE_MAX_BYTES):
                             continue
-                        with open(state_path) as stream:
+                        with open(state_path, encoding="utf-8") as stream:
                             raw = stream.read(
                                 WrapperMachine.BG_JOB_STATE_MAX_BYTES + 1)
                         if len(raw) > WrapperMachine.BG_JOB_STATE_MAX_BYTES:

@@ -52,7 +52,7 @@ def _git(cwd: str, *args: str, check: bool = True) -> subprocess.CompletedProces
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
-            env=sanitized_child_env(),
+            env=sanitized_child_env(), encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired as exc:
         raise WorktreeError("Git 操作超时") from exc

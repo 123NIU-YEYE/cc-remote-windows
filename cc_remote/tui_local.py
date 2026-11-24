@@ -64,7 +64,7 @@ def _service_environment() -> dict[str, str]:
         result = subprocess.run(
             ["systemctl", "--user", "show", "cc-remote-relay.service",
              "--property=MainPID", "--property=ActiveState"],
-            capture_output=True, text=True, timeout=2, check=True,
+            capture_output=True, text=True, timeout=2, check=True, encoding="utf-8", errors="replace",
         )
         fields = dict(line.split("=", 1) for line in result.stdout.splitlines()
                       if "=" in line)

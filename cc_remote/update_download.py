@@ -44,7 +44,7 @@ def _etag(headers: Path) -> str | None:
     if not headers.exists() or headers.stat().st_size > 65536:
         return None
     value = None
-    for line in headers.read_text(errors="replace").splitlines():
+    for line in headers.read_text(errors="replace", encoding="utf-8").splitlines():
         if line.startswith("HTTP/"):
             value = None
         if line.lower().startswith("etag:"):
@@ -81,14 +81,14 @@ def download_file(url: str, destination: Path, limit: int, *, resume: bool = Fal
         # A surviving curl keeps the same cache lock if its Python controller
         # exits. Its replacement cannot append to the file concurrently.
         result = subprocess.run([*arguments, url], check=False, capture_output=True, text=True,
-                                pass_fds=() if lock_descriptor is None else (lock_descriptor,))
+                                pass_fds=() if lock_descriptor is None else (lock_descriptor,), encoding="utf-8", errors="replace")
         size = _regular(destination, owner)
         if headers is not None and _regular(headers, owner) > 65536:
             headers.unlink()
         if headers is not None and etag and size and _etag(headers) is None:
             # An error response must not replace the validator of bytes that
             # were accepted before the outage.
-            headers.write_text(f"ETag: {etag}\n")
+            headers.write_text(f"ETag: {etag}\n", encoding="utf-8")
         if size > limit:
             destination.unlink()
             raise DownloadError("release download exceeds the permitted size")
@@ -167,7 +167,7 @@ class DownloadCache:
         if _regular(path, self.owner) > 8192:
             raise UpdateError("oversized release download cache receipt")
         try:
-            binding = json.loads(path.read_text())
+            binding = json.loads(path.read_text(encoding="utf-8"))
             observed, _ = self.identity(binding["source"], binding["name"], binding["sha256"])
             accessed = binding.get("accessed_at")
             if (binding.get("schema") != 1 or observed != path.stem or type(accessed) not in (int, float)

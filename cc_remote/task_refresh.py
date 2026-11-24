@@ -39,7 +39,7 @@ async def refresh(home: Path, release: Path, sid: str | None = None):
                for name in ("async_tasks.py", "task_store.py", "task_rpc.py")):
         raise ValueError("Task MCP implementation is missing from the selected release")
     path = home / "config.toml"
-    local = configured_server(tomllib.loads(path.read_text()), home)
+    local = configured_server(tomllib.loads(path.read_text(encoding="utf-8")), home)
     changed = local.get("cwd") != str(release)
     async with task_rpc.connect(home) as native:
         params = {"includeLayers": True}

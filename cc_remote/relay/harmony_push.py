@@ -134,7 +134,7 @@ class HuaweiPushSender:
             path = Path(credential_path).expanduser()
             if path.stat().st_size > 65536:
                 raise ValueError("oversized credential")
-            value = json.loads(path.read_text())
+            value = json.loads(path.read_text(encoding="utf-8"))
             self.project_id = value["project_id"]
             self.key_id = value["key_id"]
             self.issuer = value["sub_account"]

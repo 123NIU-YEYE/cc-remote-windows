@@ -66,7 +66,7 @@ def read_json(path: Path, owner: int, *, limit: int = 32768) -> dict:
 def write_json(path: Path, value: dict, *, mode: int = 0o644) -> None:
     fd, temporary = tempfile.mkstemp(prefix=".update-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), mode)
             json.dump(value, stream, ensure_ascii=True)
             stream.write("\n")

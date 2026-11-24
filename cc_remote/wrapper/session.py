@@ -51,7 +51,7 @@ def load_session_state(
     try:
         if f.stat().st_size > _STATE_FILE_MAX_BYTES:
             raise ValueError("session state file exceeds size limit")
-        with f.open() as stream:
+        with f.open(encoding="utf-8") as stream:
             data = json.loads(stream.read(_STATE_FILE_MAX_BYTES + 1))
         sid = data.get("cc_session_id")
         if not isinstance(sid, str) or not _SAFE_SESSION_ID.fullmatch(sid):
@@ -113,7 +113,7 @@ def save_session_id(
             raise ValueError("invalid Claude profile revision")
         payload["claude_profile_id"] = claude_profile_id
         payload["claude_profile_revision"] = claude_profile_revision
-    tmp.write_text(json.dumps(payload))
+    tmp.write_text(json.dumps(payload), encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, f)
     log.debug("saved session id", path=str(f), session_id=session_id)
