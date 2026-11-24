@@ -15,28 +15,12 @@ import subprocess
 import sys
 import time
 
+from cc_remote.windows_ipc import same_user_peer
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager, _managed_daemon_process_identity
 from cc_remote.wrapper.codex_runtime import codex_env, resolve_codex_bin
 from cc_remote.wrapper.process_scan import (
     process_command_environment_value, process_identity, process_owner_uid,
 )
-
-
-def same_user_peer(peer_port: int, port: int) -> bool:
-    import psutil
-
-    try:
-        owner = psutil.Process().username().casefold()
-        for connection in psutil.net_connections(kind="tcp"):
-            if (connection.pid and connection.laddr and connection.raddr
-                    and connection.laddr.ip == "127.0.0.1"
-                    and connection.laddr.port == peer_port
-                    and connection.raddr.ip == "127.0.0.1"
-                    and connection.raddr.port == port):
-                return psutil.Process(connection.pid).username().casefold() == owner
-    except (psutil.Error, OSError):
-        pass
-    return False
 
 
 def websocket_upgrade(header: bytes, port: int) -> bool:

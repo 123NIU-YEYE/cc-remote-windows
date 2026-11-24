@@ -52,8 +52,7 @@ class LocalControl:
     async def start(self):
         """Serve the socket; a failure only disables this optional entry point."""
         if os.name == "nt":
-            log.info("Unix peer-authenticated local control is unavailable on Windows")
-            return
+            return await self._start_windows()
         try:
             self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
             info = self.root.lstat()
@@ -75,6 +74,20 @@ class LocalControl:
             os.chmod(self.socket, 0o600)
         except (OSError, ValueError) as exc:
             log.warning("Local control socket unavailable", error=str(exc))
+            self._release_lock()
+
+    async def _start_windows(self):
+        """Serve the same requests on a same-user loopback endpoint."""
+        import pywintypes
+        from cc_remote.windows_ipc import start_server
+        from cc_remote.windows_privacy import private_directory
+        try:
+            private_directory(self.root)
+            self.lock_fd = os.open(self.root / "server.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.server = await start_server(self._client, self.socket, limit=MAX_REQUEST)
+        except (OSError, ValueError, pywintypes.error) as exc:
+            log.warning("Local control endpoint unavailable", error=str(exc))
             self._release_lock()
 
     async def close(self):

@@ -21,7 +21,8 @@ and activate through the normal deployment workflow. Default is off. The
 Wrapper creates `<CC_REMOTE_STATE_DIR>/messages/control.sock` in a private
 directory, with a same-user lifetime lock and mode 0600 socket. It only serves
 that Wrapper's local device. Unix socket paths must fit the 103-byte platform
-limit; startup fails if the configured state path is too long or unsafe.
+limit; startup fails if the configured state path is too long or unsafe. For
+Windows, see [below](#windows).
 
 New Claude Code SDK connections receive a caller-bound `cc_remote_messages`
 server automatically. Existing persistent Claude processes refresh their owned
@@ -49,6 +50,29 @@ The launcher runs `messages` as the invoking user on Linux, without sudo. A
 root-owned Wrapper socket cannot be used by a different OS user; do not relax
 the socket permissions to work around this. For development, use the repository
 venv with `python -m cc_remote.session_messages mcp` and the same two arguments.
+
+### Windows
+
+Windows has no private Unix sockets. The Wrapper serves the same requests on a
+`127.0.0.1` port chosen by the OS and publishes that port in
+`<CC_REMOTE_STATE_DIR>\messages\control.sock`, a regular file with a private
+ACL. Both sides check the TCP table: the Wrapper serves only connections from
+processes of its own Windows user, and the MCP connects only when the port is
+served by that user. The path length limit does not apply.
+
+Windows has no `cc-remote` launcher. Register the interpreter of the source
+tree that the Wrapper runs. When `scripts/run-wrapper.ps1` uses an activated
+release, that is the release directory under `.runtime\releases`; update both
+paths after activating another release:
+
+```toml
+[mcp_servers.cc_remote_messages]
+command = 'C:\path\to\release\.venv\Scripts\python.exe'
+args = ["-X", "utf8", "-m", "cc_remote.session_messages", "mcp",
+        "--socket", 'C:\Users\you\.cc-remote\messages\control.sock',
+        "--codex-home", 'C:\Users\you\.codex']
+cwd = 'C:\path\to\release'
+```
 
 No account configuration is edited automatically. No Relay login password,
 model API key or provider credential is passed to this MCP.

@@ -14,6 +14,13 @@ private 0700 directory, a mode 0600 socket and a same-user lifetime lock, like
 the [session messages](session-messages.md) socket. If the path is unsafe or
 another Wrapper holds the lock, the Wrapper logs a warning and runs without it.
 
+On Windows, `control.sock` is a private file that publishes a `127.0.0.1` port
+and is protected by the same lock. Connect with
+`cc_remote.windows_ipc.open_connection`: it reads the port only from a file
+owned by this user and verifies that the listening process belongs to this
+user. The Wrapper drops connections from other users. In-app updates still
+require macOS or Linux.
+
 One JSON line in, one JSON line out:
 
 ```json

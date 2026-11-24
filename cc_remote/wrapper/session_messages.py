@@ -148,7 +148,7 @@ class SessionMessages:
         # Validate the directory before creating the socket or lifetime lock.
         with self.store.db():
             pass
-        if len(os.fsencode(self.socket)) > 103:
+        if sys.platform != "win32" and len(os.fsencode(self.socket)) > 103:
             raise ValueError("Message socket path exceeds the platform limit")
         self.lock_fd = os.open(self.store.root / "server.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -157,13 +157,17 @@ class SessionMessages:
                 raise ValueError("Invalid message server lock")
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.store.recover()
-            if self.socket.exists() or self.socket.is_symlink():
-                info = self.socket.lstat()
-                if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
-                    raise ValueError("Refusing to replace an unrelated message socket")
-                self.socket.unlink()
-            self.server = await asyncio.start_unix_server(self._client, str(self.socket), limit=MAX_FRAME)
-            os.chmod(self.socket, 0o600)
+            if sys.platform == "win32":
+                from cc_remote.windows_ipc import start_server
+                self.server = await start_server(self._client, self.socket, limit=MAX_FRAME)
+            else:
+                if self.socket.exists() or self.socket.is_symlink():
+                    info = self.socket.lstat()
+                    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                        raise ValueError("Refusing to replace an unrelated message socket")
+                    self.socket.unlink()
+                self.server = await asyncio.start_unix_server(self._client, str(self.socket), limit=MAX_FRAME)
+                os.chmod(self.socket, 0o600)
             self.pump = asyncio.create_task(self._drain(), name="session-message-inbox")
         except BaseException:
             os.close(self.lock_fd)

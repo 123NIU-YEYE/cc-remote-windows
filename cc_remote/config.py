@@ -728,8 +728,8 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
         elif not os.path.isabs(os.path.expanduser(cfg.claude_broker_socket)):
             errors.append(
                 "CC_REMOTE_CLAUDE_BROKER_SOCKET must be an absolute path")
-    if sys.platform == "win32" and (cfg.claude_service_socket or cfg.session_messages_enabled):
-        errors.append("Unix peer-authenticated Claude service/session messaging is unavailable on Windows")
+    if sys.platform == "win32" and cfg.claude_service_socket:
+        errors.append("The Unix peer-authenticated Claude service is unavailable on Windows")
     if cfg.claude_service_socket:
         service_socket = os.path.expanduser(cfg.claude_service_socket)
         if (not os.path.isabs(service_socket) or "\x00" in service_socket

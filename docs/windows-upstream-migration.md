@@ -20,6 +20,8 @@ transaction procedure; a Git push alone is not a deployment receipt.
   Reparse points are rejected by no-follow opens. No global permission masking,
   fake directory descriptors or remembered-path emulation is used.
 - Official shared Codex control support and explicit loopback WS compatibility.
+- Same-user loopback endpoints in place of Unix sockets for cross-session
+  messaging and the local control entrance.
 - Large Claude history partial-write/read failures stay provisional; they never
   publish an authoritative empty page that erases the browser's history.
 - Explicit environment HTTP proxy selection, reconnect announcement ordering,
@@ -66,8 +68,11 @@ This proves the isolated control link, not native model execution or deployment.
 - Native Windows descriptor-relative stat, enumeration, mkdir, atomic replace
   and unlink are covered by real handle tests, including directory replacement.
   Continue the end-to-end media/file-operation acceptance on the activated build.
-- Claude's separate Unix peer-authenticated service, PTY broker and local session
-  messaging are intentionally rejected on Windows. A Windows service transport
+- Cross-session messaging and the local control entrance use same-user
+  loopback endpoints instead of Unix sockets; see
+  [session messages](session-messages.md#windows) and
+  [local control](local-control.md). Claude's separate Unix peer-authenticated
+  service and PTY broker remain rejected on Windows. A Windows service transport
   needs its own authenticated design and SDK lifetime migration acceptance.
 - Verify the daily Claude executable/sign-in, real interrupt-to-Result draining,
   queued input and native Codex shared ownership with explicit live acceptance.

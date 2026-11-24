@@ -66,6 +66,7 @@ def test_unified_outgoing_receipts_are_honest_in_summary(status, expected):
     assert turn["sessionMessages"] == [{"itemId": "call", "threadId": TARGET, "status": expected}]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX mode bits; Windows ACL privacy is tested in test_windows_local_ipc.py")
 def test_store_survives_restart_conflicts_and_caller_isolation(tmp_path):
     store = MessageStore(tmp_path / "messages")
     original, fresh = store.claim(SOURCE, "r", TARGET, "hi")
@@ -234,6 +235,7 @@ async def test_claude_bound_mcp_and_live_echo(monkeypatch):
     assert (msg.prompt, msg.source_thread_id, msg.sid) == ("hello", bound_source, target.key)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix socket contract; Windows endpoints are tested in test_windows_local_ipc.py")
 @pytest.mark.asyncio
 async def test_real_stdio_mcp_binds_codex_metadata_and_private_socket(monkeypatch):
     from mcp import ClientSession, StdioServerParameters
@@ -291,6 +293,7 @@ async def test_real_stdio_mcp_binds_codex_metadata_and_private_socket(monkeypatc
             await machine._command_scheduler.close()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix socket contract; Windows endpoints are tested in test_windows_local_ipc.py")
 @pytest.mark.asyncio
 async def test_corrupt_ack_is_unknown_not_a_rejection():
     with tempfile.TemporaryDirectory(prefix="crm-ack-", dir="/tmp") as folder:

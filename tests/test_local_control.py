@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import stat
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -269,6 +270,7 @@ async def request(path, payload):
     return reply
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix socket contract; Windows endpoints are tested in test_windows_local_ipc.py")
 @pytest.mark.asyncio
 async def test_private_socket_releases_by_account_directory_and_rejects_anything_else():
     machine, _, profile, ctx = released_machine()
@@ -290,6 +292,7 @@ async def test_private_socket_releases_by_account_directory_and_rejects_anything
     assert not control.socket.exists()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Unix socket contract; Windows endpoints are tested in test_windows_local_ipc.py")
 @pytest.mark.asyncio
 async def test_socket_timeout_keeps_release_unknown_on_retry(monkeypatch):
     from cc_remote.wrapper import local_control
