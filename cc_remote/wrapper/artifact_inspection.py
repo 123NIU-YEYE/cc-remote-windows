@@ -68,10 +68,18 @@ def prepare_codex_scope(
 ) -> CodexArtifactScope:
     """Reuse the same key across reconnects to a daemon-resident native thread."""
     directory = state_dir.resolve() / "artifact-inspection"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = directory.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise ValueError("The artifact tool state directory is not private.")
+    if sys.platform == "win32":
+        # Windows has no POSIX mode bits; privacy is the directory's ACL.
+        from cc_remote.windows_privacy import private_directory
+        try:
+            private_directory(directory)
+        except PermissionError as exc:
+            raise ValueError("The artifact tool state directory is not private.") from exc
+    else:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("The artifact tool state directory is not private.")
     database = directory / "codex-scopes.sqlite3"
     if database.is_symlink():
         raise ValueError("Invalid Codex artifact tool state file.")

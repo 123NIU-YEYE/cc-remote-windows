@@ -98,11 +98,16 @@ def create_private_file(path: str | Path) -> int:
     """Create an exclusive descriptor with a private ACL before any bytes exist."""
     import msvcrt
     import os
+    import pywintypes
     import win32con
     import win32file
 
-    handle = win32file.CreateFile(str(path), win32con.GENERIC_READ | win32con.GENERIC_WRITE | win32con.WRITE_DAC,
-                                 0, _private_attributes(), win32con.CREATE_NEW, win32con.FILE_ATTRIBUTE_NORMAL, None)
+    try:
+        handle = win32file.CreateFile(str(path), win32con.GENERIC_READ | win32con.GENERIC_WRITE | win32con.WRITE_DAC,
+                                     0, _private_attributes(), win32con.CREATE_NEW, win32con.FILE_ATTRIBUTE_NORMAL, None)
+    except pywintypes.error as exc:
+        # pywintypes.error is not an OSError; callers handle ERROR_FILE_EXISTS.
+        raise OSError(0, exc.strerror, str(path), exc.winerror) from exc
     raw = handle.Detach()
     try:
         return msvcrt.open_osfhandle(raw, os.O_RDWR | os.O_BINARY)
