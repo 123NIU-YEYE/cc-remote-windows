@@ -213,6 +213,7 @@ async def _list_codex_sessions(
     by_id.update(_rollout_only_sessions(
         codex_home if codex_home is not None else _default_codex_home(),
         known=set(by_id),
+        provider=provider,
     ))
 
     return sorted(
@@ -243,8 +244,10 @@ def _rollout_session_id(path: Path) -> Optional[str]:
 
 
 def _read_rollout_head(
-        path: Path) -> tuple[Optional[str], Optional[str], Optional[str], bool]:
-    """Best-effort (cwd, first user prompt, git branch, is_subagent) from the head.
+        path: Path,
+) -> tuple[Optional[str], Optional[str], Optional[str], bool, Optional[str]]:
+    """Best-effort (cwd, first user prompt, git branch, is_subagent, model
+    provider) from the head.
 
     Subagent rollouts are real transcripts but must never become sidebar rows: the
     app-server hides them for the same reason, and re-adding them would bury the
@@ -254,11 +257,12 @@ def _read_rollout_head(
     prompt: Optional[str] = None
     branch: Optional[str] = None
     subagent = False
+    provider: Optional[str] = None
     try:
         with open_shared(path, "rb") as handle:
             raw = handle.read(_ROLLOUT_HEAD_BYTES)
     except OSError:
-        return None, None, None, False
+        return None, None, None, False, None
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith(b"{"):
@@ -276,6 +280,8 @@ def _read_rollout_head(
         source = record.get("source")
         if isinstance(source, dict) and "subagent" in source:
             subagent = True
+        if provider is None and isinstance(record.get("model_provider"), str):
+            provider = record["model_provider"].strip() or None
         if not cwd:
             candidate = record.get("cwd") or record.get("working_directory")
             if isinstance(candidate, str) and candidate:
@@ -298,7 +304,7 @@ def _read_rollout_head(
             prompt = _usable_prompt(text)
         if cwd and prompt is not None and branch and subagent:
             break
-    return cwd, prompt, branch, subagent
+    return cwd, prompt, branch, subagent, provider
 
 
 # Injected context blocks that are not the user's request.
@@ -323,11 +329,13 @@ def _rollout_only_sessions(
     codex_home: str | os.PathLike[str] | Path,
     *,
     known: set[str],
+    provider: str = "",
 ) -> dict[str, dict[str, Any]]:
     """Conversations with a transcript on disk but absent from thread/list.
 
     Bounded by mtime so a machine with thousands of rollouts stays cheap: only the
     newest ``_ROLLOUT_SCAN_LIMIT`` files are considered, and only their head is read.
+    thread/list hides other providers' threads; so does this merge.
     """
     root = Path(codex_home) / "sessions"
     if not root.is_dir():
@@ -352,7 +360,9 @@ def _rollout_only_sessions(
             mtime = path.stat().st_mtime
         except OSError:
             continue
-        cwd, prompt, branch, subagent = _read_rollout_head(path)
+        cwd, prompt, branch, subagent, rollout_provider = _read_rollout_head(path)
+        if provider and rollout_provider and rollout_provider != provider:
+            continue
         if subagent:
             # Child threads belong to their parent conversation, exactly as the
             # app-server treats them: listing them would flood the sidebar.
