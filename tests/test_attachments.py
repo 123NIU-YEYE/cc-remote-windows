@@ -18,6 +18,7 @@ from cc_remote.attachments import (
 )
 from cc_remote.protocol import ERR_BAD_PROMPT, Query, Steer, TurnSteered
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_support import WINDOWS, has_mode
 
 
 def _b64(size: int) -> str:
@@ -132,7 +133,11 @@ def test_stashed_files_are_private_unique_and_path_safe(tmp_path):
     assert len(paths) == 2 and len(set(paths)) == 2
     assert all(os.path.dirname(path) == str(turn_dir) for path in paths)
     assert [open(path, "rb").read() for path in paths] == [b"x" * 3, b"x" * 4]
-    assert all((os.stat(path).st_mode & 0o777) == 0o600 for path in paths)
+    if not WINDOWS:
+        assert all((os.stat(path).st_mode & 0o777) == 0o600 for path in paths)
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert all(has_mode(path, 0o600) for path in paths)
 
 
 def test_turn_temp_directory_is_removed_when_query_fails():
@@ -206,7 +211,11 @@ def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
         upload_dir = workspace / "uploads" / "work-message"
         assert (upload_dir / "00-note.txt").read_bytes() == b"x" * 8
         assert (upload_dir / "image-00.png").read_bytes().startswith(b"\x89PNG")
-        assert upload_dir.stat().st_mode & 0o777 == 0o700
+        if not WINDOWS:
+            assert upload_dir.stat().st_mode & 0o777 == 0o700
+        else:
+            # On Windows, verify via ACL instead of mode bits
+            assert has_mode(upload_dir, 0o700)
         assert not (workspace.parent / "uploads").exists()
 
     asyncio.run(run())

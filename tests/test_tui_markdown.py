@@ -1,5 +1,6 @@
 """Markdown is presentation, never a rewrite of session content or URLs."""
 
+
 import pytest
 from rich.cells import cell_len
 from rich.console import Console

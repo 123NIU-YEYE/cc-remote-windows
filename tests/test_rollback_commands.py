@@ -13,6 +13,7 @@ from cc_remote.wrapper.rollback_commands import (
     RollbackCommandJournal,
     RollbackJournalError,
 )
+from tests.platform_support import WINDOWS, has_mode
 
 
 def _codex_result(
@@ -65,8 +66,13 @@ def test_rollback_journal_survives_restart_without_reclaiming_submission(
         "num_turns": 1,
         "checkpoint_id": None,
     }
-    assert stat.S_IMODE((tmp_path / "rollback-commands.json").stat().st_mode) == 0o600
-    assert stat.S_IMODE((tmp_path / "rollback-commands.lock").stat().st_mode) == 0o600
+    if not WINDOWS:
+        assert stat.S_IMODE((tmp_path / "rollback-commands.json").stat().st_mode) == 0o600
+        assert stat.S_IMODE((tmp_path / "rollback-commands.lock").stat().st_mode) == 0o600
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert has_mode(tmp_path / "rollback-commands.json", 0o600)
+        assert has_mode(tmp_path / "rollback-commands.lock", 0o600)
     assert journal.mark_submitted("browser-1", "cmd-1") is True
 
     reloaded = RollbackCommandJournal(tmp_path)

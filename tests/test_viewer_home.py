@@ -13,6 +13,7 @@ from cc_remote.viewer_home import HomePages
 from cc_remote.viewer_pages import verify_page
 from tests import test_viewer as fixtures
 from tests.test_viewer import live_viewer, create_grant, bridge_socket, bind_bridge
+from tests.platform_support import WINDOWS, is_private
 
 publication = fixtures.publication
 
@@ -40,7 +41,11 @@ def test_home_pages_are_on_demand_private_and_survive_restart(home_pages):
     assert site.root == str(project)
     assert "root" not in value["publication"] and "home" not in value["publication"]
     assert not registry.exists()  # Not a global publication/list entry.
-    assert pages.path.stat().st_mode & 0o777 == 0o600
+    if not WINDOWS:
+        assert pages.path.stat().st_mode & 0o777 == 0o600
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert is_private(pages.path)
     restarted = HomePages(pages.path, home=pages.home)
     assert verify_page(restarted.sites()[site.id], "/web/index.html")["entry"] == "/web/index.html"
     stream, _, _ = open_resource(site, "/assets/part.stl")
@@ -108,6 +113,7 @@ def test_existing_publications_win_and_ambiguity_is_preserved(publication, tmp_p
     assert not pages.path.exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="Static server discovery is Linux/macOS only")
 @pytest.mark.parametrize("argv, expected", [
     (["python3", "-m", "http.server", "8773", "--bind", "0.0.0.0", "--directory", "/home/demo/my project"], "/home/demo/my project"),
     (["/venv/bin/python3.14", "-u", "-I", "-m", "http.server", "-d", "web", "8773"], "/home/demo/web"),
@@ -124,6 +130,7 @@ def test_python_static_adapter_requires_exact_argv(argv, expected):
     assert (str(found) if found else None) == expected
 
 
+@pytest.mark.skipif(WINDOWS, reason="Static server discovery is Linux/macOS only")
 def test_static_url_needs_own_address_listener_and_process(monkeypatch):
     calls = []
     monkeypatch.setattr(static, "local_addresses", lambda: {"192.168.1.20", "127.0.0.1"})

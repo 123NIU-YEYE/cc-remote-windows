@@ -166,6 +166,7 @@ def test_reencoded_output_still_obeys_byte_cap():
     b"", b"\x89PNG\r\n\x1a\n", b"GIF89a", b"<svg/>",
     b"\0\0\1\0\xff\xff", b"RIFF\0\0\0\0WEBPVP8X", b"\xff\xd8\xff",
     b"x" * (256 * 1024 + 1),
-])
+], ids=["empty", "png_header", "gif_header", "svg_header",
+        "ico_header", "webp_header", "jpeg_header", "oversized"])
 def test_invalid_or_oversized_payloads_fail_closed(content):
     assert raster_data(content) is None

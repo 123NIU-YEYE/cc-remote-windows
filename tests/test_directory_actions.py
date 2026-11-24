@@ -7,6 +7,7 @@ import pytest
 
 from cc_remote.protocol import PrepareDirectoryAction, RunDirectoryAction, Error, ERR_BUSY
 from cc_remote.wrapper import directory_actions as module
+from tests.platform_support import native_path
 
 
 class Machine:
@@ -42,7 +43,9 @@ class Machine:
     async def send(self, value):
         self.sent.append(value)
 
-    def add(self, sid, *, profile="primary", cwd="/project", archived=False):
+    def add(self, sid, *, profile="primary", cwd=None, archived=False):
+        if cwd is None:
+            cwd = native_path("/project")
         self.rows[profile][sid] = {"session_id": sid, "cwd": cwd, "tag": "archived" if archived else None}
         return f"{profile}@{sid}"
 
@@ -145,7 +148,7 @@ def fixture(tmp_path, monkeypatch):
 
 def prepare(**kwargs):
     return PrepareDirectoryAction(client_id="browser", cmd_id="prepare", engine="codex",
-                                  cwd="/project", action="delete", **kwargs)
+                                  cwd=native_path("/project"), action="delete", **kwargs)
 
 
 def run(plan, **kwargs):
@@ -201,7 +204,7 @@ async def test_running_queued_and_background_sessions_are_retained(fixture):
     for sid, busy, background in [("working", True, False), ("background", False, True)]:
         wire = machine.add(sid)
         machine.contexts[wire] = SimpleNamespace(busy=busy, background=background,
-            codex_background_processes={"task": object()} if background else {}, btw=False, cwd="/project")
+            codex_background_processes={"task": object()} if background else {}, btw=False, cwd=native_path("/project"))
     machine.add("idle")
     machine.add("archived", archived=True)
     plan = await manager.prepare(prepare().model_copy(update={"action": "archive"}))
@@ -213,8 +216,8 @@ async def test_running_queued_and_background_sessions_are_retained(fixture):
 @pytest.mark.asyncio
 async def test_profile_collision_migration_override_and_partial_failure(fixture):
     machine, manager = fixture
-    moved = machine.add("same", cwd="/old")
-    machine.overrides[moved] = "/project"
+    moved = machine.add("same", cwd=native_path("/old"))
+    machine.overrides[moved] = native_path("/project")
     machine.add("same", profile="second")
     machine.add("running-now")
     machine.failures["primary@running-now"] = ERR_BUSY
@@ -285,7 +288,7 @@ async def test_claude_native_holder_scan_is_account_scoped_and_fails_closed(tmp_
         return SimpleNamespace(complete=False, holders={})
     monkeypatch.setattr(module, "claude_session_holders", scan)
     entries = [module.Entry(f"{profile}@same", "same", profile, False) for profile in machine.rows]
-    busy = await module.DirectoryActions(machine)._claude_external_busy(entries, "/project")
+    busy = await module.DirectoryActions(machine)._claude_external_busy(entries, native_path("/project"))
     assert busy == {entry.sid for entry in entries}
     assert observed["native_session_ids"] == {entry.sid: "same" for entry in entries}
     assert len(set(observed["config_dirs"].values())) == 2

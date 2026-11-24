@@ -20,6 +20,7 @@ from cc_remote.protocol import (
     AssistantMsgStart, ERR_DRAIN_TIMEOUT, Error, Interrupt, StateEvent,
     TurnBinding, TurnEnd, UserMsg,
 )
+from tests.platform_support import WINDOWS
 from cc_remote.config import WrapperConfig
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import codex_stream as codex_stream_module
@@ -794,6 +795,7 @@ def test_get_diff_with_explicit_unknown_sid_never_reads_focused_repo():
     asyncio.run(run())
 
 
+@pytest.mark.skipif(WINDOWS, reason="mkfifo is Unix-only")
 def test_diff_rejects_untracked_fifo_without_opening_it(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -820,6 +822,7 @@ def test_bounded_subprocess_output_has_wall_clock_timeout():
     asyncio.run(run())
 
 
+@pytest.mark.skipif(WINDOWS, reason="os.killpg is Unix-only")
 def test_bounded_subprocess_discards_residual_output_without_communicate(monkeypatch):
     class FakeStdout:
         def __init__(self):
@@ -1878,7 +1881,8 @@ def test_codex_session_settings_reads_bounded_tail_of_oversized_source(
             "collaboration_mode": {"mode": "plan"},
         },
     }) + "\n"
-    rollout.write_text(old + ("x" * 4096) + "\n" + latest)
+    # Codex writes LF; text mode would turn each into CRLF on Windows.
+    rollout.write_bytes((old + ("x" * 4096) + "\n" + latest).encode())
     monkeypatch.setattr(
         codex_sessions_module, "_rollout_path", lambda _sid: str(rollout))
 

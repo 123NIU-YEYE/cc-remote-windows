@@ -46,7 +46,7 @@ def test_shared_nodes_cycles_and_edge_labels_are_bounded():
     "graph TB\n" + ";".join(f"N{i}" for i in range(65)),
     'graph TB\nA["' + "x" * 33000 + '"]',
     'graph TB\nA["' + "中" * 12000 + '"]',
-])
+], ids=["unfinished", "many_nodes", "large_ascii", "large_cjk"])
 def test_unsupported_or_oversized_diagrams_keep_source(source):
     assert render_flowchart(source, 80) is None
     text, _, _ = render_markdown("```mermaid\n" + source + "\n```", 80)

@@ -22,6 +22,7 @@ from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
 from tests.test_codex_profiles import _machine as _profile_machine
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_support import WINDOWS, has_mode
 
 
 @pytest.fixture(autouse=True)
@@ -278,7 +279,11 @@ def test_session_pin_store_persists_and_unpins(tmp_path):
     store.set_pinned("codex", "codex-1", True)
     assert SessionPinStore(tmp_path).ids("claude") == {"claude-1"}
     assert SessionPinStore(tmp_path).ids("codex") == {"codex-1"}
-    assert oct(os.stat(tmp_path / "session-pins.json").st_mode & 0o777) == "0o600"
+    if not WINDOWS:
+        assert oct(os.stat(tmp_path / "session-pins.json").st_mode & 0o777) == "0o600"
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert has_mode(tmp_path / "session-pins.json", 0o600)
 
     store.set_pinned("claude", "claude-1", False)
     assert SessionPinStore(tmp_path).ids("claude") == set()

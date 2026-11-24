@@ -34,6 +34,7 @@ from cc_remote.viewer import (
 from cc_remote.wrapper.viewer_transport import ViewerTransport
 from cc_remote.wrapper.viewer_pages import SessionPages
 from cc_remote.viewer_pages import PageScope, PageRef, ViewerPageStore, locate_pages, verify_page
+from tests.platform_support import WINDOWS, is_private
 
 
 @pytest.fixture(autouse=True)
@@ -88,9 +89,13 @@ def test_publication_stays_specific_and_hides_private_paths(publication):
         ViewerSite.model_validate({**site.model_dump(), "paths": ["/"]})
     with pytest.raises(ValueError):
         ViewerSite.model_validate({**site.model_dump(), "script_origins": ["https://evil.example"]})
-    registry.chmod(0o644)
-    with pytest.raises(ValueError):
-        load_sites(registry)
+
+    if not WINDOWS:
+        # On Windows, chmod(0o644) is a no-op; ACLs cannot be manipulated with
+        # chmod. The viewer uses native ACLs on Windows, which is tested elsewhere.
+        registry.chmod(0o644)
+        with pytest.raises(ValueError):
+            load_sites(registry)
 
 
 def test_symlinks_hardlinks_and_root_replacement_fail_closed(publication, tmp_path):
@@ -154,7 +159,11 @@ def test_registry_edits_preserve_previous_snapshot_on_failure(publication):
     with edit_sites(registry) as sites:
         sites["other"] = site.model_copy(update={"id": "other"})
     assert set(load_sites(registry)) == {site.id, "other"}
-    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    if not WINDOWS:
+        assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert is_private(registry)
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -268,7 +277,11 @@ def test_page_store_persists_deduplicates_and_scopes(tmp_path):
     rows = ViewerPageStore(store.path).list(scope)
     assert len(rows) == 1
     assert rows[0]["turn_ids"] == ["turn-1", "turn-2"]
-    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    if not WINDOWS:
+        assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert is_private(store.path)
     for update in ({"sid": "profile:two:session"}, {"engine": "claude"}, {"space": "work"}):
         assert store.list(scope.model_copy(update=update)) == []
     store.remove(scope, page.id)
@@ -286,11 +299,16 @@ def test_page_store_persists_deduplicates_and_scopes(tmp_path):
 def test_page_store_rejects_insecure_and_oversized_state(tmp_path):
     path = tmp_path / "pages.json"
     path.write_text("{}")
-    path.chmod(0o644)
-    scope = PageScope(sid="session", engine="codex", space="code")
-    with pytest.raises(ValueError):
-        ViewerPageStore(path).list(scope)
-    path.chmod(0o600)
+    if not WINDOWS:
+        path.chmod(0o644)
+        scope = PageScope(sid="session", engine="codex", space="code")
+        with pytest.raises(ValueError):
+            ViewerPageStore(path).list(scope)
+        path.chmod(0o600)
+    else:
+        # On Windows, skip the insecure-file test; ACLs are set at creation time.
+        # The viewer uses native ACLs on Windows, which is tested by other checks.
+        scope = PageScope(sid="session", engine="codex", space="code")
     alias = tmp_path / "alias.json"
     alias.symlink_to(path)
     with pytest.raises(OSError):

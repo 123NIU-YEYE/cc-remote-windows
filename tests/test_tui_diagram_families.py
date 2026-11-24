@@ -217,6 +217,7 @@ async def test_browser_opens_only_when_explicitly_requested(monkeypatch):
         "graph TB\nA" + "x" * 33000,
         "sequenceDiagram\n" + "A->>B: hello\n" * 501,
     ],
+    ids=["large_graph", "large_sequence"],
 )
 def test_limits_fail_closed(source):
     assert render_diagram(source, 80) is None

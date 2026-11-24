@@ -16,6 +16,7 @@ from cc_remote.tui_app import Composer, WorkspaceApp, WorkspaceClient
 from cc_remote.tui_chrome import ACCENT, WARNING, settings_text, status_text
 from cc_remote.tui_presentation import SessionPresentation
 from cc_remote.tui_settings import TextValue
+from tests.platform_support import WINDOWS
 
 
 def png():
@@ -148,10 +149,10 @@ async def test_clipboard_rejects_invalid_and_empty_images(monkeypatch):
 async def test_clipboard_helper_output_exit_timeout_and_cancellation(
     monkeypatch,
 ):
-    assert (
-        await cb.read_command([sys.executable, "-c", "print('ok')"], 10)
-        == b"ok\n"
-    )
+    output = await cb.read_command([sys.executable, "-c", "print('ok')"], 10)
+    # On Windows, Python print() outputs CRLF instead of LF
+    expected = b"ok\r\n" if WINDOWS else b"ok\n"
+    assert output == expected
     with pytest.raises(ValueError, match="size limit"):
         await cb.read_command([sys.executable, "-c", "print('x' * 10000)"], 100)
     with pytest.raises(ValueError, match="unavailable"):

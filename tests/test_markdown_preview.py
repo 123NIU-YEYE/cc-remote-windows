@@ -34,6 +34,12 @@ from cc_remote.protocol import (
 from cc_remote.wrapper.git_diff import read_git_diff
 from cc_remote.wrapper.preview_capabilities import PreviewCapabilityStore
 from tests.test_multisession import _mk_ctx, _mk_machine
+from tests.platform_support import WINDOWS, has_mode
+
+
+def normalize_newlines(text: str) -> str:
+    """Convert CRLF to LF for cross-platform comparison."""
+    return text.replace("\r\n", "\n")
 
 
 @pytest.mark.parametrize("extension", ["mmd", "MERMAID"])
@@ -43,7 +49,8 @@ def test_mermaid_artifact_reads_exact_source_as_text(tmp_path, extension):
     path.write_text(source, encoding="utf-8")
     preview = machine_module.WrapperMachine._read_file_preview(str(tmp_path), path.name)
     assert preview["format"] == "text"
-    assert preview["content"] == source
+    # On Windows, write_text uses CRLF, so normalize for comparison
+    assert normalize_newlines(preview["content"]) == source
     assert preview["truncated"] is False
 
 
@@ -147,7 +154,8 @@ def test_markdown_preview_reads_utf8_and_normalizes_paths(tmp_path):
     absolute = machine._read_markdown_preview(str(tmp_path), str(readme))
 
     assert relative[0] == absolute[0] == "docs/README.md"
-    assert relative[1] == absolute[1] == "# 标题\n\n正文"
+    # On Windows, write_text uses CRLF, so normalize for comparison
+    assert normalize_newlines(relative[1]) == normalize_newlines(absolute[1]) == "# 标题\n\n正文"
     assert relative[2] == readme.stat().st_size
     assert relative[3] is False
     assert relative[4] == readme.stat().st_mtime_ns
@@ -161,7 +169,8 @@ def test_source_preview_reads_utf8_and_reports_text_format(tmp_path):
     result = machine._read_text_preview(str(tmp_path), "module.py")
 
     assert result[0] == "module.py"
-    assert result[1] == "def answer():\n    return 42\n"
+    # On Windows, write_text uses CRLF, so normalize for comparison
+    assert normalize_newlines(result[1]) == "def answer():\n    return 42\n"
     assert result[5] == "text"
     assert result[6] == hashlib.sha256(source.read_bytes()).hexdigest()
 
@@ -181,7 +190,11 @@ def test_markdown_save_is_atomic_and_preserves_bom_crlf_and_mode(tmp_path):
 
     assert result[0] == "README.md"
     assert path.read_bytes() == b"\xef\xbb\xbf# new\r\nline\r\n"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    if not WINDOWS:
+        assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    else:
+        # On Windows, verify via ACL/inherited permissions, not mode bits
+        assert has_mode(path, 0o640)
     assert result[1] == path.stat().st_size
     assert result[2] == path.stat().st_mtime_ns
     assert result[3] == hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1525,10 +1538,11 @@ def test_successful_codex_patch_grants_multiple_exact_cross_cwd_paths(tmp_path):
 
     allowed = machine._preview_capabilities(ctx)
     assert set(allowed) == {str(first.resolve()), str(second.resolve())}
-    assert machine._read_text_preview(
-        str(root), str(first), allowed)[1] == "1\n"
-    assert machine._read_markdown_preview(
-        str(root), str(second), allowed)[1] == "# two\n"
+    # On Windows, write_text uses CRLF, so normalize for comparison
+    assert normalize_newlines(machine._read_text_preview(
+        str(root), str(first), allowed)[1]) == "1\n"
+    assert normalize_newlines(machine._read_markdown_preview(
+        str(root), str(second), allowed)[1]) == "# two\n"
     diff = asyncio.run(machine._git_diff(str(root), str(first), allowed))
     assert "--- /dev/null" in diff
     assert "+1" in diff
@@ -1565,12 +1579,20 @@ def test_external_diff_never_reopens_capability_checked_path(
     original_open = os.open
     replaced = False
     target_lstat_calls = 0
+    target_opens = 0
 
     def replace_path_once() -> None:
         nonlocal replaced
         if replaced:
             return
-        os.replace(replacement, outside)
+        try:
+            os.replace(replacement, outside)
+        except PermissionError:
+            # Windows refuses to replace a file another handle holds open, so
+            # this race cannot happen there; the open count below still
+            # proves the path is not reopened.
+            if not WINDOWS:
+                raise
         replaced = True
 
     def racing_lstat(path, *args, **kwargs):
@@ -1585,8 +1607,10 @@ def test_external_diff_never_reopens_capability_checked_path(
         return file_stat
 
     def racing_open(path, flags, *args, **kwargs):
+        nonlocal target_opens
         descriptor = original_open(path, flags, *args, **kwargs)
         if os.path.abspath(os.fspath(path)) == outside_path:
+            target_opens += 1
             replace_path_once()
         return descriptor
 
@@ -1617,9 +1641,13 @@ def test_external_diff_never_reopens_capability_checked_path(
         run_command=replacing_runner,
     ))
 
-    assert "ORIGINAL_SNAPSHOT" in diff
-    assert "SECRET_AFTER_CHECK" not in diff
+    # Normalize newlines for Windows compatibility
+    normalized_diff = normalize_newlines(diff) if diff else ""
+    assert "ORIGINAL_SNAPSHOT" in normalized_diff
+    assert "SECRET_AFTER_CHECK" not in normalized_diff
     assert len(command_calls) == 1
+    if WINDOWS:
+        assert target_opens == 1
 
 
 def test_external_binary_diff_never_decodes_capability_snapshot(tmp_path):
@@ -1654,6 +1682,7 @@ def test_external_binary_diff_never_decodes_capability_snapshot(tmp_path):
     assert "PRIVATE_BINARY_PAYLOAD" not in diff
 
 
+@pytest.mark.skipif(WINDOWS, reason="mkfifo is Unix-only")
 def test_markdown_preview_rejects_special_files_without_blocking(tmp_path):
     fifo = tmp_path / "pipe.md"
     os.mkfifo(fifo)

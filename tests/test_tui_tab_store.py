@@ -7,6 +7,7 @@ import pytest
 
 from cc_remote.tui_app import WorkspaceApp, WorkspaceClient
 from cc_remote.tui_tab_store import TabStore
+from tests.platform_support import WINDOWS, has_mode
 
 
 def store(tmp_path, **kwargs):
@@ -25,7 +26,11 @@ def test_private_atomic_tabs_exclude_transient_ids_and_secrets(tmp_path):
     saved.save(["a", "a", "b", "tmp-new", "btw-aside"], "b", ("claude", "work"))
     assert saved.load() == {
         "tabs": ["a", "b"], "active": "b", "scope": ["claude", "work"]}
-    assert saved.path.stat().st_mode & 0o777 == 0o600
+    if not WINDOWS:
+        assert saved.path.stat().st_mode & 0o777 == 0o600
+    else:
+        # On Windows, verify via ACL instead of mode bits
+        assert has_mode(saved.path, 0o600)
     assert "localhost" not in saved.path.read_text()
     assert len(list(tmp_path.glob(".tabs-*"))) == 0
 

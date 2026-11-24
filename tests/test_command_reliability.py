@@ -8,6 +8,8 @@ import pytest
 from pydantic import ValidationError
 from starlette.websockets import WebSocketDisconnect
 
+from tests.platform_support import native_path
+
 from cc_remote.protocol import (
     AnswerQuestion,
     AskUser,
@@ -49,7 +51,7 @@ from cc_remote.protocol import (
     serialize,
 )
 from cc_remote.wrapper import machine as machine_module
-from cc_remote.claude_broker.client import BrokerClientError
+from cc_remote.wrapper.machine import BrokerClientError
 from cc_remote.relay.pairing import RelayHub
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -1125,7 +1127,7 @@ def test_deleted_claude_fork_retry_only_acks_without_resurrecting(monkeypatch):
         parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         cutoff = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         child = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-        cwd = "/repo/component"
+        cwd = native_path("/repo/component")
         machine._claude_forks.begin(
             "fork-request", parent, cutoff, cwd)
         machine._claude_forks.claim_submission("fork-request")
@@ -1166,8 +1168,9 @@ def test_failed_claude_fork_delete_restores_complete_journal(monkeypatch):
         child = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         cutoff = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        cwd = native_path("/repo/component")
         machine._claude_forks.begin(
-            "fork-request", parent, cutoff, "/repo/component")
+            "fork-request", parent, cutoff, cwd)
         machine._claude_forks.claim_submission("fork-request")
         machine._claude_forks.complete("fork-request", child)
 
@@ -1177,7 +1180,7 @@ def test_failed_claude_fork_delete_restores_complete_journal(monkeypatch):
         machine._is_codex_session = not_codex
         monkeypatch.setattr(
             machine_module, "get_session_info",
-            lambda _sid: SimpleNamespace(cwd="/repo/component"),
+            lambda _sid: SimpleNamespace(cwd=cwd),
         )
         monkeypatch.setattr(
             machine_module, "delete_session",
