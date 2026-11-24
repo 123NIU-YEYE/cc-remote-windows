@@ -26,6 +26,7 @@ from websockets.uri import parse_uri
 from cc_remote import __version__
 from cc_remote.wrapper.codex_daemon import CodexDaemonManager, socket_identity
 from cc_remote.wrapper.codex_service import DaemonIsolationError
+from cc_remote.wrapper.os_compat import kill_process_tree
 from cc_remote.wrapper.process_scan import process_identity
 
 REPORT_NAME = "codex-readiness.json"
@@ -152,7 +153,10 @@ async def probe_proxy(
             # Only this short-lived, thread-free probe is terminated.
             try:
                 if os.name == "nt":
-                    process.kill()
+                    # codex is often an npm shim: stop the tree, like killpg.
+                    await asyncio.to_thread(kill_process_tree, process.pid)
+                    if process.returncode is None:
+                        process.kill()
                 else:
                     os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:

@@ -256,6 +256,29 @@ while True:
     assert _exited(int(pid_file.read_text()))
 
 
+@pytest.mark.skipif(not WINDOWS, reason="Windows launcher process tree")
+def test_proxy_probe_stops_the_whole_launcher_tree(tmp_path, monkeypatch):
+    # Codex is often an npm shim (codex.cmd -> node -> codex.exe). A proxy
+    # that outlives its stdin must not survive its launcher being stopped.
+    import psutil
+
+    pid_file = tmp_path / "pid"
+    launcher = fake_executable(tmp_path / "codex", "\n".join((
+        "import os, pathlib, time",
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))",
+        "while True:",
+        "    time.sleep(1)",
+        "")))
+    monkeypatch.setattr(readiness, "_TIMEOUT", 3)
+    try:
+        with pytest.raises(TimeoutError):
+            asyncio.run(readiness.probe_proxy(str(launcher), dict(os.environ), str(tmp_path / "socket")))
+        assert _exited(int(pid_file.read_text()))
+    finally:
+        if pid_file.exists() and not _exited(int(pid_file.read_text())):
+            psutil.Process(int(pid_file.read_text())).kill()
+
+
 def test_installer_rejects_previous_activation_dead_or_reused_pid(tmp_path, monkeypatch):
     before = time.time()
     readiness.write_report(tmp_path, [{"profile": "test", "status": "disabled"}])
