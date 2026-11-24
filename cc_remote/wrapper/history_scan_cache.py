@@ -14,6 +14,7 @@ from cc_remote.wrapper.history_store import (
     HistorySourceFingerprint,
     history_source_extends,
 )
+from cc_remote.wrapper.os_compat import open_shared
 
 
 @dataclass
@@ -50,7 +51,7 @@ class IncrementalJsonlProjection:
             state, row_count, offset = factory(), 0, 0
         # Use the same bounded text-record iterator as the uncached translator:
         # skipped oversized rows must not change fallback message identities.
-        with open(source.path, encoding="utf-8") as stream:
+        with open_shared(source.path, "r", encoding="utf-8") as stream:
             stream.seek(offset)
             for line in bounded_lines(stream):
                 index = row_count
@@ -61,7 +62,7 @@ class IncrementalJsonlProjection:
                     continue
                 if isinstance(row, dict):
                     update(state, row, index)
-        with open(source.path, "rb") as stream:
+        with open_shared(source.path, "rb") as stream:
             if source.size:
                 stream.seek(source.size - 1)
             complete = not source.size or stream.read(1) == b"\n"

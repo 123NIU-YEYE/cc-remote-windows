@@ -14,6 +14,7 @@ from typing import Any
 
 from claude_agent_sdk.types import AssistantMessage, SystemMessage, UserMessage
 
+from cc_remote.wrapper.os_compat import open_shared
 from cc_remote.wrapper.sanitize import bounded_text
 from cc_remote.wrapper.stream import _bounded_jsonl_lines, transcript_path
 
@@ -130,7 +131,7 @@ def read_claude_goal(
     message_tokens: dict[str, int] = {}
     records = 0
     try:
-        with open(source_path, encoding="utf-8") as transcript:
+        with open_shared(source_path, "r", encoding="utf-8") as transcript:
             for line in _bounded_jsonl_lines(transcript):
                 records += 1
                 if records > _MAX_GOAL_RECORDS:

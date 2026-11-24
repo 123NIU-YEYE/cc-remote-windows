@@ -23,6 +23,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Callable
 
+from cc_remote.wrapper.os_compat import open_shared
 from cc_remote.wrapper.rollout_io import rollout_fstat, rollout_open
 from cc_remote.wrapper.codex_delegation import codex_message_target
 from cc_remote.wrapper.claude_rewind_history import rewind_anchor_row
@@ -1937,7 +1938,8 @@ class HistoryIndexStore:
         bounded_record = max(1024, int(max_record_bytes))
         bounded_entries = max(1, int(max_entries))
         try:
-            source = open(resolved, "rb")
+            # Claude may replace or delete its transcript during a long scan.
+            source = open_shared(resolved, "rb")
         except OSError:
             return None
         with source:

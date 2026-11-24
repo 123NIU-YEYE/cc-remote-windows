@@ -33,6 +33,7 @@ from claude_agent_sdk.types import (
 
 from cc_remote.protocol import ProcessEvent, ToolUse, TurnEnd, UserMsg
 from cc_remote.wrapper import claude_catalog
+from cc_remote.wrapper.os_compat import open_shared
 from cc_remote.wrapper.stream import (
     StreamTranslator,
     _is_agent_task_type,
@@ -511,7 +512,7 @@ def _source_agent_metadata(
     """Read only the small SDK sidecar, never the Agent transcript body."""
     sidecar = os.path.splitext(source_path)[0] + ".meta.json"
     try:
-        with open(sidecar, "rb") as source:
+        with open_shared(sidecar, "rb") as source:
             raw = source.read(_MAX_AGENT_METADATA_BYTES + 1)
     except OSError:
         return None, None, None

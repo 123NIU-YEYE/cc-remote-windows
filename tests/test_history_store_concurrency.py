@@ -1,7 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 import json
-import os
 import sqlite3
 
 import pytest
@@ -11,6 +10,7 @@ from cc_remote.wrapper.history_store import (
     HistorySourceFingerprint,
     MaterializedHistoryPage,
 )
+from tests.platform_support import replace_open_file
 
 
 def _row(uid):
@@ -166,7 +166,8 @@ def test_simultaneous_compact_readers_all_reuse_the_winning_scan(tmp_path):
 def test_small_old_snapshot_keeps_larger_compact_index(tmp_path):
     path = tmp_path / "transcript.jsonl"
     prefix = _row("first")
-    path.write_text(prefix + _row("second"))
+    # snapshot_size is a byte offset: keep the LF endings Claude writes.
+    path.write_bytes((prefix + _row("second")).encode())
     store = HistoryIndexStore(tmp_path / "state")
     assert _index(store, path).leaf == "second"
     old = store.get_claude_compact_index(
@@ -197,7 +198,7 @@ def test_compact_scan_does_not_publish_offsets_after_source_rewrite(tmp_path, re
             if replace:
                 new_path = tmp_path / "new.jsonl"
                 new_path.write_text(_row("other"))
-                os.replace(new_path, path)
+                replace_open_file(new_path, path)
             else:
                 path.write_text(_row("other"))
         finally:

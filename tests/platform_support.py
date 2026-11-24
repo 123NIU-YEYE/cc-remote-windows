@@ -88,6 +88,19 @@ def make_public(path, mode: int) -> None:
                                   security.DACL_SECURITY_INFORMATION, None, None, acl, None)
 
 
+def replace_open_file(source, target) -> None:
+    """``os.replace(source, target)`` while a reader still has ``target`` open.
+
+    Windows refuses to replace an open file even when the reader shares
+    delete (WinError 5), but lets it be deleted. Deleting it first is the same
+    rewrite for the reader, and it also fails unless the reader shares delete,
+    as it must so engines can replace their own files.
+    """
+    if WINDOWS:
+        os.unlink(target)
+    os.replace(source, target)
+
+
 def fake_executable(path, source: str) -> Path:
     """A runnable fake CLI that executes Python ``source``; returns what to run.
 

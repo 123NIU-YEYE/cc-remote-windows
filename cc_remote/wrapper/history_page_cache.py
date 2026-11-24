@@ -12,6 +12,7 @@ from cc_remote.wrapper.history_store import (
     HistorySourceFingerprint,
     history_source_extends,
 )
+from cc_remote.wrapper.os_compat import open_shared
 
 
 def unrelated_codex_append(previous, current, native_ids: frozenset[str]) -> bool:
@@ -26,7 +27,7 @@ def unrelated_codex_append(previous, current, native_ids: frozenset[str]) -> boo
         or not history_source_extends(previous, current)
     ):
         return False
-    with open(current.path, "rb") as source:
+    with open_shared(current.path, "rb") as source:
         if previous.size:
             source.seek(previous.size - 1)
             if source.read(1) != b"\n":
