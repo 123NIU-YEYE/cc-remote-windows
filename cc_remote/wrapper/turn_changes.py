@@ -61,6 +61,9 @@ def _header_path(value: str) -> str:
             value = json.loads(value)
         except ValueError as exc:
             raise ValueError("unsupported quoted path") from exc
+    if value == "/dev/null":
+        # A marker, not a path: Windows normpath would turn it into \dev\null.
+        return value
     return os.path.normpath(value[2:] if value.startswith(("a/", "b/")) else value)
 
 
@@ -252,8 +255,10 @@ def project_turn_changes(events: list[dict], cwd: str | None = None) -> dict:
     native_index = -1
     result_indexes: dict[str, int] = {}
     def canonical_path(path: str) -> str:
+        # "/dev/null" is not absolute on Windows; keep the marker unjoined.
         return (os.path.normpath(os.path.join(cwd, path))
                 if cwd and os.path.isabs(cwd) and not os.path.isabs(path)
+                and path != "/dev/null"
                 else path)
     for index, event in enumerate(events):
         kind = event.get("type")
