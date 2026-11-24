@@ -11,7 +11,11 @@ from cc_remote.protocol import (
 from cc_remote.wrapper.dsh_client import DshError
 from cc_remote.wrapper.dsh_runtime import DshHandle, DshRuntime, preset_presentation
 from cc_remote.wrapper.dsh_stream import model_id
+from tests.platform_support import native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
+
+# Default test working directory; absolute on all platforms for DSH validation
+_TEST_CWD = native_path("/tmp")
 
 
 class Client:
@@ -31,8 +35,8 @@ class Client:
 
     async def history_snapshot(self, sid, **options):
         self.calls.append(("snapshot", sid, options))
-        self.summaries.setdefault(sid[4:], {"sessionId": sid[4:], "cwd": "/tmp", "running": False})
-        return {"contract": 1, "header": {"version": 4, "id": sid[4:], "cwd": "/tmp"},
+        self.summaries.setdefault(sid[4:], {"sessionId": sid[4:], "cwd": _TEST_CWD, "running": False})
+        return {"contract": 1, "header": {"version": 4, "id": sid[4:], "cwd": _TEST_CWD},
                 "cursor": -1, "records": [], "hasMore": False,
                 "projections": {"asOfSeq": -1, "values": {}},
                 **({"commands": [{"name": "goal", "description": "Native goal"},
@@ -89,12 +93,12 @@ def setup_runtime():
 async def test_sidebar_excludes_delegated_agents_but_retains_user_forks(monkeypatch):
     machine, transport, runtime, client = setup_runtime()
     items = [
-        {"sessionId": "root", "running": True, "cwd": "/tmp"},
+        {"sessionId": "root", "running": True, "cwd": _TEST_CWD},
         {"sessionId": "user-fork", "parentSessionId": "root", "running": False},
         {"sessionId": "child", "parentSessionId": "root", "origin": "subagent", "running": True},
         {"sessionId": "grandchild", "parentSessionId": "child", "origin": "subagent", "running": False},
     ]
-    items = [{"updatedAt": 1000, "cwd": "/tmp", **item} for item in items]
+    items = [{"updatedAt": 1000, "cwd": _TEST_CWD, **item} for item in items]
     async def list_sessions():
         return items
     monkeypatch.setattr(client, "list_sessions", list_sessions)
@@ -144,7 +148,7 @@ async def test_skills_read_targets_cold_dsh_session_without_changing_other_clien
     machine.sessions[other.key] = other
     machine.focused_sid = other.key
     result = await machine._handle(GetEngineCapabilities(
-        engine="dsh", space="code", sid="dsh@cold", cwd="/tmp", skills_only=True,
+        engine="dsh", space="code", sid="dsh@cold", cwd=_TEST_CWD, skills_only=True,
         cmd_id="skills-read", client_id="viewer",
     ))
     assert result.type == "engine_capabilities"
@@ -218,7 +222,7 @@ async def test_new_session_preserves_native_default_model():
     async def activate(_ctx):
         pass
     runtime.activate = activate
-    await machine._handle(NewSession(engine="dsh", cwd="/tmp", dsh_agent_preset="standard"))
+    await machine._handle(NewSession(engine="dsh", cwd=_TEST_CWD, dsh_agent_preset="standard"))
     selected = next(call[1] for call in client.calls if call[0] == "session/selectModel")
     assert selected == {"request": {"sessionId": "created", "provider": "deepseek-official",
                                     "model": "deepseek-v4-pro", "reasoningEffort": "max"}}
@@ -228,11 +232,11 @@ async def test_new_session_preserves_native_default_model():
 @pytest.mark.asyncio
 async def test_unavailable_and_unoffered_models_never_create_a_session():
     machine, _, runtime, client = setup_runtime()
-    rejected = await machine._handle(NewSession(engine="dsh", cwd="/tmp",
+    rejected = await machine._handle(NewSession(engine="dsh", cwd=_TEST_CWD,
         model=model_id("deepseek-official", "not-offered")))
     assert rejected.code == "dsh_invalid_model"
     client.catalog["groups"] = []
-    rejected = await machine._handle(NewSession(engine="dsh", cwd="/tmp"))
+    rejected = await machine._handle(NewSession(engine="dsh", cwd=_TEST_CWD))
     assert rejected.code == "dsh_invalid_model"
     assert runtime.catalog == [] and runtime.default_model is None
     assert all(call[0] in {"session/modelCatalog", "agentPresets/list", "permissionPresets/catalog"} for call in client.calls)
@@ -629,9 +633,9 @@ async def test_pending_question_restores_cold_owner_without_focus_or_activation(
     machine, _, runtime, client = setup_runtime()
     machine.focused_sid = "other-session"
     async def catalog():
-        return [{"sessionId": "root", "running": True, "cwd": "/tmp"}, *[
+        return [{"sessionId": "root", "running": True, "cwd": _TEST_CWD}, *[
             {"sessionId": f"child-{i}", "origin": "subagent", "running": True,
-             "parentSessionId": f"child-{i - 1}" if i > 1 else "root"}
+             "parentSessionId": f"child-{i - 1}" if i > 1 else "root", "cwd": _TEST_CWD}
             for i in range(1, depth + 1)]]
     client.list_sessions = catalog
     async def follow(ctx):
@@ -667,8 +671,8 @@ async def test_question_ancestry_stops_at_missing_entries_and_cycles(parents):
     machine.focused_sid = "unrelated"
 
     async def catalog():
-        return [{"sessionId": "unrelated", "cwd": "/tmp"}, *[
-            {"sessionId": child, "origin": "subagent", "parentSessionId": parent}
+        return [{"sessionId": "unrelated", "cwd": _TEST_CWD}, *[
+            {"sessionId": child, "origin": "subagent", "parentSessionId": parent, "cwd": _TEST_CWD}
             for child, parent in parents.items()]]
 
     client.list_sessions = catalog

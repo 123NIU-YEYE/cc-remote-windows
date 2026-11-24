@@ -1,14 +1,18 @@
 """Crash windows at the native write/receipt/ACK boundaries, without a model."""
 import asyncio
 import json
-from pathlib import Path
 
 import pytest
 
 from cc_remote.protocol import CompactSession, ForkSession, NewSession, Query, SetDshControl
 from cc_remote.wrapper.dsh_client import DshError
 from cc_remote.wrapper.dsh_mutations import DshMutationJournal
+from tests.platform_support import has_mode, native_path
 from tests.test_dsh_runtime import setup_runtime
+
+# Default test working directories for DSH fork tests
+_TEST_CWD = native_path("/tmp")
+_TEST_FORK_CWD = native_path("/tmp/fork-cwd")
 
 
 def prepared(previous=None):
@@ -29,7 +33,7 @@ def prepared(previous=None):
 
 
 def create_command(**fields):
-    return NewSession(engine="dsh", cwd="/tmp", request_id="request", cmd_id="create",
+    return NewSession(engine="dsh", cwd=_TEST_CWD, request_id="request", cmd_id="create",
                       client_id="browser", prompt="one prompt", msg_id="message", **fields)
 
 
@@ -63,7 +67,7 @@ def prepared_fork():
         if endpoint == "session/fork":
             client.calls.append((endpoint, args))
             child = f"child-{sum(c[0] == endpoint for c in client.calls)}"
-            client.summaries[child] = {"sessionId": child, "cwd": "/tmp/fork-cwd", "running": False}
+            client.summaries[child] = {"sessionId": child, "cwd": _TEST_FORK_CWD, "running": False}
             return {"sessionId": child}
         return await rpc(endpoint, args)
 
@@ -125,7 +129,7 @@ async def test_fork_crash_recovers_known_child_without_repeating_native_write(bo
         assert any(frame.type == "error" and frame.code == "dsh_mutation_unknown" for frame in output.sent)
     else:
         assert len(forks) == 1
-        assert forks[0].session_id == "dsh@child-1" and forks[0].cwd == "/tmp/fork-cwd"
+        assert forks[0].session_id == "dsh@child-1" and forks[0].cwd == _TEST_FORK_CWD
         assert forks[0].parent_session_id == "dsh@parent" and forks[0].last_turn_id == "dsh-seq-1"
         assert forks[0].request_id == "fork-request" and forks[0].to == "browser"
     assert not restarted.sessions  # Recovery never activates an Agent.
@@ -187,7 +191,7 @@ async def test_completed_fork_replays_by_request_id_to_current_browser_without_n
     assert len(client.calls) == before
     result = next(frame for frame in output.sent if frame.type == "session_forked")
     assert result.to == "new-browser" and result.request_id == "fork-request"
-    assert result.session_id == "dsh@child-1" and result.cwd == "/tmp/fork-cwd"
+    assert result.session_id == "dsh@child-1" and result.cwd == _TEST_FORK_CWD
     await runtime.close()
     await recovery.close()
 
@@ -400,4 +404,4 @@ def test_journal_serializes_claims_and_rejects_payload_reuse(tmp_path):
     _, entry = other.begin("id", "original")
     assert entry["sid"] == "dsh@session"
     assert json.loads(entry["result"]) == {"reply": None}
-    assert Path(journal.path).stat().st_mode & 0o777 == 0o600
+    assert has_mode(journal.path, 0o600)

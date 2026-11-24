@@ -11,6 +11,7 @@ import pytest
 from cc_remote.wrapper.dsh_client import (
     DshClient, DshConnection, DshError, local_origin, native_session_id,
 )
+from tests.platform_support import WINDOWS
 
 ORIGIN = "http://127.0.0.1:3080"
 TOKEN = "a" * 43
@@ -91,6 +92,7 @@ def test_only_literal_loopback_authorities(origin):
         local_origin(origin)
 
 
+@pytest.mark.skipif(WINDOWS, reason="File permissions are ACL-based on Windows; chmod has no effect")
 def test_connection_repr_and_file_do_not_expose_control_token(tmp_path):
     connection = DshConnection.from_launch_url(ORIGIN + "/?token=" + TOKEN)
     assert TOKEN not in repr(connection)

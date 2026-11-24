@@ -7,6 +7,7 @@ import pytest
 
 from cc_remote.protocol import ReadDsh, SetDshControl
 from cc_remote.wrapper.dsh_client import DshError
+from tests.platform_support import native_path
 from tests.test_dsh_runtime import setup_runtime
 from tests.test_dsh_stream import record, user
 from cc_remote.wrapper.dsh_stream import DshProjection
@@ -43,7 +44,7 @@ async def test_schedule_private_involvement_hides_catalog_history_and_mutations(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target", [{"kind": "new"}, {"kind": "new_once", "create": {"cwd": "/project"}}])
+@pytest.mark.parametrize("target", [{"kind": "new"}, {"kind": "new_once", "create": {"cwd": native_path("/project")}}])
 async def test_schedule_creation_durable_unknown_receipt_prevents_duplicate_after_recovery(target):
     machine, _, runtime, client = setup_runtime()
     calls = []
@@ -68,7 +69,7 @@ async def test_schedule_creation_durable_unknown_receipt_prevents_duplicate_afte
 async def test_schedule_cas_does_not_replace_revision_and_reserved_session_is_not_linked():
     machine, _, runtime, client = setup_runtime()
     row = {"id": "task", "title": "task", "prompt": "hi", "status": "paused", "updatedAt": "revision-2",
-           "target": {"kind": "new_once", "sessionId": "reserved", "create": {"cwd": "/project"}}, "involvedSessionIds": []}
+           "target": {"kind": "new_once", "sessionId": "reserved", "create": {"cwd": native_path("/project")}}, "involvedSessionIds": []}
     calls = []
     async def rpc(endpoint, args=None):
         calls.append((endpoint, args))

@@ -11,7 +11,11 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper.dsh_client import DshError
 from cc_remote.wrapper.dsh_features import CHUNK_SIZE, path_mention
+from tests.platform_support import native_path
 from tests.test_dsh_runtime import setup_runtime
+
+# Default test working directory; absolute on all platforms for DSH validation
+_TEST_CWD = native_path("/tmp")
 
 
 @pytest.mark.asyncio
@@ -43,7 +47,7 @@ async def test_partial_references_preserve_canonical_native_session_mentions():
         assert args == {"agentId": "root", "query": "abc"}
         if endpoint == "fileReferences/list":
             raise DshError("unavailable", "resolver unavailable")
-        return [{"sessionId": "target", "label": "Example", "mention": "@[Example](dsh-session:target)", "cwd": "/tmp"}]
+        return [{"sessionId": "target", "label": "Example", "mention": "@[Example](dsh-session:target)", "cwd": _TEST_CWD}]
     client.summaries["root"] = {"sessionId": "root", "agentAvailable": True}
     client.rpc = rpc
     result = await machine._handle(ReadDsh(sid="dsh@root", kind="references", query="abc", cmd_id="read-ref", client_id="browser"))
@@ -111,7 +115,7 @@ async def test_diagnostics_only_forward_public_metadata():
 async def test_native_archive_and_unarchive_preserve_read_only_history():
     machine, _, runtime, client = setup_runtime()
     async def listing():
-        return [{"sessionId": "root", "running": False, "updatedAt": 100, "cwd": "/tmp", "projections": {"values": {}}}]
+        return [{"sessionId": "root", "running": False, "updatedAt": 100, "cwd": _TEST_CWD, "projections": {"values": {}}}]
     client.list_sessions = listing
     async def rpc(endpoint, args=None):
         assert endpoint in {"workspace/archiveSession", "workspace/unarchiveSession"} and args == {"request": {"sessionId": "root"}}
