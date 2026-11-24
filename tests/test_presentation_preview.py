@@ -51,7 +51,7 @@ async def test_pptx_preview_returns_original_package(tmp_path, monkeypatch, engi
     package({"ordinary.txt": "zip"}),
     package({"[Content_Types].xml": "<Types/>",
              "ppt/presentation.xml": b"x" * (16 * 1024 * 1024 + 1)}),
-])
+], ids=["not-zip", "not-presentation", "oversized-part"])  # zip bytes embed a timestamp
 def test_pptx_rejects_invalid_or_oversized_packages(data):
     with pytest.raises(ValueError):
         validate_presentation_preview(data)
