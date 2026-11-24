@@ -1,6 +1,12 @@
 """UI updates use isolated filesystem receipts and stub OS launchers, no models."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses pwd and deploy modules)", allow_module_level=True)
+
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json

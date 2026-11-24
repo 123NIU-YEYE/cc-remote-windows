@@ -1,6 +1,12 @@
 """Real temporary-tree retirement with stubbed OS/health observations; no model."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.release_retention/cleanup)", allow_module_level=True)
+
 import json
 import os
 from pathlib import Path

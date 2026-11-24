@@ -1,6 +1,12 @@
 """Explicit service reviews are invalidated, never silently broadened."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.release_retention/retention_services)", allow_module_level=True)
+
 import json
 from pathlib import Path
 import plistlib

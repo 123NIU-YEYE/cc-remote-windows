@@ -18,6 +18,7 @@ from uuid import uuid4
 import pytest
 from websockets.asyncio.server import unix_serve
 
+from tests.platform_support import is_private
 from cc_remote import async_tasks as tasks
 from cc_remote import task_rpc
 from cc_remote.task_store import OUTPUT_BYTES, TaskStore, public_task, request_thread
@@ -199,8 +200,8 @@ def test_submission_idempotency_limits_and_private_state(store):
         start(store)
     with pytest.raises(ValueError, match="eight"):
         start(store)
-    assert store.root.stat().st_mode & 0o077 == 0
-    assert store.path.stat().st_mode & 0o077 == 0
+    assert is_private(store.root)
+    assert is_private(store.path)
 
 
 @pytest.mark.parametrize("changes", [{"argv": []}, {"argv": ["bad\0command"]}, {"cwd": "relative"},
@@ -1069,6 +1070,7 @@ def test_real_stdio_mcp_protocol_and_native_call_metadata(store, metadata_format
     asyncio.run(run())
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX daemon socket fixture; Windows uses app-server proxy")
 @pytest.mark.parametrize("alias", [False, True])
 def test_production_socket_transport_uses_only_owned_existing_daemon(monkeypatch, alias):
     from cc_remote.wrapper import codex_daemon
@@ -1148,6 +1150,7 @@ def test_official_history_keeps_task_receipt_and_native_identity(store):
     assert events[0]["status"] == "failed" and events[0]["detail"] == "test failure"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX daemon socket fixture; Windows uses app-server proxy")
 def test_detached_task_finishes_and_notifies_after_real_mcp_disconnect():
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client

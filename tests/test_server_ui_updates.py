@@ -1,4 +1,12 @@
 """Server maintenance stays independent of selected devices and native engines."""
+from __future__ import annotations
+
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses pwd and deploy modules)", allow_module_level=True)
+
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json

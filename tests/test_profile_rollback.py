@@ -3,7 +3,6 @@
 import hashlib
 import io
 import json
-import stat
 import tarfile
 
 import pytest
@@ -18,6 +17,7 @@ from cc_remote.wrapper import codex_checkpoints
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.viewer_pages import PageRef, PageScope
 from deploy import work_registry_snapshot as snapshots
+from tests.platform_support import has_mode
 
 
 STATE_FILES = {
@@ -65,7 +65,7 @@ def test_snapshot_restores_every_participant_and_absence(tmp_path, exists):
             assert path.exists() == exists
             if exists:
                 assert path.read_bytes() == b'{"before":true}\n'
-                assert stat.S_IMODE(path.stat().st_mode) == 0o600
+                assert has_mode(path, 0o600)
         assert (state / "codex-profiles.json").read_bytes() == b'{"operator":"preserved"}'
     assert not (snapshot / "codex-profiles.json").exists()
 

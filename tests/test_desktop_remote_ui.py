@@ -1,8 +1,12 @@
 from pathlib import Path
 import plistlib
+import sys
 from unittest.mock import patch
 
 import pytest
+
+if sys.platform == "win32":
+    pytest.skip("deploy/desktop_remote_ui.py stages the legacy macOS Electron prototype", allow_module_level=True)
 
 from deploy.desktop_remote_ui import repaired_source, stage
 

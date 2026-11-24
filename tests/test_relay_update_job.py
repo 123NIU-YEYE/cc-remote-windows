@@ -1,13 +1,18 @@
 """Durable launch receipts; all systemd calls are offline fixtures."""
+from __future__ import annotations
+
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.relay_update_job)", allow_module_level=True)
+
 import concurrent.futures
 import json
 from pathlib import Path
 import subprocess
-import sys
 import threading
 from types import SimpleNamespace
-
-import pytest
 
 from deploy import relay_update_job as job
 

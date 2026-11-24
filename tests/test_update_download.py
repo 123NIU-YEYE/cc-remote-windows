@@ -1,4 +1,12 @@
 """Real curl/TLS downloads with interrupted bodies, ranges and cache recovery."""
+from __future__ import annotations
+
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses pwd)", allow_module_level=True)
+
 from datetime import datetime, timedelta, timezone
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

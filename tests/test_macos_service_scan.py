@@ -1,6 +1,12 @@
 """Bounded privileged plist reads, using stub authorization and transport."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.macos_service_scan)", allow_module_level=True)
+
 import base64
 from pathlib import Path
 from types import SimpleNamespace

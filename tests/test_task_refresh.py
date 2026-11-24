@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from cc_remote import async_tasks, task_refresh
+from tests.platform_support import native_path
 
 
 @pytest.fixture
@@ -18,7 +19,7 @@ def runtime(tmp_path, monkeypatch):
     (release / "cc_remote").mkdir(parents=True)
     for name in ("async_tasks.py", "task_store.py", "task_rpc.py"):
         (release / "cc_remote" / name).touch()
-    entry = {"command": "/usr/local/bin/cc-remote",
+    entry = {"command": native_path("/usr/local/bin/cc-remote"),
              "args": ["tasks", "mcp", "--codex-home", str(home)],
              "env": {"EXISTING_OPTION": "preserved"}}
     config = {"mcp_servers": {"cc_remote_tasks": entry}, "model": "unchanged-model"}

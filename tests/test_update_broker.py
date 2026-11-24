@@ -1,5 +1,10 @@
 """Authorization boundaries of the root broker; live socket activation is separately accepted."""
+import sys
 import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.ui_update_broker/grp)", allow_module_level=True)
+
 from deploy import ui_update_broker as broker, ui_update_job
 from tests.test_ui_updates import managed as managed
 

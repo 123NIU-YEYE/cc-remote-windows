@@ -1,6 +1,12 @@
 """Real local sockets prove health of a pre-update_status Wrapper process."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.activation/release_retention)", allow_module_level=True)
+
 from contextlib import contextmanager
 import json
 import os

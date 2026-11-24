@@ -1,7 +1,11 @@
 """Offline end-to-end updater coordination; no SSH or live service mutations."""
 import json
+import sys
 
 import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses cc_remote.update_relay)", allow_module_level=True)
 
 from cc_remote import update_relay
 from cc_remote import update as updater

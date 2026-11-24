@@ -3,10 +3,14 @@ import io
 import socket
 import ssl
 import subprocess
+import sys
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses cc_remote.update/update_relay)", allow_module_level=True)
 
 from cc_remote import update, update_download, update_errors, update_relay
 from tests.test_update import _installation

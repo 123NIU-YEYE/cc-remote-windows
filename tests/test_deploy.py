@@ -11,12 +11,12 @@ import plistlib
 import re
 import shlex
 import sqlite3
-import stat
 import subprocess
 import sys
 
 import pytest
 
+from tests.platform_support import WINDOWS, has_mode
 from cc_remote.protocol import PROTOCOL_VERSION
 from deploy.caddy_managed_block import (
     BEGIN_MARKER,
@@ -123,6 +123,8 @@ def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
         assert "CC_REMOTE_CLAUDE_BROKER_SOCKET" not in source
     assert not (ROOT / "scripts" / "claude-remote").exists()
 
+    if WINDOWS:
+        return  # The experimental PTY broker launcher is a Unix shell script.
     experiment = ROOT / "experiments" / "claude-remote"
     result = subprocess.run(
         [str(experiment), "status"],
@@ -302,8 +304,10 @@ def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
     writer.commit()
     writer.close()
     claude_root.mkdir()
-    with sqlite3.connect(claude_root / "registry.sqlite3") as database:
-        database.execute("CREATE TABLE created_after_snapshot (value INTEGER)")
+    database = sqlite3.connect(claude_root / "registry.sqlite3")
+    database.execute("CREATE TABLE created_after_snapshot (value INTEGER)")
+    database.commit()
+    database.close()
 
     restore_snapshot(snapshot)
 
@@ -339,7 +343,7 @@ def test_release_snapshot_restores_versioned_claude_control_state(tmp_path):
     restore_snapshot(snapshot)
 
     assert controls.read_bytes() == original
-    assert stat.S_IMODE(controls.stat().st_mode) == 0o600
+    assert has_mode(controls, 0o600)
     manifest = json.loads((snapshot / "manifest.json").read_text())
     assert manifest["version"] == 4
     assert manifest["wrapper_state"]["files"][controls.name]["exists"] is True
@@ -363,6 +367,7 @@ def test_release_snapshot_restores_absent_claude_control_state(tmp_path):
     assert not controls.exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="Cannot create non-private files on Windows (uses ACLs)")
 def test_release_snapshot_rejects_non_private_claude_control_state(tmp_path):
     roots = {
         "claude": tmp_path / "claude-work",
@@ -527,6 +532,7 @@ atomic_install_file "$2" "$3" root root 0644
     assert not list(tmp_path.glob(".installed.cc-remote.*"))
 
 
+@pytest.mark.skipif(WINDOWS, reason="deploy/setup_transaction.sh installs Linux/macOS releases")
 def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
     source = tmp_path / "candidate"
     destination = tmp_path / "installed"
@@ -551,6 +557,7 @@ def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
     assert not list(tmp_path.glob(".installed.cc-remote.*"))
 
 
+@pytest.mark.skipif(WINDOWS, reason="Linux/macOS release installers set POSIX modes; Windows releases keep the private state ACLs")
 def test_release_permissions_remove_inherited_group_write_and_other_access(
     tmp_path,
 ):

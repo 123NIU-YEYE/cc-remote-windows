@@ -1,6 +1,12 @@
 """Cleanup protects live dependencies and validates retirement before deletion."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.cleanup)", allow_module_level=True)
+
 import json
 import os
 from pathlib import Path

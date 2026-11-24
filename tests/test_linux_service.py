@@ -1,6 +1,12 @@
 """Supervisor identity, scoped configuration changes and updater bindings."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.linux_service)", allow_module_level=True)
+
 import json
 from pathlib import Path
 from types import SimpleNamespace

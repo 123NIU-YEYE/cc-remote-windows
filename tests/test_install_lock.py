@@ -10,6 +10,10 @@ import sys
 
 import pytest
 
+# Windows doesn't support fcntl, file descriptor passing (pass_fds), or os.geteuid()
+if sys.platform == "win32":
+    pytest.skip("Install locking backs the Linux/macOS installers and in-app updates; the tests need pass_fds and geteuid", allow_module_level=True)
+
 from cc_remote import update as updater
 from deploy.install_lock import LOCK_FD_ENV, InstallLockError, acquire_install_lock, verify_install_lock
 

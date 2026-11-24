@@ -1,6 +1,12 @@
 """Offline management CLI checks: real downloads from fixtures, no live services."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.install_cli/install_lock)", allow_module_level=True)
+
 import hashlib
 import io
 import json

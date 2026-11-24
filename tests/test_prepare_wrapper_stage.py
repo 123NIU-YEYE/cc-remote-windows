@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-import stat
 
 import pytest
 
@@ -16,6 +15,7 @@ from deploy.prepare_wrapper_stage import (
     prepare_stage,
     select_uv_command,
 )
+from tests.platform_support import has_mode
 
 
 def _release_tree(
@@ -79,7 +79,7 @@ def test_identical_nono_stage_defers_venv_copy_and_binds_manifest(
     assert not (stage / ".venv").exists()
     manifest = json.loads((stage / "deploy" / MANIFEST_NAME).read_text())
     assert manifest == payload
-    assert stat.S_IMODE((stage / "deploy" / MANIFEST_NAME).stat().st_mode) == 0o640
+    assert has_mode(stage / "deploy" / MANIFEST_NAME, 0o640)
 
 
 def test_changed_contract_builds_a_fresh_copy_linked_venv(
@@ -117,8 +117,8 @@ def test_changed_contract_builds_a_fresh_copy_linked_venv(
 
     assert payload["strategy"] == "rebuild"
     assert payload["uv"] == "0.11.16"
-    assert stat.S_IMODE((stage / ".venv").stat().st_mode) == 0o750
-    assert stat.S_IMODE((stage / ".venv" / "bin" / "python").stat().st_mode) == 0o750
+    assert has_mode(stage / ".venv", 0o750)
+    assert has_mode(stage / ".venv" / "bin" / "python", 0o750)
 
 
 @pytest.mark.parametrize("identical", [False, True])

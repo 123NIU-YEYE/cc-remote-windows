@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tarfile
 
 import pytest
@@ -20,6 +21,10 @@ from deploy.release_manifest import (
     ReleaseManifestError,
     validate_release_directory,
 )
+
+# Tests that run bash scripts and use Unix-only shell tooling
+if sys.platform == "win32":
+    pytest.skip("Unix-only tests (require bash scripts and uv executable)", allow_module_level=True)
 
 
 ROOT = Path(__file__).resolve().parents[1]

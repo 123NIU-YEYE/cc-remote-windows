@@ -1,6 +1,12 @@
 """Deferred maintenance uses stable OS jobs and never restarts native services."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses deploy.retention_job/linux_service)", allow_module_level=True)
+
 import os
 import plistlib
 import shutil

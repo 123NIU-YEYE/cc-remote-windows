@@ -8,6 +8,9 @@ import sys
 
 import pytest
 
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses cc_remote.update_relay)", allow_module_level=True)
+
 from cc_remote import update_relay
 from tests.test_update import _installation, _manifest
 from tests.test_update_relay import launch_request

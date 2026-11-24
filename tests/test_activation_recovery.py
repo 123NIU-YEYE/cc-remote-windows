@@ -1,6 +1,12 @@
 """Installer-owned admission and recovery: real locks, sockets and state images."""
 from __future__ import annotations
 
+import sys
+import pytest
+
+if sys.platform == "win32":
+    pytest.skip("Unix-only module (uses pwd and deploy modules)", allow_module_level=True)
+
 import asyncio
 import json
 import os
