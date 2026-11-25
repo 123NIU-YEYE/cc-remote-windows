@@ -483,9 +483,10 @@ def test_role_locks_and_release_workflow_are_versioned_inputs():
     assert "actions/attest" in workflow
     assert "gh release upload" in workflow
     uv_version = (ROOT / "deploy" / "uv-version.txt").read_text().strip()
+    # The release, the Linux CI job and the Windows CI job each install uv.
     assert (
         workflow + source_workflow
-    ).count(f'version: "{uv_version}"') == 2
+    ).count(f'version: "{uv_version}"') == 3
     python_version = (
         ROOT / "deploy" / "python-version.txt"
     ).read_text().strip()
