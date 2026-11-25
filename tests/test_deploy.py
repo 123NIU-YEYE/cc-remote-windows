@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from tests.platform_support import WINDOWS, has_mode, make_public
+from tests.platform_support import BASH, WINDOWS, has_mode, make_public
 from cc_remote.protocol import PROTOCOL_VERSION
 from deploy.caddy_managed_block import (
     BEGIN_MARKER,
@@ -142,8 +142,8 @@ def test_claude_pty_broker_is_not_a_documented_or_installed_feature():
 def test_setup_script_is_valid_shell_and_keeps_safe_install_order():
     script = ROOT / "deploy" / "setup-vps.sh"
     transaction = ROOT / "deploy" / "setup_transaction.sh"
-    subprocess.run(["bash", "-n", str(script)], check=True)
-    subprocess.run(["bash", "-n", str(transaction)], check=True)
+    subprocess.run([BASH, "-n", str(script)], check=True)
+    subprocess.run([BASH, "-n", str(transaction)], check=True)
     source = script.read_text()
 
     validate = source.index('caddy validate --config "$CADDY_CANDIDATE"')
@@ -512,7 +512,7 @@ atomic_install_file "$2" "$3" root root 0644
 '''
     result = subprocess.run(
         [
-            "bash",
+            BASH,
             "-c",
             harness,
             "atomic-install-test",
@@ -541,7 +541,7 @@ def test_atomic_install_replaces_destination_with_requested_mode(tmp_path):
 
     subprocess.run(
         [
-            "bash",
+            BASH,
             "-c",
             'source "$1"; atomic_install_file "$2" "$3" "$(id -un)" "$(id -gn)" 0640',
             "atomic-install-test",
@@ -575,7 +575,7 @@ def test_release_permissions_remove_inherited_group_write_and_other_access(
 
     subprocess.run(
         [
-            "bash",
+            BASH,
             "-c",
             'source "$1"; harden_release_permissions "$2"',
             "permission-test",
@@ -591,6 +591,7 @@ def test_release_permissions_remove_inherited_group_write_and_other_access(
     assert executable.stat().st_mode & 0o777 == 0o750
 
 
+@pytest.mark.skipif(WINDOWS, reason="deploy/setup_transaction.sh installs Linux/macOS releases")
 @pytest.mark.parametrize("activation", [
     "readiness-failure", "registration-failure", "registration-success", "source-success",
 ])
@@ -682,7 +683,7 @@ false  # injected relay readiness failure after the complete release switch
         )
     result = subprocess.run(
         [
-            "bash", "-c", harness, "rollback-test",
+            BASH, "-c", harness, "rollback-test",
             str(ROOT / "deploy" / "setup_transaction.sh"),
             str(appdir), str(old_release), str(new_release),
             str(caddyfile), str(caddy_backup), str(unit), str(unit_backup),
@@ -731,6 +732,7 @@ false  # injected relay readiness failure after the complete release switch
     assert not unit_backup.exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="deploy/setup_transaction.sh installs Linux/macOS releases")
 @pytest.mark.parametrize('failure', ['backup-error', 'interrupted-copy'])
 def test_relay_retention_setup_failure_keeps_the_prepared_release(tmp_path, failure):
     appdir = tmp_path.resolve() / 'app'
@@ -799,6 +801,7 @@ trap cleanup EXIT
     assert 'retaining staged release for transaction inspection' in result.stderr
 
 
+@pytest.mark.skipif(WINDOWS, reason="deploy/setup_transaction.sh installs Linux/macOS releases")
 def test_failed_release_rollback_never_deletes_the_still_active_release(tmp_path):
     appdir = tmp_path / "app"
     releases = appdir / "releases"
@@ -841,7 +844,7 @@ false
 '''
     result = subprocess.run(
         [
-            "bash",
+            BASH,
             "-c",
             harness,
             "rollback-test",

@@ -1,9 +1,16 @@
 """Legacy migration must bind to the actual service; never silently adopt."""
 from pathlib import Path
+import sys
 
 import pytest
 
 from deploy import adopt_wrapper
+
+if sys.platform == "win32":
+    # Its canonical-root check rejects every Windows path, so the refusal
+    # cases would pass without reaching the check they name.
+    pytest.skip("deploy/adopt_wrapper.py migrates a Linux systemd Wrapper installation",
+                allow_module_level=True)
 
 
 @pytest.fixture

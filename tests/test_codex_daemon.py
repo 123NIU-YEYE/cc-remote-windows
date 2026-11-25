@@ -14,7 +14,7 @@ import tempfile
 
 import pytest
 
-from tests.platform_support import WINDOWS, native_path
+from tests.platform_support import TMP, WINDOWS, native_path
 
 from cc_remote.wrapper import codex_daemon as daemon_module
 from cc_remote.wrapper import codex_handle as handle_module
@@ -50,7 +50,7 @@ def _stub_managed_daemon_nofile_verification(monkeypatch):
 
 
 class _Cfg:
-    cc_cwd = native_path("/tmp")
+    cc_cwd = TMP
     tool_result_max = 8000
 
 
@@ -211,6 +211,7 @@ def test_daemon_command_refuses_unsafe_working_directory(monkeypatch, home):
     assert result.returncode == 127
 
 
+@pytest.mark.skipif(WINDOWS, reason="fakes a Linux /proc tree with symlinked exe; the product returns None off Linux")
 @pytest.mark.parametrize("listener,allow_local,accepted", [
     ("remote", False, True), ("local", True, True), ("default", True, True),
     ("other", True, False), ("local", False, False), ("ambiguous", True, False),
@@ -884,6 +885,7 @@ def test_required_profile_bootstraps_its_own_shared_daemon(monkeypatch):
     asyncio.run(run())
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX standalone layout (current symlink, bin/codex); the Windows installer uses a junction and bin/codex.exe, which the product does not handle yet")
 def test_profile_bootstrap_reuses_verified_managed_standalone(tmp_path):
     primary = tmp_path / "primary"
     standalone = primary / "packages" / "standalone"
@@ -906,6 +908,7 @@ def test_profile_bootstrap_reuses_verified_managed_standalone(tmp_path):
     assert (linked_current / "codex").resolve() == binary
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX standalone layout (current symlink, bin/codex); the Windows installer uses a junction and bin/codex.exe, which the product does not handle yet")
 def test_profile_bootstrap_never_replaces_existing_managed_path(tmp_path):
     primary = tmp_path / "primary"
     standalone = primary / "packages" / "standalone"
@@ -929,6 +932,7 @@ def test_profile_bootstrap_never_replaces_existing_managed_path(tmp_path):
     assert not existing.is_symlink()
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX standalone layout (current symlink, bin/codex); the Windows installer uses a junction and bin/codex.exe, which the product does not handle yet")
 def test_profile_bootstrap_atomically_advances_owned_official_current(
     tmp_path,
 ):
@@ -966,6 +970,7 @@ def test_profile_bootstrap_atomically_advances_owned_official_current(
     assert old_binary.exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX standalone layout (current symlink, bin/codex); the Windows installer uses a junction and bin/codex.exe, which the product does not handle yet")
 def test_profile_bootstrap_never_replaces_external_current_symlink(tmp_path):
     source_home = tmp_path / "source"
     source_standalone = source_home / "packages" / "standalone"

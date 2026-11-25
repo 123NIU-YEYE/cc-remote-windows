@@ -20,6 +20,8 @@ from cc_remote.wrapper.claude_external import (
     classify_claude_growth,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
+from tests.platform_support import WINDOWS
+from tests.test_codex_external import LINUX_PROC_ONLY
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -63,6 +65,8 @@ def _fake_process(
     cmdline: tuple[str, ...] = (),
     environ: tuple[str, ...] | None = None,
 ) -> Path:
+    if WINDOWS:
+        pytest.skip(LINUX_PROC_ONLY)
     proc = root / str(pid)
     proc.mkdir(parents=True)
     fields = ["S"] + ["0"] * 18 + [str(start)] + ["0"] * 4

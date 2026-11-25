@@ -16,6 +16,7 @@ from cc_remote.wrapper import codex_daemon, codex_launch_barrier as launch
 from cc_remote.wrapper.codex_service import DaemonIsolationError
 from cc_remote.wrapper.process_scan import ProcessIdentity
 from deploy import check_codex_lifetime as guard
+from tests.platform_support import BASH
 
 
 @pytest.fixture
@@ -198,7 +199,7 @@ def test_installer_rollback_uses_durable_stop_intent(tmp_path, recorded):
     script = "set -euo pipefail\n" + "\n".join(
         f"{key}={shlex.quote(value)}" for key, value in settings.items())
     script += "\n" + helpers + f"\nrestart_after_rollback() {{ touch {shlex.quote(str(restarted))}; }}\nexit 42\n"
-    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
+    result = subprocess.run([BASH, "-c", script], capture_output=True, text=True, timeout=5)
     assert result.returncode == 42, result.stderr
     assert restarted.exists() is recorded
 

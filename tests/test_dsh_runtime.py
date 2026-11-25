@@ -11,11 +11,11 @@ from cc_remote.protocol import (
 from cc_remote.wrapper.dsh_client import DshError
 from cc_remote.wrapper.dsh_runtime import DshHandle, DshRuntime, preset_presentation
 from cc_remote.wrapper.dsh_stream import model_id
-from tests.platform_support import native_path
+from tests.platform_support import TMP
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 # Default test working directory; absolute on all platforms for DSH validation
-_TEST_CWD = native_path("/tmp")
+_TEST_CWD = TMP
 
 
 class Client:

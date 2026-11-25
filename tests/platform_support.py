@@ -6,11 +6,22 @@ macOS, so those runs exercise what they did before. Only Windows differs.
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 WINDOWS = sys.platform == "win32"
+
+# A short directory that exists. Tests use /tmp to keep AF_UNIX socket paths
+# under the 104 bytes macOS allows. On Windows "/tmp" is \tmp on the current
+# drive, which exists on some machines and not on others.
+TMP = tempfile.gettempdir() if WINDOWS else "/tmp"
+
+# Windows starts System32\bash.exe (WSL, often without a distribution) for
+# "bash" before searching PATH; PATH finds Git Bash, as an interactive shell does.
+BASH = (shutil.which("bash") or "bash") if WINDOWS else "bash"
 
 
 def native_path(path: str) -> str:

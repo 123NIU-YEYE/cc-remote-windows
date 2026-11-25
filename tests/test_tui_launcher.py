@@ -9,6 +9,11 @@ import sys
 
 import pytest
 
+if sys.platform == "win32":
+    pytest.skip("scripts/cc-remote-tui is the POSIX launcher: it runs the checkout's "
+                ".venv/bin/python, and Windows virtualenvs use Scripts\\python.exe",
+                allow_module_level=True)
+
 
 def test_launcher_uses_own_checkout_from_unrelated_cwd(tmp_path):
     root = Path(__file__).resolve().parents[1]

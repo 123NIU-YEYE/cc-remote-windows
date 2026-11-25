@@ -4,12 +4,12 @@ import asyncio
 import pytest
 
 from cc_remote.protocol import NewSession, Query, SetDshControl, Steer
-from tests.platform_support import native_path
+from tests.platform_support import TMP
 from tests.test_attachments import _b64, _complete_png, _png
 from tests.test_dsh_mutations import prepared
 
 # Default test working directory; absolute on all platforms for DSH validation
-_TEST_CWD = native_path("/tmp")
+_TEST_CWD = TMP
 
 
 def input_command(entry, **fields):

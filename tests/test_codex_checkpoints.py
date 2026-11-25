@@ -136,7 +136,8 @@ def test_dirty_baseline_round_trip_preserves_index_and_file_kinds(tmp_path):
     assert (root / "mode.sh").read_text(
         encoding="utf-8"
     ) == "#!/bin/sh\necho baseline\n"
-    assert stat.S_IMODE((root / "mode.sh").stat().st_mode) == 0o755
+    # Windows has no executable bit: every writable file reads back as 0o666.
+    assert sys.platform == "win32" or stat.S_IMODE((root / "mode.sh").stat().st_mode) == 0o755
     assert (root / "untracked.txt").read_text(
         encoding="utf-8"
     ) == "untracked baseline\n"
@@ -360,7 +361,7 @@ def test_finish_accepts_commit_with_unchanged_untracked_baseline(tmp_path, empty
     assert _git(root, "rev-parse", "HEAD") == head_before_finish
     for name, content in leftovers.items():
         assert (root / name).read_bytes() == content
-    assert stat.S_IMODE((root / "local.sh").stat().st_mode) == 0o700
+    assert sys.platform == "win32" or stat.S_IMODE((root / "local.sh").stat().st_mode) == 0o700
     assert os.readlink(root / "local-link") == "tracked.txt"
     with pytest.raises(CheckpointError, match="turn-1"):
         journal.rollback(consume=False)

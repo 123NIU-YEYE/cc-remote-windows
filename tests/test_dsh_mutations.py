@@ -1,18 +1,19 @@
 """Crash windows at the native write/receipt/ACK boundaries, without a model."""
 import asyncio
 import json
+import os
 
 import pytest
 
 from cc_remote.protocol import CompactSession, ForkSession, NewSession, Query, SetDshControl
 from cc_remote.wrapper.dsh_client import DshError
 from cc_remote.wrapper.dsh_mutations import DshMutationJournal
-from tests.platform_support import has_mode, native_path
+from tests.platform_support import TMP, has_mode
 from tests.test_dsh_runtime import setup_runtime
 
 # Default test working directories for DSH fork tests
-_TEST_CWD = native_path("/tmp")
-_TEST_FORK_CWD = native_path("/tmp/fork-cwd")
+_TEST_CWD = TMP
+_TEST_FORK_CWD = os.path.join(TMP, "fork-cwd")
 
 
 def prepared(previous=None):

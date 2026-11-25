@@ -11,6 +11,10 @@ import sys
 
 import pytest
 
+if sys.platform == "win32":
+    pytest.skip("deploy/install-wrapper.sh installs Linux/macOS Wrapper releases; "
+                "Windows runs the Wrapper from a source checkout", allow_module_level=True)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 

@@ -5,11 +5,11 @@ from pathlib import Path
 import pytest
 
 from cc_remote.protocol import DownloadDsh, NewSession, SwitchSession
-from tests.platform_support import native_path
+from tests.platform_support import TMP
 from tests.test_dsh_mutations import prepared
 
 # Default test working directory; absolute on all platforms for DSH validation
-_TEST_CWD = native_path("/tmp")
+_TEST_CWD = TMP
 
 
 @pytest.mark.asyncio

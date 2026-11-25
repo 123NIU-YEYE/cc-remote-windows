@@ -52,6 +52,9 @@ def start(store, *, sid=None, code="print('done')", request_id=None, **kwargs):
 @asynccontextmanager
 async def daemon(store, *, delivery="ok", reject_exec=False, thread_state="idle", thread_path=None,
                  turn_status="completed"):
+    if sys.platform == "win32":
+        pytest.skip("fake daemon listens on AF_UNIX; Windows reaches the daemon through "
+                    "app-server proxy, tested in test_windows_daemon_proxy.py")
     root = store.home / "app-server-control"
     root.mkdir(exist_ok=True)
     socket = root / "app-server-control.sock"

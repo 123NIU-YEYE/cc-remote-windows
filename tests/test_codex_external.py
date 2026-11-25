@@ -38,8 +38,10 @@ from cc_remote.wrapper.process_scan import (
     process_environment_value,
     process_identity,
 )
-from tests.platform_support import native_path
+from tests.platform_support import WINDOWS, native_path
 from tests.test_multisession import _mk_ctx, _mk_machine
+
+LINUX_PROC_ONLY = "fake Linux /proc tree: Windows has no /proc, so this scan never runs there"
 
 
 def _event(kind: str, turn_id: str) -> bytes:
@@ -52,6 +54,8 @@ def _event(kind: str, turn_id: str) -> bytes:
 def _fake_process(root: Path, pid: int, start: int, *, tty: int = 0,
                   cmdline: tuple[str, ...] = (), cwd: Path | None = None,
                   ppid: int = 0) -> Path:
+    if WINDOWS:
+        pytest.skip(LINUX_PROC_ONLY)
     proc = root / str(pid)
     (proc / "fd").mkdir(parents=True)
     (proc / "fdinfo").mkdir()

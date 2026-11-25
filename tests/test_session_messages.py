@@ -20,6 +20,7 @@ from cc_remote.wrapper.codex_stream import codex_live_user_message
 from cc_remote.wrapper.codex_external import visible_codex_user_message
 from cc_remote.wrapper.history_store import materialize_history_turns
 from cc_remote.wrapper.stream import translate_history
+from tests.platform_support import TMP
 from tests.test_multisession import _mk_ctx, _mk_machine
 from tests.test_codex_spontaneous_stream import _notification
 
@@ -95,7 +96,7 @@ def backend(monkeypatch, target_engine="claude"):
     machine.focused_sid = source.key
     source_ref, target_ref = reference(source.engine, source.key), reference(target.engine, target.key)
     rows = {source_ref: {"session_ref": source_ref, "title": "sender", "engine": source.engine},
-            target_ref: {"session_ref": target_ref, "title": "receiver", "engine": target.engine, "cwd": "/tmp"}}
+            target_ref: {"session_ref": target_ref, "title": "receiver", "engine": target.engine, "cwd": TMP}}
 
     async def catalog():
         return dict(rows)
@@ -204,7 +205,7 @@ async def test_cold_target_resumes_exact_account_without_focus_or_bootstrap(monk
     monkeypatch.setattr(machine, "_handle_immediate_query", query)
     result = await bus.call(source, "send_message", {"session_ref": recipient, "message": "hi", "request_id": "cold"})
     assert result["status"] == "accepted"
-    assert resumed == [{"resume_id": "target", "cwd": "/tmp", "engine": engine,
+    assert resumed == [{"resume_id": "target", "cwd": TMP, "engine": engine,
                         "raise_on_failure": True, f"{engine}_profile_id": "account"}]
     assert machine.focused_sid == "source"
     await machine._command_scheduler.close()
@@ -240,7 +241,7 @@ async def test_claude_bound_mcp_and_live_echo(monkeypatch):
 async def test_real_stdio_mcp_binds_codex_metadata_and_private_socket(monkeypatch):
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
-    with tempfile.TemporaryDirectory(prefix="crm-", dir="/tmp") as folder:
+    with tempfile.TemporaryDirectory(prefix="crm-", dir=TMP) as folder:
         bus, machine, target, rows, source, recipient = backend(monkeypatch)
         bus.store = MessageStore(Path(folder) / "messages")
         bus.socket = bus.store.root / "control.sock"
@@ -296,7 +297,7 @@ async def test_real_stdio_mcp_binds_codex_metadata_and_private_socket(monkeypatc
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix socket contract; Windows endpoints are tested in test_windows_local_ipc.py")
 @pytest.mark.asyncio
 async def test_corrupt_ack_is_unknown_not_a_rejection():
-    with tempfile.TemporaryDirectory(prefix="crm-ack-", dir="/tmp") as folder:
+    with tempfile.TemporaryDirectory(prefix="crm-ack-", dir=TMP) as folder:
         path = Path(folder) / "control.sock"
         received = []
         async def broken(reader, writer):

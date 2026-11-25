@@ -7280,8 +7280,10 @@ def test_managed_query_reconnect_refreshes_effort_without_blocking_stream():
         machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
         machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
 
-        await asyncio.wait_for(machine._run_turn(ctx, "hello"), timeout=0.5)
-        await asyncio.wait_for(resolution_started.wait(), timeout=0.5)
+        # The config read stays blocked, so a turn that waited on it would
+        # time out however long the bound. Keep it above slow CI runners.
+        await asyncio.wait_for(machine._run_turn(ctx, "hello"), timeout=10)
+        await asyncio.wait_for(resolution_started.wait(), timeout=10)
 
         # The immediate sentinel removes the stale chip, while the config read
         # remains entirely outside the already-accepted turn's stream drain.
