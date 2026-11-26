@@ -12250,6 +12250,12 @@ class WrapperMachine:
 
     async def _dispatch_incoming_command(self, cmd) -> None:
         """Admit commands without waiting for SDK I/O on the receive loop."""
+        if ((cmd.type == "hello" and getattr(cmd, "role", None) == "client")
+                or cmd.type in {"get_goal", "get_claude_plan"}):
+            # A browser's initial state and read-only presentation metadata
+            # must never queue behind a cold resume or a native metadata read.
+            self._start_history_command(cmd)
+            return
         if cmd.type == "list_sessions":
             self._start_session_list_command(cmd)
             return
@@ -12310,7 +12316,30 @@ class WrapperMachine:
             if self._session_messages is not None and id(cmd) in self._session_messages.commands:
                 await self._session_messages.dispatch(cmd)
                 return
-            await self._process_command(cmd)
+            if cmd.type in {"get_goal", "get_claude_plan"}:
+                try:
+                    async with asyncio.timeout(8.0):
+                        await self._process_command(cmd)
+                except TimeoutError:
+                    # Only read-only requests are bounded here. Never cancel
+                    # a write or resubmit an accepted model query on timeout.
+                    error = Error(
+                        code=ERR_INTERNAL,
+                        message="状态读取超时，请稍后重试",
+                        sid=getattr(cmd, "sid", None),
+                        to=getattr(cmd, "client_id", None),
+                        request_id=getattr(cmd, "cmd_id", None),
+                    )
+                    await self.transport.send(error)
+                    client_id = getattr(cmd, "client_id", None)
+                    cmd_id = getattr(cmd, "cmd_id", None)
+                    if client_id and cmd_id:
+                        self._remember_command(client_id, cmd_id, ())
+                        await self._send_command_ack(client_id, cmd_id)
+                    log.warning(
+                        "read-only metadata deadline exceeded", type=cmd.type)
+            else:
+                await self._process_command(cmd)
         except Exception:
             log.exception("command handling failed", type=cmd.type)
 
