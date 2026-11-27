@@ -1,0 +1,833 @@
+"""Durable correlation for persistent Codex ``thread/fork`` requests.
+
+Codex app-server returns a caller supplied ``threadSource`` on the immediate
+fork response and writes it to rollout ``session_meta``, but its state DB drops
+that value from later ``thread/list``/``thread/read`` responses.  The wrapper
+therefore journals intent before issuing the mutating RPC and the child id
+before acknowledging the browser command.  The rollout marker closes the small
+crash window between those two durable writes.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import threading
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Callable, Optional
+from uuid import uuid4
+
+from cc_remote.wrapper.os_compat import fchmod, fsync_directory
+
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_MAX_ENTRIES = 4096
+_MAX_FILE_BYTES = 4 * 1024 * 1024
+_MAX_META_RECORD_BYTES = 1024 * 1024
+_SOURCE_PREFIX = "cc-remote-fork:"
+_PROFILE_META_KEY = "__cc_remote_profile__"
+_CHILD_STATUSES = {"complete", "delete_pending", "deleted"}
+
+
+class ForkJournalError(RuntimeError):
+    """The durable fork journal could not safely serve a request."""
+
+
+def fork_thread_source(request_id: str) -> str:
+    if not isinstance(request_id, str) or not _SAFE_ID.fullmatch(request_id):
+        raise ForkJournalError("invalid fork request id")
+    return _SOURCE_PREFIX + request_id
+
+
+class CodexForkJournal:
+    """Small atomic intent/result map keyed by the reliable request id."""
+
+    def __init__(self, state_dir: Path):
+        self.path = Path(state_dir) / "codex-forks.json"
+        self._lock = threading.RLock()
+        self._profile_revision = 0
+        self.entries = self._load()
+
+    def _load(self) -> OrderedDict[str, dict[str, Any]]:
+        entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        try:
+            if self.path.stat().st_size > _MAX_FILE_BYTES:
+                raise ValueError("fork journal exceeds size limit")
+            with self.path.open(encoding="utf-8") as stream:
+                raw_text = stream.read(_MAX_FILE_BYTES + 1)
+            if len(raw_text.encode("utf-8", "surrogatepass")) > _MAX_FILE_BYTES:
+                raise ValueError("fork journal exceeds size limit")
+            raw = json.loads(raw_text)
+            if not isinstance(raw, dict):
+                raise ValueError("fork journal has an invalid shape")
+            profile_meta = raw.pop(_PROFILE_META_KEY, None)
+            if profile_meta is not None:
+                if (
+                    not isinstance(profile_meta, dict)
+                    or set(profile_meta) != {"revision"}
+                    or isinstance(profile_meta.get("revision"), bool)
+                    or not isinstance(profile_meta.get("revision"), int)
+                    or profile_meta["revision"] < 0
+                ):
+                    raise ValueError("fork journal profile metadata is invalid")
+                self._profile_revision = profile_meta["revision"]
+            if len(raw) > _MAX_ENTRIES:
+                raise ValueError("fork journal has an invalid shape")
+            for request_id, entry in raw.items():
+                self._validate_entry(request_id, entry)
+                entries[request_id] = dict(entry)
+            self._validate_aliases(entries)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            # Ignoring this state could duplicate a persistent fork after the
+            # browser retries. Refuse fail-open startup instead.
+            raise ForkJournalError("Codex fork journal is unreadable") from exc
+        return entries
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically migrate parent/child ids without replaying a fork."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise ForkJournalError("invalid Codex profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: OrderedDict[str, dict[str, Any]] = OrderedDict()
+            migrated = 0
+            for request_id, raw_entry in self.entries.items():
+                entry = dict(raw_entry)
+                parent = transform(entry["parent_session_id"])
+                migrated += parent != entry["parent_session_id"]
+                entry["parent_session_id"] = parent
+                child = entry.get("session_id")
+                if isinstance(child, str):
+                    routed_child = transform(child)
+                    migrated += routed_child != child
+                    entry["session_id"] = routed_child
+                self._validate_entry(request_id, entry)
+                updated[request_id] = entry
+            self._validate_aliases(updated)
+            self._persist(updated, profile_revision=profile_revision)
+            self.entries = updated
+            self._profile_revision = profile_revision
+            return migrated
+
+    @staticmethod
+    def _validate_aliases(entries: OrderedDict[str, dict[str, Any]]) -> None:
+        identity_fields = (
+            "parent_session_id", "last_turn_id", "target", "cwd",
+            "thread_source",
+        )
+        for request_id, entry in entries.items():
+            canonical_id = entry.get("canonical_request_id")
+            if canonical_id is None:
+                continue
+            canonical = entries.get(canonical_id)
+            if canonical is None or canonical.get("canonical_request_id") is not None:
+                raise ValueError("fork alias has no canonical root")
+            if any(entry.get(field) != canonical.get(field)
+                   for field in identity_fields):
+                raise ValueError("fork alias identity differs from its canonical root")
+            if entry.get("controls", {}) != canonical.get("controls", {}):
+                raise ValueError("fork alias controls differ from its canonical root")
+            if bool(entry.get("name_finalized")) != bool(
+                canonical.get("name_finalized")
+            ):
+                raise ValueError(
+                    "fork alias name state differs from its canonical root")
+            if (
+                entry.get("title") != canonical.get("title")
+                or entry.get("title_updated_at")
+                != canonical.get("title_updated_at")
+            ):
+                raise ValueError(
+                    "fork alias title differs from its canonical root")
+            compatible = {
+                "alias": {"intent", "submitted", "uncertain"},
+                "complete": {"complete"},
+                "delete_pending": {"delete_pending"},
+                "deleted": {"deleted"},
+                "rejected": {"rejected"},
+            }
+            allowed_canonical = compatible.get(entry.get("status"))
+            if (allowed_canonical is None
+                    or canonical.get("status") not in allowed_canonical):
+                raise ValueError("fork alias and canonical states are inconsistent")
+            if (entry.get("status") in _CHILD_STATUSES
+                    and entry.get("session_id") != canonical.get("session_id")):
+                raise ValueError("fork alias and canonical child ids differ")
+            if (entry.get("status") == "rejected"
+                    and entry.get("error_message") != canonical.get("error_message")):
+                raise ValueError("fork alias and canonical rejections differ")
+
+    @staticmethod
+    def _validate_entry(request_id: Any, entry: Any) -> None:
+        if not isinstance(request_id, str) or not _SAFE_ID.fullmatch(request_id):
+            raise ValueError("invalid request id")
+        if not isinstance(entry, dict):
+            raise ValueError("invalid journal entry")
+        required_ids = ("parent_session_id", "last_turn_id")
+        if any(not isinstance(entry.get(key), str)
+               or not _SAFE_ID.fullmatch(entry[key]) for key in required_ids):
+            raise ValueError("invalid fork identity")
+        canonical_request_id = entry.get("canonical_request_id")
+        if canonical_request_id is not None and (
+            not isinstance(canonical_request_id, str)
+            or not _SAFE_ID.fullmatch(canonical_request_id)
+        ):
+            raise ValueError("invalid canonical fork request id")
+        source_request_id = canonical_request_id or request_id
+        if entry.get("thread_source") != fork_thread_source(source_request_id):
+            raise ValueError("invalid fork source")
+        if entry.get("target") not in {"same_cwd", "worktree"}:
+            raise ValueError("invalid fork target")
+        cwd = entry.get("cwd")
+        if (not isinstance(cwd, str) or not cwd or "\x00" in cwd
+                or len(cwd.encode("utf-8", "surrogatepass")) > 4096):
+            raise ValueError("invalid fork cwd")
+        if entry.get("status") not in {
+            "intent", "alias", "submitted", "uncertain", "rejected", "complete",
+            "delete_pending", "deleted",
+        }:
+            raise ValueError("invalid fork status")
+        if entry.get("status") == "alias" and canonical_request_id is None:
+            raise ValueError("fork alias is missing its canonical request")
+        session_id = entry.get("session_id")
+        if entry.get("status") in _CHILD_STATUSES and (
+            not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id)
+        ):
+            raise ValueError("invalid child session id")
+        if entry.get("status") == "rejected" and (
+            not isinstance(entry.get("error_message"), str)
+            or not entry["error_message"]
+            or len(entry["error_message"]) > 512
+        ):
+            raise ValueError("invalid fork rejection")
+        created_at = entry.get("created_at")
+        if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
+            raise ValueError("invalid fork timestamp")
+        controls = entry.get("controls", {})
+        if not isinstance(controls, dict) or set(controls) - {
+            "model", "approval_policy", "permission_profile", "web_search",
+        }:
+            raise ValueError("invalid fork controls")
+        model = controls.get("model")
+        if model is not None and (
+            not isinstance(model, str) or not model or len(model) > 256
+        ):
+            raise ValueError("invalid fork model")
+        approval = controls.get("approval_policy")
+        if approval is not None and approval not in {
+            "untrusted", "on-request", "never",
+        }:
+            raise ValueError("invalid fork approval policy")
+        profile = controls.get("permission_profile")
+        if profile is not None and (
+            not isinstance(profile, str) or not profile or len(profile) > 256
+        ):
+            raise ValueError("invalid fork permission profile")
+        web_search = controls.get("web_search")
+        if web_search is not None and web_search not in {"cached", "live"}:
+            raise ValueError("invalid fork web search mode")
+        name_finalized = entry.get("name_finalized")
+        if name_finalized is not None and not isinstance(name_finalized, bool):
+            raise ValueError("invalid fork name finalization state")
+        title = entry.get("title")
+        if title is not None and (
+            not isinstance(title, str) or not title or len(title) > 200
+        ):
+            raise ValueError("invalid fork title")
+        title_updated_at = entry.get("title_updated_at")
+        if title_updated_at is not None and (
+            title is None
+            or isinstance(title_updated_at, bool)
+            or not isinstance(title_updated_at, (int, float))
+        ):
+            raise ValueError("invalid fork title timestamp")
+
+    def begin(
+        self,
+        request_id: str,
+        parent_session_id: str,
+        last_turn_id: str,
+        cwd: str,
+        controls: Optional[dict[str, str]] = None,
+        *,
+        target: str = "same_cwd",
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._begin(
+                request_id, parent_session_id, last_turn_id, cwd, controls,
+                target)
+
+    def _begin(
+        self,
+        request_id: str,
+        parent_session_id: str,
+        last_turn_id: str,
+        cwd: str,
+        controls: Optional[dict[str, str]],
+        target: str,
+    ) -> dict[str, Any]:
+        if target not in {"same_cwd", "worktree"}:
+            raise ForkJournalError("invalid fork target")
+        source = fork_thread_source(request_id)
+        control_snapshot = dict(controls or {})
+        identity = {
+            "parent_session_id": parent_session_id,
+            "last_turn_id": last_turn_id,
+            "target": target,
+            "cwd": cwd,
+            "thread_source": source,
+        }
+        identity_fields = {
+            key: value for key, value in identity.items()
+            if key != "thread_source"
+        }
+        existing = self.entries.get(request_id)
+        if existing is not None:
+            if any(existing.get(key) != value
+                   for key, value in identity_fields.items()):
+                raise ForkJournalError(
+                    "fork request id was already used for another source turn")
+            self.entries.move_to_end(request_id)
+            return dict(existing)
+
+        canonical: Optional[tuple[str, dict[str, Any]]] = next((
+            (key, value) for key, value in self.entries.items()
+            if value.get("status") in {"intent", "alias", "submitted", "uncertain"}
+            and all(value.get(field) == expected
+                    for field, expected in identity_fields.items())
+        ), None)
+
+        updated = OrderedDict(self.entries)
+        # Completed commands outside the wrapper's in-memory retry window are
+        # the only safe entries to compact. Keep every unresolved intent.
+        while len(updated) >= _MAX_ENTRIES:
+            removable_group = self._terminal_group_for_compaction(updated)
+            if not removable_group:
+                raise ForkJournalError("Codex fork journal capacity exhausted")
+            for key in removable_group:
+                updated.pop(key)
+        if canonical is None:
+            entry = {
+                **identity,
+                "controls": control_snapshot,
+                "status": "intent",
+                "created_at": time.time(),
+            }
+        else:
+            canonical_key, canonical_entry = canonical
+            canonical_request_id = (
+                canonical_entry.get("canonical_request_id") or canonical_key)
+            entry = {
+                **identity,
+                "thread_source": canonical_entry["thread_source"],
+                "controls": dict(canonical_entry.get("controls") or {}),
+                "canonical_request_id": canonical_request_id,
+                "status": "alias",
+                "created_at": time.time(),
+            }
+        updated[request_id] = entry
+        self._persist(updated)
+        self.entries = updated
+        return dict(updated[request_id])
+
+    @staticmethod
+    def _terminal_group_for_compaction(
+        entries: OrderedDict[str, dict[str, Any]],
+    ) -> list[str]:
+        """Return one whole, internally-consistent terminal source group."""
+        seen_sources: set[str] = set()
+        for value in entries.values():
+            source = value.get("thread_source")
+            if not isinstance(source, str) or source in seen_sources:
+                continue
+            seen_sources.add(source)
+            group = [
+                (key, candidate) for key, candidate in entries.items()
+                if candidate.get("thread_source") == source
+            ]
+            statuses = {candidate.get("status") for _, candidate in group}
+            # Deleted children are durable replay tombstones.  Compacting one
+            # would let a sufficiently old reliable fork command publish its
+            # cached SessionForked event again after a wrapper restart.  If
+            # tombstones fill the bounded journal, fail closed instead.
+            if statuses == {"complete"}:
+                children = {candidate.get("session_id") for _, candidate in group}
+                if len(children) == 1:
+                    return [key for key, _ in group]
+            elif statuses == {"rejected"}:
+                rejections = {
+                    candidate.get("error_message") for _, candidate in group}
+                if len(rejections) == 1:
+                    return [key for key, _ in group]
+        return []
+
+    def complete(self, request_id: str, session_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._complete(request_id, session_id)
+
+    def mark_name_finalized(self, request_id: str) -> dict[str, Any]:
+        """Remember that a worktree fork title must never be applied again."""
+        if not isinstance(request_id, str) or not _SAFE_ID.fullmatch(request_id):
+            raise ForkJournalError("invalid fork request id")
+        with self._lock:
+            existing = self.entries.get(request_id)
+            if existing is None:
+                raise ForkJournalError("fork intent is missing")
+            if existing.get("target") != "worktree":
+                raise ForkJournalError(
+                    "only a completed worktree fork can finalize its name")
+            if existing.get("status") in {"delete_pending", "deleted"}:
+                # Deletion owns the child.  A reconciler racing that deletion
+                # must terminate quietly instead of retrying title work forever.
+                return dict(existing)
+            if existing.get("status") != "complete":
+                raise ForkJournalError(
+                    "only a completed worktree fork can finalize its name")
+            source = existing.get("thread_source")
+            updated = OrderedDict(self.entries)
+            for key, value in tuple(updated.items()):
+                if value.get("thread_source") != source:
+                    continue
+                finalized = dict(value)
+                finalized["name_finalized"] = True
+                updated[key] = finalized
+            self._persist(updated)
+            self.entries = updated
+            return dict(updated[request_id])
+
+    def _complete(self, request_id: str, session_id: str) -> dict[str, Any]:
+        existing = self.entries.get(request_id)
+        if existing is None:
+            raise ForkJournalError("fork intent is missing")
+        if existing.get("status") == "rejected":
+            raise ForkJournalError("rejected fork request cannot complete")
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        if existing.get("status") in {"delete_pending", "deleted"}:
+            if existing.get("session_id") != session_id:
+                raise ForkJournalError(
+                    "deleted fork request resolved to another child session")
+            return dict(existing)
+        if (existing.get("status") == "complete"
+                and existing.get("session_id") != session_id):
+            raise ForkJournalError("fork request resolved to two child sessions")
+        updated = OrderedDict(self.entries)
+        source = existing.get("thread_source")
+        for key, value in list(updated.items()):
+            if (value.get("thread_source") == source
+                    and value.get("status") in {
+                        "intent", "alias", "submitted", "uncertain", "complete",
+                    }):
+                resolved = dict(value)
+                resolved["status"] = "complete"
+                resolved["session_id"] = session_id
+                updated[key] = resolved
+                updated.move_to_end(key)
+        self._persist(updated)
+        self.entries = updated
+        return dict(updated[request_id])
+
+    def mark_submitted(self, request_id: str) -> dict[str, Any]:
+        """Durably cross the no-replay boundary before writing the RPC."""
+        with self._lock:
+            self._claim_submission(request_id)
+            entry = self.entries.get(request_id)
+            return dict(entry) if entry is not None else {}
+
+    def claim_submission(self, request_id: str) -> bool:
+        """Atomically let exactly one canonical/alias handler write the RPC."""
+        with self._lock:
+            return self._claim_submission(request_id)
+
+    def _claim_submission(self, request_id: str) -> bool:
+        entry = self.entries.get(request_id)
+        if entry is None:
+            raise ForkJournalError("fork intent is missing")
+        canonical_id = entry.get("canonical_request_id") or request_id
+        canonical = self.entries.get(canonical_id)
+        if canonical is None:
+            raise ForkJournalError("canonical fork intent is missing")
+        if canonical.get("status") != "intent":
+            return False
+        updated = OrderedDict(self.entries)
+        submitted = dict(canonical)
+        submitted["status"] = "submitted"
+        updated[canonical_id] = submitted
+        updated.move_to_end(canonical_id)
+        self._persist(updated)
+        self.entries = updated
+        return True
+
+    def mark_uncertain(self, request_id: str) -> dict[str, Any]:
+        """Persist that a submitted RPC must only be reconciled, never replayed."""
+        with self._lock:
+            return self._set_status(request_id, "uncertain")
+
+    def reject(self, request_id: str, message: str) -> dict[str, Any]:
+        bounded = str(message or "Codex app-server rejected the fork")[:512]
+        with self._lock:
+            return self._set_status(
+                request_id, "rejected", error_message=bounded)
+
+    def get(self, request_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            entry = self.entries.get(request_id)
+            return dict(entry) if entry is not None else None
+
+    def completed_results(self, limit: int) -> list[dict[str, Any]]:
+        """Return newest unique completed forks for catalog recovery."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ForkJournalError("invalid completed fork result limit")
+        with self._lock:
+            results: list[dict[str, Any]] = []
+            seen_sources: set[str] = set()
+            for entry in reversed(tuple(self.entries.values())):
+                source = entry.get("thread_source")
+                if (
+                    entry.get("status") != "complete"
+                    or not isinstance(source, str)
+                    or source in seen_sources
+                ):
+                    continue
+                seen_sources.add(source)
+                results.append(dict(entry))
+                if len(results) >= limit:
+                    break
+            return results
+
+    def set_title(self, session_id: str, title: str) -> bool:
+        """Persist a renamed fork while its native catalog row is absent."""
+        if (
+            not isinstance(session_id, str)
+            or not _SAFE_ID.fullmatch(session_id)
+        ):
+            raise ForkJournalError("invalid forked session id")
+        if not isinstance(title, str) or not title or len(title) > 200:
+            raise ForkJournalError("invalid fork title")
+        with self._lock:
+            updated = OrderedDict(self.entries)
+            changed = False
+            updated_at = time.time()
+            for request_id, entry in tuple(updated.items()):
+                if (
+                    entry.get("status") != "complete"
+                    or entry.get("session_id") != session_id
+                ):
+                    continue
+                renamed = dict(entry)
+                renamed["title"] = title
+                renamed["title_updated_at"] = updated_at
+                updated[request_id] = renamed
+                changed = True
+            if not changed:
+                return False
+            self._validate_aliases(updated)
+            self._persist(updated)
+            self.entries = updated
+            return True
+
+    def child_entry(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return the strongest durable lifecycle record for one fork child."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        rank = {"complete": 1, "delete_pending": 2, "deleted": 3}
+        with self._lock:
+            candidates = [
+                value for value in self.entries.values()
+                if value.get("session_id") == session_id
+                and value.get("status") in rank
+            ]
+            if not candidates:
+                return None
+            return dict(max(candidates, key=lambda value: rank[value["status"]]))
+
+    def completed_children(
+        self, limit: int = _MAX_ENTRIES,
+    ) -> list[dict[str, Any]]:
+        """Return newest unique, live fork children for catalog repair.
+
+        Aliased reliable commands can point at the same native child.  Expose
+        each child once, and never expose deletion-owned lifecycle states.  The
+        caller still verifies the exact child in its owning Codex state DB
+        before placing it in a public session list.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ForkJournalError("invalid completed child limit")
+        bounded = min(limit, _MAX_ENTRIES)
+        rank = {"complete": 1, "delete_pending": 2, "deleted": 3}
+        with self._lock:
+            strongest: dict[str, str] = {}
+            for value in self.entries.values():
+                child = value.get("session_id")
+                status = value.get("status")
+                if not isinstance(child, str) or status not in rank:
+                    continue
+                previous = strongest.get(child)
+                if previous is None or rank[status] > rank[previous]:
+                    strongest[child] = status
+
+            children: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for value in reversed(self.entries.values()):
+                child = value.get("session_id")
+                if not isinstance(child, str) or child in seen:
+                    continue
+                status = value.get("status")
+                if status not in rank:
+                    continue
+                seen.add(child)
+                if strongest.get(child) != "complete":
+                    continue
+                children.append(dict(value))
+                if len(children) >= bounded:
+                    break
+            return children
+
+    def begin_delete(self, session_id: str) -> Optional[str]:
+        """Persist deletion intent before the native child is touched."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") in _CHILD_STATUSES
+            ]
+            if not matches:
+                return None
+            target = "deleted" if any(
+                value.get("status") == "deleted" for _, value in matches
+            ) else "delete_pending"
+            updated = OrderedDict(self.entries)
+            changed = False
+            for key, value in matches:
+                if value.get("status") == target:
+                    continue
+                pending = dict(value)
+                pending["status"] = target
+                updated[key] = pending
+                changed = True
+            if changed:
+                self._persist(updated)
+                self.entries = updated
+            return target
+
+    def finish_delete(self, session_id: str) -> bool:
+        """Turn every pending reference to a child into a replay tombstone."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") in {"delete_pending", "deleted"}
+            ]
+            if not matches:
+                return False
+            updated = OrderedDict(self.entries)
+            changed = False
+            for key, value in matches:
+                if value.get("status") == "deleted":
+                    continue
+                deleted = dict(value)
+                deleted["status"] = "deleted"
+                updated[key] = deleted
+                changed = True
+            if changed:
+                self._persist(updated)
+                self.entries = updated
+            return True
+
+    def abort_delete(self, session_id: str) -> bool:
+        """Restore a child after a proven native deletion failure."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") == "delete_pending"
+            ]
+            if not matches:
+                return False
+            updated = OrderedDict(self.entries)
+            for key, value in matches:
+                restored = dict(value)
+                restored["status"] = "complete"
+                updated[key] = restored
+            self._persist(updated)
+            self.entries = updated
+            return True
+
+    def _set_status(
+        self, request_id: str, status: str, **fields: Any,
+    ) -> dict[str, Any]:
+        existing = self.entries.get(request_id)
+        if existing is None:
+            raise ForkJournalError("fork intent is missing")
+        canonical_id = existing.get("canonical_request_id") or request_id
+        canonical = self.entries.get(canonical_id)
+        if canonical is None:
+            raise ForkJournalError("canonical fork intent is missing")
+        if canonical.get("status") in _CHILD_STATUSES:
+            return dict(existing)
+        if canonical.get("status") == "rejected" and status != "rejected":
+            raise ForkJournalError("rejected fork request cannot be resubmitted")
+        updated = OrderedDict(self.entries)
+        source = canonical.get("thread_source")
+        targets = (
+            [key for key, value in updated.items()
+             if value.get("thread_source") == source]
+            if status == "rejected" else [canonical_id]
+        )
+        for key in targets:
+            entry = dict(updated[key])
+            entry["status"] = status
+            entry.update(fields)
+            updated[key] = entry
+            updated.move_to_end(key)
+        self._persist(updated)
+        self.entries = updated
+        return dict(updated[request_id])
+
+    def _persist(
+        self,
+        entries: OrderedDict[str, dict[str, Any]],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
+        tmp = self.path.with_suffix(f".{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(self.path.parent, 0o700)
+            serializable = OrderedDict(entries)
+            serializable[_PROFILE_META_KEY] = {
+                "revision": (
+                    self._profile_revision
+                    if profile_revision is None else profile_revision
+                ),
+            }
+            payload = json.dumps(serializable, separators=(",", ":"))
+            if len(payload.encode("utf-8")) > _MAX_FILE_BYTES:
+                raise ValueError("fork journal exceeds size limit")
+            with tmp.open("w", encoding="utf-8") as stream:
+                fchmod(stream.fileno(), tmp, 0o600)
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, self.path)
+            fsync_directory(self.path.parent)
+        except Exception as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise ForkJournalError("Codex fork journal could not be persisted") from exc
+
+
+def rollout_fork_meta(path: Optional[str]) -> Optional[dict[str, str]]:
+    """Read the bounded session_meta record needed for crash recovery."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            # session_meta is normally the first record. Bound both malformed
+            # leading data and record size so recovery cannot become a file scan.
+            for _ in range(16):
+                line = stream.readline(_MAX_META_RECORD_BYTES + 1)
+                if not line:
+                    return None
+                if len(line) > _MAX_META_RECORD_BYTES or not line.endswith("\n"):
+                    return None
+                try:
+                    record = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, dict):
+                    return None
+                values: dict[str, str] = {}
+                required = {
+                    "session_id": payload.get("id"),
+                    "thread_source": payload.get("thread_source"),
+                    "forked_from_id": payload.get("forked_from_id"),
+                }
+                if all(isinstance(value, str) for value in required.values()):
+                    values.update(required)  # type: ignore[arg-type]
+                    if isinstance(payload.get("cwd"), str):
+                        values["cwd"] = payload["cwd"]
+                    return values
+                return None
+    except (OSError, UnicodeError):
+        return None
+    return None
+
+
+def find_rollout_fork(
+    thread_source: str,
+    parent_session_id: str,
+    cwd: str,
+    *,
+    roots: Optional[tuple[str, ...]] = None,
+    max_files_per_root: int = 1000,
+) -> Optional[dict[str, str]]:
+    """Find a committed fork by its persistent rollout marker.
+
+    Date-based Codex rollout paths and filenames sort chronologically, so a
+    reverse walk finds the just-created child first. Active and archived roots
+    each have their own hard file bound; symlinks are never followed.
+    """
+    if roots is None:
+        roots = (
+            os.path.expanduser("~/.codex/sessions"),
+            os.path.expanduser("~/.codex/archived_sessions"),
+        )
+    expected_cwd = os.path.realpath(cwd)
+    for source_root in roots:
+        root = os.path.realpath(source_root)
+        scanned = 0
+        if not os.path.isdir(root):
+            continue
+        for directory, dirs, files in os.walk(root, topdown=True):
+            dirs.sort(reverse=True)
+            files.sort(reverse=True)
+            for filename in files:
+                if scanned >= max_files_per_root:
+                    break
+                if not filename.endswith(".jsonl"):
+                    continue
+                scanned += 1
+                path = os.path.realpath(os.path.join(directory, filename))
+                try:
+                    if os.path.commonpath((root, path)) != root:
+                        continue
+                except ValueError:
+                    continue
+                meta = rollout_fork_meta(path)
+                if meta is None:
+                    continue
+                if (
+                    meta.get("thread_source") == thread_source
+                    and meta.get("forked_from_id") == parent_session_id
+                    and (not meta.get("cwd")
+                         or os.path.realpath(meta["cwd"]) == expected_cwd)
+                ):
+                    return meta
+            if scanned >= max_files_per_root:
+                break
+    return None

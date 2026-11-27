@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import json
+import stat
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from cc_remote.wrapper import codex_forks as codex_forks_module
+from cc_remote.wrapper.codex_forks import (
+    CodexForkJournal,
+    ForkJournalError,
+    find_rollout_fork,
+)
+
+
+def test_fork_journal_persists_intent_and_result_atomically(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+
+    intent = journal.begin("request-1", "parent", "turn-1", "/repo")
+    assert intent["status"] == "intent"
+    assert intent["thread_source"] == "cc-remote-fork:request-1"
+    if sys.platform != "win32":
+        assert stat.S_IMODE(
+            (tmp_path / "codex-forks.json").stat().st_mode) == 0o600
+
+    journal.complete("request-1", "child")
+    reloaded = CodexForkJournal(tmp_path)
+    result = reloaded.begin("request-1", "parent", "turn-1", "/repo")
+    assert result["status"] == "complete"
+    assert result["session_id"] == "child"
+
+    with pytest.raises(ForkJournalError, match="another source turn"):
+        reloaded.begin("request-1", "parent", "different-turn", "/repo")
+
+    submitted = reloaded.begin("request-2", "parent", "turn-2", "/repo")
+    assert submitted["status"] == "intent"
+    reloaded.mark_submitted("request-2")
+    assert CodexForkJournal(tmp_path).entries["request-2"]["status"] == "submitted"
+    reloaded.reject("request-2", "invalid lastTurnId")
+    rejected = CodexForkJournal(tmp_path).entries["request-2"]
+    assert rejected["status"] == "rejected"
+    assert rejected["error_message"] == "invalid lastTurnId"
+
+
+def test_worktree_fork_control_snapshot_survives_journal_reload(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    controls = {
+        "model": "gpt-test",
+        "approval_policy": "on-request",
+        "permission_profile": ":workspace",
+        "web_search": "live",
+    }
+
+    journal.begin(
+        "request-1",
+        "parent",
+        "cc-remote-worktree-head",
+        "/repo-worktree",
+        controls,
+        target="worktree",
+    )
+
+    reloaded = CodexForkJournal(tmp_path)
+    assert reloaded.entries["request-1"]["target"] == "worktree"
+    assert reloaded.entries["request-1"]["controls"] == controls
+
+    journal.complete("request-1", "child")
+    journal.mark_name_finalized("request-1")
+    finalized = CodexForkJournal(tmp_path).entries["request-1"]
+    assert finalized["name_finalized"] is True
+
+
+def test_fork_child_delete_lifecycle_survives_restart_and_can_abort(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-1", "parent", "turn-1", "/repo")
+    journal.claim_submission("request-1")
+    journal.complete("request-1", "child")
+    assert journal.completed_children() == [journal.get("request-1")]
+
+    assert journal.begin_delete("child") == "delete_pending"
+    assert journal.completed_children() == []
+    assert CodexForkJournal(tmp_path).child_entry("child")["status"] == (
+        "delete_pending")
+    assert journal.abort_delete("child") is True
+    assert journal.child_entry("child")["status"] == "complete"
+    assert journal.completed_children() == [journal.get("request-1")]
+
+    assert journal.begin_delete("child") == "delete_pending"
+    assert journal.finish_delete("child") is True
+    reloaded = CodexForkJournal(tmp_path)
+    assert reloaded.child_entry("child")["status"] == "deleted"
+    assert reloaded.complete("request-1", "child")["status"] == "deleted"
+    assert reloaded.begin_delete("child") == "deleted"
+
+
+def test_completed_children_never_overrides_a_stronger_child_tombstone(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-old", "parent-old", "turn-old", "/repo")
+    journal.complete("request-old", "same-child")
+    journal.begin_delete("same-child")
+    journal.finish_delete("same-child")
+
+    # Distinct source groups are individually valid journal records. Even if a
+    # malformed upstream reconciliation later associates another completed
+    # request with the same native child, deletion remains the strongest owner.
+    journal.begin("request-new", "parent-new", "turn-new", "/repo")
+    journal.complete("request-new", "same-child")
+
+    assert journal.child_entry("same-child")["status"] == "deleted"
+    assert journal.completed_children() == []
+
+
+def test_rollout_marker_recovery_scans_active_and_archived_with_bounds(tmp_path):
+    active = tmp_path / "sessions"
+    archived = tmp_path / "archived_sessions"
+    active.mkdir()
+    target_dir = archived / "2026" / "07" / "12"
+    target_dir.mkdir(parents=True)
+    target = target_dir / "rollout-child.jsonl"
+    target.write_text(json.dumps({
+        "type": "session_meta",
+        "payload": {
+            "id": "child",
+            "cwd": "/repo",
+            "thread_source": "cc-remote-fork:request-1",
+            "forked_from_id": "parent",
+        },
+    }) + "\n")
+
+    meta = find_rollout_fork(
+        "cc-remote-fork:request-1",
+        "parent",
+        "/repo",
+        roots=(str(active), str(archived)),
+        max_files_per_root=10,
+    )
+
+    assert meta is not None
+    assert meta["session_id"] == "child"
+    assert find_rollout_fork(
+        "cc-remote-fork:other",
+        "parent",
+        "/repo",
+        roots=(str(active), str(archived)),
+        max_files_per_root=10,
+    ) is None
+
+
+def test_fork_journal_serializes_two_concurrent_requests(tmp_path, monkeypatch):
+    journal = CodexForkJournal(tmp_path)
+    original_persist = journal._persist
+
+    def slow_persist(entries):
+        time.sleep(0.01)
+        original_persist(entries)
+
+    monkeypatch.setattr(journal, "_persist", slow_persist)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda number: journal.begin(
+                f"request-{number}", "parent", f"turn-{number}", "/repo"),
+            (1, 2),
+        ))
+
+    assert {entry["last_turn_id"] for entry in results} == {"turn-1", "turn-2"}
+    reloaded = CodexForkJournal(tmp_path)
+    assert set(reloaded.entries) == {"request-1", "request-2"}
+
+
+def test_fork_journal_aliases_same_unresolved_identity_to_one_canonical(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    first = journal.begin("request-old", "parent", "turn-1", "/repo")
+    assert journal.claim_submission("request-old") is True
+
+    alias = journal.begin("request-new", "parent", "turn-1", "/repo")
+
+    assert alias["status"] == "alias"
+    assert alias["canonical_request_id"] == "request-old"
+    assert alias["thread_source"] == first["thread_source"]
+    assert journal.claim_submission("request-new") is False
+
+    unresolved_reload = CodexForkJournal(tmp_path)
+    assert unresolved_reload.entries["request-new"]["status"] == "alias"
+    assert unresolved_reload.entries["request-new"][
+        "canonical_request_id"] == "request-old"
+    assert unresolved_reload.claim_submission("request-new") is False
+
+    unresolved_reload.complete("request-new", "shared-child")
+    reloaded = CodexForkJournal(tmp_path)
+    assert {reloaded.entries[key]["session_id"] for key in (
+        "request-old", "request-new")} == {"shared-child"}
+    assert {reloaded.entries[key]["status"] for key in (
+        "request-old", "request-new")} == {"complete"}
+
+    # A completed fork is historical, not an unresolved ownership claim: the
+    # user may deliberately fork the same turn again later.
+    later = reloaded.begin("request-later", "parent", "turn-1", "/repo")
+    assert later["status"] == "intent"
+    assert later["thread_source"] == "cc-remote-fork:request-later"
+
+
+def test_fork_journal_lists_unique_completed_results_newest_first(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-old", "parent", "turn-old", "/repo")
+    journal.claim_submission("request-old")
+    journal.begin("request-alias", "parent", "turn-old", "/repo")
+    journal.complete("request-alias", "child-old")
+    journal.begin("request-new", "parent", "turn-new", "/repo")
+    journal.complete("request-new", "child-new")
+    assert journal.set_title("child-old", "Renamed fork") is True
+    assert journal.set_title("not-a-fork", "Ignored") is False
+
+    results = journal.completed_results(10)
+
+    assert [entry["session_id"] for entry in results] == [
+        "child-new",
+        "child-old",
+    ]
+    assert len({entry["thread_source"] for entry in results}) == 2
+    old_result = next(
+        entry for entry in results if entry["session_id"] == "child-old")
+    assert old_result["title"] == "Renamed fork"
+    assert old_result["title_updated_at"] >= old_result["created_at"]
+    reloaded = CodexForkJournal(tmp_path)
+    assert reloaded.completed_results(10)[1]["title"] == "Renamed fork"
+    with pytest.raises(ForkJournalError, match="invalid completed"):
+        journal.completed_results(0)
+
+
+def test_fork_journal_rejects_orphaned_alias_on_reload(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-old", "parent", "turn-1", "/repo")
+    journal.claim_submission("request-old")
+    journal.begin("request-new", "parent", "turn-1", "/repo")
+    path = tmp_path / "codex-forks.json"
+    raw = json.loads(path.read_text())
+    raw.pop("request-old")
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ForkJournalError, match="unreadable"):
+        CodexForkJournal(tmp_path)
+
+
+def test_fork_journal_compacts_complete_alias_group_atomically(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(codex_forks_module, "_MAX_ENTRIES", 3)
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-old", "parent", "turn-old", "/repo")
+    journal.claim_submission("request-old")
+    journal.begin("request-alias", "parent", "turn-old", "/repo")
+    journal.complete("request-alias", "old-child")
+
+    journal.begin("request-keep", "parent", "turn-keep", "/repo")
+    # Capacity is now canonical+alias+keep. Adding one more request must remove
+    # the WHOLE terminal source group, never only its canonical root.
+    journal.begin("request-new", "parent", "turn-new", "/repo")
+
+    assert "request-old" not in journal.entries
+    assert "request-alias" not in journal.entries
+    assert set(journal.entries) == {"request-keep", "request-new"}
+    reloaded = CodexForkJournal(tmp_path)
+    assert set(reloaded.entries) == {"request-keep", "request-new"}
+
+
+def test_fork_journal_never_compacts_deleted_replay_tombstone(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(codex_forks_module, "_MAX_ENTRIES", 1)
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-deleted", "parent", "turn-old", "/repo")
+    journal.claim_submission("request-deleted")
+    journal.complete("request-deleted", "deleted-child")
+    journal.begin_delete("deleted-child")
+    journal.finish_delete("deleted-child")
+
+    with pytest.raises(ForkJournalError, match="capacity exhausted"):
+        journal.begin("request-new", "parent", "turn-new", "/repo")
+
+    reloaded = CodexForkJournal(tmp_path)
+    assert reloaded.entries["request-deleted"]["status"] == "deleted"

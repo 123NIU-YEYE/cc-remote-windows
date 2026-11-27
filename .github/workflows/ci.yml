@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (${{ matrix.os }})
+    needs: web
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: .venv/bin/python
+          - os: windows-2025
+            python: .venv/Scripts/python.exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: "1"
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.16"
+      - name: Install dependencies
+        run: |
+          uv venv --python 3.13 .venv
+          uv pip sync \
+            --python ${{ matrix.python }} \
+            --require-hashes --only-binary=:all: --no-binary=http-ece \
+            requirements.lock
+          uv pip install --python ${{ matrix.python }} -r requirements-dev.txt
+      - name: Restore built Web client
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+      - name: Run pytest
+        run: ${{ matrix.python }} -m pytest --junitxml=test-results.xml
+      - name: Preserve test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ matrix.os }}
+          path: test-results.xml
+          if-no-files-found: ignore
+
+  web:
+    name: Web build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: ".nvmrc"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm --prefix web ci
+      - name: Build Web client
+        run: npm --prefix web run build
+      - name: Preserve built Web client
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 1

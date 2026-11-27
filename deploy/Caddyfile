@@ -1,0 +1,55 @@
+# /etc/caddy/Caddyfile
+#
+# Replace cc-remote.example.com with your domain. Caddy auto-provisions and
+# renews the Let's Encrypt TLS certificate (needs ports 80 + 443 open on the
+# vps, and the domain's A record pointing at the vps).
+# reverse_proxy upgrades WebSocket automatically: wss://domain/ws -> 127.0.0.1:8765/ws
+# setup-vps.sh also merges bounded HTTP server read/write/header limits into
+# the shared Caddyfile's global options block.
+
+cc-remote.example.com {
+	@entry path / /index.html
+	@login path /api/login
+	request_body @login {
+		max_size 4KB
+	}
+	header @entry Cache-Control "no-store"
+	@application {
+		not path /html-preview-runner.html /html-preview-runner.js /dsh/* /__cc_viewer/bridge/*
+	}
+	@html_preview path /html-preview-runner.html /html-preview-runner.js
+	# The relay supplies the Bridge runner's HTTP sandbox + per-publication CSP.
+	# Do not overwrite it with the main app's CSP / X-Frame-Options: DENY.
+	header @application {
+		Strict-Transport-Security "max-age=31536000"
+		# Only GitHub image hosts and its attachment redirect bucket are external.
+		# Keep scripts, connections, and the HTML preview runner isolated below.
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://github.com/user-attachments/assets/ https://raw.githubusercontent.com https://user-images.githubusercontent.com https://private-user-images.githubusercontent.com https://camo.githubusercontent.com https://avatars.githubusercontent.com https://github-production-user-asset-6210df.s3.amazonaws.com; media-src 'self' blob:; connect-src 'self' wss://cc-remote.example.com; frame-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+	header @html_preview {
+		Strict-Transport-Security "max-age=31536000"
+		Cache-Control "no-store"
+		Content-Security-Policy "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; connect-src 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+	# Optional DeepSeek Harness (DSH) desktop surface. A wrapper-side supervisor
+	# opens a reverse tunnel from the desktop to 127.0.0.1:3082, where its Node
+	# proxy terminates the DSH session cookie and serves its own login gate.
+	# /dsh/* is deliberately excluded from @application above: those headers set
+	# frame-ancestors 'none' and X-Frame-Options DENY, which would make the DSH
+	# panel unframeable by the cc-remote page that embeds it. handle_path strips
+	# the prefix because the DSH shell uses <base href="./"> and relative asset
+	# URLs, and its own Host answers "/" (not "/dsh/") .
+	handle_path /dsh/* {
+		reverse_proxy 127.0.0.1:3082
+	}
+	reverse_proxy 127.0.0.1:8765
+	encode zstd gzip
+}

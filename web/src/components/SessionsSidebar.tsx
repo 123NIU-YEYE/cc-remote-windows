@@ -1,0 +1,553 @@
+import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEvent } from "react";
+import type { ClaudeProfileInfo, CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
+import type { CompletionBadgeKind } from "../completion-badges";
+import type { DshRead } from "../dsh-api";
+const DshSearch = lazy(() => import("./DshSearch"));
+import { Icon, EngineIcon } from "../icons";
+const NO_ACCOUNT_PROFILES: never[] = [];
+import {
+  compareSessionsByActivity,
+  orderCodeDirectoryGroups,
+  visibleDirectorySessions,
+} from "../session-order";
+import {
+  canDeleteSidebarSession,
+  isSessionArchiveBlockedByState,
+  isSessionMigrationBlockedByState,
+  isWorktreeForkBlockedByState,
+  sessionMenuCapabilities,
+} from "../session-worktree";
+import { useImeSubmit } from "../use-ime-submit";
+import { codexProfilePresentation } from "../codex-profile-presentation";
+import { newWorkProfileForSidebarFilter } from "../work-profile-selection";
+import { manualUnreadKey } from "../manual-unread";
+import { useManualUnread } from "../use-manual-unread";
+import { useMobileSidebar } from "../use-mobile-sidebar";
+const SessionCardMenu = lazy(() => import("./SessionCardMenu").then(module => ({ default: module.SessionCardMenu })));
+const TimedTaskIndicator = lazy(() => import("./TimedTaskIndicator").then(module => ({ default: module.TimedTaskIndicator })));
+
+interface Props {
+  readDsh?: DshRead;
+  onDshSearch?: (sid: string, query: string) => void;
+  open: boolean;
+  engine: Engine;
+  space: Space;
+  profileScopeKey: string;
+  machineId?: string;
+  claudeProfiles?: ClaudeProfileInfo[];
+  defaultClaudeProfileId?: string | null;
+  codexProfiles?: CodexProfileInfo[];
+  defaultCodexProfileId?: string | null;
+  onSpaceChange: (space: Space) => void;
+  sessions: SessionInfo[];
+  // Live state per resident session (from the client's runtimes), overriding the
+  // list_sessions snapshot so a background session's dot updates in real time.
+  liveStates?: Record<string, State>;
+  completionBadges?: Record<string, CompletionBadgeKind>;
+  activeSessionId: string | null;
+  onSelect: (id: string) => void | boolean;
+  onNew: (profileId?: string) => void;
+  onNewInDir: (cwd: string) => void;
+  onClose: () => void;
+  onOpenChange?: (open: boolean) => void;
+  onRename: (id: string, title: string) => void;
+  onArchive: (id: string, archived: boolean) => void;
+  onPin: (session: SessionInfo, pinned: boolean) => void;
+  onDelete: (id: string) => void;
+  onForkWorktree: (session: SessionInfo) => void;
+  onMigrate: (session: SessionInfo) => void;
+}
+
+function basename(cwd?: string | null): string {
+  if (!cwd) return "其他";
+  const parts = cwd.replace(/[/\\]+$/, "").split(/[/\\]/);
+  return parts[parts.length - 1] || cwd;
+}
+
+function sessionDateGroup(value?: string | null): { key: string; label: string } {
+  if (!value) return { key: "older", label: "更早" };
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 10_000_000_000 ? numeric : numeric * 1000)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return { key: "older", label: "更早" };
+  const today = new Date();
+  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const day = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  if (day === start) return { key: "today", label: "今天" };
+  if (day === start - 86_400_000) return { key: "yesterday", label: "昨天" };
+  if (day >= start - 6 * 86_400_000) return { key: "week", label: "最近 7 天" };
+  return { key: "older", label: "更早" };
+}
+
+export function SessionsSidebar({ open, engine, space, readDsh, onDshSearch,
+  profileScopeKey, machineId, claudeProfiles = [], defaultClaudeProfileId,
+  codexProfiles = [], defaultCodexProfileId,
+  onSpaceChange, sessions, liveStates,
+  completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose, onOpenChange,
+  onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
+  const sidebarRef = useMobileSidebar(open, onOpenChange);
+  const manualUnread = useManualUnread();
+  const [q, setQ] = useState("");
+  const [menuCardId, setMenuCardId] = useState<string | null>(null);
+  const menuAnchor = useRef<HTMLButtonElement>(null);
+  const [lifting, setLifting] = useState(false);
+  const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [profileFilters, setProfileFilters] =
+    useState<Record<string, string>>({});
+  // "archived" group starts collapsed; project groups start expanded.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
+  const [expandedDirectories, setExpandedDirectories] = useState<Record<string, boolean>>({});
+  const pressTimer = useRef<number | null>(null);
+  const pressStart = useRef<{ x: number; y: number } | null>(null);
+  const cancelPress = useCallback(() => {
+    if (pressTimer.current !== null) window.clearTimeout(pressTimer.current);
+    pressTimer.current = null;
+    pressStart.current = null;
+  }, []);
+
+  const accountProfiles = engine === "dsh" ? NO_ACCOUNT_PROFILES : engine === "codex" ? codexProfiles : claudeProfiles;
+  const defaultAccountProfileId = engine === "codex"
+    ? defaultCodexProfileId : defaultClaudeProfileId;
+  const showProfileManagement = accountProfiles.length > 1;
+  const profileFilter = profileFilters[profileScopeKey] ?? "all";
+  const setProfileFilter = (profileId: string) => {
+    setProfileFilters((current) => (
+      current[profileScopeKey] === profileId
+        ? current
+        : { ...current, [profileScopeKey]: profileId }
+    ));
+  };
+
+  const profilePresentationFor = (session: SessionInfo) =>
+    codexProfilePresentation(
+      accountProfiles,
+      defaultAccountProfileId,
+      engine === "codex"
+        ? session.codex_profile_id : session.claude_profile_id,
+    );
+  const filter = q.toLowerCase();
+  const matches = (s: SessionInfo) => {
+    const profilePresentation = profilePresentationFor(s);
+    return (
+      (!showProfileManagement
+        || profileFilter === "all"
+        || (engine === "codex"
+          ? s.codex_profile_id : s.claude_profile_id) === profileFilter)
+      && (!filter
+        || (s.summary || "").toLowerCase().includes(filter)
+        || (s.first_prompt || "").toLowerCase().includes(filter)
+        || (s.cwd || "").toLowerCase().includes(filter)
+        || (s.claude_profile_label || "").toLowerCase().includes(filter)
+        || (s.codex_profile_label || "").toLowerCase().includes(filter)
+        || (profilePresentation?.fullLabel ?? "").toLowerCase().includes(filter)
+        || (s.native_session_id || s.session_id).toLowerCase().includes(filter))
+    );
+  };
+  const filtered = sessions.filter(matches);
+  const archived = filtered.filter((s) => s.tag === "archived");
+  const active = filtered.filter((s) => s.tag !== "archived");
+  const pinned = active.filter((s) => s.pinned).sort(compareSessionsByActivity);
+  const regular = active.filter((s) => !s.pinned);
+
+  const groups: Record<string, SessionInfo[]> = {};
+  for (const s of regular) {
+    const key = space === "work" ? sessionDateGroup(s.last_modified).key : (s.cwd || "");
+    (groups[key] = groups[key] || []).push(s);
+  }
+  for (const k of Object.keys(groups)) {
+    groups[k].sort(compareSessionsByActivity);
+  }
+  const groupKeys = space === "work"
+    ? ["today", "yesterday", "week", "older"].filter((key) => groups[key]?.length)
+    : orderCodeDirectoryGroups(groups);
+
+  const toggleGroup = (key: string) => setCollapsed((c) => ({ ...c, [key]: !c[key] }));
+  const commitRename = (value = renaming?.value ?? "") => {
+    if (renaming && value.trim()) onRename(renaming.id, value.trim());
+    setRenaming(null);
+  };
+  const renameIme = useImeSubmit<HTMLInputElement>(commitRename);
+  const startRename = (s: SessionInfo) => {
+    setRenaming({ id: s.session_id, value: s.summary || s.first_prompt || "" });
+    setMenuCardId(null); setLifting(false);
+  };
+  const doArchive = (s: SessionInfo, archived: boolean) => {
+    onArchive(s.session_id, archived);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doPin = (s: SessionInfo) => {
+    onPin(s, !s.pinned);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doForkWorktree = (s: SessionInfo) => {
+    onForkWorktree(s);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doMigrate = (s: SessionInfo) => {
+    onMigrate(s);
+    setMenuCardId(null); setLifting(false);
+  };
+  const doCopyId = (s: SessionInfo) => {
+    navigator.clipboard?.writeText(
+      s.native_session_id ?? s.session_id).catch(() => {});
+    setCopiedId(s.session_id);
+    window.setTimeout(() => setCopiedId(null), 1200);
+  };
+  const doDelete = (s: SessionInfo) => {
+    onDelete(s.session_id);
+    setMenuCardId(null); setLifting(false);
+  };
+  const closeMenu = () => { setMenuCardId(null); setLifting(false); };
+
+  // reset menu/lift state when the sidebar closes (so it doesn't linger into the next open)
+  useEffect(() => {
+    if (!open) { cancelPress(); setMenuCardId(null); setLifting(false); }
+    return cancelPress;
+  }, [open, cancelPress]);
+
+  useEffect(() => {
+    if (!showProfileManagement
+        || (profileFilter !== "all"
+          && !accountProfiles.some(
+            (profile) => profile.id === profileFilter))) {
+      setProfileFilters((current) => {
+        if ((current[profileScopeKey] ?? "all") === "all") return current;
+        return { ...current, [profileScopeKey]: "all" };
+      });
+    }
+  }, [
+    accountProfiles,
+    profileFilter,
+    profileScopeKey,
+    showProfileManagement,
+  ]);
+
+  // dismiss the ⋯ popover on any click outside it — covers the sidebar header, footer,
+  // the side scrim, and the rest of the page (not just .s-scroll). The long-press lift
+  // is dismissed via .s-lift-scrim instead, so we only handle the non-lifting popover here.
+  useEffect(() => {
+    if (menuCardId === null || lifting) return;
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Element | null;
+      if (t && (t.closest?.(".card-menu") || t.closest?.(".scard-act"))) return;  // click inside menu / on ⋯
+      setMenuCardId(null);
+    };
+    document.addEventListener("click", onDocClick);
+    return () => document.removeEventListener("click", onDocClick);
+  }, [menuCardId, lifting]);
+
+  // long-press (500ms hold, no >10px move) => lift the card + dim the rest + show actions.
+  // Browser scroll/zoom ownership can cancel a touch before a >10px move
+  // reaches React. Clear on cancellation and scroll too, including momentum;
+  // a timer left behind must not lift a card halfway through a native fling.
+  const onCardTouchStart = (s: SessionInfo, e: TouchEvent) => {
+    cancelPress();
+    if (e.touches.length !== 1) return;
+    pressStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    pressTimer.current = window.setTimeout(() => {
+      cancelPress();
+      setMenuCardId(s.session_id);
+      setLifting(true);
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, 500);
+  };
+  const onCardTouchMove = (e: TouchEvent) => {
+    if (e.touches.length !== 1) { cancelPress(); return; }
+    if (!pressStart.current) return;
+    const dx = Math.abs(e.touches[0].clientX - pressStart.current.x);
+    const dy = Math.abs(e.touches[0].clientY - pressStart.current.y);
+    if (dx > 10 || dy > 10) cancelPress();
+  };
+
+  const renderCard = (s: SessionInfo, showLocation = false) => {
+    const isActive = s.session_id === activeSessionId;
+    const isArchived = s.tag === "archived";
+    const isMenu = menuCardId === s.session_id;
+    const capabilities = sessionMenuCapabilities(s);
+    if (renaming && renaming.id === s.session_id) {
+      return (
+        <div key={s.session_id} className={"scard" + (engine === "dsh" ? " dsh-session-card" : "") + (isActive ? " active" : "")}>
+          <div className="scard-top">
+            <input
+              ref={renameIme.inputRef}
+              className="scard-rename"
+              autoFocus
+              value={renaming.value}
+              onChange={(e) => setRenaming({ ...renaming, value: e.target.value })}
+              onCompositionStart={renameIme.startComposition}
+              onCompositionEnd={(e) => {
+                renameIme.endComposition();
+                setRenaming({ ...renaming, value: e.currentTarget.value });
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && !e.nativeEvent.isComposing
+                    && e.nativeEvent.keyCode !== 229) {
+                  setRenaming(null);
+                  return;
+                }
+                if (!renameIme.shouldSubmitKey({
+                  key: e.key,
+                  shiftKey: e.shiftKey,
+                  isComposing: e.nativeEvent.isComposing,
+                  keyCode: e.nativeEvent.keyCode,
+                })) return;
+                e.preventDefault();
+                renameIme.requestSubmit();
+              }}
+              onBlur={(e) => commitRename(e.currentTarget.value)}
+            />
+          </div>
+        </div>
+      );
+    }
+    const onTitleClick = () => {
+      if (lifting) { closeMenu(); return; }
+      if (onSelect(s.session_id) !== false && machineId) {
+        manualUnread.update({ machineId, engine: s.engine ?? engine, space: s.space ?? space }, s.session_id, false);
+      }
+    };
+    // Prefer live runtime state (resident session) over the list snapshot.
+    const st = liveStates?.[s.session_id] ?? s.state;
+    const unreadScope = machineId ? { machineId, engine: s.engine ?? engine, space: s.space ?? space } : null;
+    const completion = unreadScope && manualUnread.marks[manualUnreadKey(unreadScope, s.session_id)]
+      ? "unread" : completionBadges?.[s.session_id];
+    const sessionBusy = st === "running" || st === "interrupting";
+    // Parent activity hides its own completion, not an unread side-chat result.
+    const visibleCompletion = sessionBusy && completion !== "unread"
+      ? completion === "btw" || completion === "both" ? "btw" : undefined
+      : completion;
+    const completionLabel = visibleCompletion === "unread" ? "未读" : visibleCompletion === "btw" ? "BTW 完成"
+      : visibleCompletion === "both" ? "2 项完成"
+      : visibleCompletion ? "已完成" : null;
+    const forkBlocked = isWorktreeForkBlockedByState(st);
+    const migrationBlocked = isSessionMigrationBlockedByState(st);
+    const archiveBlocked = !isArchived && (engine === "codex" || engine === "dsh")
+      && isSessionArchiveBlockedByState(st);
+    const profilePresentation = profilePresentationFor(s);
+    return (
+      <div
+        key={s.session_id}
+        className={"scard" + (profilePresentation ? " has-profile-ribbon" : "") + (engine === "dsh" ? " dsh-session-card" : "") + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
+        onTouchStart={(e) => onCardTouchStart(s, e)}
+        onTouchMove={onCardTouchMove}
+        onTouchEnd={cancelPress}
+        onTouchCancel={cancelPress}
+        onPointerCancel={cancelPress}
+        onClick={onTitleClick}
+      >
+        {profilePresentation && (
+          <span
+            className={`scard-profile-ribbon tone-${profilePresentation.tone}`}
+            title={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
+            aria-label={`${engine === "codex" ? "Codex" : "Claude"} 账号：${profilePresentation.fullLabel}`}
+          >
+            {profilePresentation.name}
+          </span>
+        )}
+        <div className={"scard-top" + (sessionBusy && visibleCompletion === "btw" ? " has-btw-completion" : "")}>
+          <span className="scard-title">
+            {s.summary || (s.first_prompt || "").slice(0, 40) || s.session_id.slice(0, 8)}
+          </span>
+          {isActive && <span className="pill idle"><span className="sd" />当前</span>}
+          {!isArchived && !!s.timed_tasks?.length && <Suspense fallback={null}><TimedTaskIndicator tasks={s.timed_tasks} hidden={isMenu} /></Suspense>}
+          {sessionBusy && (
+            <span className={"pill " + st}><span className="sd" />{st === "running" ? "运行" : "中断"}</span>
+          )}
+          {completionLabel && (
+            <span className="pill completed"><span className="sd" />{completionLabel}</span>
+          )}
+        </div>
+        {(showLocation || engine === "dsh") && s.cwd && (
+          <div className="scard-location" title={s.cwd}>
+            <Icon name="folder" size={12} />
+            <span>{basename(s.cwd)}</span>
+          </div>
+        )}
+        {s.first_prompt && !s.summary && <div className="scard-prev">{s.first_prompt}</div>}
+        <div className="scard-actions">
+          <button ref={isMenu ? menuAnchor : undefined} className="scard-act" aria-label="更多操作"
+            aria-expanded={isMenu}
+            onClick={(e) => { e.stopPropagation(); setMenuCardId(isMenu ? null : s.session_id); setLifting(false); }}>
+            <Icon name="dots" size={15} />
+          </button>
+        </div>
+        {isMenu && (
+          <Suspense fallback={null}><SessionCardMenu anchor={menuAnchor} onClose={closeMenu}>
+            {capabilities.rename && (
+              <button onClick={() => startRename(s)}><Icon name="edit" size={15} />重命名</button>
+            )}
+            <button onClick={() => doPin(s)}>
+              <Icon name="pin" size={15} />{s.pinned ? "取消置顶" : "置顶"}
+            </button>
+            {unreadScope && <button onClick={() => {
+              manualUnread.update(unreadScope, s.session_id, true); setMenuCardId(null); setLifting(false);
+            }}><Icon name="message" size={15} />标记为未读</button>}
+            {space === "code" && capabilities.forkWorktree && (
+              <button onClick={() => doForkWorktree(s)} disabled={forkBlocked}
+                title={forkBlocked ? "请等待当前任务结束" : "从当前 Git HEAD 创建新工作树"}>
+                <Icon name="branch" size={15} />派生到新工作树…
+              </button>
+            )}
+            {space === "code" && capabilities.migrate && (
+              <button onClick={() => doMigrate(s)} disabled={migrationBlocked}
+                title={migrationBlocked
+                  ? "请等待当前任务结束"
+                  : "保留对话历史并在另一目录继续"}>
+                <Icon name="folder-open" size={15} />迁移到目录…
+              </button>
+            )}
+            <button onClick={() => doCopyId(s)}><Icon name={copiedId === s.session_id ? "check" : "copy"} size={15} />{copiedId === s.session_id ? "已复制" : "复制 session ID"}</button>
+            {capabilities.archive && (isArchived ? (
+              <button onClick={() => doArchive(s, false)}><Icon name="archive" size={15} />取消归档</button>
+            ) : (
+              <button onClick={() => doArchive(s, true)} disabled={archiveBlocked}
+                title={archiveBlocked ? "请停止当前任务并清空排队后再归档" : "归档会话"}>
+                <Icon name="archive" size={15} />归档
+              </button>
+            ))}
+            {capabilities.delete
+                && canDeleteSidebarSession(engine, space, isArchived) && (
+              <button className="danger" onClick={() => doDelete(s)}>
+                <Icon name="trash" size={15} />{space === "work" ? "删除工作" : "删除会话"}
+              </button>
+            )}
+          </SessionCardMenu></Suspense>
+        )}
+      </div>
+    );
+  };
+
+  const renderGroup = (key: string, items: SessionInfo[], label?: string) => {
+    // While searching, expand every group so matches in collapsed/archived groups are visible.
+    const isCollapsed = filter ? false : collapsed[key];
+    const title = label || (space === "work"
+      ? ({ today: "今天", yesterday: "昨天", week: "最近 7 天", older: "更早" }[key] ?? "更早")
+      : basename(key));
+    const isCodeDirectoryGroup = space === "code" && !label;
+    const canAdd = isCodeDirectoryGroup && !!key;
+    const showDirectoryPath = isCodeDirectoryGroup && !!key;
+    const showPinnedLocation = key === "__pinned__";
+    const directoryExpanded = !!expandedDirectories[key];
+    const visibleItems = isCodeDirectoryGroup
+      ? visibleDirectorySessions(items, directoryExpanded, !!filter)
+      : items;
+    const hiddenCount = items.length - visibleItems.length;
+    return (
+      <div key={key || "other"} className="sgroup-wrap">
+        <div className="sgroup-head">
+          <button className={"sgroup-toggle" + (isCollapsed ? " collapsed" : "")}
+            aria-label={showDirectoryPath ? `${title}，${key}` : undefined}
+            onClick={() => toggleGroup(key)}>
+            <span className={"sgroup-icon " + (isCodeDirectoryGroup ? "folder-icon" : "chev")}>
+              <Icon name={isCodeDirectoryGroup ? (isCollapsed ? "folder" : "folder-open") : "chev"}
+                size={isCodeDirectoryGroup ? 15 : 13} />
+            </span>
+            <span className="label">{title}</span>
+            <span className="count">{items.length}</span>
+          </button>
+          {canAdd && (
+            <button className="sgroup-add" title={`在 ${title} 新建会话`} aria-label="在此目录新建会话"
+              onClick={(e) => { e.stopPropagation(); onNewInDir(key); }}>
+              <Icon name="plus" size={14} />
+            </button>
+          )}
+          {showDirectoryPath && <span className="sgroup-path-tip" role="tooltip">{key}</span>}
+        </div>
+        {!isCollapsed && <div className="sgroup-items">
+          {visibleItems.map((session) => renderCard(session, showPinnedLocation))}
+          {isCodeDirectoryGroup && !filter && items.length > 5 && (
+            <button className="sgroup-more" onClick={(event) => {
+              event.stopPropagation();
+              setExpandedDirectories((current) => ({
+                ...current, [key]: !directoryExpanded,
+              }));
+            }}>
+              {directoryExpanded ? "收起" : `展开其余 ${hiddenCount} 个会话`}
+            </button>
+          )}
+        </div>}
+      </div>
+    );
+  };
+
+  return (
+    <>
+      <div className={"scrim-side" + (open ? " show" : "")} onClick={onClose} />
+      <aside ref={sidebarRef} className={"sessions" + (open ? " show" : "")} inert={!open} aria-hidden={!open}>
+        {/* Fade a sibling surface, never the native list scroller's ancestors. */}
+        <div className="s-fade" aria-hidden="true" />
+        {/* Keep the contents stable while the shell animates both surfaces. */}
+        <div className="s-inner">
+          <div className="s-head">
+            <button type="button" className="brand" onClick={onClose} aria-label="cc-remote，收起会话列表">
+              <span className="brand-mark"><EngineIcon engine={engine} size={20} /></span>
+              <span className="name"><b>cc</b><span>·remote</span></span>
+            </button>
+            <button className="iconbtn" onClick={onClose} aria-label="收起"><Icon name="chevrons-left" /></button>
+          </div>
+          <div className="space-switch" role="tablist" aria-label="切换工作空间">
+            <button role="tab" aria-selected={space === "work"}
+              className={space === "work" ? "active" : ""}
+              onClick={() => onSpaceChange("work")} disabled={engine === "dsh"}
+              title={engine === "dsh" ? "DSH 暂不支持 Work" : undefined}>
+              <Icon name="work" size={17} />Work
+              {engine === "dsh" && <span className="space-lock" aria-hidden="true"><Icon name="lock" size={13} /></span>}
+            </button>
+            <button role="tab" aria-selected={space === "code"}
+              className={space === "code" ? "active" : ""}
+              onClick={() => onSpaceChange("code")}>
+              <Icon name="code" size={18} />Code
+            </button>
+          </div>
+          {showProfileManagement && (
+            <div className="codex-profile-filter" role="group"
+              aria-label={`筛选 ${engine === "codex" ? "Codex" : "Claude"} 账号`}>
+              <button className={profileFilter === "all" ? "active" : ""}
+                onClick={() => setProfileFilter("all")}>全部</button>
+              {accountProfiles.map((profile) => (
+                (() => {
+                  const presentation = codexProfilePresentation(
+                    accountProfiles, defaultAccountProfileId, profile.id);
+                  return (
+                    <button key={profile.id}
+                      className={profileFilter === profile.id ? "active" : ""}
+                      onClick={() => setProfileFilter(profile.id)}
+                      title={profile.error ?? presentation?.fullLabel ?? profile.label}>
+                      {presentation && (
+                        <i className={`profile-tone tone-${presentation.tone}`} />
+                      )}
+                      {presentation?.fullLabel ?? profile.label}
+                    </button>
+                  );
+                })()
+              ))}
+            </div>
+          )}
+          <div className="search">
+            <Icon name="search" size={17} />
+            <input value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder={space === "work" ? "搜索工作…" : "搜索会话、路径…"}
+              aria-label={space === "work" ? "搜索工作" : "搜索会话"} />
+          </div>
+          <div className="s-scroll" onClick={closeMenu} onScrollCapture={cancelPress}>
+            {engine === "dsh" && q.trim() && readDsh && onDshSearch && (activeSessionId || sessions.length > 0) && <Suspense fallback={null}><DshSearch key={profileScopeKey} query={q} sid={activeSessionId ?? sessions[0].session_id} read={readDsh} onSelect={onDshSearch} /></Suspense>}
+            {filtered.length === 0 && <div className="s-group">{sessions.length === 0 ? "暂无会话" : "无匹配"}</div>}
+            {pinned.length > 0 && renderGroup("__pinned__", pinned, "置顶")}
+            {groupKeys.map((k) => renderGroup(k, groups[k]))}
+            {archived.length > 0 && renderGroup("archived", archived, "已归档")}
+            <div className={"s-lift-scrim" + (lifting ? " show" : "")} onClick={closeMenu} />
+          </div>
+          <div className="s-foot">
+            <button className="newbtn" onClick={() => onNew(
+              newWorkProfileForSidebarFilter(
+                engine, space, profileFilter,
+              ),
+            )}><Icon name="plus" size={19} />{space === "work" ? "新工作" : "新会话"}</button>
+          </div>
+        </div>
+      </aside>
+    </>
+  );
+}
